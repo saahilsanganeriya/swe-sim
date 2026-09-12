@@ -157,11 +157,14 @@ rationale; asset references not present in the manifest.
   changes are never applied, see 10.2), `expected_base` and `expected_gold`
   (per-test statuses recorded by `validate`), `runner` (command template
   producing JUnit XML).
-- `controls`: `oracle` (asset), `plausible_wrong` (>= 1, each with rationale
-  and `expected_reward: 0`), `alternative_correct` (>= 1 when the judge flags
-  structural tests, else optional, `expected_reward: 1`), `tamper` (>= 1 of
-  class `incorrect-exploit` with `expected_reward: 0`; optional `benign-edit`
-  class with `expected_reward: 1` and expected signals).
+- `controls`: `oracle` (asset), `plausible_wrong` (>= 1, each with rationale,
+  `expected_success: 0` and `expected_reward_max`), `alternative_correct`
+  (>= 1 when the judge flags structural tests, else optional,
+  `expected_success: 1`), `tamper` (>= 1 of class `incorrect-exploit` with
+  `expected_reward: 0`; optional `benign-edit` class with `expected_success:
+  1` and expected signals).
+- `groups`: requirement groups for partial credit (10.5): `{id, weight,
+  tests}` covering every FAIL_TO_PASS id exactly once.
 - `difficulty`: `annotated`, `judged` (score, rationale, model id, prompt
   version), `measured` (filled by `score`, keyed by run config hash).
 - `thread`: cached discussion with URLs, redacted of the gold diff.
@@ -204,7 +207,11 @@ domain knowledge determines: which exception type and message, which of two
 output shapes, whether to warn or raise, what to do for an input the reporter
 could not share, which public name to expose. The judge records this fact
 and its alternatives. Facts a capable engineer could infer from the code or
-the domain are tagged `repo-derivable` and do not qualify. Empirical screen:
+the domain are tagged `repo-derivable` and do not qualify. Non-derivability
+alone does not make a good task: prefer missing **decisions with engineering
+consequences** (backward compatibility, failure handling, output semantics,
+migration behavior) over arbitrary strings such as an exact message that is
+unknowable but inconsequential. Empirical screen:
 after calibration runs, a task the frontier tier passes in `hidden` on all
 attempts is moved out of the interactive comparison set (its underspecification
 is not load-bearing) and kept as a calibration record. Prefer annotated
@@ -254,10 +261,12 @@ without Temporal.
 5. `validate`: runs controls through Harbor on Modal once per spec version
    (the contract is identical across conditions): base expected statuses via
    `nop` (must show every F2P failing and every P2P passing, recorded as
-   `expected_base`), oracle (`expected_gold`, reward 1), each plausible-wrong
-   (0), each alternative-correct (1), each tamper (`incorrect-exploit` must be
-   0; `benign-edit` must be 1 with its expected signals). Any mismatch marks
-   the scenario `invalid` with the failing control. Output `validation.json`.
+   `expected_base`), oracle (`expected_gold`, reward 1, success 1), each
+   plausible-wrong (success 0 and reward at most its declared maximum), each
+   alternative-correct (success 1), each tamper (`incorrect-exploit` must earn
+   reward 0; `benign-edit` must succeed with its expected signals). Any
+   mismatch marks the scenario `invalid` with the failing control. Output
+   `validation.json`.
 6. `register`: appends to `registry.json` and Harbor `dataset.toml` with
    version, hashes, validation status, asset paths.
 7. `run`: per `TrialWorkflow`, launches `harbor run` for one trial id; on
@@ -290,6 +299,14 @@ without Temporal.
 
 ## 8. The stakeholder service
 
+Form (decided 2026-09-12): a **constrained chatbot**, not an agent. One
+structured model call per request with the stakeholder-visible view, persona,
+patience state, and transcript injected, and for review the diff as input;
+no shell, no tools, no code execution, structured output `{reply,
+disclosed_fact_ids}`. A tool-using stakeholder (Harbor's native mode runs a
+full coding agent as the user) adds an execution and leak surface that
+diff-only review does not need.
+
 Hosted on Modal as a web endpoint, one deployment, many sessions. Holds per
 session: the stakeholder-visible view of the spec (facts with discovery in
 `{brief, on-request, volunteered-at-review, repo-derivable}`, persona,
@@ -320,8 +337,11 @@ recorded model id are for reproducibility of configuration, not of output.
 Patience (decided 2026-09-12): asking is neither rewarded nor penalized by
 the grader. Its cost is modeled as a **patience budget owned by code**, part
 of the `RunConfig` as `patience_profile = {start, question_cost,
-review_cost, terse_below, refuse_at}`. Each `ask` spends `question_cost`,
-each `review` spends `review_cost`. While patience is above `terse_below`
+review_cost, terse_below, refuse_at}`. Budget is spent per stakeholder
+**reply**, not per question mark: each `ask` exchange spends `question_cost`,
+each `review` exchange spends `review_cost`. The instruction states the
+availability truthfully ("I can answer a few follow-ups; investigate what you
+can from the repository first"). While patience is above `terse_below`
 the stakeholder answers in full. Between `terse_below` and `refuse_at` the
 service instructs the model to answer in one or two sentences and to deflect
 questions whose facts are `repo-derivable` toward the code. At or below
@@ -354,9 +374,19 @@ hostname is in the allowlist.
   `timeout_sec` from `RunConfig`.
 - `[verifier] network_mode = "no-network"`, `environment_mode = "separate"`,
   `[verifier.environment]` builds from `tests/Dockerfile`.
-- `artifacts = [{source = "/app", exclude = [".git", "**/__pycache__",
-  "**/.venv", "**/node_modules", "**/.tox"]}]`. No collect hooks. Collection
-  is a tar by Harbor of the working tree; no agent-controlled program runs.
+- Collection (verified on Modal 2026-09-12, spike `smoke3-tar-collect`):
+  one `[[verifier.collect]]` hook, run by Harbor as root in the agent
+  container after the agent phase, under the allowlist baseline:
+  `du` size check (over 500 MB writes `oversized` and stops), then
+  `tar --numeric-owner --exclude=./.git --exclude=./.venv ... -cf
+  /logs/artifacts/app.tar -C /app .`, then writes `/logs/artifacts/collect.status`
+  with tar's exit code, file count, size, sha256 and the executing user. Only
+  root-owned binaries run; no agent code executes. `/logs/artifacts` is
+  collected by Harbor by default and transferred to the separate verifier
+  reliably (manifest status `ok`). Harbor's own directory-artifact path is
+  **not** used: its host-side `extractall(filter="data")` aborts the whole
+  download on the first absolute symlink and silently truncates the tree
+  (observed: manifest `failed`, partial files delivered).
 - Metadata: source, spec hash, condition, run config hash, annotated
   difficulty, image digest.
 
@@ -403,43 +433,74 @@ applies a named asset).
 
 ### 10.1 Inputs and outputs
 
-Input: the collected `/app` tree (placed by Harbor under the verifier's
-artifacts path; the grader locates it by the receipt file), `/pristine`,
-`expected_tests.json`, `policy.json`. Outputs in `/logs/verifier/`:
+Input: `/logs/artifacts/app.tar` and `/logs/artifacts/collect.status`
+(the receipt), `/pristine`, `expected_tests.json`, `policy.json`, and
+`groups.json` (requirement groups, 10.5). Outputs in `/logs/verifier/`:
 
-- `reward.json`, numeric only: `reward` (0 or 1), `f2p_passed`,
-  `f2p_expected`, `p2p_passed`, `p2p_expected`, `integrity_signal_count`,
+- `reward.json`, numeric only (Harbor rejects any non-numeric value):
+  `reward` (partial credit in [0, 1], 10.5), `success` (0 or 1: the whole
+  contract passed), `f2p_passed`, `f2p_expected`, `p2p_passed`,
+  `p2p_expected`, `groups_passed`, `groups_total`, `integrity_signal_count`,
   `outcome_code` (integer enum), `patch_applied` (0 or 1).
 - `report.json`: `outcome` (string), `integrity_signals` (list with paths and
-  kinds), `per_test` (id, expected, observed), `patch_sha256`,
-  `reviewed_diff_sha256` (from transcript, filled by worker), `dropped_paths`
-  (changes not applied under policy), `receipt` (present or missing), timings.
+  kinds), `per_test` (id, group, expected, observed), `per_group` (id,
+  weight, passed), `patch_sha256`, `reviewed_diff_sha256` (filled by the
+  worker from the transcript), `dropped_paths`, `rejected_members` (tar
+  entries refused: symlinks, devices, absolute or parent paths), `receipt`
+  (parsed `collect.status` or `missing`), timings.
 
 ### 10.2 Steps
 
-1. Receipt check: if the collected tree is absent or lacks
-   `/app/.swesim/receipt`, outcome `collection-failure` (infrastructure).
-2. Diff: compute the change set between `/pristine` and the collected tree:
-   added, modified, deleted regular files. Policy: reject symlinks, special
-   files, type changes, paths outside the repository root, paths under
-   `.git`; drop changes to `protected_paths` (contract test files, `conftest.py`
-   at any depth, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`
-   `[tool.pytest]`, CI config, `.gitattributes`, dependency lockfiles) and
-   record each drop as an integrity signal. If nothing remains, outcome
-   `agent-invalid-submission`.
+1. Receipt check: `collect.status` missing or unparsable, or `app.tar`
+   missing while the receipt reports `rc=0`, is `collection-failure`
+   (infrastructure). Receipt `oversized` is `agent-invalid-submission`.
+   A receipt sha256 that does not match `app.tar` is `collection-failure`.
+2. Extract member by member with `tarfile` `filter="data"` into a scratch
+   directory, refusing symlinks, hard links, devices, and any member whose
+   normalized path escapes the root; each refusal is recorded in
+   `rejected_members`. Compute the change set against `/pristine`: added,
+   modified, deleted regular files, compared by content hash. Policy: drop
+   changes to `protected_paths` (contract test files, `conftest.py` at any
+   depth, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, CI config,
+   `.gitattributes`, `.gitignore`, dependency lockfiles) and record each drop
+   as an integrity signal; globs are matched on normalized, case-folded
+   paths. If nothing remains, outcome `agent-invalid-submission`.
 3. Apply the remaining change set onto `/pristine` as a fresh copy; record
    `patch_sha256` over the canonical change set.
-4. Run the contract as the unprivileged user with the verifier-owned runner
+4. Chown the applied tree to the unprivileged test user (the verifier runs
+   as root on Harbor's Modal backend; files arrive owned by the host uid).
+   Run the contract as the unprivileged user with the verifier-owned runner
    config: one pytest invocation producing JUnit XML at a path chosen per run
    and not known to the code under test in advance; parse per-test statuses;
    require every expected id exactly once; missing, skipped, xfailed, or
    errored count as failed. Cross-check the process exit code with the parsed
    result; on disagreement re-run each F2P test in a fresh process and take
    the per-process result.
-5. `reward = 1` iff every F2P id observed `passed` and every P2P id observed
-   `passed`, else 0. Integrity signals never change `reward`; controls
-   (7.5) decide whether a task with a rewarded exploit is accepted at all.
+5. `success = 1` iff every F2P id observed `passed` and every P2P id observed
+   `passed`, else 0. `reward` is the partial credit of 10.5. Integrity signals
+   never change either; controls (7.5) decide whether a task whose exploit
+   control earns credit is accepted at all.
 6. Write both files; exit 0.
+
+### 10.5 Partial reward
+
+Fraction of tests passed is a poor reward: doing nothing passes every
+PASS_TO_PASS test, one requirement may have a hundred parameterized tests and
+another two, and counts are not comparable across tasks. Instead, credit is
+awarded per **requirement group**: `groups.json` maps each FAIL_TO_PASS test
+to exactly one group with a weight, derived at `spec` time from the
+requirement-to-test links in the record (tests not linked to any requirement
+form a residual group; weights default to equal and are human-editable). A
+group passes only if every test in it passes. Regression rule for the pilot,
+fixed in the contract before any model runs: any PASS_TO_PASS failure sets
+`reward = 0`. Then `reward = sum(weight_j * passed_j)`, and `success = 1` iff
+`reward == 1` and no regression. `success` feeds pass@k and pass^k; `reward`
+is exported for training and for explaining near misses. Controls under this
+rule: oracle `reward 1, success 1`; nop `reward 0`; each plausible-wrong
+control declares `expected_success: 0` and `expected_reward_max` (a
+legitimate partial solution may earn its declared partial credit, an
+evaluator-bypass attempt must earn 0); each `incorrect-exploit` tamper must
+earn `reward 0`; `benign-edit` controls earn 1 with their expected signals.
 
 ### 10.3 Outcome classes and attribution
 
@@ -577,9 +638,10 @@ dashboard has two pages:
 2. **Trial page**, the primary screen. While the trial runs: status, elapsed
    solver time, and the stakeholder chat streamed live from the service
    (questions, replies, disclosed-fact annotations, patience remaining,
-   review rounds). Agent actions are not available live because installed
-   agents write their trajectory at the end of the run through Harbor; the
-   page says so. After the trial: the complete timeline interleaving agent
+   review rounds). Agent actions are shown live only if Harbor's output
+   subscription hooks (`trial.py` logging callbacks) can be wired to the
+   worker in time; otherwise the page says the agent trajectory arrives at
+   the end of the run. After the trial: the complete timeline interleaving agent
    actions (from Harbor's trajectory), questions and replies by timestamp,
    the patch with dropped protected paths marked, per-test expected versus
    observed, outcome, integrity signals, the human label field, and links to
@@ -635,10 +697,14 @@ presentation. A third task only if everything above is done.
 
 ## 21. Unresolved, with the smallest verification
 
-- Harbor placement of a directory artifact inside the separate verifier and
-  behavior of `exclude`: one run with a small tree and a directory listing.
-- Installed agents running as `agent` user on Harbor's Modal backend: one run
-  of mini-swe-agent with `[agent] user`.
+- Resolved 2026-09-12 by spikes `smoke2*` and `smoke3-tar-collect`: the
+  separate verifier receives `/logs/artifacts` reliably at the same path;
+  Harbor's directory artifact with `exclude` is unreliable (aborts on absolute
+  symlinks); `[agent] user = "agent"` works for the oracle agent and the
+  agent cannot remove a root-owned directory; the verifier runs as root;
+  multi-key numeric `reward.json` is accepted.
+- Installed agents (mini-swe-agent) running as the `agent` user on Modal,
+  including their install step: one run.
 - Modal web endpoint reachable from a Harbor Modal sandbox under allowlist
   by hostname: one probe from the smoke task.
 - Temporal `TrialWorkflow` id dedup and worker restart: the restart check in
