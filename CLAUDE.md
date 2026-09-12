@@ -2,7 +2,7 @@
 
 Plan: `docs/superpowers/plans/2026-09-12-swesim-implementation.md`.
 Checklist: `PLAN.md`.
-Execute one implementation stream; no unavailable skill is a prerequisite.
+Execute the working model in PLAN.md: an integrator owns models.py and cli.py; six parallel streams in separate worktrees own disjoint files; cloud phases run from integrated main. Fall back to one sequential stream if subagents are unavailable.
 The repository-URL source discovers PRs itself. SWE-bench demonstrates the
 interaction mechanism; the GitHub feature task demonstrates implementation
 complexity. Diff size is a filter, never measured difficulty.

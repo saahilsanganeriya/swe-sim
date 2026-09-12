@@ -16,7 +16,7 @@ cloud execution required to produce evidence is an explicit implementation step.
 - [ ] **M9 Viewing** — Task 14: runs page, episode timeline, near-live stakeholder chat and completed agent trajectory; dashboard tests pass.
 - [ ] **M10 Reviewable delivery** — Tasks 15–16: tracked complete example and sanitized run with submitted patch; README, grading, architecture and operations docs; complete offline suite and `verify.sh 10` pass; commit pushed.
 
-Execution order: 1–10, **12 before 11**, then 14, 13, 15–16. Task 12 is needed before
+Execution order when sequential: 1–10, **12 before 11**, then 14, 13, 15–16. See the working model below for the parallel form. Task 12 is needed before
 Temporal calls register/score/export. Run one tier first; additional repeats
 and a frontier tier follow the complete end-to-end path. Insufficient repeats
 produce null pass@k/pass^k at the requested k, never a silently reduced k.
@@ -33,3 +33,34 @@ frozen `scenario.json` and `approval.json` afterwards. Supervised mode
 (`swesim approve <id>` by a person, or `--approval-mode human` in Temporal)
 remains available but is not used for the overnight run. Never hand-edit a
 draft to satisfy a gate; re-draft once or move to the next candidate.
+
+## Execution working model (parallel streams, frozen interfaces)
+
+Phase 0 (integrator): Task 1 models + `tests/test_contracts.py` (imports every
+cross-module name the plan promises). `swesim/models.py` is then frozen; streams
+request schema changes from the integrator instead of editing it. `swesim/cli.py`
+is wired only by the integrator.
+
+Phase 1 (six parallel streams, each in its own git worktree and branch, owning
+only the files listed, tests first, done when its tests pass and are committed):
+
+| stream | tasks | owns | cloud |
+|---|---|---|---|
+| verifier | 2, 3 | `swesim/verifier/`, tests policy/parsers/grader | no |
+| compile | 4, 5, 7 code | `swesim/templates/`, `stages/compile.py`, `agents/`, `harbor_cli.py`, `stages/validate.py`, `stages/approve.py`, `llm.py` | no |
+| sources | 6, 10 code | `swesim/sources/`, `stages/mine.py`, `judge.py`, `draft_spec.py`, `tamper.py` | GitHub API, HF datasets only |
+| stakeholder | 8 | `swesim/stakeholder/` | no (deploy in phase 3) |
+| scoring+ui | 12, 14 | `stages/register.py`, `score.py`, `export.py`, `swesim/dashboard/` | no |
+| orchestration | 11, 13 | `swesim/workflows/`, `scripts/vm/` | no |
+
+Phase 2 (integrator): merge streams, run the full suite and the contract test,
+fix naming drift, wire the CLI, `verify.sh 3`.
+
+Phase 3 (cloud, wall-clock bound; parallel where independent): deploy the
+stakeholder; SWE-bench path (mine, judge, draft, auto-approve, compile,
+validate on Modal, interactive episode); pypdf path (discovery, probe, draft,
+validate, run); VM + Temporal; docs written as artifacts appear.
+
+Phase 4 (integrator): scores, exports, example snapshot, docs, `verify.sh 10`.
+If subagents are unavailable, execute the same streams sequentially in the
+order 1-10, 12, 11, 14, 13, 15-16.
