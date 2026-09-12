@@ -54,3 +54,9 @@ Known residual: submitted code runs inside pytest and can attempt to forge
 its reports. These checks are tested defenses, not a proof against every
 attack. New feature tasks need independent behavioral controls and measured
 outcomes; 200–1,500 source lines does not guarantee a capability gradient.
+
+## Unattended-run rules
+- Before the first LLM-dependent stage, probe each configured model id with one tiny request. If a provider or id is unavailable, fall back: judge and draft to `anthropic/claude-sonnet-5`, stakeholder to `anthropic/claude-sonnet-5`, solver stays `anthropic/claude-haiku-4-5-20251001`; record the substitution in `docs/ops.md` and in `difficulty.judged.model_id`.
+- Nothing graded depends on the laptop's Docker: all builds and runs go through Harbor's Modal backend. Local Docker is only for optional smoke tests.
+- `gh auth token` supplies the GitHub token for mining; write it to the ignored env file the VM scripts copy, never into tracked files.
+- No step may wait for a human. If something genuinely needs a person (a provider outage, an exhausted quota, a missing permission), write it to `docs/ops.md` with the evidence and continue with independent work.
