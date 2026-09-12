@@ -1563,3 +1563,762 @@ Run: `uv run python -c "from swesim.paths import Workspace; from swesim.stages.m
 git add swesim/sources swesim/stages/mine.py swesim/stages/judge.py swesim/stages/draft_spec.py swesim/tamper.py tests/test_swebench_source.py tests/test_tamper.py
 git commit -m "feat(sources): swebench-annotated pool A mining with threads, judge rubric, spec drafting, code-generated tamper controls"
 ```
+
+---
+
+### Task 7: validate stage (controls on Modal) and approve/compile CLI wiring
+
+**Files:**
+- Create: `swesim/stages/validate.py`, `swesim/harbor_cli.py`
+- Modify: `swesim/cli.py` (replace stubs for `mine`, `judge`, `draft`, `approve`, `compile`, `validate`)
+- Create: `tests/test_validate.py`
+
+**Interfaces:**
+- Produces: `harbor_cli.run_task(task_dir: Path, agent: str, jobs_dir: Path, job_name: str, model: str | None = None, agent_kwargs: dict | None = None, env_provider: str = "modal", timeout_sec: int = 3600) -> Path` (returns the trial directory; raises `HarborRunError` with the exception message from `result.json`); `harbor_cli.read_reward(trial_dir) -> dict`, `harbor_cli.read_report(trial_dir) -> dict`; `validate.validate_scenario(ws, spec, run_config, stakeholder_url) -> dict` writing `workspace/scenarios/<id>/validation.json` with `{status: "valid"|"invalid", failures: [...], expected_base: {...}, expected_gold: {...}, controls: {name: {reward, success, outcome, expected}}, probe: {...}, trial_dirs: {...}}`; approval flow: `swesim approve <id>` validates `scenario.draft.json` (edited by the human) and writes `scenario.json`.
+- Consumes: `compile_scenario`, `PatchAgent` import path, reward/report formats from Task 3.
+
+- [ ] **Step 1: Write failing test (expectation logic, no cloud)**
+
+```python
+# tests/test_validate.py
+from swesim.stages.validate import evaluate_controls
+def test_expectations():
+    results = {"nop": {"reward": 0, "success": 0, "outcome_code": 3}, "oracle": {"reward": 1.0, "success": 1, "outcome_code": 1},
+               "plausible-wrong:keyerror": {"reward": 0.0, "success": 0, "outcome_code": 2},
+               "tamper:root-conftest": {"reward": 0.0, "success": 0, "outcome_code": 2}}
+    spec_controls = {"plausible_wrong": [{"name": "keyerror", "expected_success": 0, "expected_reward_max": 0.5}],
+                     "alternative_correct": [], "tamper": [{"name": "root-conftest", "cls": "incorrect-exploit", "expected_reward": 0.0}]}
+    ok, failures = evaluate_controls(results, spec_controls)
+    assert ok and failures == []
+    results["tamper:root-conftest"]["reward"] = 1.0; results["tamper:root-conftest"]["success"] = 1
+    ok, failures = evaluate_controls(results, spec_controls)
+    assert not ok and "tamper:root-conftest" in failures[0]
+```
+
+- [ ] **Step 2: Implement harbor_cli.py and validate.py**
+
+```python
+# swesim/harbor_cli.py
+from __future__ import annotations
+import json, os, subprocess
+from pathlib import Path
+class HarborRunError(RuntimeError): pass
+
+def run_task(task_dir: Path, agent: str, jobs_dir: Path, job_name: str, model: str | None = None, agent_kwargs: dict | None = None,
+             env_provider: str = "modal", timeout_sec: int = 3600) -> Path:
+    cmd = ["harbor", "run", "-p", str(task_dir), "--agent", agent, "-e", env_provider, "--jobs-dir", str(jobs_dir), "--job-name", job_name, "--yes"]
+    if model: cmd += ["-m", model]
+    for k, v in (agent_kwargs or {}).items(): cmd += ["--ak", f"{k}={v}"]
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec, env=env)
+    trials = sorted((jobs_dir / job_name).glob("*__*"))
+    if not trials: raise HarborRunError(f"no trial dir; harbor stdout tail: {proc.stdout[-1500:]} stderr: {proc.stderr[-1500:]}")
+    result = json.loads((trials[-1] / "result.json").read_text())
+    if result.get("exception_info"): raise HarborRunError(json.dumps(result["exception_info"])[:2000])
+    return trials[-1]
+
+def read_reward(trial_dir: Path) -> dict:
+    p = trial_dir / "verifier" / "reward.json"; return json.loads(p.read_text()) if p.exists() else {}
+def read_report(trial_dir: Path) -> dict:
+    p = trial_dir / "verifier" / "report.json"; return json.loads(p.read_text()) if p.exists() else {}
+```
+
+```python
+# swesim/stages/validate.py
+from __future__ import annotations
+import json, re
+from pathlib import Path
+from swesim import harbor_cli
+from swesim.models import ScenarioSpec, RunConfig
+from swesim.paths import Workspace
+from swesim.stages.compile import compile_scenario
+PATCH_AGENT = "swesim.agents.patch_agent:PatchAgent"
+
+def evaluate_controls(results: dict[str, dict], controls: dict) -> tuple[bool, list[str]]:
+    failures = []
+    if results["oracle"].get("success") != 1: failures.append("oracle: success != 1")
+    if results["nop"].get("reward", 1) != 0: failures.append("nop: reward != 0")
+    for c in controls["plausible_wrong"]:
+        r = results[f"plausible-wrong:{c['name']}"]
+        if r.get("success") != c.get("expected_success", 0): failures.append(f"plausible-wrong:{c['name']}: success {r.get('success')}")
+        if c.get("expected_reward_max") is not None and r.get("reward", 1) > c["expected_reward_max"] + 1e-9: failures.append(f"plausible-wrong:{c['name']}: reward {r.get('reward')} > max")
+    for c in controls["alternative_correct"]:
+        if results[f"alt-correct:{c['name']}"].get("success") != 1: failures.append(f"alt-correct:{c['name']}: success != 1")
+    for c in controls["tamper"]:
+        r = results[f"tamper:{c['name']}"]
+        if c.get("cls") == "incorrect-exploit" and r.get("reward", 1) != 0: failures.append(f"tamper:{c['name']}: exploit earned reward {r.get('reward')}")
+        if c.get("cls") == "benign-edit" and r.get("success") != 1: failures.append(f"tamper:{c['name']}: benign edit failed")
+    return (not failures), failures
+
+def gold_lines(oracle_diff: str) -> list[str]:
+    adds = [l[1:].strip() for l in oracle_diff.splitlines() if l.startswith("+") and not l.startswith("+++") and len(l.strip()) > 20]
+    return adds[:3]
+
+def validate_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, stakeholder_url: str) -> dict:
+    sdir = ws.scenario_dir(spec.id); comp = compile_scenario(ws, spec, run_config, stakeholder_url)
+    task = comp.task_dirs["full"]; jobs = ws.jobs_dir / "validate" / spec.id; results = {}; trial_dirs = {}
+    def run(name: str, agent: str, kwargs: dict | None = None):
+        td = harbor_cli.run_task(task, agent, jobs, f"{spec.id}--{name}", agent_kwargs=kwargs)
+        trial_dirs[name] = str(td); results[name] = harbor_cli.read_reward(td); results[name]["report"] = harbor_cli.read_report(td)
+    run("nop", "nop"); run("oracle", "oracle")
+    for c in spec.controls.plausible_wrong: run(f"plausible-wrong:{c.name}", PATCH_AGENT, {"patch": str((task / "controls" / f"{c.name}.diff").resolve())})
+    for c in spec.controls.alternative_correct: run(f"alt-correct:{c.name}", PATCH_AGENT, {"patch": str((task / "controls" / f"{c.name}.diff").resolve())})
+    for c in spec.controls.tamper: run(f"tamper:{c.name}", PATCH_AGENT, {"patch": str((task / "controls" / f"{c.name}.diff").resolve())})
+    probe_dir = harbor_cli.run_task(task, PATCH_AGENT, jobs, f"{spec.id}--probe", agent_kwargs={"probe": "true", "gold_lines": json.dumps(gold_lines((task / "solution" / "oracle.diff").read_text()))})
+    probe_txt = (probe_dir / "agent" / "probe.txt").read_text() if (probe_dir / "agent" / "probe.txt").exists() else ""
+    hits = re.search(r"HITS_BEGIN\n(.*?)HITS_END", probe_txt, re.S); probe = {"raw": probe_txt[-2000:], "gold_hits": (hits.group(1).strip().splitlines() if hits else [])}
+    ok, failures = evaluate_controls(results, spec.controls.model_dump())
+    base = {t["id"]: t["observed"] for t in results["nop"]["report"].get("per_test", [])}
+    gold = {t["id"]: t["observed"] for t in results["oracle"]["report"].get("per_test", [])}
+    if any(v == "passed" for k, v in base.items() if k in spec.contract.fail_to_pass): failures.append("a FAIL_TO_PASS test already passes on base"); ok = False
+    if probe["gold_hits"]: failures.append(f"gold patch lines reachable in agent image: {probe['gold_hits'][:3]}"); ok = False
+    out = {"status": "valid" if ok else "invalid", "failures": failures, "expected_base": base, "expected_gold": gold,
+           "controls": {k: {kk: vv for kk, vv in v.items() if kk != "report"} for k, v in results.items()}, "probe": probe,
+           "trial_dirs": trial_dirs, "spec_hash": spec.spec_hash, "image_digest": comp.image_digest}
+    (sdir / "validation.json").write_text(json.dumps(out, indent=2)); return out
+```
+
+- [ ] **Step 3: Wire the CLI**
+
+Replace the stub loop in `swesim/cli.py` with real commands (keep stubs for stages not yet implemented):
+
+```python
+# swesim/cli.py (additions)
+import json, typer
+from pathlib import Path
+from swesim.models import ScenarioSpec, RunConfig
+from swesim.paths import Workspace
+app = typer.Typer(no_args_is_help=True)
+WS = Workspace("workspace")
+
+@app.command()
+def mine(source: str = "swebench-annotated", pool: str = "A", instance: list[str] = typer.Option(None), repo: str = "", pr: int = 0, no_threads: bool = False):
+    if source == "swebench-annotated":
+        from swesim.stages.mine import mine_swebench; typer.echo(mine_swebench(WS, pool, instance or None, fetch_threads=not no_threads))
+    elif source == "github-repo":
+        from swesim.stages.mine import mine_github_repo; typer.echo(mine_github_repo(WS, repo, pr or None))
+    else: raise typer.BadParameter(source)
+
+@app.command()
+def judge(candidates: Path, model: str = "anthropic/claude-sonnet-5", limit: int = 20):
+    from swesim.stages.judge import judge_candidate
+    out = candidates.with_suffix(".judged.jsonl"); n = 0
+    with open(candidates) as f, open(out, "w") as g:
+        for line in f:
+            if n >= limit: break
+            row = json.loads(line); row["judge"] = judge_candidate(row, model); g.write(json.dumps(row) + "\n"); n += 1
+    typer.echo(out)
+
+@app.command()
+def draft(judged: Path, instance: str, model: str = "anthropic/claude-sonnet-5"):
+    from swesim.stages.draft_spec import draft as _draft
+    row = next(json.loads(l) for l in open(judged) if json.loads(l)["instance_id"] == instance)
+    sid = instance.lower().replace("__", "--"); typer.echo(_draft(row, row["judge"], model, WS.scenario_dir(sid)))
+
+@app.command()
+def approve(scenario_id: str):
+    """Validate the human-edited scenario.draft.json and freeze it as scenario.json."""
+    sdir = WS.scenario_dir(scenario_id); spec = ScenarioSpec.model_validate_json((sdir / "scenario.draft.json").read_text())
+    (sdir / "scenario.json").write_text(spec.model_dump_json(indent=2)); typer.echo(f"approved {scenario_id} spec_hash={spec.spec_hash}")
+
+def _load(scenario_id: str) -> ScenarioSpec:
+    return ScenarioSpec.model_validate_json((WS.scenario_dir(scenario_id) / "scenario.json").read_text())
+
+@app.command()
+def compile(scenario_id: str, stakeholder_url: str = typer.Option(..., envvar="SWESIM_STAKEHOLDER_URL"), condition: str = "interactive"):
+    from swesim.stages.compile import compile_scenario
+    res = compile_scenario(WS, _load(scenario_id), RunConfig.default(condition), stakeholder_url); typer.echo(json.dumps({k: str(v) for k, v in res.task_dirs.items()}))
+
+@app.command()
+def validate(scenario_id: str, stakeholder_url: str = typer.Option(..., envvar="SWESIM_STAKEHOLDER_URL")):
+    from swesim.stages.validate import validate_scenario
+    out = validate_scenario(WS, _load(scenario_id), RunConfig.default("full"), stakeholder_url); typer.echo(json.dumps({"status": out["status"], "failures": out["failures"]}, indent=2))
+    raise typer.Exit(0 if out["status"] == "valid" else 1)
+```
+
+- [ ] **Step 4: Run the first real scenario through draft → approve → validate on Modal**
+
+```bash
+export $(grep -v '^#' ~/Documents/.env | xargs)
+uv run swesim mine --instance pydata__xarray-5362 --instance psf__requests-1963
+uv run swesim judge workspace/candidates/swebench-annotated.jsonl
+uv run swesim draft workspace/candidates/swebench-annotated.judged.jsonl pydata__xarray-5362
+# Human step: open workspace/scenarios/pydata--xarray-5362/scenario.draft.json, check every fact's excerpt, fix discovery tags, then:
+uv run swesim approve pydata--xarray-5362
+SWESIM_STAKEHOLDER_URL=https://placeholder.modal.run uv run swesim validate pydata--xarray-5362
+```
+Expected: `validation.json` with `status: valid`; nop shows every FAIL_TO_PASS id failing on base; oracle success 1; the three tamper controls reward 0; plausible-wrong success 0. If the SWE-bench image's conda activate path differs, fix `runner.command` in the draft and re-approve. Record the first `validation.json` under `examples/` in Task 15.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add swesim/harbor_cli.py swesim/stages/validate.py swesim/cli.py tests/test_validate.py
+git commit -m "feat(validate): run nop/oracle/control patches and reachability probe on Modal; approve and compile CLI"
+```
+
+---
+
+### Task 8: Stakeholder service on Modal, session protocol, shims
+
+**Files:**
+- Create: `swesim/stakeholder/__init__.py`, `swesim/stakeholder/session.py`, `swesim/stakeholder/prompts.py`, `swesim/stakeholder/tools.py`, `swesim/stakeholder/service.py`, `swesim/stakeholder/modal_app.py`, `swesim/stakeholder/shims/ask-user`, `swesim/stakeholder/shims/request-review`, `scripts/deploy_stakeholder.sh`
+- Create: `tests/test_session.py`, `tests/test_service.py`
+
+**Interfaces:**
+- Produces HTTP API (FastAPI): `POST /sessions` (header `X-Worker-Secret`) body `{trial_id, spec_hash, condition, run_config_hash, visible_view: {...}, stakeholder_config: {...}, image: str}` → `{token}`; `POST /ask` (header `Authorization: Bearer <token>`) body `{request_id, question}` → `{reply, disclosed_fact_ids, patience_remaining, tool_calls: [...]}`; `POST /review` body `{request_id, diff, files: {path: content}}` → same shape plus `reviewed_diff_sha256`; `POST /freeze` → `{transcript_hash, frozen: true}`; `GET /transcript/{trial_id}` (worker secret) → full transcript JSON; `GET /health`.
+- `session.Session(trial_id, visible_view, config)` with `ask(request_id, question, llm) -> Reply`, `review(request_id, diff, files, llm, tools) -> Reply`, `freeze() -> str`, `to_dict()`; patience tiers per spec section 8; serialized via an `asyncio.Lock` per session; cached replies by `request_id`.
+- `prompts.system_prompt(visible_view, persona, patience_state, review_mode) -> str` builds the context from the stakeholder-visible view only: facts with `discovery in {brief, on-request, volunteered-at-review, repo-derivable}`, requirements, checks descriptions; never `author-only`, never oracle or test assets.
+- `tools.run_check(image, repo_dir, diff, command, timeout=120) -> {stdout, stderr, exit_code}` using `modal.Sandbox.create(image=modal.Image.from_registry(image), block_network=True, timeout=timeout)`.
+- Visible view construction (in the worker, Task 11): `stakeholder.view.visible_view(spec) -> dict` (put in `swesim/stakeholder/view.py`).
+
+- [ ] **Step 1: Write failing tests**
+
+```python
+# tests/test_session.py
+import asyncio
+from swesim.stakeholder.session import Session
+from swesim.models import RunConfig
+VIEW = {"brief": "It breaks.", "facts": [{"id": "f1", "text": "Raise ValueError, not KeyError", "discovery": "on-request", "kind": "interface"},
+        {"id": "f4", "text": "weighted.py holds the code", "discovery": "repo-derivable", "kind": "context"}],
+        "requirements": [{"id": "r1", "text": "Raise ValueError"}], "persona": {"summary": "maintainer", "tone": "terse", "disclosure_style": "answers what is asked", "role": "maintainer"}, "checks": []}
+class FakeLLM:
+    def __init__(self): self.calls = 0
+    def __call__(self, system, messages, schema):
+        self.calls += 1; return {"reply": "ValueError.", "disclosed_fact_ids": ["f1"]}
+def test_patience_tiers_and_idempotency():
+    cfg = RunConfig.default("interactive").stakeholder.model_copy(update={"patience_profile": {"start": 3, "question_cost": 1, "review_cost": 2, "terse_below": 2, "refuse_at": 0}})
+    s = Session("t1", VIEW, cfg); llm = FakeLLM()
+    r1 = asyncio.run(s.ask("q1", "Which exception?", llm)); assert r1.reply == "ValueError." and r1.patience_remaining == 2 and r1.disclosed_fact_ids == ["f1"]
+    r1b = asyncio.run(s.ask("q1", "Which exception?", llm)); assert r1b.reply == r1.reply and llm.calls == 1   # cached by request_id
+    r2 = asyncio.run(s.ask("q2", "And the message?", llm)); assert r2.patience_remaining == 1 and r2.tier == "terse"
+    r3 = asyncio.run(s.ask("q3", "More?", llm)); assert r3.patience_remaining == 0 and r3.tier == "refused" and llm.calls == 2
+    h = s.freeze(); assert len(h) == 64
+    import pytest
+    with pytest.raises(Session.Frozen): asyncio.run(s.ask("q4", "x", llm))
+def test_system_prompt_excludes_author_only():
+    from swesim.stakeholder.prompts import system_prompt
+    view = dict(VIEW); view["facts"] = VIEW["facts"] + [{"id": "f9", "text": "SECRET", "discovery": "author-only", "kind": "interface"}]
+    assert "SECRET" not in system_prompt(view, view["persona"], {"tier": "full", "remaining": 3}, "diff-only")
+```
+
+```python
+# tests/test_service.py
+from fastapi.testclient import TestClient
+from swesim.stakeholder import service
+def test_session_lifecycle(monkeypatch):
+    monkeypatch.setenv("SWESIM_WORKER_SECRET", "s3")
+    monkeypatch.setattr(service, "call_llm", lambda system, messages, schema, cfg: {"reply": "ValueError.", "disclosed_fact_ids": ["f1"]})
+    c = TestClient(service.app)
+    r = c.post("/sessions", headers={"X-Worker-Secret": "s3"}, json={"trial_id": "t1", "spec_hash": "h", "condition": "interactive", "run_config_hash": "r",
+        "visible_view": {"brief": "b", "facts": [{"id": "f1", "text": "x", "discovery": "on-request", "kind": "interface"}], "requirements": [], "persona": {"summary": "m", "tone": "t", "disclosure_style": "d", "role": "maintainer"}, "checks": []},
+        "stakeholder_config": {"model_id": "openai/gpt-5.5", "prompt_version": "v1", "temperature": 0.0, "patience_profile": {"start": 2, "question_cost": 1, "review_cost": 2, "terse_below": 1, "refuse_at": 0}, "review_mode": "diff-only", "max_tool_calls_per_activation": 4}, "image": "ubuntu:24.04"})
+    tok = r.json()["token"]; h = {"Authorization": f"Bearer {tok}"}
+    a = c.post("/ask", headers=h, json={"request_id": "1", "question": "which exception?"}).json(); assert a["reply"] == "ValueError." and a["patience_remaining"] == 1
+    f = c.post("/freeze", headers=h).json(); assert f["frozen"] and len(f["transcript_hash"]) == 64
+    assert c.post("/ask", headers=h, json={"request_id": "2", "question": "x"}).status_code == 410
+    t = c.get("/transcript/t1", headers={"X-Worker-Secret": "s3"}).json(); assert t["transcript_hash"] == f["transcript_hash"] and len(t["events"]) >= 2
+```
+
+- [ ] **Step 2: Implement session.py and prompts.py**
+
+```python
+# swesim/stakeholder/prompts.py
+from __future__ import annotations
+VISIBLE = {"brief", "on-request", "volunteered-at-review", "repo-derivable"}
+def system_prompt(view: dict, persona: dict, patience: dict, review_mode: str) -> str:
+    facts = [f for f in view["facts"] if f.get("discovery") in VISIBLE]
+    lines = [f"You are the {persona.get('role','maintainer')} who owns this request. Persona: {persona['summary']}. Tone: {persona['tone']}. Style: {persona['disclosure_style']}.",
+             "You are cooperative about requirements and limited about implementation: describe expected versus observed behavior, clarify what you want, never prescribe code, algorithms, or edits, never invent requirements beyond the facts below.",
+             "Answer at the level of specificity asked: a broad question gets the requirement list; exact exception types, messages, or shapes need a specific question.",
+             f"Availability: {patience['tier']} (remaining {patience['remaining']}). If terse, answer in one or two sentences and point the agent at the repository for anything it could find itself.",
+             "The original request:", view["brief"], "Requirements (what you actually want):"]
+    lines += [f"- {r['id']}: {r['text']}" for r in view.get("requirements", [])]
+    lines.append("Facts you know (share only when a question relates; mark repo-derivable facts as things the agent can find in the code):")
+    lines += [f"- {f['id']} [{f['kind']}, {f['discovery']}]: {f['text']}" for f in facts]
+    if review_mode == "diff-only": lines.append("For reviews you only read the diff; say explicitly that you have not executed anything.")
+    else: lines.append("For reviews you may run predefined checks; report what you observed, not how to fix it.")
+    return "\n".join(lines)
+REPLY_SCHEMA = '{"reply": "text shown to the agent", "disclosed_fact_ids": ["ids of facts you conveyed"]}'
+```
+
+```python
+# swesim/stakeholder/session.py
+from __future__ import annotations
+import asyncio, hashlib, json, time
+from dataclasses import dataclass, field, asdict
+from swesim.stakeholder.prompts import system_prompt, REPLY_SCHEMA
+REFUSAL = "I have to step away now; I can't answer more questions. Please investigate from the repository and finish with what you have."
+
+@dataclass
+class Reply:
+    reply: str; disclosed_fact_ids: list[str]; patience_remaining: int; tier: str; tool_calls: list[dict] = field(default_factory=list); reviewed_diff_sha256: str | None = None
+
+class Session:
+    class Frozen(Exception): pass
+    def __init__(self, trial_id: str, view: dict, cfg, image: str | None = None):
+        self.trial_id = trial_id; self.view = view; self.cfg = cfg; self.image = image
+        p = cfg.patience_profile if hasattr(cfg, "patience_profile") else cfg["patience_profile"]
+        self.p = p if isinstance(p, dict) else p.model_dump()
+        self.remaining = self.p["start"]; self.events: list[dict] = []; self.cache: dict[str, Reply] = {}
+        self.frozen = False; self.transcript_hash: str | None = None; self.lock = asyncio.Lock(); self.created_at = time.time()
+    def _tier(self) -> str:
+        if self.remaining <= self.p["refuse_at"]: return "refused"
+        return "terse" if self.remaining < self.p["terse_below"] else "full"
+    def _record(self, kind: str, **kw): self.events.append({"kind": kind, "ts": time.time(), **kw})
+    async def _exchange(self, request_id: str, kind: str, cost: int, messages: list[dict], llm, tool_calls: list[dict], reviewed_sha: str | None) -> Reply:
+        if self.frozen: raise Session.Frozen()
+        async with self.lock:
+            if request_id in self.cache: return self.cache[request_id]
+            tier = self._tier()
+            if tier == "refused":
+                rep = Reply(REFUSAL, [], self.remaining, tier, tool_calls, reviewed_sha)
+            else:
+                self.remaining = max(0, self.remaining - cost)
+                sysm = system_prompt(self.view, self.view["persona"], {"tier": tier, "remaining": self.remaining}, self.cfg.review_mode if hasattr(self.cfg, "review_mode") else self.cfg["review_mode"])
+                history = [{"role": e["role"], "content": e["content"]} for e in self.events if e["kind"] == "message"]
+                out = llm(sysm, history + messages, REPLY_SCHEMA)
+                rep = Reply(out.get("reply", ""), [i for i in out.get("disclosed_fact_ids", []) if isinstance(i, str)], self.remaining, tier, tool_calls, reviewed_sha)
+            self._record("message", role="user", content=messages[-1]["content"], request_id=request_id, exchange=kind)
+            self._record("message", role="assistant", content=rep.reply, request_id=request_id, disclosed_fact_ids=rep.disclosed_fact_ids, tier=rep.tier, patience_remaining=rep.patience_remaining, tool_calls=tool_calls, reviewed_diff_sha256=reviewed_sha)
+            self.cache[request_id] = rep; return rep
+    async def ask(self, request_id: str, question: str, llm) -> Reply:
+        return await self._exchange(request_id, "ask", self.p["question_cost"], [{"role": "user", "content": question}], llm, [], None)
+    async def review(self, request_id: str, diff: str, files: dict[str, str], llm, tools=None) -> Reply:
+        sha = hashlib.sha256(diff.encode()).hexdigest(); calls = []
+        content = "Please review my current changes.\n\nDIFF:\n" + diff[:20000]
+        if tools is not None:
+            for c in tools.plan_and_run(self.view, diff, files, self.image):
+                calls.append(c); content += f"\n\nCHECK {c['id']} ({c['description']}): exit={c['exit_code']}\n{c['stdout'][-1500:]}"
+        else:
+            content += "\n\n(You have not executed anything; you are reading the diff only.)"
+        return await self._exchange(request_id, "review", self.p["review_cost"], [{"role": "user", "content": content}], llm, calls, sha)
+    def freeze(self) -> str:
+        self.frozen = True
+        self.transcript_hash = hashlib.sha256(json.dumps(self.events, sort_keys=True).encode()).hexdigest(); return self.transcript_hash
+    def to_dict(self) -> dict:
+        return {"trial_id": self.trial_id, "events": self.events, "patience_start": self.p["start"], "patience_end": self.remaining,
+                "frozen": self.frozen, "transcript_hash": self.transcript_hash, "created_at": self.created_at}
+```
+
+- [ ] **Step 3: Implement tools.py, service.py, modal_app.py, shims**
+
+```python
+# swesim/stakeholder/tools.py
+from __future__ import annotations
+import shlex
+class CheckTools:
+    """run_check via Modal Sandbox: apply the diff to the base image's repo and run a predefined check, offline."""
+    def __init__(self, checks: list[dict], repo_dir: str, max_calls: int = 4, timeout: int = 120):
+        self.checks = checks; self.repo_dir = repo_dir; self.max_calls = max_calls; self.timeout = timeout
+    def plan_and_run(self, view: dict, diff: str, files: dict[str, str], image: str | None) -> list[dict]:
+        if not image or not self.checks: return []
+        import modal
+        out = []
+        img = modal.Image.from_registry(image).apt_install("git")
+        for c in self.checks[: self.max_calls]:
+            script = f"cd {shlex.quote(self.repo_dir)} && cat > /tmp/agent.diff <<'SWESIM_EOF'\n{diff}\nSWESIM_EOF\ngit apply --whitespace=nowarn /tmp/agent.diff && {c['command']}"
+            sb = modal.Sandbox.create("bash", "-lc", script, image=img, timeout=self.timeout, block_network=True)
+            sb.wait(); out.append({"id": c["id"], "description": c["description"], "exit_code": sb.returncode, "stdout": sb.stdout.read()[-4000:], "stderr": sb.stderr.read()[-2000:]})
+        return out
+```
+
+```python
+# swesim/stakeholder/service.py
+from __future__ import annotations
+import hashlib, hmac, json, os, secrets
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+from swesim.llm import chat_json
+from swesim.models import StakeholderConfig
+from swesim.stakeholder.session import Session
+from swesim.stakeholder.tools import CheckTools
+
+app = FastAPI(title="swesim stakeholder")
+SESSIONS: dict[str, Session] = {}; TOKENS: dict[str, str] = {}
+
+def call_llm(system: str, messages: list[dict], schema: str, cfg: StakeholderConfig) -> dict:
+    return chat_json(cfg.model_id, system, messages, schema, temperature=cfg.temperature)
+
+def _worker(secret: str | None):
+    if not secret or not hmac.compare_digest(secret, os.environ.get("SWESIM_WORKER_SECRET", "")): raise HTTPException(401)
+def _session(auth: str | None) -> Session:
+    tok = (auth or "").removeprefix("Bearer ").strip(); tid = TOKENS.get(tok)
+    if not tid: raise HTTPException(401)
+    s = SESSIONS[tid]
+    if s.frozen: raise HTTPException(410, "session frozen")
+    return s
+
+class NewSession(BaseModel):
+    trial_id: str; spec_hash: str; condition: str; run_config_hash: str; visible_view: dict; stakeholder_config: dict; image: str | None = None
+class Ask(BaseModel): request_id: str; question: str
+class Review(BaseModel): request_id: str; diff: str; files: dict[str, str] = {}
+
+@app.get("/health")
+def health(): return {"ok": True, "sessions": len(SESSIONS)}
+
+@app.post("/sessions")
+def new_session(body: NewSession, x_worker_secret: str | None = Header(default=None)):
+    _worker(x_worker_secret)
+    if body.trial_id in SESSIONS: return {"token": next(t for t, tid in TOKENS.items() if tid == body.trial_id)}
+    cfg = StakeholderConfig.model_validate(body.stakeholder_config)
+    s = Session(body.trial_id, body.visible_view, cfg, image=body.image); s._record("session", spec_hash=body.spec_hash, condition=body.condition, run_config_hash=body.run_config_hash)
+    tok = secrets.token_urlsafe(24); SESSIONS[body.trial_id] = s; TOKENS[tok] = body.trial_id; return {"token": tok}
+
+@app.post("/ask")
+async def ask(body: Ask, authorization: str | None = Header(default=None)):
+    s = _session(authorization)
+    r = await s.ask(body.request_id, body.question, lambda sy, m, sc: call_llm(sy, m, sc, s.cfg)); return r.__dict__
+
+@app.post("/review")
+async def review(body: Review, authorization: str | None = Header(default=None)):
+    s = _session(authorization)
+    tools = CheckTools(s.view.get("checks", []), s.view.get("repo_dir", "/app"), s.cfg.max_tool_calls_per_activation) if s.cfg.review_mode == "checks" else None
+    r = await s.review(body.request_id, body.diff, body.files, lambda sy, m, sc: call_llm(sy, m, sc, s.cfg), tools); return r.__dict__
+
+@app.post("/freeze")
+def freeze(authorization: str | None = Header(default=None)):
+    tok = (authorization or "").removeprefix("Bearer ").strip(); tid = TOKENS.get(tok)
+    if not tid: raise HTTPException(401)
+    s = SESSIONS[tid]; h = s.transcript_hash or s.freeze(); return {"frozen": True, "transcript_hash": h}
+
+@app.get("/transcript/{trial_id}")
+def transcript(trial_id: str, x_worker_secret: str | None = Header(default=None)):
+    _worker(x_worker_secret)
+    if trial_id not in SESSIONS: raise HTTPException(404)
+    return SESSIONS[trial_id].to_dict()
+```
+
+```python
+# swesim/stakeholder/modal_app.py
+import modal
+app = modal.App("swesim-stakeholder")
+image = (modal.Image.debian_slim(python_version="3.12").pip_install("fastapi[standard]", "pydantic>=2.7", "anthropic>=0.40", "openai>=1.50")
+         .add_local_python_source("swesim"))
+@app.function(image=image, secrets=[modal.Secret.from_name("swesim-llm")], min_containers=1, max_containers=1, timeout=3600)
+@modal.asgi_app()
+def web():
+    from swesim.stakeholder.service import app as fastapi_app
+    return fastapi_app
+```
+
+`swesim/stakeholder/shims/ask-user`:
+```bash
+#!/bin/bash
+# Usage: ask-user "question". Sends one question to the stakeholder; prints the reply.
+set -u
+if [ -z "${SWESIM_SESSION_TOKEN:-}" ]; then echo "No stakeholder is available in this task."; exit 0; fi
+Q="$*"; RID=$(cat /proc/sys/kernel/random/uuid)
+python3 - "$SWESIM_STAKEHOLDER_URL" "$SWESIM_SESSION_TOKEN" "$RID" "$Q" <<'PY'
+import json, sys, urllib.request
+url, tok, rid, q = sys.argv[1:5]
+req = urllib.request.Request(url + "/ask", data=json.dumps({"request_id": rid, "question": q}).encode(), headers={"Content-Type": "application/json", "Authorization": "Bearer " + tok})
+try:
+    r = json.load(urllib.request.urlopen(req, timeout=180)); print(r["reply"]); print(f"\n[stakeholder availability remaining: {r['patience_remaining']}]")
+except urllib.error.HTTPError as e:
+    print("The stakeholder is no longer available." if e.code == 410 else f"stakeholder error {e.code}")
+PY
+```
+
+`swesim/stakeholder/shims/request-review`:
+```bash
+#!/bin/bash
+# Sends the current diff (tracked + untracked, capped) to the stakeholder for review; prints the feedback.
+set -u
+if [ -z "${SWESIM_SESSION_TOKEN:-}" ]; then echo "No stakeholder is available in this task."; exit 0; fi
+cd "${SWESIM_REPO_DIR:-/app}" || exit 0
+git add -N . >/dev/null 2>&1
+DIFF=$(git diff --no-ext-diff --no-color | head -c 200000)
+RID=$(cat /proc/sys/kernel/random/uuid)
+python3 - "$SWESIM_STAKEHOLDER_URL" "$SWESIM_SESSION_TOKEN" "$RID" <<'PY' "$DIFF"
+import json, sys, urllib.request
+url, tok, rid, diff = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+req = urllib.request.Request(url + "/review", data=json.dumps({"request_id": rid, "diff": diff, "files": {}}).encode(), headers={"Content-Type": "application/json", "Authorization": "Bearer " + tok})
+try:
+    r = json.load(urllib.request.urlopen(req, timeout=300)); print(r["reply"]); print(f"\n[stakeholder availability remaining: {r['patience_remaining']}]")
+except urllib.error.HTTPError as e:
+    print("The stakeholder is no longer available." if e.code == 410 else f"stakeholder error {e.code}")
+PY
+```
+
+`scripts/deploy_stakeholder.sh`:
+```bash
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export $(grep -v '^#' ~/Documents/.env | xargs)
+modal secret create swesim-llm ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" OPENAI_API_KEY="$OPENAI_API_KEY" SWESIM_WORKER_SECRET="${SWESIM_WORKER_SECRET:-$(openssl rand -hex 16)}" --force
+uv run modal deploy swesim/stakeholder/modal_app.py
+uv run python -c "import modal; print(modal.Function.from_name('swesim-stakeholder','web').get_web_url())" | tee .stakeholder_url
+```
+
+- [ ] **Step 4: Run unit tests, deploy, probe**
+
+Run: `uv run pytest tests/test_session.py tests/test_service.py -q` → 3 passed.
+Run: `bash scripts/deploy_stakeholder.sh && curl -s "$(cat .stakeholder_url)/health"` → `{"ok":true,...}`. Record the URL in `CLAUDE.md` and `.env` as `SWESIM_STAKEHOLDER_URL`; record the worker secret in `~/Documents/.env` as `SWESIM_WORKER_SECRET` (never commit).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add swesim/stakeholder scripts/deploy_stakeholder.sh tests/test_session.py tests/test_service.py .gitignore
+git commit -m "feat(stakeholder): session protocol with patience tiers, idempotent requests, freeze, diff-only and checks review, Modal deploy, shims"
+```
+
+---
+
+### Task 9: One interactive episode end to end (run stage, minimal)
+
+**Files:**
+- Create: `swesim/stakeholder/view.py`, `swesim/stages/run.py`
+- Modify: `swesim/cli.py` (add `run`)
+- Create: `tests/test_run.py`
+
+**Interfaces:**
+- Produces: `view.visible_view(spec) -> dict` (`brief`, `facts` without author-only, `requirements`, `persona`, `checks`, `repo_dir`); `run.run_trial(ws, spec, run_config, attempt_index, stakeholder_url, worker_secret) -> TrialRecord(trial_id, condition, task_dir, trial_dir, reward, report, transcript, status)`; per-trial task materialization: copies the compiled condition dir to `workspace/trials/<trial_id>/task/` and sets `SWESIM_SESSION_TOKEN` and `SWESIM_TRIAL_ID` in `[environment.env]`; after `harbor run` returns, fetches `GET /transcript/{trial_id}`, checks `transcript_hash` against the receipt's, writes `workspace/trials/<trial_id>/{reward.json,report.json,transcript.json,status.json}`.
+
+- [ ] **Step 1: Test the visible view and task materialization**
+
+```python
+# tests/test_run.py
+import tomllib
+from swesim.models import ScenarioSpec, RunConfig, minimal_spec_dict, trial_id
+from swesim.stakeholder.view import visible_view
+from swesim.stages.run import materialize_trial_task
+from swesim.paths import Workspace
+def test_visible_view_drops_author_only():
+    d = minimal_spec_dict(); d["ledger"].append({"id": "f9", "text": "SECRET", "kind": "interface", "provenance": "authored", "authored_rationale": "x", "discovery": "author-only"})
+    v = visible_view(ScenarioSpec.model_validate(d)); assert all(f["id"] != "f9" for f in v["facts"]) and v["brief"] == "It breaks."
+def test_materialize_sets_token(tmp_path):
+    ws = Workspace(tmp_path); src = tmp_path / "task"; src.mkdir(); (src / "task.toml").write_text('[environment.env]\nSWESIM_SESSION_TOKEN = ""\nSWESIM_TRIAL_ID = ""\n')
+    out = materialize_trial_task(ws, src, "abc123", "tok")
+    t = tomllib.loads((out / "task.toml").read_text()); assert t["environment"]["env"]["SWESIM_SESSION_TOKEN"] == "tok" and t["environment"]["env"]["SWESIM_TRIAL_ID"] == "abc123"
+```
+
+- [ ] **Step 2: Implement**
+
+```python
+# swesim/stakeholder/view.py
+from swesim.models import ScenarioSpec, Discovery
+def visible_view(spec: ScenarioSpec) -> dict:
+    return {"brief": next(b.text for b in spec.briefs if b.profile == "natural"),
+            "facts": [{"id": f.id, "text": f.text, "kind": f.kind.value, "discovery": f.discovery.value} for f in spec.ledger if f.discovery != Discovery.AUTHOR_ONLY],
+            "requirements": [{"id": r.id, "text": r.text} for r in spec.requirements], "persona": spec.persona.model_dump(),
+            "checks": [c.model_dump() for c in spec.checks], "repo_dir": spec.environment.repo_dir}
+```
+
+```python
+# swesim/stages/run.py
+from __future__ import annotations
+import json, re, shutil, urllib.request
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from swesim import harbor_cli
+from swesim.models import ScenarioSpec, RunConfig, trial_id as make_trial_id
+from swesim.paths import Workspace
+from swesim.stakeholder.view import visible_view
+
+@dataclass
+class TrialRecord:
+    trial_id: str; scenario_id: str; condition: str; attempt_index: int; run_config_hash: str; task_dir: str; trial_dir: str | None
+    reward: dict; report: dict; transcript: dict; status: str
+
+def materialize_trial_task(ws: Workspace, compiled_task_dir: Path, tid: str, token: str) -> Path:
+    dst = ws.root / "trials" / tid / "task"; shutil.rmtree(dst, ignore_errors=True); shutil.copytree(compiled_task_dir, dst)
+    p = dst / "task.toml"; s = p.read_text()
+    s = re.sub(r'SWESIM_SESSION_TOKEN = ".*"', f'SWESIM_SESSION_TOKEN = "{token}"', s); s = re.sub(r'SWESIM_TRIAL_ID = ".*"', f'SWESIM_TRIAL_ID = "{tid}"', s)
+    p.write_text(s); return dst
+
+def _post(url: str, body: dict, headers: dict) -> dict:
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", **headers}); return json.load(urllib.request.urlopen(req, timeout=60))
+def _get(url: str, headers: dict) -> dict:
+    return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60))
+
+def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: int, stakeholder_url: str, worker_secret: str) -> TrialRecord:
+    tid = make_trial_id(spec.spec_hash, rc.condition, rc.run_config_hash, attempt_index)
+    compiled = ws.task_dir(spec.id, rc.condition); token = ""
+    if rc.condition == "interactive":
+        token = _post(f"{stakeholder_url}/sessions", {"trial_id": tid, "spec_hash": spec.spec_hash, "condition": rc.condition, "run_config_hash": rc.run_config_hash,
+                      "visible_view": visible_view(spec), "stakeholder_config": rc.stakeholder.model_dump(), "image": spec.environment.image}, {"X-Worker-Secret": worker_secret})["token"]
+    task = materialize_trial_task(ws, compiled, tid, token); tdir = ws.root / "trials" / tid
+    (tdir / "status.json").write_text(json.dumps({"status": "running", "trial_id": tid}))
+    status = "completed"; trial_dir = None; reward = {}; report = {}; transcript = {}
+    try:
+        trial_dir = harbor_cli.run_task(task, rc.agent, ws.jobs_dir / "runs", tid, model=rc.model, timeout_sec=rc.solver_timeout_sec + 2400)
+        reward = harbor_cli.read_reward(trial_dir); report = harbor_cli.read_report(trial_dir)
+    except harbor_cli.HarborRunError as e:
+        status = "launch-failed"; report = {"error": str(e)}
+    if rc.condition == "interactive":
+        try:
+            _post(f"{stakeholder_url}/freeze", {}, {"Authorization": f"Bearer {token}"})
+        except Exception: pass
+        transcript = _get(f"{stakeholder_url}/transcript/{tid}", {"X-Worker-Secret": worker_secret})
+        if report.get("transcript_hash") and transcript.get("transcript_hash") and report["transcript_hash"] != transcript["transcript_hash"]:
+            report["transcript_hash_mismatch"] = True
+    rec = TrialRecord(tid, spec.id, rc.condition, attempt_index, rc.run_config_hash, str(task), str(trial_dir) if trial_dir else None, reward, report, transcript, status)
+    for name, obj in (("reward.json", reward), ("report.json", report), ("transcript.json", transcript), ("record.json", asdict(rec))): (tdir / name).write_text(json.dumps(obj, indent=2))
+    (tdir / "status.json").write_text(json.dumps({"status": status, "trial_id": tid})); return rec
+```
+
+Add to `swesim/cli.py`:
+```python
+@app.command()
+def run(scenario_id: str, condition: str = "interactive", attempt: int = 0, model: str = "anthropic/claude-haiku-4-5-20251001",
+        stakeholder_url: str = typer.Option(..., envvar="SWESIM_STAKEHOLDER_URL"), worker_secret: str = typer.Option(..., envvar="SWESIM_WORKER_SECRET")):
+    from swesim.stages.run import run_trial
+    rc = RunConfig.default(condition).model_copy(update={"model": model})
+    rec = run_trial(WS, _load(scenario_id), rc, attempt, stakeholder_url, worker_secret); typer.echo(json.dumps({"trial_id": rec.trial_id, "status": rec.status, "reward": rec.reward}))
+```
+
+- [ ] **Step 3: Run the first interactive episode**
+
+```bash
+export $(grep -v '^#' ~/Documents/.env | xargs); export SWESIM_STAKEHOLDER_URL=$(cat .stakeholder_url)
+uv run swesim compile pydata--xarray-5362
+uv run swesim run pydata--xarray-5362 --condition interactive --attempt 0
+```
+Expected: `workspace/trials/<tid>/transcript.json` has at least one `ask` exchange with `disclosed_fact_ids`, `reward.json` numeric, `report.json` `transcript_hash` equal to the transcript's. Inspect with `harbor view workspace/jobs`.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add swesim/stakeholder/view.py swesim/stages/run.py swesim/cli.py tests/test_run.py
+git commit -m "feat(run): per-trial task materialization with session token, harbor run, transcript fetch and hash binding"
+```
+
+---
+
+### Task 10: github-repo source: discovery, filters, environment build recipe
+
+**Files:**
+- Create: `swesim/sources/github_repo.py`
+- Modify: `swesim/stages/mine.py` (add `mine_github_repo`), `swesim/stages/draft_spec.py` (accept `dockerfile` environments)
+- Create: `tests/test_github_repo.py`
+
+**Interfaces:**
+- Produces: `github_repo.discover(repo: str, since: str, max_prs: int = 200, min_comments: int = 4, diff_min: int = 20, diff_max: int = 600, pr: int | None = None) -> tuple[list[dict], dict]` (candidates and a reject histogram); each candidate `{repo, pr, issue, base_commit, merge_commit, title, issue_body, thread, patch, test_patch, source_files, test_files, additions, deletions}`; `github_repo.build_recipe(repo, base_commit, profile="python-pytest") -> dict(install_command, test_command, repo_dir="/app")`; `github_repo.candidate_to_row(c) -> dict` in the same shape as SWE-bench rows (`problem_statement` = issue title + body, `hints_text` = issue comments before the PR, `fail_to_pass`/`pass_to_pass` filled by `probe_tests` below).
+- `github_repo.probe_tests(row, jobs_dir) -> dict` runs, via Harbor on Modal with the `dockerfile` environment (`nop` agent on a probe task whose verifier runs the PR's test files on base and after applying the gold patch), and returns `fail_to_pass`/`pass_to_pass` ids (tests that fail on base and pass with gold; tests passing in both). This replaces SWE-bench's precomputed lists. Bounded by `--max-builds`.
+- Pre-selected demonstration repository: `py-pdf/pypdf` (install: `pip install -e '.[full]' -r requirements/ci.txt`; test command `python -I -m pytest -rA -p no:cacheprovider -m "not samples and not enable_socket" --junitxml={junit_path} <files>`); since `2026-06-01`.
+
+- [ ] **Step 1: Write failing tests (pure functions)**
+
+```python
+# tests/test_github_repo.py
+from swesim.sources import github_repo as gr
+def test_linked_issue_extraction():
+    assert gr.linked_issues("Fixes #12 and closes #34; see #99 unrelated") == [12, 34]
+def test_split_patch_by_tests():
+    patch = "diff --git a/pypdf/a.py b/pypdf/a.py\n--- a/pypdf/a.py\n+++ b/pypdf/a.py\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n@@ -1 +1 @@\n-a\n+b\n"
+    src, tst = gr.split_patch(patch)
+    assert "pypdf/a.py" in src and "tests/test_a.py" not in src and "tests/test_a.py" in tst
+def test_filters_reject_reasons():
+    c = {"comments_total": 1, "additions": 5, "deletions": 0, "test_files": [], "source_files": ["a.py"], "issue": None}
+    assert gr.reject_reason(c, min_comments=4, diff_min=20, diff_max=600) == "no-linked-issue"
+def test_build_recipe_pypdf():
+    r = gr.build_recipe("py-pdf/pypdf", "abc")
+    assert "pip install -e" in r["install_command"] and r["repo_dir"] == "/app" and "-rA" in r["test_command"]
+```
+
+- [ ] **Step 2: Implement**
+
+```python
+# swesim/sources/github_repo.py
+from __future__ import annotations
+import json, re, subprocess
+from collections import Counter
+from swesim.sources import threads
+LINK = re.compile(r"(?:[Ff]ix(?:es|ed)?|[Cc]los(?:es|ed)?|[Rr]esolves?)\s*:?\s*#(\d+)")
+KNOWN_RECIPES = {"py-pdf/pypdf": {"install_command": "pip install -e '.[full]' -r requirements/ci.txt", "test_marker": '-m "not samples and not enable_socket"'}}
+
+def linked_issues(body: str) -> list[int]: return sorted({int(n) for n in LINK.findall(body or "")})
+
+def split_patch(patch: str) -> tuple[str, str]:
+    src, tst = [], []
+    for chunk in re.split(r"(?=^diff --git )", patch, flags=re.M):
+        if not chunk.strip(): continue
+        path = re.match(r"diff --git a/(\S+)", chunk).group(1)
+        (tst if re.search(r"(^|/)tests?/|test_.*\.py$|_test\.py$|conftest\.py$", path) else src).append(chunk)
+    return "".join(src), "".join(tst)
+
+def reject_reason(c: dict, min_comments: int, diff_min: int, diff_max: int) -> str | None:
+    if not c.get("issue"): return "no-linked-issue"
+    if not c.get("test_files"): return "no-test-changes"
+    if not c.get("source_files"): return "no-source-changes"
+    n = c["additions"] + c["deletions"]
+    if n < diff_min: return "diff-too-small"
+    if n > diff_max: return "diff-too-large"
+    if c.get("comments_total", 0) < min_comments: return "thin-thread"
+    return None
+
+def _gh(path: str, paginate: bool = False):
+    cmd = ["gh", "api", path] + (["--paginate"] if paginate else []); return json.loads(subprocess.run(cmd, capture_output=True, text=True, check=True).stdout)
+
+def discover(repo: str, since: str, max_prs: int = 200, min_comments: int = 4, diff_min: int = 20, diff_max: int = 600, pr: int | None = None) -> tuple[list[dict], dict]:
+    prs = [ _gh(f"repos/{repo}/pulls/{pr}") ] if pr else [p for p in _gh(f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100", paginate=True)[:max_prs*2] if p.get("merged_at") and p["merged_at"] >= since][:max_prs]
+    cands, rejects = [], Counter()
+    for p in prs:
+        issues = linked_issues(p.get("body") or "")
+        patch = subprocess.run(["gh", "api", f"repos/{repo}/pulls/{p['number']}", "-H", "Accept: application/vnd.github.v3.diff"], capture_output=True, text=True).stdout
+        src, tst = split_patch(patch)
+        c = {"repo": repo, "pr": p["number"], "title": p["title"], "base_commit": p["base"]["sha"], "merge_commit": p.get("merge_commit_sha"),
+             "additions": p.get("additions", 0), "deletions": p.get("deletions", 0), "patch": src, "test_patch": tst,
+             "source_files": re.findall(r"^diff --git a/(\S+)", src, re.M), "test_files": re.findall(r"^diff --git a/(\S+)", tst, re.M), "issue": None, "thread": None}
+        if issues:
+            c["issue"] = issues[0]; c["thread"] = threads.fetch_pr_thread(repo, p["number"])
+            c["comments_total"] = len(c["thread"]["pr_comments"]) + len(c["thread"]["review_comments"]) + sum(len(i["comments"]) for i in c["thread"]["linked_issues"])
+        r = reject_reason(c, min_comments, diff_min, diff_max)
+        if r: rejects[r] += 1
+        else: cands.append(c)
+    return cands, dict(rejects)
+
+def build_recipe(repo: str, base_commit: str, profile: str = "python-pytest") -> dict:
+    k = KNOWN_RECIPES.get(repo, {}); install = k.get("install_command", "pip install -e . && pip install pytest")
+    marker = k.get("test_marker", "")
+    return {"repo_dir": "/app", "install_command": f"pip install --upgrade pip && {install} && pip install pytest",
+            "test_command": f"python -I -m pytest -rA -p no:cacheprovider {marker} --junitxml={{junit_path}} {{test_files}}".replace("  ", " ")}
+
+def candidate_to_row(c: dict) -> dict:
+    iss = (c["thread"] or {}).get("linked_issues", [{}])[0] if c.get("thread") else {}
+    before_pr = [x for x in iss.get("comments", [])]
+    return {"instance_id": f"{c['repo'].replace('/', '__')}-{c['pr']}", "repo": c["repo"], "base_commit": c["base_commit"], "version": "",
+            "problem_statement": (iss.get("title", c["title"]) + "\n\n" + iss.get("body", "")).strip(), "hints_text": "\n\n".join(x["body"] for x in before_pr),
+            "fail_to_pass": [], "pass_to_pass": [], "patch": c["patch"], "test_patch": c["test_patch"], "image": None, "repo_dir": "/app",
+            "annotation": {"underspecified": "", "underspecified_notes": "", "false_negative": "", "false_negative_notes": "", "difficulty": ""}, "thread": c["thread"] or {}}
+```
+
+`probe_tests` (in the same file): build a probe Harbor task from the `dockerfile` environment with `tests/test.sh` that runs the PR's test files on `/pristine` (before test.patch) → JSON, then applies `test.patch` → JSON, then applies `oracle.diff` too → JSON, and writes `reward.json` `{"reward": 1}`; read the three status maps from `/logs/verifier/probe.json`: `fail_to_pass = tests failing after test.patch and passing after gold; pass_to_pass = tests passing in both`. Implement as `probe_tests(row, ws) -> dict` using `compile_scenario`'s templates with a minimal spec stub; if the build fails, record the reason and return `{}`.
+
+Add to `swesim/stages/mine.py`:
+```python
+def mine_github_repo(ws: Workspace, repo: str, pr: int | None = None, since: str = "2026-06-01", max_candidates: int = 20, max_builds: int = 3) -> Path:
+    import json
+    from swesim.sources import github_repo as gr
+    cands, rejects = gr.discover(repo, since, pr=pr)
+    out = ws.candidates_dir / f"github-repo--{repo.replace('/', '__')}.jsonl"; out.parent.mkdir(parents=True, exist_ok=True)
+    built = 0
+    with open(out, "w") as f:
+        for c in cands[:max_candidates]:
+            row = gr.candidate_to_row(c); row.update(gr.build_recipe(repo, c["base_commit"]))
+            if built < max_builds:
+                probe = gr.probe_tests(row, ws); built += 1; row.update(probe)
+            if not row["fail_to_pass"]: rejects["no-f2p-after-probe"] = rejects.get("no-f2p-after-probe", 0) + 1; continue
+            f.write(json.dumps(row) + "\n")
+    (out.with_suffix(".rejects.json")).write_text(json.dumps(rejects, indent=2))
+    if out.stat().st_size == 0: (out.with_suffix(".status")).write_text("no-valid-candidate")
+    return out
+```
+
+- [ ] **Step 3: Run on pypdf, then draft/approve/validate the chosen candidate**
+
+```bash
+uv run swesim mine --source github-repo --repo py-pdf/pypdf
+uv run swesim judge workspace/candidates/github-repo--py-pdf__pypdf.jsonl --limit 5
+uv run swesim draft workspace/candidates/github-repo--py-pdf__pypdf.judged.jsonl py-pdf__pypdf-<PR>
+# edit scenario.draft.json (environment.kind = dockerfile with dockerfile_asset produced by draft for github-repo rows), then
+uv run swesim approve py-pdf--pypdf-<pr> && uv run swesim validate py-pdf--pypdf-<pr>
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add swesim/sources/github_repo.py swesim/stages/mine.py tests/test_github_repo.py
+git commit -m "feat(sources): github-repo discovery with bounded filters, reject histogram, build recipe, test probe"
+```
