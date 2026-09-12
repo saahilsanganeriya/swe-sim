@@ -328,6 +328,24 @@ without Temporal.
    it a legitimate behavioral requirement; does the evaluator accept
    alternative correct implementations). Output `judged.jsonl`. A prior, not
    a difficulty measure.
+
+   How underspecification is detected without human annotators (the
+   `github-repo` source), most to least objective: (a) the **issue-to-contract
+   delta**, extracted by code: exception class names and string literals
+   asserted in the test patch, new public names introduced by the gold patch,
+   and behavioral branches visible in the diff that the issue text never
+   mentions; the judge classifies each as a stakeholder decision or an
+   implementation detail; (b) **thread evidence**: maintainer questions in the
+   issue before the PR and reviewer-requested behavior or interface changes;
+   (c) the **Verified rubric itself**: the judge scores underspecification 0
+   to 3 using the annotators' published instructions, and `swesim
+   judge-calibrate --n 150` measures its agreement with the 1,699 human labels
+   on a held-out sample at the severity-2 threshold before the judge is used
+   on new repositories; the agreement figure is reported in the grading
+   document; (d) the empirical `hidden` screen (section 6). With the
+   `withheld` brief profile, the judge's main output is the list of facts in
+   the issue that are decisions with engineering consequences, which are the
+   candidates for withholding.
 3. `draft_spec`: LLM drafts `ScenarioSpec` with excerpts; drafts control
    patches; produces the `withheld` brief and its withheld facts by
    category, with the leak check run in code. Output `scenario.draft.json`. The workflow then waits for the
