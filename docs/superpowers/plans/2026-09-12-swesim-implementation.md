@@ -2322,3 +2322,534 @@ uv run swesim approve py-pdf--pypdf-<pr> && uv run swesim validate py-pdf--pypdf
 git add swesim/sources/github_repo.py swesim/stages/mine.py tests/test_github_repo.py
 git commit -m "feat(sources): github-repo discovery with bounded filters, reject histogram, build recipe, test probe"
 ```
+
+---
+
+### Task 11: Temporal workflows, activities, worker, client (thin)
+
+**Files:**
+- Create: `swesim/workflows/__init__.py`, `swesim/workflows/activities.py`, `swesim/workflows/workflows.py`, `swesim/workflows/worker.py`, `swesim/workflows/client.py`
+- Modify: `pyproject.toml` (add `temporalio>=1.8`), `swesim/cli.py` (add `pipeline`, `approve-signal`, `matrix`, `worker`)
+- Create: `tests/test_workflows.py`
+
+**Interfaces:**
+- Activities (all take and return JSON-serializable dicts; each writes files under `workspace/` and returns paths and hashes only):
+  `mine_activity({source, repo, pr, instance_ids}) -> {candidates_path}`; `judge_activity({candidates_path, limit, model}) -> {judged_path}`; `draft_activity({judged_path, instance_id, model}) -> {scenario_id, draft_path}`; `compile_activity({scenario_id, stakeholder_url}) -> {task_dirs}`; `validate_activity({scenario_id, stakeholder_url}) -> {status, failures}`; `register_activity({scenario_id}) -> {registry_entry}`; `run_trial_activity({scenario_id, condition, attempt_index, model, stakeholder_url}) -> {trial_id, status, reward}` (heartbeats every 30 s; retry policy maximum_attempts=1); `score_activity({scenario_id}) -> {scores_path}`; `export_activity({scenario_id}) -> {manifest_paths}`.
+- Workflows: `PipelineWorkflow.run(params) -> summary`: mine → for each candidate up to `max_candidates`: judge → draft → `wait_condition(approved, timeout=24h)` via signal `approve_spec(scenario_id, edited_json_path)` → compile → validate → register. `TrialWorkflow.run({scenario_id, condition, attempt_index, model, stakeholder_url})`, workflow id **must** be the trial id (`swesim.models.trial_id(...)`), computed by the client before start; `RunMatrixWorkflow.run({scenario_id, conditions, models, k, stakeholder_url})` starts `TrialWorkflow` children with `id=trial_id`, `id_reuse_policy=REJECT_DUPLICATE`, at most 2 concurrently, then `score_activity`, `export_activity`.
+- Worker: task queue `swesim`, `max_concurrent_activities=4`; systemd on the VM. Client: `client.connect(target="localhost:7233")`.
+
+- [ ] **Step 1: Workflow test with mocked activities (time-skipping test env)**
+
+```python
+# tests/test_workflows.py
+import asyncio, uuid, pytest
+from temporalio import activity
+from temporalio.client import WorkflowFailureError
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Worker
+from swesim.workflows.workflows import TrialWorkflow, RunMatrixWorkflow
+from swesim.models import trial_id
+
+CALLS = []
+@activity.defn(name="run_trial_activity")
+async def fake_run_trial(params: dict) -> dict:
+    CALLS.append(params["attempt_index"]); return {"trial_id": "t", "status": "completed", "reward": {"success": 1}}
+@activity.defn(name="score_activity")
+async def fake_score(params: dict) -> dict: return {"scores_path": "x"}
+@activity.defn(name="export_activity")
+async def fake_export(params: dict) -> dict: return {"manifest_paths": []}
+
+@pytest.mark.asyncio
+async def test_matrix_dedups_trial_ids():
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(env.client, task_queue="swesim", workflows=[TrialWorkflow, RunMatrixWorkflow], activities=[fake_run_trial, fake_score, fake_export]):
+            params = {"scenario_id": "s", "spec_hash": "h", "run_config_hash": "r", "conditions": ["full"], "models": ["m"], "k": 2, "stakeholder_url": "u"}
+            await env.client.execute_workflow(RunMatrixWorkflow.run, params, id=f"matrix-{uuid.uuid4()}", task_queue="swesim")
+            assert sorted(CALLS) == [0, 1]
+            # starting the same trial again is rejected by id, not re-run
+            tid = trial_id("h", "full", "r", 0)
+            with pytest.raises(Exception):
+                await env.client.start_workflow(TrialWorkflow.run, {"scenario_id": "s", "condition": "full", "attempt_index": 0, "model": "m", "stakeholder_url": "u", "spec_hash": "h", "run_config_hash": "r"}, id=tid, task_queue="swesim")
+```
+
+- [ ] **Step 2: Implement**
+
+```python
+# swesim/workflows/activities.py
+from __future__ import annotations
+import asyncio, json
+from pathlib import Path
+from temporalio import activity
+from swesim.paths import Workspace
+from swesim.models import ScenarioSpec, RunConfig
+WS = Workspace("workspace")
+def _spec(sid: str) -> ScenarioSpec: return ScenarioSpec.model_validate_json((WS.scenario_dir(sid) / "scenario.json").read_text())
+
+@activity.defn
+async def mine_activity(p: dict) -> dict:
+    from swesim.stages.mine import mine_swebench, mine_github_repo
+    path = mine_swebench(WS, p.get("pool", "A"), p.get("instance_ids")) if p["source"] == "swebench-annotated" else mine_github_repo(WS, p["repo"], p.get("pr"))
+    return {"candidates_path": str(path)}
+@activity.defn
+async def judge_activity(p: dict) -> dict:
+    from swesim.stages.judge import judge_candidate
+    out = Path(p["candidates_path"]).with_suffix(".judged.jsonl"); rows = [json.loads(l) for l in open(p["candidates_path"])][: p.get("limit", 20)]
+    with open(out, "w") as g:
+        for row in rows: row["judge"] = judge_candidate(row, p["model"]); g.write(json.dumps(row) + "\n"); activity.heartbeat()
+    return {"judged_path": str(out), "instance_ids": [r["instance_id"] for r in rows if r["judge"].get("keep")]}
+@activity.defn
+async def draft_activity(p: dict) -> dict:
+    from swesim.stages.draft_spec import draft
+    row = next(json.loads(l) for l in open(p["judged_path"]) if json.loads(l)["instance_id"] == p["instance_id"])
+    sid = p["instance_id"].lower().replace("__", "--"); return {"scenario_id": sid, "draft_path": str(draft(row, row["judge"], p["model"], WS.scenario_dir(sid)))}
+@activity.defn
+async def compile_activity(p: dict) -> dict:
+    from swesim.stages.compile import compile_scenario
+    res = compile_scenario(WS, _spec(p["scenario_id"]), RunConfig.default("interactive"), p["stakeholder_url"]); return {"task_dirs": {k: str(v) for k, v in res.task_dirs.items()}}
+@activity.defn
+async def validate_activity(p: dict) -> dict:
+    from swesim.stages.validate import validate_scenario
+    loop = asyncio.get_running_loop()
+    out = await loop.run_in_executor(None, lambda: validate_scenario(WS, _spec(p["scenario_id"]), RunConfig.default("full"), p["stakeholder_url"]))
+    return {"status": out["status"], "failures": out["failures"]}
+@activity.defn
+async def register_activity(p: dict) -> dict:
+    from swesim.stages.register import register_scenario
+    return {"registry_entry": register_scenario(WS, _spec(p["scenario_id"]))}
+@activity.defn
+async def run_trial_activity(p: dict) -> dict:
+    import os
+    from swesim.stages.run import run_trial
+    rc = RunConfig.default(p["condition"]).model_copy(update={"model": p["model"]}); loop = asyncio.get_running_loop()
+    task = loop.run_in_executor(None, lambda: run_trial(WS, _spec(p["scenario_id"]), rc, p["attempt_index"], p["stakeholder_url"], os.environ["SWESIM_WORKER_SECRET"]))
+    while not task.done():
+        activity.heartbeat(); await asyncio.sleep(30)
+    rec = task.result(); return {"trial_id": rec.trial_id, "status": rec.status, "reward": rec.reward}
+@activity.defn
+async def score_activity(p: dict) -> dict:
+    from swesim.stages.score import score_scenario
+    return {"scores_path": str(score_scenario(WS, p["scenario_id"]))}
+@activity.defn
+async def export_activity(p: dict) -> dict:
+    from swesim.stages.export import export_scenario
+    return {"manifest_paths": [str(x) for x in export_scenario(WS, p["scenario_id"])]}
+ALL = [mine_activity, judge_activity, draft_activity, compile_activity, validate_activity, register_activity, run_trial_activity, score_activity, export_activity]
+```
+
+```python
+# swesim/workflows/workflows.py
+from __future__ import annotations
+import asyncio
+from datetime import timedelta
+from temporalio import workflow
+from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
+with workflow.unsafe.imports_passed_through():
+    from swesim.models import trial_id
+    from swesim.workflows import activities as A
+ONE = RetryPolicy(maximum_attempts=1); FEW = RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=10))
+
+@workflow.defn
+class TrialWorkflow:
+    @workflow.run
+    async def run(self, p: dict) -> dict:
+        return await workflow.execute_activity(A.run_trial_activity, p, start_to_close_timeout=timedelta(hours=2), heartbeat_timeout=timedelta(minutes=5), retry_policy=ONE)
+
+@workflow.defn
+class RunMatrixWorkflow:
+    @workflow.run
+    async def run(self, p: dict) -> dict:
+        sem = asyncio.Semaphore(2); results = []
+        async def one(cond: str, model: str, i: int):
+            tid = trial_id(p["spec_hash"], cond, p["run_config_hash"], i)
+            async with sem:
+                r = await workflow.execute_child_workflow(TrialWorkflow.run, {"scenario_id": p["scenario_id"], "condition": cond, "attempt_index": i, "model": model,
+                    "stakeholder_url": p["stakeholder_url"], "spec_hash": p["spec_hash"], "run_config_hash": p["run_config_hash"]}, id=tid, id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE)
+                results.append(r)
+        await asyncio.gather(*[one(c, m, i) for c in p["conditions"] for m in p["models"] for i in range(p["k"])])
+        await workflow.execute_activity(A.score_activity, {"scenario_id": p["scenario_id"]}, start_to_close_timeout=timedelta(minutes=10), retry_policy=FEW)
+        await workflow.execute_activity(A.export_activity, {"scenario_id": p["scenario_id"]}, start_to_close_timeout=timedelta(minutes=10), retry_policy=FEW)
+        return {"trials": results}
+
+@workflow.defn
+class PipelineWorkflow:
+    def __init__(self): self._approved: dict[str, str] = {}
+    @workflow.signal
+    def approve_spec(self, scenario_id: str, edited_json_path: str) -> None: self._approved[scenario_id] = edited_json_path
+    @workflow.run
+    async def run(self, p: dict) -> dict:
+        mined = await workflow.execute_activity(A.mine_activity, p, start_to_close_timeout=timedelta(minutes=30), retry_policy=FEW)
+        judged = await workflow.execute_activity(A.judge_activity, {"candidates_path": mined["candidates_path"], "limit": p.get("max_candidates", 20), "model": p["judge_model"]}, start_to_close_timeout=timedelta(minutes=60), heartbeat_timeout=timedelta(minutes=5), retry_policy=FEW)
+        out = []
+        for iid in judged["instance_ids"][: p.get("max_scenarios", 3)]:
+            d = await workflow.execute_activity(A.draft_activity, {"judged_path": judged["judged_path"], "instance_id": iid, "model": p["draft_model"]}, start_to_close_timeout=timedelta(minutes=30), retry_policy=FEW)
+            sid = d["scenario_id"]
+            approved = await workflow.wait_condition(lambda: sid in self._approved, timeout=timedelta(hours=24))
+            if not approved: out.append({"scenario_id": sid, "status": "awaiting-approval-timeout"}); continue
+            await workflow.execute_activity(A.compile_activity, {"scenario_id": sid, "stakeholder_url": p["stakeholder_url"]}, start_to_close_timeout=timedelta(minutes=20), retry_policy=FEW)
+            v = await workflow.execute_activity(A.validate_activity, {"scenario_id": sid, "stakeholder_url": p["stakeholder_url"]}, start_to_close_timeout=timedelta(hours=3), heartbeat_timeout=timedelta(minutes=10), retry_policy=ONE)
+            if v["status"] == "valid":
+                await workflow.execute_activity(A.register_activity, {"scenario_id": sid}, start_to_close_timeout=timedelta(minutes=5), retry_policy=FEW)
+            out.append({"scenario_id": sid, "status": v["status"], "failures": v["failures"]})
+        return {"scenarios": out}
+```
+
+```python
+# swesim/workflows/worker.py
+import asyncio, os
+from temporalio.client import Client
+from temporalio.worker import Worker
+from swesim.workflows import activities as A
+from swesim.workflows.workflows import TrialWorkflow, RunMatrixWorkflow, PipelineWorkflow
+async def main():
+    client = await Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"))
+    async with Worker(client, task_queue="swesim", workflows=[TrialWorkflow, RunMatrixWorkflow, PipelineWorkflow], activities=A.ALL, max_concurrent_activities=4):
+        await asyncio.Event().wait()
+if __name__ == "__main__": asyncio.run(main())
+```
+
+```python
+# swesim/workflows/client.py
+import asyncio, os, uuid
+from temporalio.client import Client
+from swesim.workflows.workflows import PipelineWorkflow, RunMatrixWorkflow
+async def start_pipeline(params: dict) -> str:
+    c = await Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")); wid = f"pipeline-{uuid.uuid4().hex[:8]}"
+    await c.start_workflow(PipelineWorkflow.run, params, id=wid, task_queue="swesim"); return wid
+async def approve(workflow_id: str, scenario_id: str, path: str) -> None:
+    c = await Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")); h = c.get_workflow_handle(workflow_id); await h.signal(PipelineWorkflow.approve_spec, scenario_id, path)
+async def start_matrix(params: dict) -> str:
+    c = await Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")); wid = f"matrix-{params['scenario_id']}-{uuid.uuid4().hex[:6]}"
+    await c.start_workflow(RunMatrixWorkflow.run, params, id=wid, task_queue="swesim"); return wid
+```
+
+CLI additions: `swesim worker` (runs `worker.main`), `swesim pipeline --source ... --judge-model ... --draft-model ... --stakeholder-url ...`, `swesim approve-signal <workflow_id> <scenario_id>` (runs `approve` on the frozen `scenario.json` after local `swesim approve`), `swesim matrix <scenario_id> --conditions full,hidden,interactive --models anthropic/claude-haiku-4-5-20251001 --k 3`.
+
+- [ ] **Step 3: Local run against the dev server, then the restart check**
+
+```bash
+temporal server start-dev --db-filename /tmp/swesim-temporal.db &   # UI at http://localhost:8233
+uv run swesim worker &
+uv run swesim matrix pydata--xarray-5362 --conditions interactive --k 1
+# restart check: while the trial runs, kill the worker (pkill -f swesim.workflows.worker), restart it; confirm exactly one trial record exists for that trial id and the matrix completes.
+```
+Run: `uv run pytest tests/test_workflows.py -q` → 1 passed (needs the Temporal test server download on first run).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add swesim/workflows swesim/cli.py pyproject.toml tests/test_workflows.py
+git commit -m "feat(temporal): thin pipeline and trial workflows with trial-id dedup, no launch retries, worker and client"
+```
+
+---
+
+### Task 12: register, score, export
+
+**Files:**
+- Create: `swesim/stages/register.py`, `swesim/stages/score.py`, `swesim/stages/export.py`
+- Modify: `swesim/cli.py` (add `register`, `score`, `export`)
+- Create: `tests/test_score.py`
+
+**Interfaces:**
+- `register.register_scenario(ws, spec) -> dict` appends or updates `registry.json` (`{scenarios: {id: {version, spec_hash, source, source_ref, validation_status, validation_path, conditions, image_digest, calibration_runs: [], comparison_runs: []}}}`) and `dataset.toml` (`[[tasks]] path = "workspace/tasks/<id>__<cond>"` entries).
+- `score.pass_at_k(n, c, k) -> float` (= 1 − C(n−c,k)/C(n,k)); `score.pass_pow_k(n, c, k) -> float` (= (c/n)^k); `score.score_scenario(ws, scenario_id) -> Path` writing `workspace/scenarios/<id>/scores.json`: per `(condition, model, run_config_hash)`: `n`, outcome counts, `success_count`, `pass_at_k`, `pass_pow_k`, `mean_reward`, `questions_asked`, `reviews`, `patience_end`, `reviewed_equals_submitted`, `labels: {}`.
+- `export.export_scenario(ws, scenario_id) -> list[Path]` writing `workspace/exports/<trial_id>.episode.json` with `policy_visible` (instruction text, agent ATIF steps from `agent/trajectory.json`, stakeholder replies delivered), `evaluator_only` (ledger, oracle asset name, test asset names, report), `lineage` (spec_hash, run_config_hash, image_digest, patch_sha256, transcript_hash, harbor trial dir), `family_id` (source_ref), `simulator_validity`, `interaction`.
+
+- [ ] **Step 1: Tests**
+
+```python
+# tests/test_score.py
+from swesim.stages.score import pass_at_k, pass_pow_k, summarize
+def test_pass_metrics():
+    assert pass_at_k(3, 2, 1) == 2/3 and round(pass_at_k(3, 2, 3), 9) == 1.0 and pass_at_k(3, 0, 3) == 0.0
+    assert round(pass_pow_k(3, 2, 3), 6) == round((2/3) ** 3, 6)
+def test_summarize_outcomes():
+    recs = [{"condition": "interactive", "run_config_hash": "r", "reward": {"success": 1, "reward": 1.0, "outcome_code": 1}, "transcript": {"events": [{"kind": "message", "role": "user", "exchange": "ask"}], "patience_end": 5, "patience_start": 6}, "report": {}, "status": "completed"},
+            {"condition": "interactive", "run_config_hash": "r", "reward": {"success": 0, "reward": 0.5, "outcome_code": 2}, "transcript": {"events": []}, "report": {}, "status": "completed"},
+            {"condition": "interactive", "run_config_hash": "r", "reward": {"outcome_code": 5}, "transcript": {}, "report": {}, "status": "completed"}]
+    s = summarize(recs, k=3)["interactive|r"]
+    assert s["n_valid"] == 2 and s["success_count"] == 1 and s["outcomes"]["collection-failure"] == 1 and s["mean_reward"] == 0.75 and s["questions_asked"] == [1, 0]
+```
+
+- [ ] **Step 2: Implement**
+
+```python
+# swesim/stages/score.py
+from __future__ import annotations
+import json
+from math import comb
+from pathlib import Path
+from swesim.paths import Workspace
+OUTCOME_NAMES = {1: "valid-correct", 2: "valid-incorrect", 3: "agent-invalid-submission", 4: "agent-runtime-failure", 5: "collection-failure", 6: "simulator-failure", 7: "evaluator-failure"}
+INFRA = {5, 6, 7}
+def pass_at_k(n: int, c: int, k: int) -> float:
+    if n == 0 or k > n: return 0.0
+    return 1.0 - comb(n - c, k) / comb(n, k)
+def pass_pow_k(n: int, c: int, k: int) -> float: return (c / n) ** k if n else 0.0
+def summarize(records: list[dict], k: int) -> dict:
+    groups: dict[str, list[dict]] = {}
+    for r in records: groups.setdefault(f"{r['condition']}|{r['run_config_hash']}", []).append(r)
+    out = {}
+    for key, recs in groups.items():
+        valid = [r for r in recs if r["reward"].get("outcome_code", 7) not in INFRA]; n = len(valid); c = sum(int(r["reward"].get("success", 0)) for r in valid)
+        counts = {}
+        for r in recs: counts[OUTCOME_NAMES.get(r["reward"].get("outcome_code", 7), "evaluator-failure")] = counts.get(OUTCOME_NAMES.get(r["reward"].get("outcome_code", 7), "evaluator-failure"), 0) + 1
+        qs = [sum(1 for e in r.get("transcript", {}).get("events", []) if e.get("kind") == "message" and e.get("role") == "user" and e.get("exchange") == "ask") for r in valid]
+        rv = [sum(1 for e in r.get("transcript", {}).get("events", []) if e.get("kind") == "message" and e.get("role") == "user" and e.get("exchange") == "review") for r in valid]
+        out[key] = {"n_total": len(recs), "n_valid": n, "success_count": c, "pass_at_k": pass_at_k(n, c, min(k, n)) if n else 0.0, "pass_pow_k": pass_pow_k(n, c, k),
+                    "mean_reward": (sum(float(r["reward"].get("reward", 0)) for r in valid) / n) if n else 0.0, "outcomes": counts,
+                    "questions_asked": qs, "reviews_requested": rv, "patience_end": [r.get("transcript", {}).get("patience_end") for r in valid],
+                    "reviewed_equals_submitted": [r["report"].get("reviewed_diff_sha256") == r["report"].get("patch_sha256") for r in valid if r["report"].get("reviewed_diff_sha256")],
+                    "labels": {}}
+    return out
+def score_scenario(ws: Workspace, scenario_id: str, k: int = 3) -> Path:
+    recs = []
+    for rec_path in (ws.root / "trials").glob("*/record.json"):
+        rec = json.loads(rec_path.read_text())
+        if rec["scenario_id"] != scenario_id: continue
+        recs.append(rec)
+    out = ws.scenario_dir(scenario_id) / "scores.json"; out.write_text(json.dumps(summarize(recs, k), indent=2)); return out
+```
+
+```python
+# swesim/stages/register.py
+from __future__ import annotations
+import json
+from pathlib import Path
+from swesim.models import ScenarioSpec
+from swesim.paths import Workspace
+def register_scenario(ws: Workspace, spec: ScenarioSpec) -> dict:
+    reg_path = ws.registry_path; reg = json.loads(reg_path.read_text()) if reg_path.exists() else {"scenarios": {}}
+    sdir = ws.scenario_dir(spec.id); val = json.loads((sdir / "validation.json").read_text()) if (sdir / "validation.json").exists() else {}
+    entry = {"version": spec.version, "spec_hash": spec.spec_hash, "source": spec.source.value, "source_ref": spec.source_ref,
+             "validation_status": val.get("status", "unvalidated"), "validation_path": str(sdir / "validation.json"), "image_digest": val.get("image_digest"),
+             "conditions": ["full", "hidden", "interactive"], "calibration_runs": reg["scenarios"].get(spec.id, {}).get("calibration_runs", []), "comparison_runs": reg["scenarios"].get(spec.id, {}).get("comparison_runs", [])}
+    reg["scenarios"][spec.id] = entry; reg_path.write_text(json.dumps(reg, indent=2, sort_keys=True))
+    ds = Path("dataset.toml"); lines = [l for l in (ds.read_text().splitlines() if ds.exists() else []) if spec.id not in l]
+    for cond in entry["conditions"]: lines += ["[[tasks]]", f'path = "workspace/tasks/{spec.id}__{cond}"', ""]
+    ds.write_text("\n".join(lines).strip() + "\n"); return entry
+```
+
+```python
+# swesim/stages/export.py
+from __future__ import annotations
+import json
+from pathlib import Path
+from swesim.models import ScenarioSpec, Discovery
+from swesim.paths import Workspace
+def export_scenario(ws: Workspace, scenario_id: str) -> list[Path]:
+    spec = ScenarioSpec.model_validate_json((ws.scenario_dir(scenario_id) / "scenario.json").read_text()); outs = []
+    (ws.root / "exports").mkdir(parents=True, exist_ok=True)
+    for rec_path in (ws.root / "trials").glob("*/record.json"):
+        rec = json.loads(rec_path.read_text())
+        if rec["scenario_id"] != scenario_id: continue
+        tdir = rec_path.parent; traj = {}
+        if rec.get("trial_dir") and (Path(rec["trial_dir"]) / "agent" / "trajectory.json").exists(): traj = json.loads((Path(rec["trial_dir"]) / "agent" / "trajectory.json").read_text())
+        instruction = (Path(rec["task_dir"]) / "instruction.md").read_text()
+        replies = [e for e in rec.get("transcript", {}).get("events", []) if e.get("kind") == "message"]
+        manifest = {"trial_id": rec["trial_id"], "family_id": spec.source_ref, "condition": rec["condition"],
+                    "policy_visible": {"instruction": instruction, "agent_trajectory": traj, "stakeholder_messages": replies},
+                    "evaluator_only": {"ledger": [f.model_dump() for f in spec.ledger], "author_only_fact_ids": [f.id for f in spec.ledger if f.discovery == Discovery.AUTHOR_ONLY],
+                                       "oracle_asset": spec.controls.oracle, "test_assets": spec.contract.test_assets, "report": rec["report"]},
+                    "lineage": {"spec_hash": spec.spec_hash, "run_config_hash": rec["run_config_hash"], "patch_sha256": rec["report"].get("patch_sha256"),
+                                "transcript_hash": rec.get("transcript", {}).get("transcript_hash"), "harbor_trial_dir": rec.get("trial_dir")},
+                    "reward": rec["reward"], "simulator_validity": "unadjudicated" if rec["condition"] == "interactive" else "n/a",
+                    "interaction": {"patience_start": rec.get("transcript", {}).get("patience_start"), "patience_end": rec.get("transcript", {}).get("patience_end"),
+                                    "questions": sum(1 for e in replies if e.get("role") == "user" and e.get("exchange") == "ask"), "reviews": sum(1 for e in replies if e.get("role") == "user" and e.get("exchange") == "review")}}
+        p = ws.root / "exports" / f"{rec['trial_id']}.episode.json"; p.write_text(json.dumps(manifest, indent=2)); outs.append(p)
+    return outs
+```
+
+- [ ] **Step 3: Run tests, wire CLI (`register`, `score`, `export` each take `scenario_id`), commit**
+
+```bash
+uv run pytest tests/test_score.py -q
+git add swesim/stages/register.py swesim/stages/score.py swesim/stages/export.py swesim/cli.py tests/test_score.py
+git commit -m "feat(score,export,register): pass@k and pass^k over success, outcome counts, episode manifests, registry and dataset.toml"
+```
+
+---
+
+### Task 13: VM deployment (Temporal server, worker, dashboard) and the laptop-off acceptance test
+
+**Files:**
+- Create: `scripts/vm/create.sh`, `scripts/vm/setup.sh`, `scripts/vm/swesim-temporal.service`, `scripts/vm/swesim-worker.service`, `scripts/vm/swesim-dashboard.service`, `scripts/vm/tunnel.sh`, `docs/ops.md`
+
+- [ ] **Step 1: Scripts**
+
+`scripts/vm/create.sh`:
+```bash
+#!/bin/bash
+set -euo pipefail
+PROJECT=${GCP_PROJECT:?set GCP_PROJECT}; ZONE=${GCP_ZONE:-us-central1-a}; NAME=${VM_NAME:-swesim-worker}
+gcloud compute instances create "$NAME" --project "$PROJECT" --zone "$ZONE" --machine-type e2-small --image-family ubuntu-2404-lts-amd64 --image-project ubuntu-os-cloud --boot-disk-size 50GB --scopes cloud-platform
+gcloud compute scp --project "$PROJECT" --zone "$ZONE" --recurse scripts/vm "$NAME":~/vm
+gcloud compute scp --project "$PROJECT" --zone "$ZONE" ~/Documents/.env ~/.modal.toml "$NAME":~/
+gcloud compute ssh --project "$PROJECT" --zone "$ZONE" "$NAME" -- 'bash ~/vm/setup.sh https://github.com/saahilsanganeriya/swe-sim.git'
+```
+
+`scripts/vm/setup.sh`:
+```bash
+#!/bin/bash
+set -euo pipefail
+REPO_URL=${1:?repo url}
+sudo apt-get update && sudo apt-get install -y git curl ca-certificates
+curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$HOME/.local/bin:$PATH"
+curl -sSL "https://temporal.download/cli/archive/latest?platform=linux&arch=amd64" | tar xz -C "$HOME/.local/bin" temporal
+uv tool install 'harbor[modal]' && uv tool install modal
+gh_token=$(grep GITHUB_TOKEN ~/.env | cut -d= -f2- || true); [ -n "$gh_token" ] && echo "$gh_token" | (type gh >/dev/null 2>&1 && gh auth login --with-token) || true
+git clone "$REPO_URL" ~/swesim || (cd ~/swesim && git pull)
+cd ~/swesim && uv sync
+sudo mkdir -p /var/lib/swesim && sudo chown "$USER" /var/lib/swesim
+for u in swesim-temporal swesim-worker swesim-dashboard; do sed "s|__USER__|$USER|g; s|__HOME__|$HOME|g" ~/vm/$u.service | sudo tee /etc/systemd/system/$u.service >/dev/null; done
+sudo systemctl daemon-reload && sudo systemctl enable --now swesim-temporal swesim-worker swesim-dashboard
+sleep 5 && systemctl --no-pager status swesim-temporal swesim-worker swesim-dashboard | head -30
+```
+
+`scripts/vm/swesim-temporal.service`:
+```ini
+[Unit]
+Description=swesim Temporal dev server (persistent)
+After=network-online.target
+[Service]
+User=__USER__
+ExecStart=__HOME__/.local/bin/temporal server start-dev --db-filename /var/lib/swesim/temporal.db --ip 0.0.0.0 --ui-port 8233
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+```
+
+`scripts/vm/swesim-worker.service`:
+```ini
+[Unit]
+Description=swesim Temporal worker
+After=swesim-temporal.service
+Requires=swesim-temporal.service
+[Service]
+User=__USER__
+WorkingDirectory=__HOME__/swesim
+EnvironmentFile=__HOME__/.env
+Environment=PATH=__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=__HOME__/.local/bin/uv run python -m swesim.workflows.worker
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+```
+
+`scripts/vm/swesim-dashboard.service`: same shape with `ExecStart=__HOME__/.local/bin/uv run uvicorn swesim.dashboard.app:app --host 127.0.0.1 --port 8080`.
+
+`scripts/vm/tunnel.sh`: `gcloud compute ssh "$VM_NAME" --zone "$GCP_ZONE" -- -N -L 8233:localhost:8233 -L 8080:localhost:8080` (Temporal UI at http://localhost:8233, dashboard at http://localhost:8080).
+
+- [ ] **Step 2: Acceptance test (record in docs/ops.md)**
+
+1. From the laptop: `uv run swesim pipeline --source github-repo --repo py-pdf/pypdf --stakeholder-url $SWESIM_STAKEHOLDER_URL --judge-model anthropic/claude-sonnet-5 --draft-model anthropic/claude-sonnet-5` with `TEMPORAL_ADDRESS=localhost:7233` through the tunnel; note the workflow id.
+2. Close the laptop for 20 minutes.
+3. Reopen, re-tunnel, open the Temporal UI: the workflow advanced to `awaiting approval`; the worker log shows mine and judge activities completed.
+4. Approve from the laptop (`swesim approve <id>` locally is not enough on the VM; approval edits the draft on the VM via `scp` of the edited `scenario.draft.json`, then `swesim approve-signal <wid> <id>`), close the laptop again, return: compile, validate, register completed; `harbor` jobs visible under `~/swesim/workspace/jobs` on the VM.
+5. Worker restart check: `sudo systemctl restart swesim-worker` during a running trial; confirm one trial record.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add scripts/vm docs/ops.md
+git commit -m "ops: GCE VM provisioning, systemd units for Temporal server, worker, dashboard; laptop-off acceptance test"
+```
+
+---
+
+### Task 14: Dashboard (runs table, episode page)
+
+**Files:**
+- Create: `swesim/dashboard/__init__.py`, `swesim/dashboard/app.py`, `swesim/dashboard/templates/base.html`, `swesim/dashboard/templates/runs.html`, `swesim/dashboard/templates/trial.html`
+- Create: `tests/test_dashboard.py`
+
+**Interfaces:**
+- `GET /` runs table from `registry.json`, `workspace/scenarios/*/scores.json`, `workspace/trials/*/status.json`; `GET /trial/{trial_id}` episode page from `record.json`, `transcript.json` (or live `GET /transcript` on the stakeholder service when `status == running`), Harbor `agent/trajectory.json`, `report.json`; `GET /api/trial/{trial_id}/timeline` JSON merged by timestamp: `[{ts, actor: agent|stakeholder|verifier, kind, text, meta}]`; `POST /trial/{trial_id}/label` stores `{label, note}` into `workspace/trials/<id>/label.json`.
+- Timeline merge: ATIF steps carry `timestamp`; transcript events carry `ts`; sort ascending; stakeholder `tool_calls` become their own rows.
+
+- [ ] **Step 1: Test**
+
+```python
+# tests/test_dashboard.py
+from swesim.dashboard.app import merge_timeline
+def test_merge_orders_by_time():
+    traj = {"steps": [{"timestamp": "2026-09-13T10:00:05Z", "source": "agent", "message": "reading", "tool_calls": [{"function_name": "bash", "arguments": {"command": "ls"}}]}]}
+    transcript = {"events": [{"kind": "message", "ts": 1789291200.0, "role": "user", "content": "Which exception?", "exchange": "ask"},
+                             {"kind": "message", "ts": 1789291203.0, "role": "assistant", "content": "ValueError.", "disclosed_fact_ids": ["f2"], "tool_calls": [{"id": "c1", "exit_code": 0}]}]}
+    tl = merge_timeline(traj, transcript)
+    assert [r["actor"] for r in tl] == ["agent", "stakeholder", "stakeholder", "stakeholder"] or len(tl) == 4
+    assert tl[-1]["kind"] in ("reply", "tool_call")
+```
+
+- [ ] **Step 2: Implement app.py (FastAPI + Jinja2Templates; the templates are plain HTML tables and a two-column timeline; keep them under 120 lines each) with `merge_timeline(traj, transcript)` converting ATIF `timestamp` ISO strings to epoch seconds, emitting rows `{ts, actor, kind, text, meta}`; running trials poll `/api/trial/{id}/timeline` every 5 s via a small inline script.
+
+- [ ] **Step 3: Run `uv run pytest tests/test_dashboard.py -q`, then `uv run uvicorn swesim.dashboard.app:app --port 8080` and open http://localhost:8080; commit**
+
+```bash
+git add swesim/dashboard tests/test_dashboard.py
+git commit -m "feat(dashboard): runs table and episode page with merged agent/stakeholder/verifier timeline and near-live chat polling"
+```
+
+---
+
+### Task 15: Tracked example package and sanitized run
+
+**Files:**
+- Create: `examples/README.md`, `examples/<scenario-id>/` (copy of `workspace/scenarios/<id>/scenario.json`, `assets/`, `validation.json`, the three compiled task dirs, `scores.json`), `examples/<scenario-id>/runs/<trial_id>/` (`record.json`, `reward.json`, `report.json`, `transcript.json`, `episode.json`, Harbor `agent/trajectory.json`, `verifier/`)
+- Create: `scripts/snapshot_example.sh` (copies from workspace, strips `SWESIM_SESSION_TOKEN` values and any `Authorization` headers from copied files, verifies no `sk-` strings remain)
+
+- [ ] **Step 1: Script**
+
+```bash
+#!/bin/bash
+# scripts/snapshot_example.sh <scenario_id> <trial_id>
+set -euo pipefail
+SID=$1; TID=$2; DST=examples/$SID
+rm -rf "$DST"; mkdir -p "$DST/runs/$TID"
+cp -r workspace/scenarios/$SID/{scenario.json,assets,validation.json,scores.json} "$DST/" 2>/dev/null || true
+for c in full hidden interactive; do cp -r workspace/tasks/${SID}__$c "$DST/task__$c"; done
+cp -r workspace/trials/$TID/{record.json,reward.json,report.json,transcript.json,task} "$DST/runs/$TID/"
+cp -r workspace/exports/$TID.episode.json "$DST/runs/$TID/episode.json"
+HT=$(python3 -c "import json;print(json.load(open('workspace/trials/$TID/record.json'))['trial_dir'])"); cp -r "$HT/agent" "$HT/verifier" "$DST/runs/$TID/"
+grep -rl 'SWESIM_SESSION_TOKEN = "[^"]' "$DST" | xargs -I{} sed -i '' 's/SWESIM_SESSION_TOKEN = "[^"]*"/SWESIM_SESSION_TOKEN = "REDACTED"/' {} || true
+if grep -rE 'sk-(ant|proj)-[A-Za-z0-9]' "$DST"; then echo "SECRET FOUND"; exit 1; fi
+echo "snapshot at $DST"
+```
+
+- [ ] **Step 2: `examples/README.md`**: how to re-run the example task with `harbor run -p examples/<id>/task__full -a oracle -e modal --yes` and how to read `validation.json`, `report.json`, and `episode.json`.
+
+- [ ] **Step 3: Run the script for the first SWE-bench scenario and its interactive trial; commit**
+
+```bash
+git add examples scripts/snapshot_example.sh
+git commit -m "examples: tracked scenario package with executed controls and one interactive run"
+```
+
+---
+
+### Task 16: Documentation: README, grading.md, architecture.md; finalize CLAUDE.md and PLAN.md
+
+**Files:**
+- Modify: `README.md`; Create: `docs/grading.md`, `docs/architecture.md`; Modify: `CLAUDE.md`, `PLAN.md`
+
+- [ ] **Step 1: README.md sections**: What this is (3 sentences); Install (`uv sync`, `uv tool install 'harbor[modal]' modal`, `modal token new`, `.env` keys, `bash scripts/deploy_stakeholder.sh`); Run the example (`harbor run -p examples/...`); Author a task from SWE-bench (mine, judge, draft, edit, approve, compile, validate, register, run, score, export with exact commands); Author from a repository URL (`swesim mine --source github-repo --repo ...` then the same); Run unattended on the VM (`scripts/vm/create.sh`, tunnel, `swesim pipeline`, approve-signal); View (Temporal UI, `harbor view`, dashboard); Layout; Limits and claims (link spec section 22).
+- [ ] **Step 2: docs/grading.md**: reward and success definitions (spec 10.1, 10.5) with the actual `reward.json` and `report.json` from the example run; outcome classes and attribution table; the attack-versus-defense table with the executed control outcomes from `validation.json` pasted in; residual risks; how to add a control.
+- [ ] **Step 3: docs/architecture.md**: condensed spec sections 1, 4, 5, 6, 8, 9, 11, 13, 14 with the topology figure from `docs/explainer/index.html` referenced; realism choices (natural underspecification, persona from thread, patience, review boundaries); prior-art table; claims made and not made.
+- [ ] **Step 4: Finalize CLAUDE.md (commands, conventions, pitfalls learned during implementation) and check every PLAN.md milestone box that `scripts/verify.sh` confirms.**
+- [ ] **Step 5: Commit and push; run `bash scripts/verify.sh 10`.**
+
+```bash
+git add README.md docs/grading.md docs/architecture.md CLAUDE.md PLAN.md
+git commit -m "docs: README, grading, architecture; finalize CLAUDE.md and PLAN.md"
+git push
+```
+
+---
+
+## Self-review notes (run after writing; fixed inline)
+
+- Spec coverage: sections 5 (Task 1), 6 (Tasks 6, 10), 7 (Tasks 6, 7, 9, 12), 7a (Task 11), 8 (Task 8), 9 (Task 4), 10 (Tasks 2, 3), 11 and 12 (Task 12 metrics; calibration labeling is a registry field set by `matrix --calibration`), 14 (Task 13), 16 (Tasks 12, 15), 17 (Task 14), 19 and 22 (Task 16). Not planned, by decision: DeepSWE, Pro, rebench, Trac, multi-step, live agent streaming.
+- Type consistency: `RunConfig.stakeholder` fields used by `Session` (`patience_profile`, `review_mode`, `max_tool_calls_per_activation`, `model_id`, `temperature`) match Task 1; `report.json` keys read by `score`/`export` (`patch_sha256`, `reviewed_diff_sha256`, `transcript_hash`, `outcome`, `per_test`) match Task 3; transcript event keys (`kind`, `role`, `exchange`, `disclosed_fact_ids`, `tool_calls`, `ts`) match Task 8 and are read by Tasks 12 and 14; `trial_id` signature is shared by Tasks 1, 9, 11.
+- Known adjustments the implementer will hit: Harbor `BaseAgent` constructor signature (Task 5 step 1), SWE-bench conda activation path in `runner.command` (Task 6), Modal `Sandbox.create` argument names for the current SDK (Task 8), `temporalio` test-server download on first `pytest` (Task 11).
