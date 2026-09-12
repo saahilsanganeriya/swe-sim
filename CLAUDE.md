@@ -1,41 +1,56 @@
-# swesim: working notes for Claude Code
+# swesim implementation conventions
 
-## What this is
-A pipeline that turns underspecified GitHub issues (SWE-bench's human-annotated
-pool and any repository URL) into three-condition Harbor tasks with a simulated
-stakeholder, graded in a separate offline verifier on Modal, orchestrated by
-Temporal. Spec: docs/superpowers/specs/2026-09-12-swe-simulator-design.md.
-Plan: docs/superpowers/plans/2026-09-12-swesim-implementation.md. Checklist: PLAN.md.
+Plan: `docs/superpowers/plans/2026-09-12-swesim-implementation.md`.
+Checklist: `PLAN.md`.
+Execute one implementation stream; no unavailable skill is a prerequisite.
+The repository-URL source discovers PRs itself. SWE-bench demonstrates the
+interaction mechanism; the GitHub feature task demonstrates implementation
+complexity. Diff size is a filter, never measured difficulty.
 
 ## Commands
-- Install: `uv sync`; tools: `uv tool install 'harbor[modal]' && uv tool install modal`
-- Secrets: `export $(grep -v '^#' ~/Documents/.env | xargs)` before any `harbor run` or LLM call. Never commit them.
-- Tests: `uv run pytest -q` (fast, offline). Modal runs are never part of pytest.
-- Verify milestone: `bash scripts/verify.sh <n>`
-- CLI: `uv run swesim --help` (mine, judge, draft, approve, compile, validate, register, run, score, export, view, worker, pipeline, matrix)
-- Harbor smoke recipe that works: `references/modal-smoke-task/` (read its README first)
-- Stakeholder deploy: `bash scripts/deploy_stakeholder.sh` → URL in `.stakeholder_url`; export `SWESIM_STAKEHOLDER_URL=$(cat .stakeholder_url)` and `SWESIM_WORKER_SECRET` from `.env`
-- Temporal locally: `temporal server start-dev --db-filename /tmp/swesim-temporal.db` (UI :8233), then `uv run swesim worker`
 
-## Hard rules (from two adversarial reviews; do not relitigate)
-- `reward.json` numeric only; `report.json` for everything else. `success` is binary and drives pass@k/pass^k; `reward` is partial credit by requirement groups; any PASS_TO_PASS failure sets reward to 0.
-- Any `incorrect-exploit` tamper control that earns reward > 0 makes the scenario `invalid`.
-- Collection = root `[[verifier.collect]]` hook (`user = "root"`, absolute paths): pkill agent, fresh `/var/swesim-collect` (700), tar, freeze, receipt. File artifacts only. Never trust `/logs/artifacts`.
-- Strict allowlist baseline (model API + stakeholder host) in both `[environment]` and `[agent]`; `[verifier]` no-network, separate. Agent toolchain pre-baked (uv system-wide, `uv tool install mini-swe-agent` as user agent, `UV_OFFLINE=1`).
-- Grader code under `swesim/verifier/` is stdlib-only (it runs inside the verifier image).
-- Stakeholder LLM context = stakeholder-visible view only (no author-only facts, no oracle, no tests). Patience is code-owned. Asking is never rewarded or penalized.
-- `TrialWorkflow` id = `trial_id(spec_hash, condition, run_config_hash, attempt_index)`; `run_trial_activity` retry maximum_attempts=1.
-- Pool A only for SWE-bench; pytest-based repos only (no django, no sympy). github-repo demo repository: py-pdf/pypdf.
+- Bootstrap Task 1 dependencies, then `uv sync --extra dev --frozen`.
+- Fast checks: `uv run --frozen --offline python -m pytest -q tests --ignore=tests/integration`.
+- Acceptance: `bash scripts/verify.sh N`. It does not run cloud jobs or start servers.
+- CLI: `uv run swesim --help`.
+- Secrets: python-dotenv reads `SWESIM_ENV_FILE` or `~/Documents/.env`; never `export $(...)`, shell-source an untrusted file, or print secret values.
+- Cloud: Harbor 0.23.0 and Modal 1.5.5 are project dependencies, not merely tools on PATH. `harbor run --max-retries 0 -e modal`.
+- Stakeholder: `bash scripts/deploy_stakeholder.sh`; keep `.stakeholder_url` and credential files ignored.
+- Temporal uses a persistent development server on the VM; UI, API and dashboard are reached through SSH forwards 8233, 7233 and 8080.
 
-## Conventions
-- Python 3.12, pydantic v2 `extra="forbid"` models, typer CLI, small focused modules (see plan file structure).
-- TDD: write the failing test from the plan first, run it, implement, run, commit. Commit message ends with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`. Push after every milestone.
-- Workspace outputs live under `workspace/` (gitignored). Tracked deliverables: `examples/`, `registry.json`, docs.
+## Contracts
 
-## Pitfalls already hit
-- Harbor directory artifacts silently truncate on absolute symlinks: use the collect-hook tar.
-- Modal's allowlist blocks apt over HTTP even when mirrors are listed: never rely on network at agent setup.
-- Harbor runs `uv` bootstrap as the agent user in a non-login shell: install uv at `/usr/local/bin`, `chown -R agent:agent /home/agent`, set `UV_CACHE_DIR=/tmp/uv-cache`.
-- The verifier runs as root; chown the applied tree to `tester` before running tests.
-- `harbor run --agent module.path:Class` is the non-deprecated way to load `PatchAgent`; the repo root must be on PYTHONPATH.
-- SWE-bench images keep the repo at `/testbed` with a conda env `testbed`; run tests via `source /opt/miniconda3/bin/activate testbed && python -I -m pytest -rA ...`.
+- Hidden and interactive share the selected brief profile; full uses natural plus stakeholder-visible facts. Each category-targeted removal has an original-issue excerpt and a withholding operation. Preserve and measure the natural profile; validate provenance/leaks before human approval.
+
+- `reward.json` has finite numbers only. `success` is whole-contract correctness; `reward` is partial credit by fixed positive-weight requirement groups. Any regression sets reward to zero.
+- No-op grading still runs tests. Missing base statuses cannot validate a task. Incorrect-exploit controls must apply and earn zero; infrastructure errors do not count as defeated attacks.
+- Diff the submission against the untouched base, apply allowed source changes, then overlay hidden assertions. Preserve `/testbed` or `/app` so editable installs import submitted code.
+- Start the trusted pytest launcher with the task's own interpreter and `-I`; import pytest before adding submitted roots. Require exact IDs, JUnit/terminal/exit agreement. Disagreement earns zero; reruns are diagnostics.
+- Collector is root-owned, invoked with a cleared environment and absolute executables. Freeze in `finally`, including oversized/invalid submissions. Root-only `/var/swesim-collect` contains file artifacts and a JSON receipt. No git commands run during collection.
+- Baseline and agent network policy are strict allowlists; separate verifier is offline. Agent toolchain is pinned and pre-baked. Compiler checks actual asset hashes and consumes the approved Dockerfile asset in both images.
+- Stakeholder state is persisted before replies, request IDs bind to bodies, and exchange/freeze use the same lock. Author-only facts, oracle and hidden tests are excluded from its context. Fact labels are worker-only annotations.
+- Pilot review mode is diff-only and explicitly unverified. No sandbox reviewer, source debugging or patch suggestions. Asking changes availability, never grader reward.
+- Policy exports use actual agent observations. A generated service reply is not proof the policy received it. Keep audit annotations under evaluator-only; unadjudicated simulator traces are not labeled training-ready.
+- Trial identity includes spec hash, condition, actual model/config/build hash, purpose and attempt index. Save frozen spec/config with each run. Never pool calibration and comparison.
+- A per-trial systemd unit owns Harbor; the Temporal worker launches once and polls. Persisted workflow IDs alone do not make an activity exactly-once. Unknown launch state is reconciled, not retried blindly.
+- Human approval is required for scenario content only. The agent prints the exact command and waits on dependent work. Approval validates the frozen file and hashes on the VM, not a laptop-only path.
+
+## Execution and evidence
+
+Use tests before implementation for the substantive contracts in the plan.
+Execute Task 12 before Task 11. Do not duplicate the UI surfaces: Temporal
+shows workflow state; the episode page shows the conversation and outcomes.
+Commit coherent tasks; push milestones. Keep `workspace/` ignored and
+`examples/`, `registry.json`, docs tracked. Do not stage other agents' edits.
+Do not add an invented co-author attribution to commits.
+
+The prior smoke used `/logs/artifacts` and did not test the hardened root
+collector. Preserve that distinction. A passing unit test is not a Modal
+integration result. Record actual failures and unresolved limits in
+`docs/ops.md`; any incompatible spec requirement belongs in the plan review's
+spec-issues list until the owner revises it.
+
+Known residual: submitted code runs inside pytest and can attempt to forge
+its reports. These checks are tested defenses, not a proof against every
+attack. New feature tasks need independent behavioral controls and measured
+outcomes; 200–1,500 source lines does not guarantee a capability gradient.

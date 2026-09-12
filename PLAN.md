@@ -1,23 +1,33 @@
-# swesim build plan: milestones and acceptance checks
+# swesim milestones and acceptance checks
 
-This file is the checklist a `/goal` run works through. Each milestone maps to
-tasks in `docs/superpowers/plans/2026-09-12-swesim-implementation.md` and is
-accepted only when `bash scripts/verify.sh <n>` exits 0. Check a box only after
-the verify script passes for that milestone. Commit and push after each one.
+Plan: [implementation plan](docs/superpowers/plans/2026-09-12-swesim-implementation.md).
+Spec is read-only during this plan review. A box is checked only after
+`bash scripts/verify.sh N` succeeds. Checks are cumulative and offline; the
+cloud execution required to produce evidence is an explicit implementation step.
 
-Spec: `docs/superpowers/specs/2026-09-12-swe-simulator-design.md` (v2.1).
-Verified recipe for every compiled task: `references/modal-smoke-task/`.
+- [ ] **M1 Models** — Task 1: dependencies installed; strict model, asset, group and hash round-trip tests pass.
+- [ ] **M2 Grader** — Tasks 2–3: safe extraction, source import, exact-ID/exit cross-checks, genuine base outcomes and content hashes pass tests.
+- [ ] **M3 Compiler** — Tasks 4–5: three task variants render, assets are verified, root collector is packaged, PatchAgent implements Harbor's abstract API. This milestone alone claims no cloud run.
+- [ ] **M4 Authored SWE-bench task** — Tasks 6–7: mine/judge/draft; human approval bound to spec hash; executed Modal nop/oracle/wrong/tamper controls with complete base/gold test evidence; valid validation file.
+- [ ] **M5 Interaction** — Tasks 8–9: durable stakeholder sessions, serialized freeze, bounded replies; a real mini-swe-agent interactive episode with a paired question/reply, trajectory and transcript hash matching collection.
+- [ ] **M6 Repo URL** — Task 10: mine a GitHub repository URL without a PR override; retain filter/build rejections; automatically select a feature candidate, get human approval, validate and run it. A failed search is recorded honestly and leaves M6 incomplete.
+- [ ] **M7 Pipeline and dataset** — Task 12 then Task 11: both scenarios registered with frozen evidence; actual attempts in full/hidden/interactive and hidden runs on both natural/withheld profiles for one scenario; reproducible score tables and exports; Temporal approval/hash, model-specific trial IDs and launch/poll logic tested; explicit integration test included.
+- [ ] **M8 Cloud independence** — Task 13: GCE persistent Temporal server/worker and detached trial units; saved evidence of pipeline progress with laptop closed, plus worker restart yielding one launch and one terminal trial record.
+- [ ] **M9 Viewing** — Task 14: runs page, episode timeline, near-live stakeholder chat and completed agent trajectory; dashboard tests pass.
+- [ ] **M10 Reviewable delivery** — Tasks 15–16: tracked complete example and sanitized run with submitted patch; README, grading, architecture and operations docs; complete offline suite and `verify.sh 10` pass; commit pushed.
 
-- [ ] **M1 Models** (Task 1): `swesim/models.py` v2 with strict validators; `uv run pytest tests/test_models.py` passes.
-- [ ] **M2 Verifier** (Tasks 2, 3): `swesim/verifier/{policy,parsers,grader}.py`, stdlib only; grader tests pass including protected-path drop, regression-to-zero, receipt handling, numeric-only reward.
-- [ ] **M3 Compile + first Modal run** (Tasks 4, 5): templates render three conditions; `swesim compile` works on a scenario; `patch-agent` loads under Harbor; oracle and nop run on Modal against one compiled SWE-bench task.
-- [ ] **M4 Validate** (Tasks 6, 7): SWE-bench pool A mining with threads; judge; draft; human approve; `swesim validate <id>` writes `validation.json` with status `valid` (oracle success 1, nop 0, all incorrect-exploit tamper controls reward 0, plausible-wrong within bound, FAIL_TO_PASS failing on base, no gold lines reachable).
-- [ ] **M5 Stakeholder + first episode** (Tasks 8, 9): service deployed on Modal (`.stakeholder_url` present, `/health` ok); session tests pass; one `interactive` trial record exists with at least one ask exchange, a numeric `reward.json`, and matching transcript hashes.
-- [ ] **M6 Repository-URL source** (Task 10): `swesim mine --source github-repo --repo py-pdf/pypdf` produces candidates with a reject histogram; one pypdf scenario drafted, approved, validated (`valid`).
-- [ ] **M7 Temporal** (Task 11): workflow test passes; a `RunMatrixWorkflow` completed against the dev server; worker restart check documented in `docs/ops.md` with exactly one trial record for the interrupted trial id.
-- [ ] **M8 Score/export/register** (Task 12): `scores.json` for both scenarios with pass@k, pass^k, outcome counts; `workspace/exports/*.episode.json` exist; `registry.json` lists both scenarios as `valid`.
-- [ ] **M9 VM + dashboard** (Tasks 13, 14): systemd units and scripts present; dashboard tests pass; `docs/ops.md` records the laptop-off acceptance test result.
-- [ ] **M10 Example + docs** (Tasks 15, 16): `examples/<scenario>/` with validation, three task dirs, one sanitized run; `README.md`, `docs/grading.md`, `docs/architecture.md` complete; `bash scripts/verify.sh 10` exits 0.
+Execution order: 1–10, **12 before 11**, then 14, 13, 15–16. Task 12 is needed before
+Temporal calls register/score/export. Run one tier first; additional repeats
+and a frontier tier follow the complete end-to-end path. Insufficient repeats
+produce null pass@k/pass^k at the requested k, never a silently reduced k.
 
-Order is the critical path. Do not start M6 before M4 is `valid`. Do not start
-M9 before M7. The second model tier and a third scenario come after M10.
+Preserve the floor early: with six hours remaining, snapshot the first valid
+simulation and write the initial README/grading/architecture docs even if M6
+is blocked. This does not waive M6 or mark dependent milestones complete.
+Keep optional sandbox review, third tasks and extensive UI work deferred.
+
+Approval is an actual human checkpoint: the agent prints the pending draft
+path and exact approval command and continues independent work. It cannot
+execute approval itself or treat silence as approval. On the VM the human
+approves the VM's file and sends its hash to Temporal. A timed-out approval
+remains pending work, never success.
