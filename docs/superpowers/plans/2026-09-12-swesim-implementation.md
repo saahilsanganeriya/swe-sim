@@ -3137,8 +3137,31 @@ def test_approval_wait_none_is_success(monkeypatch):
         async def wait(predicate,timeout):
             w.approve_spec({"scenario_id":"aaa","spec_hash":"h"}); assert predicate(); return None
         monkeypatch.setattr(W,'act',act); monkeypatch.setattr(W.workflow,'wait_condition',wait)
-        result=await w.run({})
+        result=await w.run({'approval_mode':'human'})
         assert result['scenarios'][0]['status']=='complete' and 'verify_approval_activity' in calls and 'validate_activity' in calls
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize('approved',[True,False])
+def test_auto_approval_never_waits_and_rejection_stops_validation(monkeypatch,approved):
+    async def scenario():
+        w=W.PipelineWorkflow(); calls=[]
+        async def act(name,p,minutes=10):
+            calls.append(name)
+            if name=='auto_approve_activity':
+                return {'approved':approved,'spec_hash':'h','reasons':[] if approved else ['gate rejected']}
+            return {'candidates_path':'c','judged_path':'j','instance_ids':['a'],
+                'scenario_id':'aaa','draft_path':'d','status':'valid','failures':[],
+                'trials':[],'spec_hash':'h'}
+        async def wait(*args,**kwargs):
+            raise AssertionError('automatic approval must not wait for a person')
+        monkeypatch.setattr(W,'act',act); monkeypatch.setattr(W.workflow,'wait_condition',wait)
+        result=await w.run({})
+        assert 'auto_approve_activity' in calls
+        assert ('verify_approval_activity' in calls)==approved
+        assert ('validate_activity' in calls)==approved
+        assert ('register_activity' in calls)==approved
+        expected='complete' if approved else 'auto-approval-rejected'
+        assert result['scenarios'][0]['status']==expected
     asyncio.run(scenario())
 
 def test_matrix_uses_precomputed_distinct_model_ids(monkeypatch):
