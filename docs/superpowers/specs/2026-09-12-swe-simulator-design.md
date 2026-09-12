@@ -58,8 +58,9 @@ In scope by the presentation, in critical-path order:
 5. Temporal orchestration, thin: one pipeline workflow, one trial workflow,
    persistent dev server on the VM, worker under systemd.
 6. Tracked example task package and one sanitized example run in the repo.
-7. Minimal dashboard: a task/run table and one episode view (transcript,
-   patch, per-test results, labels), plus `harbor view` and the Temporal UI.
+7. Dashboard: a runs table and a trial page with the live stakeholder chat
+   while running and the full interleaved episode after completion (section
+   17), plus `harbor view` and the Temporal UI.
 8. README, grading document, architecture and realism document.
 
 Model configurations for the pilot: two, one weaker tier and one frontier
@@ -169,7 +170,7 @@ rationale; asset references not present in the manifest.
 
 `agent` (Harbor agent name, version), `model` (provider id), `condition`,
 `solver_timeout_sec`, `stakeholder` (`model_id`, `prompt_version`,
-`temperature`, `question_budget`, `review_budget`, `review_mode: diff-only`),
+`temperature`, `patience_profile` (section 8), `review_mode: diff-only`),
 `k`, `harbor_version`, `environment_provider: modal`, `run_config_hash`.
 Every trial id embeds it: `trial_id = h(spec_hash, condition, run_config_hash,
 attempt_index)`.
@@ -315,6 +316,20 @@ is asked; broad legitimate questions may receive broad answers (no forced
 drip). The reply carries `disclosed_fact_ids` as a self-report annotation.
 The simulator is stochastic and is labeled so; temperature 0 and the
 recorded model id are for reproducibility of configuration, not of output.
+
+Patience (decided 2026-09-12): asking is neither rewarded nor penalized by
+the grader. Its cost is modeled as a **patience budget owned by code**, part
+of the `RunConfig` as `patience_profile = {start, question_cost,
+review_cost, terse_below, refuse_at}`. Each `ask` spends `question_cost`,
+each `review` spends `review_cost`. While patience is above `terse_below`
+the stakeholder answers in full. Between `terse_below` and `refuse_at` the
+service instructs the model to answer in one or two sentences and to deflect
+questions whose facts are `repo-derivable` toward the code. At or below
+`refuse_at` the service returns a fixed refusal without calling the model.
+The patience value and its trajectory are recorded per request and exported;
+profiles are a difficulty knob and are frozen per run config. Post-training
+consumers may compute a shaped penalty from the exported counts; the
+environment's reward never includes one.
 
 Review, frozen mode `diff-only` for every compared run: the agent's
 `request-review` shim sends the current diff (hashed); the service replies
@@ -546,17 +561,33 @@ limited to agents actually run.
   `evaluator_only` (ledger, oracle path, hidden test asset names, report),
   `lineage` (spec hash, run config hash, image digest, patch sha, transcript
   hash, harbor job id), `family_id` (source instance, for split grouping),
-  `simulator_validity` (`ok` | `failure` | `unadjudicated`). Trainer
-  integration and training are out of scope.
+  `simulator_validity` (`ok` | `failure` | `unadjudicated`), `interaction`
+  (questions asked, reviews requested, patience start and end, refusals).
+  Trainer integration and training are out of scope.
 
 ## 17. Viewing
 
-Temporal UI for pipeline and trial state. `harbor view` for raw
-trajectories. swesim dashboard, minimal: one table of scenarios by condition
-by model with outcome counts and pass@k and pass^k, and one episode page
-showing brief, transcript with disclosed-fact annotations, requirement list,
-patch, per-test results, outcome, integrity signals, and the human label
-field.
+Three surfaces. The Temporal UI shows pipeline and trial workflow state,
+pending approvals, retries. `harbor view` shows raw trajectories. The swesim
+dashboard has two pages:
+
+1. **Runs table**: scenarios by condition by model with live status from
+   Temporal, outcome counts, pass@k and pass^k, calibration versus comparison
+   labels, links to each trial.
+2. **Trial page**, the primary screen. While the trial runs: status, elapsed
+   solver time, and the stakeholder chat streamed live from the service
+   (questions, replies, disclosed-fact annotations, patience remaining,
+   review rounds). Agent actions are not available live because installed
+   agents write their trajectory at the end of the run through Harbor; the
+   page says so. After the trial: the complete timeline interleaving agent
+   actions (from Harbor's trajectory), questions and replies by timestamp,
+   the patch with dropped protected paths marked, per-test expected versus
+   observed, outcome, integrity signals, the human label field, and links to
+   the episode manifest and raw Harbor directory.
+
+Implementation: a small FastAPI app on the VM reading the workspace, job
+directories, Temporal's visibility API, and the stakeholder service's
+transcript endpoint; polling, no websockets.
 
 ## 18. Repository layout
 
