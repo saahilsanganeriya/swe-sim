@@ -189,7 +189,7 @@ footer{margin-top:80px;color:var(--muted);font-size:13.5px;border-top:1px solid 
   <div class="grid g2">
     <div class="card">
       <div class="eyebrow">The report, as written</div>
-      <pre style="margin-top:10px"><code>Mod(Mod(x + 1, 2) + 1, 2) should simplify to Mod(x, 2)
+      <pre style="margin-top:10px;white-space:pre-wrap"><code>Mod(Mod(x + 1, 2) + 1, 2) should simplify to Mod(x, 2)
 
 Currently it does not simplify.</code></pre>
       <p style="color:var(--ink2);font-size:14.5px;margin:8px 0 0">One example. No general rule. No hint of where in the code the problem is, or which cases must <em>not</em> be simplified.</p>
@@ -234,24 +234,24 @@ Currently it does not simplify.</code></pre>
       <text x="365" y="140" text-anchor="middle" class="b">the agent</text>
       <text x="365" y="160" text-anchor="middle" class="t2">explores, edits, runs tests</text>
       <text x="365" y="176" text-anchor="middle" class="t2">and can raise its hand</text>
-      <path class="arrow" d="M365 108 V52"/>
-      <path class="arrow" d="M395 52 V108"/>
-      <text x="336" y="84" text-anchor="end" class="t3">ask-user "…"</text>
-      <text x="424" y="84" class="t3">an answer, in character</text>
-      <g class="stake"><rect x="240" y="8" width="250" height="44" rx="10"/></g>
-      <text x="365" y="26" text-anchor="middle" class="b">the stakeholder</text>
-      <text x="365" y="42" text-anchor="middle" class="t2">a chatbot playing the maintainer, holding the real answers</text>
+      <path class="arrow" d="M350 108 V58"/>
+      <path class="arrow" d="M380 58 V108"/>
+      <text x="340" y="88" text-anchor="end" class="t3">ask-user "…"</text>
+      <text x="390" y="88" class="t3">an answer, in character</text>
+      <g class="stake"><rect x="200" y="8" width="330" height="48" rx="10"/></g>
+      <text x="365" y="28" text-anchor="middle" class="b">the stakeholder</text>
+      <text x="365" y="45" text-anchor="middle" class="t2">a chatbot playing the maintainer · knows the real answers</text>
       <path class="arrow" d="M452 150 H538"/>
       <g class="neutral"><rect x="540" y="110" width="130" height="80" rx="10"/></g>
       <text x="605" y="146" text-anchor="middle" class="b">a patch</text>
       <text x="605" y="166" text-anchor="middle" class="t2">its changes only</text>
-      <path class="arrow" d="M672 150 H758"/>
-      <g class="verif"><rect x="760" y="96" width="180" height="108" rx="10"/></g>
-      <text x="850" y="122" text-anchor="middle" class="b">the grader</text>
-      <text x="850" y="142" text-anchor="middle" class="t2">a fresh clean copy of the code</text>
-      <text x="850" y="158" text-anchor="middle" class="t2">+ the real fix's tests</text>
-      <text x="850" y="174" text-anchor="middle" class="t2">in a room the agent never enters</text>
-      <text x="850" y="194" text-anchor="middle" class="t3">reward: 1 or 0</text>
+      <path class="arrow" d="M672 150 H738"/>
+      <g class="verif"><rect x="740" y="96" width="205" height="108" rx="10"/></g>
+      <text x="842" y="122" text-anchor="middle" class="b">the grader</text>
+      <text x="842" y="142" text-anchor="middle" class="t2">a fresh, clean copy of the code</text>
+      <text x="842" y="158" text-anchor="middle" class="t2">+ the real fix's tests</text>
+      <text x="842" y="174" text-anchor="middle" class="t2">a room the agent never enters</text>
+      <text x="842" y="194" text-anchor="middle" class="t3">reward: 1 or 0</text>
       <text x="480" y="250" text-anchor="middle" class="t2">Three things changed versus SWE-bench: the question stays messy, there is someone to ask, and the grading room is sealed.</text>
       <text x="480" y="272" text-anchor="middle" class="t3">Asking is never rewarded by itself. It only matters when a needed fact is not in the code.</text>
     </svg>
@@ -404,17 +404,18 @@ Currently it does not simplify.</code></pre>
 <section>
   <h2><span class="num">11</span>The factory: how problems get made</h2>
   <p class="sub">All of the above is one problem. The product is the machine that makes many. It is a nine-step pipeline, and every step after the third reads one shared file format, so adding a new source of problems means writing one new "front door".</p>
-  <div class="chain">
-    <div class="stage"><b>mine</b><span>find candidate issue + fix pairs, fetch their threads</span></div>
-    <div class="stage"><b>judge</b><span>an AI rates: how hard, how unclear, are the tests fair</span></div>
-    <div class="stage"><b>spec</b><span>an AI drafts the ledger and persona; a human edits and approves</span></div>
-    <div class="stage"><b>compile</b><span>build the three versions as Harbor tasks</span></div>
-    <div class="stage"><b>validate</b><span>the five test-takers</span></div>
-    <div class="stage"><b>register</b><span>add to the dataset with a version</span></div>
-    <div class="stage"><b>run</b><span>agents attempt it, in the cloud, several times</span></div>
-    <div class="stage"><b>score</b><span>pass rates, outcomes, failure labels</span></div>
-    <div class="stage"><b>view</b><span>dashboard</span></div>
+  <div class="grid g3" style="gap:12px">
+    <div class="stage"><b>1 · mine</b><span>find candidate issue + fix pairs, fetch their threads</span></div>
+    <div class="stage"><b>2 · judge</b><span>an AI rates: how hard, how unclear, are the tests fair</span></div>
+    <div class="stage"><b>3 · spec</b><span>an AI drafts the ledger and persona; a human edits and approves</span></div>
+    <div class="stage"><b>4 · compile</b><span>build the three versions as Harbor tasks</span></div>
+    <div class="stage"><b>5 · validate</b><span>the five test-takers from section 10</span></div>
+    <div class="stage"><b>6 · register</b><span>add to the dataset with a version and provenance</span></div>
+    <div class="stage"><b>7 · run</b><span>agents attempt it in the cloud, several times each</span></div>
+    <div class="stage"><b>8 · score</b><span>pass rates, outcome counts, failure labels</span></div>
+    <div class="stage"><b>9 · view</b><span>dashboard: funnel, problem cards, run matrix, episode explainer</span></div>
   </div>
+  <p style="color:var(--ink2);font-size:14.5px;margin:10px 0 0">Steps 1 to 3 differ per source. Steps 4 to 9 read only the shared record, so they never change.</p>
   <h3>Three front doors</h3>
   <div class="grid g3">
     <div class="card"><div class="eyebrow">Starting point</div><h3 style="margin-top:6px">SWE-bench's rejected problems</h3><p style="color:var(--ink2);font-size:14.5px;margin:0">The 109-problem pool from section 3, with human notes on what is missing. Environments already exist as prebuilt images, so the first tasks come from here.</p></div>
@@ -423,17 +424,17 @@ Currently it does not simplify.</code></pre>
   </div>
   <div class="card" style="margin-top:16px">
     <h3 style="margin:0 0 8px">What "mine" does with a repository link</h3>
-    <svg viewBox="0 0 960 150" width="100%" role="img" aria-label="Repo link to merged PRs to linked issues to filters to candidates">
-      <g class="neutral"><rect x="20" y="40" width="150" height="60" rx="10"/></g><text x="95" y="66" text-anchor="middle" class="b">repo URL</text><text x="95" y="86" text-anchor="middle" class="t2">github.com/org/project</text>
-      <path class="arrow" d="M172 70 H218"/>
-      <g class="neutral"><rect x="220" y="40" width="150" height="60" rx="10"/></g><text x="295" y="66" text-anchor="middle" class="b">merged fixes</text><text x="295" y="86" text-anchor="middle" class="t2">pull requests, by date</text>
-      <path class="arrow" d="M372 70 H418"/>
-      <g class="neutral"><rect x="420" y="40" width="150" height="60" rx="10"/></g><text x="495" y="66" text-anchor="middle" class="b">their issues</text><text x="495" y="86" text-anchor="middle" class="t2">"Fixes #123" links</text>
-      <path class="arrow" d="M572 70 H618"/>
-      <g class="neutral"><rect x="620" y="40" width="150" height="60" rx="10"/></g><text x="695" y="66" text-anchor="middle" class="b">filters</text><text x="695" y="86" text-anchor="middle" class="t2">tests changed · real discussion · buildable</text>
-      <path class="arrow" d="M772 70 H818"/>
-      <g class="agent"><rect x="820" y="40" width="120" height="60" rx="10"/></g><text x="880" y="66" text-anchor="middle" class="b">candidates</text><text x="880" y="86" text-anchor="middle" class="t2">+ reasons for rejects</text>
-      <text x="480" y="134" text-anchor="middle" class="t3">Every rejected pair keeps its reason, so the funnel is inspectable and the filters can be tuned.</text>
+    <svg viewBox="0 0 960 170" width="100%" role="img" aria-label="Repo link to merged PRs to linked issues to filters to candidates">
+      <g class="neutral"><rect x="10" y="40" width="160" height="76" rx="10"/></g><text x="90" y="66" text-anchor="middle" class="b">repo URL</text><text x="90" y="86" text-anchor="middle" class="t2">github.com/org/project</text>
+      <path class="arrow" d="M172 78 H204"/>
+      <g class="neutral"><rect x="206" y="40" width="160" height="76" rx="10"/></g><text x="286" y="66" text-anchor="middle" class="b">merged fixes</text><text x="286" y="86" text-anchor="middle" class="t2">pull requests, by date</text>
+      <path class="arrow" d="M368 78 H400"/>
+      <g class="neutral"><rect x="402" y="40" width="160" height="76" rx="10"/></g><text x="482" y="66" text-anchor="middle" class="b">their issues</text><text x="482" y="86" text-anchor="middle" class="t2">"Fixes #123" links</text>
+      <path class="arrow" d="M564 78 H596"/>
+      <g class="neutral"><rect x="598" y="40" width="160" height="76" rx="10"/></g><text x="678" y="62" text-anchor="middle" class="b">filters</text><text x="678" y="82" text-anchor="middle" class="t2">tests changed · real discussion</text><text x="678" y="100" text-anchor="middle" class="t2">environment buildable</text>
+      <path class="arrow" d="M760 78 H792"/>
+      <g class="agent"><rect x="794" y="40" width="156" height="76" rx="10"/></g><text x="872" y="62" text-anchor="middle" class="b">candidates</text><text x="872" y="82" text-anchor="middle" class="t2">each accepted pair, plus</text><text x="872" y="100" text-anchor="middle" class="t2">a reason for every reject</text>
+      <text x="480" y="152" text-anchor="middle" class="t3">Every rejected pair keeps its reason, so the funnel is inspectable and the filters can be tuned.</text>
     </svg>
   </div>
   <h3>Keeping the factory running: Temporal</h3>
@@ -448,24 +449,26 @@ Currently it does not simplify.</code></pre>
   <svg viewBox="0 0 960 380" width="100%" role="img" aria-label="Cloud topology">
     <rect x="16" y="16" width="928" height="290" rx="14" fill="none" stroke="var(--grid)"/>
     <text x="30" y="40" class="t3">MODAL · a cloud that runs isolated containers on demand</text>
-    <g class="agent"><rect x="40" y="70" width="290" height="190" rx="12"/></g>
+    <g class="agent"><rect x="40" y="70" width="300" height="190" rx="12"/></g>
     <text x="56" y="96" class="b">Agent's room</text>
     <text x="56" y="118" class="t2">the project at the moment before the fix</text>
     <text x="56" y="136" class="t2">history after that moment erased</text>
     <text x="56" y="154" class="t2">the project's own tests, but not the fix's</text>
-    <text x="56" y="180" class="t2">two extra commands installed:</text>
-    <text x="56" y="198" style="font-family:var(--mono);font-size:12.5px">ask-user "…"   request-review</text>
-    <text x="56" y="228" class="t3">internet: its AI API + the stakeholder only</text>
-    <text x="56" y="246" class="t3">checked today: anthropic ok · example.com blocked · github blocked</text>
-    <g class="stake"><rect x="400" y="70" width="240" height="110" rx="12"/></g>
+    <text x="56" y="178" class="t2">two extra commands installed:</text>
+    <text x="56" y="196" style="font-family:var(--mono);font-size:12.5px">ask-user "…"   request-review</text>
+    <text x="56" y="224" class="t3">internet: its AI API + the stakeholder only</text>
+    <text x="56" y="240" class="t3">checked today: AI API reachable,</text>
+    <text x="56" y="254" class="t3">example.com and github.com blocked</text>
+    <g class="stake"><rect x="400" y="70" width="250" height="110" rx="12"/></g>
     <text x="416" y="96" class="b">Stakeholder service</text>
     <text x="416" y="116" class="t2">ledger · persona · transcript</text>
-    <text x="416" y="134" class="t2">budgets enforced by code, not by the AI</text>
-    <text x="416" y="152" class="t2">an AI writes the replies in character</text>
+    <text x="416" y="134" class="t2">budgets enforced by code, not the AI</text>
+    <text x="416" y="152" class="t2">an AI writes replies in character</text>
     <text x="416" y="170" class="t3">one service, many problems at once</text>
-    <g class="neutral"><rect x="400" y="198" width="240" height="62" rx="12"/></g>
-    <text x="416" y="222" class="b">Review room</text>
-    <text x="416" y="242" class="t2">runs small fixtures on the agent's diff · knows no answers</text>
+    <g class="neutral"><rect x="400" y="198" width="250" height="62" rx="12"/></g>
+    <text x="416" y="220" class="b">Review room</text>
+    <text x="416" y="238" class="t2">runs small fixtures on the agent's diff</text>
+    <text x="416" y="252" class="t3">knows no answers</text>
     <g class="verif"><rect x="690" y="70" width="230" height="190" rx="12"/></g>
     <text x="706" y="96" class="b">Grading room</text>
     <text x="706" y="118" class="t2">clean copy, patch applied</text>
@@ -475,14 +478,14 @@ Currently it does not simplify.</code></pre>
     <text x="706" y="200" class="t3">no internet at all</text>
     <text x="706" y="218" class="t3">the agent never enters</text>
     <text x="706" y="236" class="t3">writes reward.json</text>
-    <path d="M330 118 H398" stroke="var(--s2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/><text x="364" y="110" text-anchor="middle" class="t3">questions</text>
-    <path d="M398 148 H332" stroke="var(--s2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/><text x="364" y="164" text-anchor="middle" class="t3">answers</text>
-    <path d="M520 180 V196" stroke="var(--ink2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-    <path d="M330 232 C 360 296, 640 296, 688 232" stroke="var(--s3)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-    <text x="510" y="292" text-anchor="middle" class="t3">the patch, and nothing else, crosses over</text>
+    <path d="M340 118 H398" stroke="var(--s2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/><text x="369" y="110" text-anchor="middle" class="t3">questions</text>
+    <path d="M398 148 H342" stroke="var(--s2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/><text x="369" y="164" text-anchor="middle" class="t3">answers</text>
+    <path d="M525 180 V196" stroke="var(--ink2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+    <path d="M340 236 C 370 300, 640 300, 688 236" stroke="var(--s3)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+    <text x="514" y="296" text-anchor="middle" class="t3">the patch, and nothing else, crosses over</text>
     <path class="blocked" d="M185 260 V 322"/><text x="185" y="340" text-anchor="middle" class="t3">github · pypi · everything else: blocked</text>
     <g class="neutral"><rect x="690" y="322" width="230" height="46" rx="10"/></g>
-    <text x="706" y="342" class="b">Storage</text><text x="706" y="359" class="t2">every run, transcript, ledger and score, kept</text>
+    <text x="706" y="342" class="b">Storage</text><text x="706" y="359" class="t2">runs · transcripts · ledgers · scores</text>
     <path d="M805 260 V320" stroke="var(--ink2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
   </svg>
   <div class="legend"><span><span class="dot agent"></span>agent</span><span><span class="dot stake"></span>stakeholder</span><span><span class="dot verif"></span>grader</span><span><span class="dot gray"></span>holds no secrets</span></div>
