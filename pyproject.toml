@@ -16,6 +16,11 @@ dependencies = [
   "pandas>=2.2",
   "datasets>=3.0",
   "rich>=13.7",
+  "harbor[modal]==0.23.0",
+  "modal==1.5.5",
+  "temporalio>=1.8",
+  "python-dotenv>=1.2.3",
+  "tomli-w>=1.2.0",
 ]
 
 [project.optional-dependencies]
@@ -33,3 +38,9 @@ packages = ["swesim"]
 
 [tool.ruff]
 line-length = 100
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
