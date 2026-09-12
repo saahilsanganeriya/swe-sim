@@ -36,7 +36,7 @@ draft to satisfy a gate; re-draft once or move to the next candidate.
 
 ## Execution working model (parallel streams, frozen interfaces)
 
-All subagents run on `fable` (see CLAUDE.md). Phase 0 (integrator): Task 1 models + `tests/test_contracts.py` (imports every
+Model rule (CLAUDE.md): code, design and review on `fable`; recon and simple mechanical work on `opus`/`sonnet`; never `haiku`. Phase 0 (integrator): Task 1 models + `tests/test_contracts.py` (imports every
 cross-module name the plan promises). `swesim/models.py` is then frozen; streams
 request schema changes from the integrator instead of editing it. `swesim/cli.py`
 is wired only by the integrator.

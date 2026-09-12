@@ -62,4 +62,6 @@ outcomes; 200–1,500 source lines does not guarantee a capability gradient.
 - No step may wait for a human. If something genuinely needs a person (a provider outage, an exhausted quota, a missing permission), write it to `docs/ops.md` with the evidence and continue with independent work.
 
 ## Subagent model rule (user directive, 2026-09-12)
-Every subagent dispatched for this project runs on the most capable model available, `fable` (the session model): implementers, reviewers, integrators, debuggers, designers, doc writers. Never dispatch `sonnet` or `haiku` for any role, regardless of what a skill's model-selection guidance says. Pass `model: fable` explicitly on every dispatch (or omit it, which inherits the session model).
+- Code work, design work, and review work run on `fable` (the session model): implementers, integrators, debuggers, task and final reviewers, anyone editing or judging code, specs, or plans. Pass `model: fable` explicitly.
+- Reconnaissance and simple mechanical work run on `opus` or `sonnet`: reading files or docs to answer a question, searching the codebase or web, collecting logs and evidence, copying artifacts, formatting reports, running a documented command and reporting its output.
+- Never dispatch `haiku` for anything on this project. When a task mixes recon with code changes, it is code work.
