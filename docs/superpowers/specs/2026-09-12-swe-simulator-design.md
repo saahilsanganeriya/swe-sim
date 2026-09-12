@@ -400,18 +400,27 @@ hostname is in the allowlist.
 
 - `[environment] network_mode = "allowlist"` is the **baseline**, which
   governs agent setup and collection (Harbor restores the baseline after the
-  agent phase; agent setup runs before it, verified in `trial.py`
-  `_prepare`). Harbor's installed agents need package mirrors during setup
-  (observed: mini-swe-agent's installer runs `apt-get`, the uv installer, and
-  `uv tool install`; with a strict baseline the trial failed with
-  `NetworkConnectionError`). Baseline `allowed_hosts` therefore includes the
-  model API hosts, the stakeholder host, and the install mirrors
-  (`*.ubuntu.com`, `deb.debian.org`, `astral.sh`, `github.com`,
-  `*.githubusercontent.com`, `pypi.org`, `files.pythonhosted.org`). This is
-  safe because no agent code runs outside the agent phase: setup runs
-  Harbor's installer, collection runs root-owned `tar`. Compile also pre-bakes
-  the reference agent's dependencies into the image so setup is a no-op when
-  possible.
+  agent phase; agent setup runs before it in `trial.py` `_prepare`). The
+  baseline is **strict**: model API hosts plus the stakeholder host only.
+  Harbor's installed agents normally fetch their toolchain at setup
+  (mini-swe-agent's installer runs `apt-get`, the uv bootstrap, `uv python
+  install`, `uv tool install`), and on Modal even an allowlist containing the
+  package mirrors did not let `apt-get` through (HTTP mirrors; observed
+  `NetworkConnectionError`). Therefore compile **pre-bakes the reference
+  agent's toolchain** into the image and setup becomes a no-op. Verified
+  recipe (spike `smoke6-prebaked`, 2026-09-12, mini-swe-agent 2.4.6 with
+  Haiku 4.5, reward 1, 1m29s):
+  - as root: `apt-get install curl bash build-essential git ca-certificates
+    python3`; `useradd -m -u 1001 agent`; install uv system-wide
+    (`UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1`);
+  - as `agent`: `uv python install 3.12 && uv tool install --python 3.12
+    mini-swe-agent --with litellm --with orjson --with fastapi`;
+  - as root: `chown -R agent:agent /home/agent`;
+  - `[environment.env]`: `UV_OFFLINE = "1"`, `UV_NO_PROGRESS = "1"`,
+    `UV_CACHE_DIR = "/tmp/uv-cache"` so Harbor's setup commands succeed
+    offline and fail loudly if something is missing.
+  The Python version constant comes from Harbor's adapter
+  (`_MINI_SWE_AGENT_PYTHON_VERSION`, currently 3.12) and is read at compile.
 - `[agent] user = "agent"`, `network_mode = "allowlist"` with **only** the
   model API hosts and the stakeholder host (the agent phase policy; verified:
   github.com and example.com blocked, api.anthropic.com reachable),
@@ -747,8 +756,11 @@ presentation. A third task only if everything above is done.
   symlinks); `[agent] user = "agent"` works for the oracle agent and the
   agent cannot remove a root-owned directory; the verifier runs as root;
   multi-key numeric `reward.json` is accepted.
-- Installed agents (mini-swe-agent) running as the `agent` user on Modal,
-  including their install step: one run.
+- Resolved 2026-09-12 by spike `smoke6-prebaked`: mini-swe-agent runs as
+  the `agent` user on Modal under the strict baseline with a pre-baked
+  toolchain; ATIF trajectory (`agent/trajectory.json`) and the native
+  trajectory are written; the collect hook and separate verifier work with a
+  real agent run.
 - Modal web endpoint reachable from a Harbor Modal sandbox under allowlist
   by hostname: one probe from the smoke task.
 - Temporal `TrialWorkflow` id dedup and worker restart: the restart check in
