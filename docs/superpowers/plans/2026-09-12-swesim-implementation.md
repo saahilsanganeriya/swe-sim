@@ -26,7 +26,7 @@
 - Grader code that runs inside the verifier container (`swesim/verifier/*.py`) uses the Python standard library only.
 - Stakeholder LLM context never contains `author-only` facts, the oracle, or hidden test files.
 - Temporal: `TrialWorkflow` id is `trial_id(spec_hash, condition, run_config_hash, attempt_index)`; include the actual model, condition, compiled environment digest and purpose in RunConfig. Launch is not retried. On the VM launch a per-trial systemd unit so a Temporal worker restart cannot kill its Harbor process; polling and result ingestion are retryable and idempotent.
-- Commit each coherent task and push milestone commits to origin main. Do not invent co-author identities. Stage only the task files; preserve concurrent edits.
+- Commit each coherent task and push milestone commits to origin main. Commit messages end with the environment's default attribution line `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and no other attribution. Stage only the task files; preserve concurrent edits.
 - Load only required keys from `SWESIM_ENV_FILE` (default `~/Documents/.env`) with python-dotenv, never shell evaluation or `export $(...)`. Save credentials only in ignored mode-0600 files. Do not put worker/provider secrets in task artifacts, command arguments, Temporal payloads, or log output. Model IDs are explicit config, verified by a small provider call before a sweep; do not substitute models silently.
 
 ---
