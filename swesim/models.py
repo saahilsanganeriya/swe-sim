@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 class Source(StrEnum):
     SWEBENCH_ANNOTATED = "swebench-annotated"
-    GITHUB_PR = "github-pr"
+    GITHUB_REPO = "github-repo"
     DEEPSWE = "deepswe"
     SWE_REBENCH = "swe-rebench"
     SWEBENCH_PRO = "swebench-pro"

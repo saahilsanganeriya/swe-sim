@@ -23,7 +23,9 @@ In scope by the presentation:
 2. The full pipeline as CLI stages: mine, judge, spec, compile, validate,
    register, run, score, view (section 7).
 3. Two to three tasks run end to end through those commands, each in three
-   conditions (full, hidden, interactive), with controls executed and recorded.
+   conditions (full, hidden, interactive), with controls executed and recorded:
+   at least one from the SWE-bench pool and at least one discovered
+   automatically from a GitHub repository URL.
 4. A simulated stakeholder service with a fact ledger, budgets owned by code,
    and review grounded in the agent's current work (section 8).
 5. Grading in a separate clean verifier with a correctness-only reward and
@@ -33,9 +35,9 @@ In scope by the presentation:
 8. README, grading document, architecture and realism document.
 
 Explicit non-goals for the first version: multi-step (multi-PR) episodes, Harbor's
-native user-agent bridge mode, Modal or Daytona execution, SWE-bench Pro and
-SWE-rebench importers beyond a stub, a Trac fetcher for django issues, and any
-claim that a model has not seen a task.
+native user-agent bridge mode, SWE-bench Pro and SWE-rebench importers, a Trac
+fetcher for django issues, and any claim that a model has not seen a task.
+DeepSWE import is a bonus, attempted only after the two primary sources work.
 
 ## 3. Prior art and positioning
 
@@ -60,7 +62,7 @@ Grading plumbing is adopted from DeepSWE v1.1 with attribution.
 ```
 sources ──▶ mine ──▶ judge ──▶ spec ──▶ compile ──▶ validate ──▶ register
  (swebench-annotated,          │          │            │             │
-  github-pr, deepswe,      ScenarioSpec  Harbor task  controls    dataset.toml
+  github-repo, deepswe,    ScenarioSpec  Harbor task  controls    dataset.toml
   swe-rebench*, pro*,       (normalized)  directory   outcomes    + registry.json
   authored*)                                                          │
                                                                       ▼
@@ -74,6 +76,11 @@ sources ──▶ mine ──▶ judge ──▶ spec ──▶ compile ──�
 
 Everything after `spec` consumes only the normalized record. Sources differ
 only in where the ledger comes from, and that provenance is a recorded field.
+
+The pipeline is orchestrated by **Temporal** (section 7a): each stage is an
+activity, each scenario's journey is a workflow, and the human edit of the
+drafted ledger is a signal the workflow waits on. Stages remain plain
+functions so they can also be run directly for debugging.
 
 ## 5. The normalized scenario record (`ScenarioSpec`)
 
@@ -116,14 +123,31 @@ Stored as `scenario.json` in each task's source directory. Fields:
 
 ## 6. Sources
 
-| Source | Trial status | Brief (`natural`) | Ledger provenance | Environment |
-|---|---|---|---|---|
-| `swebench-annotated` | primary | `problem_statement` verbatim | `annotator-note` (what is missing), `issue-thread` (`hints_text` plus API), `pr-review` | prebuilt `swebench/sweb.eval.x86_64.*` |
-| `github-pr` | one task | issue body | `issue-thread`, `pr-thread`, `pr-review` | Dockerfile built by pipeline |
-| `deepswe` | stub, import path proven on one task if time | `display_description` (authored brief) | `instruction-bullet` | their pinned image |
-| `swe-rebench` | stub | `problem_statement` | LLM-extracted from `hints_text` | 6,542 of 21,336 have images; score direction unverified |
-| `swebench-pro` | stub, gated | `problem_statement` | `requirements-field`, `interface` | `dockerhub_tag`; verifier reported to reject correct implementations about 24 percent of the time, so alternative-correct control is mandatory |
-| `authored` | interface only | human or LLM written | `authored` | any |
+Priority for the first version, set by Saahil on 2026-09-12: (1) SWE-bench annotated
+pool as the starting point, (2) a **GitHub repository URL** from which the
+pipeline discovers issues and linked merged PRs itself, (3) DeepSWE as a
+lower-priority bonus. SWE-rebench and SWE-bench Pro are future sources with
+the interface reserved and no importer.
+
+| Source | Trial status | Input | Brief (`natural`) | Ledger provenance | Environment |
+|---|---|---|---|---|---|
+| `swebench-annotated` | primary, first tasks | pool letter, optional instance ids | `problem_statement` verbatim | `annotator-note`, `issue-thread` (`hints_text` plus API), `pr-review` | prebuilt `swebench/sweb.eval.x86_64.*` |
+| `github-repo` | primary, end-state | repo URL; optional `--pr` / `--issue` to pin | issue body | `issue-thread`, `pr-thread`, `pr-review` | Dockerfile built by pipeline at the PR base commit |
+| `deepswe` | bonus | task id | `display_description` (authored brief) | `instruction-bullet` | their pinned image |
+| `authored` | interface only | scenario JSON | human or LLM written | `authored` | any |
+| `swe-rebench`, `swebench-pro` | future | | | | |
+
+`github-repo` discovery: list merged PRs in a date window; for each, resolve
+linked issues from the PR body ("Fixes #N", "Closes #N") and from the issue
+timeline cross-references; keep pairs where the PR changes both source and
+tests, the source diff is inside a size band, and the combined issue plus PR
+thread has at least a floor of non-bot comments; fetch threads and review
+comments; emit candidates with rejection reasons. Passing `--pr` skips
+discovery for that PR. Environment for this source is built by the pipeline:
+clone at the PR's base commit, install with the repo's declared tooling, run
+the test command once to confirm the PR's tests fail before the fix, then
+apply DeepSWE-style history stripping. Repos whose tests need network or
+services are rejected at `mine` with that reason.
 
 Pool for `swebench-annotated`: the 1,699 annotated instances. Pool A
 (underspecified score 2 or 3, test-validity concern 1 or less, no other major
@@ -146,11 +170,12 @@ All stages are subcommands of one CLI (`swesim`) operating on a workspace
 directory. Code owns every decision that affects reward; LLMs draft text and
 propose classifications that are recorded as annotations.
 
-1. `mine --source swebench-annotated [--pool A]` or `mine --source github-pr
-   --repo URL --pr N`: applies hard filters (linked issue where applicable,
-   tests changed, source diff size band, thread length floor, image
-   availability, merge date), fetches threads, writes `candidates.jsonl` with
-   per-candidate rejection reasons.
+1. `mine --source swebench-annotated [--pool A]` or `mine --source github-repo
+   --repo URL [--pr N]`: discovers issue and PR pairs (section 6), applies
+   hard filters (linked issue where applicable, tests changed, source diff
+   size band, thread length floor, image or build availability, merge date),
+   fetches threads, writes `candidates.jsonl` with per-candidate rejection
+   reasons.
 2. `judge`: frontier model rubric over issue, thread, diff and tests scoring
    complexity, spec gap, test behavioralness, self-containedness; the four
    questions above; writes `judged.jsonl`. Score is a prior, not a difficulty
@@ -175,6 +200,40 @@ propose classifications that are recorded as annotations.
    task and condition, outcome classes (section 10), interaction metrics,
    and evidence-based labels where determinable; writes `scores.json`.
 9. `view`: serves the dashboard (section 17).
+
+## 7a. Orchestration with Temporal
+
+Decision (Saahil, 2026-09-12): run the pipeline on Temporal. Rationale: the
+stages are long-running, failure-prone, and partly human-gated; durable
+execution gives retries, timeouts, visibility, and a natural place for the
+human-in-the-loop step, and the Temporal Web UI shows pipeline state without
+us building that screen.
+
+Mapping:
+
+- `MineRepositoryWorkflow(repo_url, window, filters)`: activities
+  `discover_pairs`, `fetch_threads`, `apply_filters`; starts one
+  `ScenarioWorkflow` child per surviving candidate. For the SWE-bench source,
+  `MinePoolWorkflow(pool)` does the same from the annotation CSVs.
+- `ScenarioWorkflow(candidate)`: activities `judge`, `draft_spec`, then waits
+  on signal `spec_approved(edited_spec)` with a timeout, then `compile`,
+  `validate`, `register`. A rejected judge score or a failed validation ends
+  the workflow in a recorded terminal state with the reason.
+- `RunMatrixWorkflow(task_id, conditions, models, k)`: one `run_trial`
+  activity per cell with heartbeats (Harbor on Modal can take many minutes),
+  bounded concurrency via a task queue, then `score`.
+- Activity contracts: idempotent on `(scenario_id, version, stage)`; outputs
+  are files in the workspace plus a small JSON result; retries with backoff
+  for network and provider errors; no retries for validation failures.
+- Local: `temporal server start-dev` (Web UI on port 8233), one Python worker
+  process (`python -m swesim.worker`), `temporalio` SDK. Temporal Cloud is a
+  drop-in later. The `swesim` CLI stages start workflows or send signals;
+  `--direct` runs the underlying function without Temporal for debugging.
+- Not on Temporal: the episode itself (Harbor orchestrates the trial) and the
+  stakeholder service (a plain HTTP service).
+
+Cost acknowledged: roughly two to three hours of integration during the
+trial. Paid for by moving DeepSWE import and the review sandbox to stretch.
 
 ## 8. The simulated stakeholder
 
@@ -371,11 +430,13 @@ Job directories are synced to storage and indexed in `registry.json`.
 
 ## 17. Viewing
 
-`harbor view` for raw trajectory inspection. Our dashboard, a small Python
-web app reading the workspace and job directories, adds four screens:
+Three surfaces. The Temporal Web UI shows every workflow, its stage, retries,
+and pending human approvals. `harbor view` shows raw trajectories. Our
+dashboard, a small Python web app reading the workspace, job directories and
+Temporal's visibility API, adds four screens:
 
 1. Pipeline funnel: candidates, judged, specified, compiled, validated,
-   registered, with rejection reasons.
+   registered, with rejection reasons, linked to the Temporal workflow.
 2. Task card: brief per condition, ledger with provenance and discovery
    paths, persona, requirements, controls and their outcomes.
 3. Run matrix: task by condition by model by attempt, reward components,
@@ -389,6 +450,7 @@ web app reading the workspace and job directories, adds four screens:
 ```
 swesim/
   swesim/            CLI package: mine, judge, spec, compile, validate, register, run, score, view
+  swesim/workflows/  Temporal workflows and activities; worker entry point
   sources/           one module per source producing ScenarioSpec
   stakeholder/       hosted stakeholder service, review sandbox, shims
   verifier/          grader.py, overlay logic, tamper scans, report parsing
@@ -414,18 +476,20 @@ swesim/
 
 ## 20. Schedule
 
-Evening of 2026-09-12: scaffold CLI and `ScenarioSpec`; `swebench-annotated`
-mine and thread fetch on Pool A; compile one instance to a `full` task and
-run `oracle` and `nop` locally; sidecar service and shims; first
-`interactive` run with mini-swe-agent.
+Evening of 2026-09-12: scaffold CLI and `ScenarioSpec`; Temporal dev server,
+worker, and the `ScenarioWorkflow` skeleton with stub activities;
+`swebench-annotated` mine and thread fetch on Pool A; compile one instance to
+a `full` task and run `oracle` and `nop` on Modal; stakeholder service and
+shims; first `interactive` run with mini-swe-agent.
 
 Morning of 2026-09-13: verifier with overlay, report parsing and integrity
-signals; controls and `validate`; second and third tasks including one
-`github-pr` task; `register`; `run` and `score` with three conditions and k
-attempts on the GCP VM if ready, else locally.
+signals; controls and `validate`; `github-repo` discovery and environment
+build on one repository, producing the second task; a third task from either
+source; `register`; `run` and `score` with three conditions and k attempts on
+Modal.
 
 Afternoon of 2026-09-13: dashboard, docs, presentation. Stretch, only if the
-above is done: DeepSWE import on one task, review worker.
+above is done: DeepSWE import on one task, review sandbox.
 
 ## 21. Unresolved integration details
 
@@ -437,6 +501,8 @@ above is done: DeepSWE import on one task, review worker.
 - SWE-rebench score direction and per-candidate image availability.
 - Trac fetcher for django issue threads.
 - Model identifiers for the GPT small tier.
+- Temporal: `temporalio` SDK version pin, worker concurrency for `run_trial`,
+  and whether Modal job polling needs activity heartbeats or a child workflow.
 
 ## 22. Claims we make and do not make
 
