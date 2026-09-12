@@ -2009,6 +2009,7 @@ git commit -m "feat(sources): swebench-annotated pool A mining with threads, jud
 
 **Files:**
 - Create: `swesim/stages/validate.py`, `swesim/harbor_cli.py`
+- Create: `swesim/stages/approve.py`, `tests/test_approve.py`
 - Modify: `swesim/cli.py` (replace stubs for `mine`, `judge`, `draft`, `approve`, `compile`, `validate`)
 - Create: `tests/test_validate.py`
 
@@ -2194,18 +2195,11 @@ def draft(judged: Path, instance: str, model: str = "anthropic/claude-sonnet-5")
     sid = instance.lower().replace("__", "--"); typer.echo(_draft(row, row["judge"], model, WS.scenario_dir(sid)))
 
 @app.command()
-def approve(scenario_id: str):
-    """Validate the human-edited scenario.draft.json and freeze it as scenario.json."""
-    sdir = WS.scenario_dir(scenario_id); spec = ScenarioSpec.model_validate_json((sdir / "scenario.draft.json").read_text())
-    import hashlib
-    from swesim.paths import atomic_json
-    for asset in spec.assets.values():
-        p=(sdir/asset.path).resolve()
-        if not p.is_relative_to(sdir.resolve()) or not p.is_file(): raise typer.BadParameter("asset path")
-        if len(p.read_bytes())!=asset.bytes or hashlib.sha256(p.read_bytes()).hexdigest()!=asset.sha256: raise typer.BadParameter("asset mismatch")
-    atomic_json(sdir/"scenario.json",spec.model_dump(mode="json"))
-    atomic_json(sdir/"approval.json",{"spec_hash":spec.spec_hash,"approved_by":"human-command","version":spec.version})
-    typer.echo(f"approved {scenario_id} spec_hash={spec.spec_hash}")
+def approve(scenario_id: str, auto: bool = typer.Option(False, "--auto", help="Unattended mode: code-owned gates approve instead of a human; recorded as approved_by=auto-validators, review_needed=true")):
+    """Freeze scenario.draft.json as scenario.json. Human mode records a human command; --auto records that the validators approved."""
+    from swesim.stages.approve import approve_scenario
+    out = approve_scenario(WS, scenario_id, auto=auto)
+    typer.echo(json.dumps(out)); raise typer.Exit(0 if out["approved"] else 1)
 
 def _load(scenario_id: str) -> ScenarioSpec:
     return ScenarioSpec.model_validate_json((WS.scenario_dir(scenario_id) / "scenario.json").read_text())
@@ -2222,6 +2216,53 @@ def validate(scenario_id: str, stakeholder_url: str = typer.Option("", envvar="S
     raise typer.Exit(0 if out["status"] == "valid" else 1)
 ```
 
+- [ ] **Step 3b: Approval stage shared by the CLI and Temporal (`swesim/stages/approve.py`)**
+
+```python
+# swesim/stages/approve.py
+"""Approval freezes a draft into scenario.json. Two modes:
+human: a person edited the draft and runs `swesim approve <id>`.
+auto (unattended runs): code-owned gates decide; the record says so and flags the scenario for post-hoc human review."""
+from __future__ import annotations
+import hashlib, json
+from swesim.models import ScenarioSpec, Discovery, OperationType
+from swesim.paths import Workspace, atomic_json
+
+def auto_gates(spec: ScenarioSpec, sdir) -> list[str]:
+    """Return failure reasons; empty means the validators approve."""
+    fails = []
+    judged = (spec.difficulty.judged or {})
+    if judged.get("keep") is not True: fails.append("judge did not accept (no non-derivable, consequential, thread-resolved gap)")
+    f2p = set(spec.contract.fail_to_pass)
+    if not any(f.discovery == Discovery.ON_REQUEST and set(f.tests) & f2p for f in spec.ledger): fails.append("no on-request fact is linked to a FAIL_TO_PASS test; interaction would not be load-bearing")
+    withheld = next((b for b in spec.briefs if b.profile == "withheld"), None)
+    if withheld is not None:
+        targets = {o.target for o in spec.operations if o.type == OperationType.WITHHOLDING}
+        for f in spec.ledger:
+            if f.id in targets and f.source_excerpt and f.source_excerpt.strip().lower() in withheld.text.lower(): fails.append(f"withheld brief still contains excerpt of {f.id}")
+        title = next(b for b in spec.briefs if b.profile == "natural").text.strip().splitlines()[0][:60].lower()
+        if title and title not in withheld.text.lower(): fails.append("withheld brief lost the natural title line")
+    if not spec.controls.plausible_wrong or not any(c.cls == "incorrect-exploit" for c in spec.controls.tamper): fails.append("controls incomplete")
+    return fails
+
+def approve_scenario(ws: Workspace, scenario_id: str, auto: bool) -> dict:
+    sdir = ws.scenario_dir(scenario_id); spec = ScenarioSpec.model_validate_json((sdir / "scenario.draft.json").read_text())
+    for asset in spec.assets.values():
+        p = (sdir / asset.path).resolve()
+        if not p.is_relative_to(sdir.resolve()) or not p.is_file(): return {"approved": False, "reasons": [f"asset path {asset.path}"]}
+        data = p.read_bytes()
+        if len(data) != asset.bytes or hashlib.sha256(data).hexdigest() != asset.sha256: return {"approved": False, "reasons": [f"asset mismatch {asset.path}"]}
+    reasons = auto_gates(spec, sdir) if auto else []
+    if reasons: return {"approved": False, "reasons": reasons, "mode": "auto"}
+    atomic_json(sdir / "scenario.json", spec.model_dump(mode="json"))
+    atomic_json(sdir / "approval.json", {"spec_hash": spec.spec_hash, "version": spec.version,
+                "approved_by": "auto-validators" if auto else "human-command", "review_needed": bool(auto),
+                "gates": ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "withholding-leak", "controls"] if auto else ["schema", "assets"]})
+    return {"approved": True, "spec_hash": spec.spec_hash, "mode": "auto" if auto else "human"}
+```
+
+Unit test (`tests/test_approve.py`): a minimal spec with `difficulty.judged.keep = True` and an on-request fact linked to a FAIL_TO_PASS test approves in auto mode and writes `approved_by: auto-validators`; the same spec with `keep = False`, or with the withheld brief still containing a withheld excerpt, returns `approved: False` with the reason and writes nothing.
+
 - [ ] **Step 4: Run the first real scenario through draft → approve → validate on Modal**
 
 ```bash
@@ -2234,13 +2275,19 @@ rows=[json.loads(x) for x in open(p)]
 row=next((r for r in rows if r['judge']['keep']),None)
 if row is None: raise SystemExit('no-valid-candidate; retain rejection report')
 subprocess.run(['uv','run','swesim','draft',p,row['instance_id']],check=True)
-print('HUMAN APPROVAL REQUIRED:',row['instance_id'].lower().replace('__','--'))
+print('DRAFTED:',row['instance_id'].lower().replace('__','--'))
 PYCODE
 ```
-The implementation agent now stops dependent work and prints the actual draft
-path and `uv run swesim approve <selected-id>` command with the selected ID
-substituted. It must not execute approval itself. Independent tests/docs may
-continue. After approval, load the ID from the new approval.json and run:
+**Unattended mode (the overnight run):** approve with the code-owned gates,
+`uv run swesim approve --auto <selected-id>`. If it returns `approved: false`,
+read the reasons: for a judge or load-bearing failure pick the next candidate
+with `keep`; for a withholding leak re-run `draft` once (the drafter is told
+the violating excerpts) and retry; after two failures record the reasons in
+`docs/ops.md` and move to the next candidate. Never edit `scenario.draft.json`
+by hand to satisfy a gate. The record says `approved_by: auto-validators,
+review_needed: true`, and the human reviews `scenario.json` in the morning.
+**Supervised mode:** print the draft path and `uv run swesim approve
+<selected-id>` and wait for the human. Then run:
 ```bash
 uv run python - <<'PYCODE'
 import pathlib,subprocess
@@ -3036,11 +3083,12 @@ rows=[json.loads(l) for l in open(p)]
 r=next((x for x in rows if x['judge']['keep']),None)
 if r is None: raise SystemExit('no-valid-candidate; do not supply a hand-picked PR to satisfy repo-only acceptance')
 subprocess.run(['uv','run','swesim','draft',p,r['instance_id']],check=True)
-print('Human approval pending for',r['instance_id'].lower().replace('__','--'))
+print('DRAFTED:',r['instance_id'].lower().replace('__','--'))
 PYCODE
+uv run swesim approve --auto <drafted-id>     # unattended mode; supervised mode: human runs `swesim approve <id>`
 ```
-After the human runs the printed approval command, use the approved GitHub
-scenario ID for `validate`, `register` and `run --condition interactive`. Task
+Use the approved GitHub scenario ID for `validate`, `register` and `run
+--condition interactive`. Task
 12 supplies registration before Temporal is exercised. Record discovered PR,
 filters, candidate rejections, build count and the real trial id. The test
 `tests/test_github_repo.py` must cover URL normalization, more than one page,
@@ -3148,6 +3196,10 @@ async def draft_activity(p):
     if not path.exists(): await blocking(lambda:draft(row,row['judge'],p['draft_model'],path.parent))
     return {'scenario_id':sid,'draft_path':str(path)}
 @activity.defn
+async def auto_approve_activity(p):
+    from swesim.stages.approve import approve_scenario
+    return approve_scenario(WS, p['scenario_id'], auto=True)
+@activity.defn
 async def verify_approval_activity(p):
     spec=_spec(p['scenario_id']); approval=json.loads((WS.scenario_dir(spec.id)/'approval.json').read_text())
     if p['spec_hash']!=spec.spec_hash or approval['spec_hash']!=spec.spec_hash: raise ValueError('approval hash differs from frozen spec')
@@ -3213,7 +3265,7 @@ async def score_activity(p):
 async def export_activity(p):
     from swesim.stages.export import export_scenario
     return {'manifest_paths':[str(x) for x in await blocking(lambda:export_scenario(WS,p['scenario_id']))]}
-ALL=[mine_activity,judge_activity,draft_activity,verify_approval_activity,compile_activity,validate_activity,
+ALL=[mine_activity,judge_activity,draft_activity,auto_approve_activity,verify_approval_activity,compile_activity,validate_activity,
      register_activity,plan_trials_activity,launch_trial_activity,await_trial_activity,score_activity,export_activity]
 ```
 
@@ -3264,9 +3316,15 @@ class PipelineWorkflow:
         if not judged['instance_ids']: return {'status':'no-valid-candidate','scenarios':[]}
         for iid in judged['instance_ids'][:p.get('max_scenarios',1)]:
             draft=await act('draft_activity',{**p,**judged,'instance_id':iid},30); sid=draft['scenario_id']
-            self.state={'stage':'awaiting-approval',**draft}
-            try: await workflow.wait_condition(lambda:sid in self.approvals,timeout=timedelta(hours=24))
-            except TimeoutError: return {'status':'awaiting-approval-timeout','scenarios':out,'pending':draft}
+            if p.get('approval_mode','auto')=='auto':
+                self.state={'stage':'auto-approving',**draft}
+                approved=await act('auto_approve_activity',{'scenario_id':sid})   # code-owned gates; approval.json says auto-validators
+                if not approved['approved']: out.append({'scenario_id':sid,'status':'auto-approval-rejected','reasons':approved['reasons']}); continue
+                self.approvals[sid]=approved['spec_hash']
+            else:
+                self.state={'stage':'awaiting-approval',**draft}
+                try: await workflow.wait_condition(lambda:sid in self.approvals,timeout=timedelta(hours=24))
+                except TimeoutError: return {'status':'awaiting-approval-timeout','scenarios':out,'pending':draft}
             accepted=await act('verify_approval_activity',{'scenario_id':sid,'spec_hash':self.approvals[sid]})
             step={**p,**accepted}
             await act('compile_activity',step,30); validation=await act('validate_activity',step,180)
@@ -3617,16 +3675,16 @@ SWESIM_VM=${VM_NAME:-swesim-worker}
 SWESIM_ARCHIVE=$(mktemp /tmp/swesim-source.XXXXXX.tar)
 trap 'rm -f "$SWESIM_ARCHIVE"' EXIT
 git archive --format=tar HEAD -o "$SWESIM_ARCHIVE"
-gcloud compute instances create "$SWESIM_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --machine-type e2-standard-2 --image-family ubuntu-2404-lts-amd64 --image-project ubuntu-os-cloud --boot-disk-size 50GB
+gcloud compute instances create --quiet "$SWESIM_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --machine-type e2-standard-2 --image-family ubuntu-2404-lts-amd64 --image-project ubuntu-os-cloud --boot-disk-size 50GB
 # Prepare ~/.config/swesim/worker.env with only required service/provider keys;
 # mining.env contains a read-only GH_TOKEN. Both must already be mode 0600.
 test -f "$HOME/.config/swesim/worker.env"
 test -f "$HOME/.config/swesim/mining.env"
-gcloud compute ssh "$SWESIM_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --command 'mkdir -p ~/.config/swesim ~/swesim && chmod 700 ~/.config/swesim'
-gcloud compute scp "$SWESIM_ARCHIVE" "$SWESIM_VM":~/source.tar --project "$GCP_PROJECT" --zone "$GCP_ZONE"
-gcloud compute scp "$HOME/.config/swesim/worker.env" "$HOME/.config/swesim/mining.env" "$SWESIM_VM":~/.config/swesim/ --project "$GCP_PROJECT" --zone "$GCP_ZONE"
-gcloud compute scp "$HOME/.modal.toml" "$SWESIM_VM":~/.modal.toml --project "$GCP_PROJECT" --zone "$GCP_ZONE"
-gcloud compute ssh "$SWESIM_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --command 'chmod 600 ~/.modal.toml ~/.config/swesim/*.env && tar -xf ~/source.tar -C ~/swesim && bash ~/swesim/scripts/vm/setup.sh'
+gcloud compute ssh --quiet "$SWESIM_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --command 'mkdir -p ~/.config/swesim ~/swesim && chmod 700 ~/.config/swesim'
+gcloud compute scp --quiet "$SWESIM_ARCHIVE" "$SWESIM_VM":~/source.tar --project "$GCP_PROJECT" --zone "$GCP_ZONE"
+gcloud compute scp --quiet "$HOME/.config/swesim/worker.env" "$HOME/.config/swesim/mining.env" "$SWESIM_VM":~/.config/swesim/ --project "$GCP_PROJECT" --zone "$GCP_ZONE"
+gcloud compute scp --quiet "$HOME/.modal.toml" "$SWESIM_VM":~/.modal.toml --project "$GCP_PROJECT" --zone "$GCP_ZONE"
+gcloud compute ssh --quiet "$SWESIM_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --command 'chmod 600 ~/.modal.toml ~/.config/swesim/*.env && tar -xf ~/source.tar -C ~/swesim && bash ~/swesim/scripts/vm/setup.sh'
 ```
 
 `scripts/vm/setup.sh`:
@@ -3702,7 +3760,7 @@ WantedBy=default.target
 #!/bin/bash
 set -euo pipefail
 : "${GCP_PROJECT:?}" "${GCP_ZONE:?}"
-gcloud compute ssh "${VM_NAME:-swesim-worker}" --project "$GCP_PROJECT" --zone "$GCP_ZONE" -- -N -L 7233:localhost:7233 -L 8233:localhost:8233 -L 8080:localhost:8080
+gcloud compute ssh --quiet "${VM_NAME:-swesim-worker}" --project "$GCP_PROJECT" --zone "$GCP_ZONE" -- -N -L 7233:localhost:7233 -L 8233:localhost:8233 -L 8080:localhost:8080
 ```
 
 - [ ] **Step 2: Acceptance test (record actual evidence in docs/ops.md and workspace/evidence/ops.json)**
@@ -3716,8 +3774,11 @@ Close the laptop for 20 minutes. Reconnect and save Temporal's history JSON:
 : "${WORKFLOW_ID:?Use the id printed by pipeline}"
 temporal workflow show --workflow-id "$WORKFLOW_ID" --output json > workspace/evidence/pipeline-history.json
 ```
-Human approval happens on the VM: download/edit/upload the draft, then the
-human runs these with the actual pending ID supplied by the workflow query:
+In unattended mode (`--approval-mode auto`, the default) the workflow approves
+with the code-owned gates and continues; no human step exists. In supervised
+mode (`--approval-mode human`) approval happens on the VM: download/edit/upload
+the draft, then the human runs these with the pending ID from the workflow
+query:
 ```bash
 : "${SCENARIO_ID:?Pending scenario ID}"
 uv run swesim approve "$SCENARIO_ID"

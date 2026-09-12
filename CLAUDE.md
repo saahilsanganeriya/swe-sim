@@ -33,7 +33,7 @@ complexity. Diff size is a filter, never measured difficulty.
 - Policy exports use actual agent observations. A generated service reply is not proof the policy received it. Keep audit annotations under evaluator-only; unadjudicated simulator traces are not labeled training-ready.
 - Trial identity includes spec hash, condition, actual model/config/build hash, purpose and attempt index. Save frozen spec/config with each run. Never pool calibration and comparison.
 - A per-trial systemd unit owns Harbor; the Temporal worker launches once and polls. Persisted workflow IDs alone do not make an activity exactly-once. Unknown launch state is reconciled, not retried blindly.
-- Human approval is required for scenario content only. The agent prints the exact command and waits on dependent work. Approval validates the frozen file and hashes on the VM, not a laptop-only path.
+- Approval is unattended by default: `swesim approve --auto <id>` lets the code-owned gates (schema, assets, judge acceptance, on-request fact linked to F2P, withholding leak, controls) decide and records `approved_by: auto-validators, review_needed: true`. Never hand-edit a draft to pass a gate; re-draft once or take the next candidate. Supervised human approval remains available but is not used overnight.
 
 ## Execution and evidence
 
