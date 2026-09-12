@@ -48,8 +48,11 @@ In scope by the presentation, in critical-path order:
 1. The separate verifier with path policy, expected-test manifest, numeric
    reward, report, and outcome attribution, exercised by real controls on one
    SWE-bench task (sections 9, 10).
-2. The stakeholder service with the session protocol and diff-only review,
+2. The stakeholder service with the session protocol, the limited tool loop
+   (`read_diff`, `read_changed_file`, and `run_check` in a Modal Sandbox),
    exercised by one interactive episode with a real agent (section 8).
+   If `run_check` is not working by the morning of 09-13, compared runs use
+   `diff-only` and say so.
 3. The full `swebench-annotated` path: mine, judge, spec (human-edited),
    compile to three conditions, validate, register, run, score, export, on a
    task that passes the non-derivability requirement (section 6).
@@ -68,7 +71,7 @@ tier, k = 3 attempts, three conditions. Expansion to more tiers only after
 everything above exists.
 
 Non-goals for the first version: DeepSWE, SWE-bench Pro, SWE-rebench importers;
-Trac fetcher; review fixture sandbox (diff-only review is the frozen mode);
+Trac fetcher; stakeholder source-debugging tools;
 multi-step episodes; Harbor's native user-agent bridge; GKE; Temporal Cloud;
 GCS auto-sync (an `export` command and durable job directories suffice);
 automated semantic failure labeling; four polished dashboard screens; any
@@ -157,6 +160,9 @@ rationale; asset references not present in the manifest.
   changes are never applied, see 10.2), `expected_base` and `expected_gold`
   (per-test statuses recorded by `validate`), `runner` (command template
   producing JUnit XML).
+- `checks`: predefined stakeholder reproducer checks `[{id, description,
+  command, asset?, expected_observation}]`, disjoint from the contract tests;
+  derived from the reporter's reproducer or ordinary user workflows.
 - `controls`: `oracle` (asset), `plausible_wrong` (>= 1, each with rationale,
   `expected_success: 0` and `expected_reward_max`), `alternative_correct`
   (>= 1 when the judge flags structural tests, else optional,
@@ -173,7 +179,8 @@ rationale; asset references not present in the manifest.
 
 `agent` (Harbor agent name, version), `model` (provider id), `condition`,
 `solver_timeout_sec`, `stakeholder` (`model_id`, `prompt_version`,
-`temperature`, `patience_profile` (section 8), `review_mode: diff-only`),
+`temperature`, `patience_profile` (section 8), `review_mode: checks | diff-only`,
+`max_tool_calls_per_activation`),
 `k`, `harbor_version`, `environment_provider: modal`, `run_config_hash`.
 Every trial id embeds it: `trial_id = h(spec_hash, condition, run_config_hash,
 attempt_index)`.
@@ -299,13 +306,37 @@ without Temporal.
 
 ## 8. The stakeholder service
 
-Form (decided 2026-09-12): a **constrained chatbot**, not an agent. One
-structured model call per request with the stakeholder-visible view, persona,
-patience state, and transcript injected, and for review the diff as input;
-no shell, no tools, no code execution, structured output `{reply,
-disclosed_fact_ids}`. A tool-using stakeholder (Harbor's native mode runs a
-full coding agent as the user) adds an execution and leak surface that
-diff-only review does not need.
+Form (decided 2026-09-12, revised after discussion): a **limited,
+event-driven agent**, cooperative about requirements and limited about
+implementation. It is activated by events (`ask`, `review`) and runs a small
+bounded tool loop (at most 4 tool calls per activation) before replying.
+Its tools are code-controlled and read-only:
+
+- `read_diff()`: the diff submitted with the current `review` request.
+- `read_changed_file(path)`: a file from the submitted snapshot, only for
+  paths present in the diff.
+- `run_check(check_id)`: one of the scenario's **predefined reproducer
+  checks** (user-level workflows or the reporter's reproducer, never the
+  hidden contract tests), executed in an isolated Modal Sandbox built from
+  the task image with the submitted diff applied, no network, no secrets,
+  bounded time and output. Returns observed behavior and output.
+
+Four boundaries: knowledge (stakeholder-visible view only; no oracle, no
+hidden tests); tools (the three above; no editing, no shell, no source
+debugging); feedback (expected versus observed behavior and requirement
+clarifications; never prescribed edits or algorithms, enforced by prompt and
+audited in the transcript); availability (the patience budget, identical
+across compared runs). The stakeholder's "looks good" is feedback, not
+reward. Every tool call and its result is recorded in the transcript and
+shown on the trial page beside the reply, so a reviewer can judge whether the
+stakeholder clarified or effectively solved.
+
+Review modes, frozen per `RunConfig` and identical across compared runs:
+`checks` (tools available, the default once `run_check` works) or
+`diff-only` (only `read_diff` and `read_changed_file`; replies state that
+nothing was executed). Prior art: SWE-Interact gives its simulated user tools
+to inspect the workspace; our difference is evidence-backed generation of the
+stakeholder's knowledge and inspectability of its actions.
 
 Hosted on Modal as a web endpoint, one deployment, many sessions. Holds per
 session: the stakeholder-visible view of the spec (facts with discovery in
@@ -351,10 +382,10 @@ profiles are a difficulty knob and are frozen per run config. Post-training
 consumers may compute a shaped penalty from the exported counts; the
 environment's reward never includes one.
 
-Review, frozen mode `diff-only` for every compared run: the agent's
-`request-review` shim sends the current diff (hashed); the service replies
-against the recorded requirements and the diff only, states that it has not
-executed anything, and never introduces requirements outside the ledger. The
+Review: the agent's `request-review` shim sends the current diff (hashed);
+the stakeholder may read it, read changed files, and run predefined checks
+per the review mode, then replies against the recorded requirements and what
+it observed; it never introduces requirements outside the ledger. The
 reviewed diff hash is recorded so `score` can report whether the submitted
 patch matches the last reviewed diff.
 
@@ -367,10 +398,23 @@ hostname is in the allowlist.
 
 ### 9.1 `task.toml` (per condition)
 
-- `[environment] network_mode = "allowlist"`, `allowed_hosts` = model API hosts
-  plus the stakeholder host. This is the baseline, so it also governs the
-  collection phase (Harbor restores the baseline after the agent phase).
-- `[agent] user = "agent"`, `network_mode = "allowlist"` (same hosts),
+- `[environment] network_mode = "allowlist"` is the **baseline**, which
+  governs agent setup and collection (Harbor restores the baseline after the
+  agent phase; agent setup runs before it, verified in `trial.py`
+  `_prepare`). Harbor's installed agents need package mirrors during setup
+  (observed: mini-swe-agent's installer runs `apt-get`, the uv installer, and
+  `uv tool install`; with a strict baseline the trial failed with
+  `NetworkConnectionError`). Baseline `allowed_hosts` therefore includes the
+  model API hosts, the stakeholder host, and the install mirrors
+  (`*.ubuntu.com`, `deb.debian.org`, `astral.sh`, `github.com`,
+  `*.githubusercontent.com`, `pypi.org`, `files.pythonhosted.org`). This is
+  safe because no agent code runs outside the agent phase: setup runs
+  Harbor's installer, collection runs root-owned `tar`. Compile also pre-bakes
+  the reference agent's dependencies into the image so setup is a no-op when
+  possible.
+- `[agent] user = "agent"`, `network_mode = "allowlist"` with **only** the
+  model API hosts and the stakeholder host (the agent phase policy; verified:
+  github.com and example.com blocked, api.anthropic.com reachable),
   `timeout_sec` from `RunConfig`.
 - `[verifier] network_mode = "no-network"`, `environment_mode = "separate"`,
   `[verifier.environment]` builds from `tests/Dockerfile`.
