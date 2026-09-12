@@ -1,4 +1,6 @@
-# Pending plan edits (apply after Codex's in-place review commit lands)
+# Pending plan edits — ALL APPLIED as of 2026-09-12 16:45 PDT
+
+Items 1-7 were applied by Codex's in-place review (commit 680e0a9); items 8-9 by Claude (commit a6df4ec). Kept for the record.
 
 Do not edit `docs/superpowers/plans/2026-09-12-swesim-implementation.md` while Codex holds it.
 
