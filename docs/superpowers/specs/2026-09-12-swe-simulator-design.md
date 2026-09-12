@@ -271,9 +271,11 @@ and test files, the source diff is within the kind's band, the issue plus PR
 thread has at least `--min-comments` non-bot comments, and the issue predates
 the PR; fetch threads; write `candidates.jsonl` with a reason per reject.
 
-Complexity bands (decided 2026-09-12 after measuring merged-PR sizes in
-pypdf, xarray and sqlglot: median 14 to 32 additions, 90th percentile 80 to
-132, and PRs above 5,000 lines essentially absent or mechanical):
+Complexity bands (decided 2026-09-12 after measuring 6458 merged PRs since
+2025-09-01 across the 12 SWE-bench repos and the 91 DeepSWE upstream repos:
+additions p50 28, p90 450, p99 5264; 71 PRs above 5,000 lines,
+all migrations, generated code, docs or release rollups; details and the
+per-repo ranking in `docs/notes/2026-09-12-target-repos.md`):
 
 | kind | source additions | source files | thread comments | issue labels preferred |
 |---|---|---|---|---|
