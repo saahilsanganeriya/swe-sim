@@ -60,3 +60,6 @@ outcomes; 200–1,500 source lines does not guarantee a capability gradient.
 - Nothing graded depends on the laptop's Docker: all builds and runs go through Harbor's Modal backend. Local Docker is only for optional smoke tests.
 - `gh auth token` supplies the GitHub token for mining; write it to the ignored env file the VM scripts copy, never into tracked files.
 - No step may wait for a human. If something genuinely needs a person (a provider outage, an exhausted quota, a missing permission), write it to `docs/ops.md` with the evidence and continue with independent work.
+
+## Subagent model rule (user directive, 2026-09-12)
+Every subagent dispatched for this project runs on the most capable model available, `fable` (the session model): implementers, reviewers, integrators, debuggers, designers, doc writers. Never dispatch `sonnet` or `haiku` for any role, regardless of what a skill's model-selection guidance says. Pass `model: fable` explicitly on every dispatch (or omit it, which inherits the session model).
