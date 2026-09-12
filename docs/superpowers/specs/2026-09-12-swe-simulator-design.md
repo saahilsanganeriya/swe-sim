@@ -51,7 +51,8 @@ In scope by the presentation, in critical-path order:
 2. The stakeholder service with the session protocol and diff-only review,
    exercised by one interactive episode with a real agent (section 8).
 3. The full `swebench-annotated` path: mine, judge, spec (human-edited),
-   compile to three conditions, validate, register, run, score, export.
+   compile to three conditions, validate, register, run, score, export, on a
+   task that passes the non-derivability requirement (section 6).
 4. The `github-repo` path from a repository URL with bounded discovery, one
    task discovered, built, validated and run through the same stages.
 5. Temporal orchestration, thin: one pipeline workflow, one trial workflow,
@@ -187,10 +188,26 @@ second, DeepSWE a bonus after both work (not in trial scope).
 Pools for `swebench-annotated` (exact predicates over the ensembled CSV,
 `other_major_issues == 0` throughout): A: `underspecified >= 2 and
 false_negative <= 1` (109); B: `underspecified >= 2 and false_negative == 2`
-(245); C: `underspecified <= 1 and false_negative == 2` (276). Only A is used
-for the first version. 539 rows pass the published filter and 500 are in Verified;
-pools are defined by scores, not by set difference. django instances are
-deprioritized (Trac tracker).
+(245); C: `underspecified <= 1 and false_negative == 2` (276). A and B are
+both candidate pools for the first version; B instances are admitted only after the
+judge classifies the test's unstated assumption as a stakeholder choice
+(clarification) rather than an evaluator defect (repair). 539 rows pass the
+published filter and 500 are in Verified; pools are defined by scores, not by
+set difference. django instances are deprioritized (Trac tracker).
+
+Non-derivability requirement (added after review of the SymPy `Mod`
+example, which a strong model solves from mathematics alone): a candidate is
+kept for the interactive set only if at least one contract-required fact is a
+**choice among reasonable alternatives** that neither the repository nor
+domain knowledge determines: which exception type and message, which of two
+output shapes, whether to warn or raise, what to do for an input the reporter
+could not share, which public name to expose. The judge records this fact
+and its alternatives. Facts a capable engineer could infer from the code or
+the domain are tagged `repo-derivable` and do not qualify. Empirical screen:
+after calibration runs, a task the frontier tier passes in `hidden` on all
+attempts is moved out of the interactive comparison set (its underspecification
+is not load-bearing) and kept as a calibration record. Prefer annotated
+difficulty above fifteen minutes and multi-file fixes.
 
 Annotator notes describe both missing intent and evaluator defects; a note is
 never a fact's sole provenance. If a thread references a reproducer that is
