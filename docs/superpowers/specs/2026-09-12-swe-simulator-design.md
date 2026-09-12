@@ -178,19 +178,28 @@ propose classifications that are recorded as annotations.
 
 ## 8. The simulated stakeholder
 
-Topology: a compose service `user` alongside `main`, plus an optional
-`review-worker` service. The hidden ledger, persona and requirements are
-mounted only into `user`. `main` gets two shell commands installed by compile:
+Topology: a **hosted stakeholder service**, not a compose sidecar. Rationale:
+Harbor's Modal and Daytona backends disable network allowlists whenever a
+compose file is present, and Docker Desktop on the development Mac fails
+Harbor's egress-control kernel check. A single service outside every sandbox
+keeps the leak boundary (the ledger never enters the agent container), works
+with any single-container provider, and lets one deployment serve many trials
+keyed by a per-trial session token. For local development the same service
+runs on localhost and the agent reaches it through Harbor's agent-host
+allowance.
 
-- `ask-user "<question>"`: POSTs to the `user` service with a per-trial token;
+The service holds, per trial session: the ledger, persona, requirements,
+budgets, and a verbatim transcript. `main` gets two shell commands installed
+by compile:
+
+- `ask-user "<question>"`: POSTs to the service with the session token;
   prints the reply.
-- `request-review`: commits the working tree on the agent's branch, sends the
-  diff to `user`; `user` forwards it to `review-worker`, which applies it to a
-  pristine checkout, runs the review fixtures (never the hidden contract
-  tests), and returns bounded results; `user` writes a review grounded in the
-  diff and those results. If `review-worker` is not built in time, the
-  fallback is diff-only review with results marked `unverified` in the
-  transcript.
+- `request-review`: commits the working tree on the agent's branch and sends
+  the diff. The service runs the review fixtures (never the hidden contract
+  tests) in an isolated **review sandbox** (a Modal Sandbox on the same
+  provider, no access to the ledger), and writes a review grounded in the diff
+  and those results. If the review sandbox is not built in time, the fallback
+  is diff-only review with results marked `unverified` in the transcript.
 
 Code owns: turn and question budgets, review-round budget, token validation,
 verbatim transcript, event records, and refusal to disclose `author-only`
@@ -201,9 +210,13 @@ configurable (Anthropic or OpenAI), temperature 0, seed recorded. Historical
 review comments are never replayed; their mined requirements drive review of
 the current work only.
 
+Transcripts and ledgers are written by the service to the storage bucket per
+session and joined to Harbor trial results by trial id in `score`; they are
+not collected as Harbor artifacts from the agent container.
+
 Leak boundary: the ledger never enters `main`. Replies can still leak content
-by construction, which is intended; the sidecar API exposes only `ask` and
-`review`, executes no submitted code, and is reachable only from `main`.
+by construction, which is intended; the service API exposes only `ask` and
+`review`, executes no submitted code itself, and requires a session token.
 
 ## 9. Compilation to Harbor tasks
 
@@ -212,21 +225,21 @@ Per scenario and condition, a task directory `tasks/<id>__<condition>/`:
 - `task.toml`: separate verifier environment; `[[verifier.collect]]` hooks
   that commit the working tree and write `git diff --binary <base> HEAD` to an
   artifact, and copy the sidecar ledger and transcript to a second artifact;
-  `artifacts` declared for both; `[agent] network_mode = "allowlist"` with only
-  the agent model hosts, `[verifier] network_mode = "no-network"`; metadata
-  with source, provenance summary, annotated difficulty, condition.
+  `artifacts` declared; `[agent] network_mode = "allowlist"` with only the
+  agent model hosts and the stakeholder service host, `[verifier]
+  network_mode = "no-network"`; metadata with source, provenance summary,
+  annotated difficulty, condition.
 - `instruction.md`: the brief for the condition. `full` includes every ledger
-  fact. `hidden` is the natural brief; the compose file omits the `user`
-  service and the shims report that no stakeholder is available.
-  `interactive` is the natural brief plus one paragraph describing the two
-  shell commands and the budgets. One environment image serves all three
-  conditions; only the compose file and instruction differ.
+  fact. `hidden` is the natural brief; no session token is issued and the
+  shims report that no stakeholder is available. `interactive` is the natural
+  brief plus one paragraph describing the two shell commands and the budgets.
+  One environment image serves all three conditions; only the instruction and
+  the session configuration differ.
 - `environment/Dockerfile`: FROM the pinned prebuilt image or the pipeline's
   build; DeepSWE-style git time travel (real branch at base commit, origin
   removed, non-ancestor branches and tags deleted, reflog expired, gc); shims
   installed; project tests left in place; PR test files that the contract
   overlays are left at their base-commit state.
-- `environment/docker-compose.yaml`: `main`, `user`, optional `review-worker`.
 - `tests/Dockerfile`: FROM the same pinned image; hidden test files, overlay
   files, runner config and `grader.py` baked in.
 - `solution/solve.sh`: applies the gold patch and commits, so Harbor's
@@ -321,15 +334,21 @@ to genuinely unseen tasks, and their interface is defined now.
 
 ## 14. Infrastructure
 
-Phase 1, development and validation: this Mac with Docker Desktop, Harbor's
-Docker backend. Compose sidecars and network allowlists are both supported on
-this backend. Prebuilt SWE-bench images are x86 only and run under emulation
-here. Phase 2, sweeps: one x86 VM on GCP running Docker and Harbor, same task
-directories, same commands. Modal and Daytona are deferred: their compose
-modes disable the network-allowlist capability, so sidecars and egress
-control cannot coexist there without a different topology, such as a hosted
-user service. Storage: a GCS bucket receives each job directory after `run`.
-Secrets: `~/Documents/.env` for model keys, `gh` for GitHub. Sweep duration is
+Primary execution provider: **Modal**, through Harbor's `modal` backend,
+single-container tasks with per-phase network allowlists (verified in Harbor
+0.23 source: allowlists are supported on Modal when no compose file is
+present). The stakeholder service and the review sandbox are deployed on Modal
+as well, so one account covers execution, stakeholder, and review. Fallback:
+one x86 VM on GCP running Docker and Harbor's Docker backend, which supports
+compose and egress control together; gcloud is installed locally for this.
+
+Local development: Docker Desktop on the Mac runs x86 images under emulation
+and has about 7.6 GB allocated; it fails Harbor's egress-control kernel
+check, so local runs are for smoke tests only and never for graded results.
+
+Storage: a GCS bucket receives each job directory after `run` and each
+stakeholder session transcript. Secrets: `~/Documents/.env` for model keys,
+`gh` for GitHub, Modal token via `modal token new`. Sweep duration is
 measured, not promised.
 
 ## 15. Agents
@@ -371,9 +390,9 @@ web app reading the workspace and job directories, adds four screens:
 swesim/
   swesim/            CLI package: mine, judge, spec, compile, validate, register, run, score, view
   sources/           one module per source producing ScenarioSpec
-  sidecar/           user service, review worker, shims
+  stakeholder/       hosted stakeholder service, review sandbox, shims
   verifier/          grader.py, overlay logic, tamper scans, report parsing
-  templates/         Harbor task templates (task.toml, Dockerfiles, compose, test.sh)
+  templates/         Harbor task templates (task.toml, Dockerfiles, shims, test.sh)
   dashboard/         web app
   workspace/         candidates, scenarios, tasks, validation, jobs (gitignored except registry)
   data/annotations/  SWE-bench Verified annotation CSVs and pools
@@ -410,11 +429,11 @@ above is done: DeepSWE import on one task, review worker.
 
 ## 21. Unresolved integration details
 
-- Docker Desktop egress-control support on this Mac (kernel feature check).
-- x86 emulation speed for SWE-bench images on Apple Silicon.
-- Exact `[[verifier.collect]]` behavior for sidecar artifacts and the
-  stop-main-before-sidecar option; collection is best-effort in Harbor, so the
-  verifier validates artifact presence itself.
+- Harbor `modal` backend: image build from our Dockerfiles, allowlist entries
+  for the stakeholder host, and `--allow-agent-host` behavior for local runs.
+- Modal Sandbox as the review sandbox: startup latency and cost per review.
+- Collection is best-effort in Harbor, so the verifier validates artifact
+  presence itself.
 - SWE-rebench score direction and per-candidate image availability.
 - Trac fetcher for django issue threads.
 - Model identifiers for the GPT small tier.
