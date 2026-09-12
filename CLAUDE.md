@@ -65,3 +65,6 @@ outcomes; 200–1,500 source lines does not guarantee a capability gradient.
 - Code work, design work, and review work run on `fable` (the session model): implementers, integrators, debuggers, task and final reviewers, anyone editing or judging code, specs, or plans. Pass `model: fable` explicitly.
 - Reconnaissance and simple mechanical work run on `opus` or `sonnet`: reading files or docs to answer a question, searching the codebase or web, collecting logs and evidence, copying artifacts, formatting reports, running a documented command and reporting its output.
 - Never dispatch `haiku` for anything on this project. When a task mixes recon with code changes, it is code work.
+
+## Skills to use during execution (when the superpowers plugin is present)
+`superpowers:subagent-driven-development` to run the plan (fresh implementer per task, review gate per task, ledger at `.superpowers/sdd/2026-09-12-swesim-implementation/progress.md`, final whole-branch review); `superpowers:test-driven-development` inside every task; `superpowers:verification-before-completion` before checking any PLAN.md box; `superpowers:systematic-debugging` on any failing Modal run or test; `superpowers:using-git-worktrees` for stream isolation. If the plugin is absent, follow the same steps manually; no skill is a prerequisite.
