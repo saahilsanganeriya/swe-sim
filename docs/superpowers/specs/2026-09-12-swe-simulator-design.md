@@ -334,8 +334,14 @@ without Temporal.
    delta**, extracted by code: exception class names and string literals
    asserted in the test patch, new public names introduced by the gold patch,
    and behavioral branches visible in the diff that the issue text never
-   mentions; the judge classifies each as a stakeholder decision or an
-   implementation detail; (b) **thread evidence**: maintainer questions in the
+   mentions; the judge classifies **each candidate gap**, never the issue as
+   a whole, on four questions: derivable from the repository, consequential
+   for callers, resolved by a stakeholder statement in the thread or only by
+   the patch, and category; a candidate is accepted only if at least one gap
+   is non-derivable, consequential and stakeholder-resolved, and that list is
+   also the menu for the `withheld` brief; the judge model differs from the
+   draft model so their errors are not correlated, and prompt version and
+   model id are recorded in `difficulty.judged`; (b) **thread evidence**: maintainer questions in the
    issue before the PR and reviewer-requested behavior or interface changes;
    (c) the **Verified rubric itself**: the judge scores underspecification 0
    to 3 using the annotators' published instructions, and `swesim
