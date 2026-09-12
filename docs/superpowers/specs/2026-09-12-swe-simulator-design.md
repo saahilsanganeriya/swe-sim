@@ -98,7 +98,7 @@ claim that a model has not seen a task.
 |---|---|---|
 | SWE-bench | Issue text to patch; FAIL_TO_PASS and PASS_TO_PASS; ships `hints_text` but does not show it to the agent | no interlocutor; underspecified issues are unsolvable by design |
 | SWE-bench Verified | Human filter on underspecification and test fairness; 500 kept of 1,699 annotated | the rejected instances and their human notes |
-| Ambig-SWE (Vijayvargiya et al., ICLR 2026) | A benchmark variant of Verified with information removed by an LLM, plus a simulated user, plus agent evaluation | natural rather than synthetic underspecification; provenance for what the user knows |
+| Ambig-SWE (Vijayvargiya et al., ICLR 2026) | A benchmark variant of Verified with information removed by an LLM summary, plus a simulated user given the full issue, hints and file locations | we start from issues humans rated underspecified, remove by category with each removal recorded as a ledger fact, keep the natural brief for measurement, and give the stakeholder provenance-tagged knowledge without file locations |
 | Ask or Assume? (Edwards and Schuster, 2026) | Agent-side clarification scaffold on that variant; Full 70.8 vs Hidden 54.8 for Sonnet 4.5 in its setup | environment-side pipeline, grading integrity |
 | tau-bench (Sierra) | LLM user with hidden scenario, final-state reward, pass^k | domain transfer to code |
 | DeepSWE v1.1 (2026) | Harbor tasks, separate verifier, collected patch, stripped git history, per-test reports | interaction; generation from public threads |
@@ -150,13 +150,30 @@ rationale; asset references not present in the manifest.
 - `assets`: manifest `{name: {path, sha256, bytes}}`, paths relative to the
   scenario directory; covers hidden test files, protected-path overlays,
   reproducer files, control patches, the Dockerfile.
-- `briefs`: `[{profile, text, provenance}]`; `natural` required with
-  provenance `original-issue`; other profiles are `authored`. A brief must
-  keep a recognizable symptom or request, enough context to begin, and a
-  desired outcome; withheld material must be discoverable through the
-  repository, questions, or review. Lossiness is selected for, not targeted
-  to a percentage; extra omissions are separate authored profiles whose
-  effect is measured.
+- `briefs`: `[{profile, text, provenance}]`. Three profiles:
+  - `natural` (required): the issue exactly as filed, provenance
+    `original-issue`.
+  - `withheld` (decided 2026-09-12, default interactive brief when present):
+    a model-produced version of the natural issue with **specific
+    categories removed**, never a free summary. Removable categories:
+    reproduction code and commands, error messages and tracebacks, literal
+    expected outputs, file, function and line references, version pins, and
+    explicit "the fix is" proposals. The brief must keep a recognizable
+    symptom or request, enough context to begin, and the desired outcome.
+    Every removed span becomes a ledger fact with `provenance:
+    original-issue`, `source_excerpt` equal to the removed text verbatim,
+    `source_url` the issue, `discovery: on-request` (or `repo-derivable`
+    when the agent can recover it from the code, such as a file location),
+    and an `operations` entry of type `withholding`. Provenance of the
+    profile is `withheld`. Code checks at `approve` that none of the withheld
+    excerpts appear in the withheld brief and that the title's symptom words
+    are retained.
+  - other `authored` profiles (for example `title-only`) are optional
+    difficulty variants.
+  Lossiness is therefore selected for (the natural issue is already rated
+  underspecified) and then extended in a recorded, reversible way. The
+  natural brief is always kept so the effect of withholding is measured
+  (section 11), never assumed.
 - `ledger`: `[Fact]` with `id`, `text`, `kind` (`behavior` | `interface` |
   `constraint` | `reproduction` | `context`), `provenance`
   (`issue-thread` | `pr-thread` | `pr-review` | `annotator-note` | `authored`),
@@ -164,9 +181,10 @@ rationale; asset references not present in the manifest.
   `authored_rationale` required), `discovery` (`brief` | `on-request` |
   `volunteered-at-review` | `repo-derivable` | `author-only`), `tests`
   (contract test ids; must be empty for `author-only`).
-- `operations`: `[{type: clarification | evaluator-repair | synthetic-extension,
-  target, rationale}]`, one entry for every change relative to the historical
-  material.
+- `operations`: `[{type: clarification | evaluator-repair |
+  synthetic-extension | withholding, target, rationale}]`, one entry for every
+  change relative to the historical material; `withholding` entries name the
+  fact ids moved from the brief to the ledger.
 - `persona`: `{summary, tone, disclosure_style, derived_from_urls}`.
 - `requirements`: `[{id, text, fact_id?, tests, source_url}]`, mined from
   review; used by the stakeholder's review reply; never replayed verbatim.
@@ -193,7 +211,8 @@ rationale; asset references not present in the manifest.
 ### 5.2 `RunConfig` (per run, versioned, hashed)
 
 `agent` (Harbor agent name, version), `model` (provider id), `condition`,
-`solver_timeout_sec`, `stakeholder` (`model_id`, `prompt_version`,
+`brief_profile` (`withheld` if the scenario has one, else `natural`; applies
+to `hidden` and `interactive`), `solver_timeout_sec`, `stakeholder` (`model_id`, `prompt_version`,
 `temperature`, `patience_profile` (section 8), `review_mode: checks | diff-only`,
 `max_tool_calls_per_activation`),
 `k`, `harbor_version`, `environment_provider: modal`, `run_config_hash`.
@@ -310,7 +329,8 @@ without Temporal.
    alternative correct implementations). Output `judged.jsonl`. A prior, not
    a difficulty measure.
 3. `draft_spec`: LLM drafts `ScenarioSpec` with excerpts; drafts control
-   patches. Output `scenario.draft.json`. The workflow then waits for the
+   patches; produces the `withheld` brief and its withheld facts by
+   category, with the leak check run in code. Output `scenario.draft.json`. The workflow then waits for the
    `approve_spec` signal carrying the human-edited JSON, or times out into
    `awaiting-approval`. The human edit is the authoring step and is recorded.
 4. `compile`: validates the spec, resolves image digest, emits three Harbor
@@ -522,11 +542,13 @@ hostname is in the allowlist.
 
 ### 9.2 `instruction.md`
 
-`full`: natural brief plus the stakeholder-visible facts (never author-only),
-plus "no stakeholder is available". `hidden`: natural brief plus "no
-stakeholder is available". `interactive`: natural brief plus one paragraph on
-`ask-user`, `request-review`, and the budgets. All three state the same
-solver time budget.
+`full`: the natural brief plus the stakeholder-visible facts (never
+author-only), plus "no stakeholder is available"; it is the most complete
+statement in every scenario. `hidden`: the `brief_profile` brief (withheld
+when present) plus "no stakeholder is available". `interactive`: the same
+brief plus one paragraph on `ask-user`, `request-review`, and availability.
+All three state the same solver time budget. `hidden` and `interactive`
+always share a brief, so their difference is the stakeholder alone.
 
 ### 9.3 `environment/Dockerfile`
 
@@ -686,6 +708,11 @@ separate "interaction helped" from "the model only needed the facts"; it
 measures whether the agent obtains and uses the facts through interaction.
 With two tasks and k = 3 the tier comparison is an existence demonstration,
 not a measured gradient; no ranking claim is made.
+
+Withholding is measured: for at least one scenario, `hidden` is run on both
+the `natural` and the `withheld` brief so the cost of the recorded removals
+is reported alongside the interaction effect, not folded into it. Reported
+results always name the brief profile.
 
 Calibration versus comparison: runs used to select or re-profile tasks are
 labeled `calibration` in the registry; accepted tasks and configs are frozen;
@@ -871,8 +898,10 @@ probe output, `collect.status`, agent trajectory summary per spike).
 
 ## 22. Claims, and the presentation's questions
 
-Claims we make: tasks come from naturally underspecified issues with
-excerpt-backed provenance and recorded operations; hidden material never
+Claims we make: tasks come from issues humans rated underspecified, whose
+briefs may be further withheld by category with every removal recorded as a
+fact carrying the reporter's own text; excerpt-backed provenance and recorded
+operations throughout; hidden material never
 enters the agent container; grading runs on a policy-filtered change set
 against a recorded base in a container the agent never enters; controls are
 executed with recorded outcomes; interaction is measured and reported
