@@ -42,7 +42,7 @@ Execute Task 12 before Task 11. Do not duplicate the UI surfaces: Temporal
 shows workflow state; the episode page shows the conversation and outcomes.
 Commit coherent tasks; push milestones. Keep `workspace/` ignored and
 `examples/`, `registry.json`, docs tracked. Do not stage other agents' edits.
-Do not add an invented co-author attribution to commits.
+Commit messages end with the attribution line this environment adds by default (`Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`); do not add other attributions.
 
 The prior smoke used `/logs/artifacts` and did not test the hardened root
 collector. Preserve that distinction. A passing unit test is not a Modal
