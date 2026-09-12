@@ -93,7 +93,11 @@ Stored as `scenario.json` in each task's source directory. Fields:
 - `briefs`: list of `{profile, text, provenance}` where `profile` is a named
   disclosure profile: `full` (brief plus every ledger fact), `natural` (the
   original issue text verbatim), and optional authored profiles such as
-  `repro-withheld`. `provenance` is `original-issue` or `authored`.
+  `repro-withheld` or `title-only`. `provenance` is `original-issue` or
+  `authored`. The default interactive brief is `natural`: lossiness is
+  selected for by the judge's spec-gap score, not manufactured. Sources whose
+  instructions are detailed (DeepSWE) or issues that happen to be clear get an
+  `authored` brief, labeled as such.
 - `ledger`: list of facts `{id, text, kind, provenance, discovery, tests}`:
   - `kind`: `behavior` | `interface` | `constraint` | `reproduction` |
     `context`.
@@ -225,9 +229,9 @@ Mapping:
 - Activity contracts: idempotent on `(scenario_id, version, stage)`; outputs
   are files in the workspace plus a small JSON result; retries with backoff
   for network and provider errors; no retries for validation failures.
-- Local: `temporal server start-dev` (Web UI on port 8233), one Python worker
-  process (`python -m swesim.worker`), `temporalio` SDK. Temporal Cloud is a
-  drop-in later. The `swesim` CLI stages start workflows or send signals;
+- Deployment: Temporal server and the worker run on the always-on GCE VM
+  (section 14); `temporalio` SDK. Temporal Cloud is a drop-in later. The
+  `swesim` CLI stages start workflows or send signals from any machine;
   `--direct` runs the underlying function without Temporal for debugging.
 - Not on Temporal: the episode itself (Harbor orchestrates the trial) and the
   stakeholder service (a plain HTTP service).
@@ -393,22 +397,29 @@ to genuinely unseen tasks, and their interface is defined now.
 
 ## 14. Infrastructure
 
-Primary execution provider: **Modal**, through Harbor's `modal` backend,
-single-container tasks with per-phase network allowlists (verified in Harbor
-0.23 source: allowlists are supported on Modal when no compose file is
-present). The stakeholder service and the review sandbox are deployed on Modal
-as well, so one account covers execution, stakeholder, and review. Fallback:
-one x86 VM on GCP running Docker and Harbor's Docker backend, which supports
-compose and egress control together; gcloud is installed locally for this.
+Goal (Saahil, 2026-09-12): the pipeline must keep running with the laptop
+closed. Nothing stateful lives on the laptop.
+
+| Component | Where | Why |
+|---|---|---|
+| Temporal server | one small GCE VM (`e2-small`), `temporal server start-dev --db-filename` on a persistent disk; Web UI reached over an SSH tunnel. Temporal Cloud is a one-line address change later | zero signup now, durable enough for the first version |
+| Pipeline worker | same VM, `python -m swesim.worker` under systemd; runs `harbor run -e modal` for `validate` and `run` | Harbor's client must stay alive for a job; a VM does, a laptop does not |
+| Agent sandboxes, verifier containers, image builds | Modal via Harbor's `modal` backend; images are built in Modal from our Dockerfiles, so the worker VM needs no Docker | verified today: build, oracle 1, nop 0, per-phase allowlists |
+| Stakeholder service, review sandbox | Modal web endpoint and Modal Sandboxes, deployed with `modal deploy` | always on, independent of the worker |
+| Artifacts, transcripts, scores, registry mirror | GCS bucket | durable, readable by the dashboard from anywhere |
+| Dashboard | runs on the VM (or Cloud Run later), reads GCS and Temporal visibility | viewable while the laptop is off |
+| Laptop | `swesim` CLI as a thin client: start workflows, edit and approve ledgers (signals), open dashboards | authoring and review only |
 
 Local development: Docker Desktop on the Mac runs x86 images under emulation
-and has about 7.6 GB allocated; it fails Harbor's egress-control kernel
-check, so local runs are for smoke tests only and never for graded results.
+with about 7.6 GB allocated and fails Harbor's egress-control kernel check;
+use it for smoke tests only, never for graded results. GKE was considered and
+rejected for the first version: it adds cluster operations without adding a
+capability at this scale; the VM plus Modal split covers durability and
+isolation.
 
-Storage: a GCS bucket receives each job directory after `run` and each
-stakeholder session transcript. Secrets: `~/Documents/.env` for model keys,
-`gh` for GitHub, Modal token via `modal token new`. Sweep duration is
-measured, not promised.
+Secrets: model keys in a Modal secret and on the VM; Modal token on the VM;
+GitHub token on the VM for mining; gcloud installed locally for provisioning.
+Sweep duration is measured, not promised.
 
 ## 15. Agents
 
