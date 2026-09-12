@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>swesim, explained from scratch</title>
+<title>swesim: underspecified issues in, multi-turn gradable SWE simulations out</title>
 <style>
 :root{
   color-scheme: light;
@@ -26,19 +26,18 @@
   }
 }
 *{box-sizing:border-box}
-html,body{margin:0;background:var(--plane);color:var(--ink);font:16.5px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+html,body{margin:0;background:var(--plane);color:var(--ink);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
 a{color:var(--s1);text-decoration:none}a:hover{text-decoration:underline}
-main{max-width:1040px;margin:0 auto;padding:40px 24px 96px}
-header.hero{padding:48px 0 16px}
+main{max-width:1080px;margin:0 auto;padding:40px 24px 96px}
+header.hero{padding:56px 0 24px}
 .eyebrow{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
-h1{font-size:40px;line-height:1.15;margin:8px 0 14px;font-weight:700;letter-spacing:-.01em}
-.lede{font-size:20px;color:var(--ink2);max-width:800px;margin:0 0 18px}
-section{margin-top:72px}
-.num{display:inline-flex;width:30px;height:30px;border-radius:50%;background:var(--ink);color:var(--surface);align-items:center;justify-content:center;font-weight:700;font-size:15px;margin-right:10px;vertical-align:middle}
-h2{font-size:27px;margin:0 0 8px;letter-spacing:-.01em}
-h3{font-size:17.5px;margin:26px 0 8px}
-p{max-width:800px}
-.sub{color:var(--ink2);margin:0 0 22px}
+h1{font-size:40px;line-height:1.15;margin:8px 0 12px;font-weight:700;letter-spacing:-.01em}
+.lede{font-size:19px;color:var(--ink2);max-width:820px;margin:0 0 20px}
+.meta{display:flex;gap:18px;flex-wrap:wrap;font-size:14px;color:var(--muted)}.meta b{color:var(--ink2);font-weight:600}
+section{margin-top:64px}
+h2{font-size:26px;margin:0 0 6px;letter-spacing:-.01em}
+h3{font-size:17px;margin:28px 0 8px}
+.sub{color:var(--ink2);margin:0 0 22px;max-width:820px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:22px 24px}
 .grid{display:grid;gap:16px}
 .g2{grid-template-columns:repeat(2,minmax(0,1fr))}.g3{grid-template-columns:repeat(3,minmax(0,1fr))}.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
@@ -47,65 +46,53 @@ p{max-width:800px}
 .tag.stake{border-color:var(--s2);background:var(--s2w)}.tag.agent{border-color:var(--s1);background:var(--s1w)}.tag.verif{border-color:var(--s3);background:var(--s3w)}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
 .dot.agent{background:var(--s1)}.dot.stake{background:var(--s2)}.dot.verif{background:var(--s3)}.dot.gray{background:var(--axis)}
-.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13.5px;color:var(--ink2);margin:10px 0 0}
-code{font-family:var(--mono);font-size:14px;background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:0 5px}
-pre{font-family:var(--mono);font-size:13.5px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;overflow:auto;line-height:1.5}
+.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--ink2);margin:10px 0 0}
+code{font-family:var(--mono);font-size:13.5px;background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:0 5px}
+pre{font-family:var(--mono);font-size:13.5px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;overflow:auto;line-height:1.5;white-space:pre-wrap}
 pre code{border:none;padding:0;background:none}
 table{width:100%;border-collapse:collapse;font-size:14.5px;background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
 th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--grid);vertical-align:top}
 th{font-weight:600;color:var(--ink2);font-size:13px;letter-spacing:.02em}
 tr:last-child td{border-bottom:none}
 td.n{font-variant-numeric:tabular-nums;text-align:right}
+.mark{font-weight:700}
 .tile{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px}
-.tile .l{font-size:13.5px;color:var(--ink2)}.tile .v{font-size:34px;font-weight:600;line-height:1.1;margin-top:4px}.tile .d{font-size:13.5px;color:var(--muted);margin-top:4px}
-.callout{border-left:3px solid var(--s1);padding:12px 18px;background:var(--surface);border-radius:0 10px 10px 0;color:var(--ink2);max-width:none}
-.callout b{color:var(--ink)}
-.analogy{border-left:3px solid var(--s2);padding:12px 18px;background:var(--surface);border-radius:0 10px 10px 0;color:var(--ink2);max-width:none}
-.analogy b{color:var(--ink)}
-/* funnel bars */
-.fun{display:grid;grid-template-columns:260px 1fr 80px;gap:10px 14px;align-items:center;font-size:14.5px}
-.fun .lab{color:var(--ink2)}.fun .lab b{color:var(--ink);font-weight:600}
-.fun .bar{height:22px;border-radius:0 4px 4px 0;position:relative}
-.fun .val{font-variant-numeric:tabular-nums;color:var(--ink2);text-align:right}
-/* chain */
-.chain{display:flex;overflow-x:auto;padding:6px 2px 14px}
-.stage{min-width:112px;flex:1;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 12px 10px;position:relative}
-.stage+.stage{margin-left:22px}
-.stage+.stage::before{content:"";position:absolute;left:-22px;top:50%;width:22px;height:1px;background:var(--axis)}
-.stage+.stage::after{content:"";position:absolute;left:-7px;top:calc(50% - 4px);border-left:7px solid var(--axis);border-top:4px solid transparent;border-bottom:4px solid transparent}
+.tile .l{font-size:13px;color:var(--ink2)}.tile .v{font-size:34px;font-weight:600;line-height:1.1;margin-top:4px}.tile .d{font-size:13px;color:var(--muted);margin-top:4px}
+.stage{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 12px 10px}
 .stage b{display:block;font-family:var(--mono);font-size:14px}
 .stage span{display:block;font-size:12.5px;color:var(--ink2);margin-top:4px;line-height:1.4}
-/* chat */
-.chat{display:flex;flex-direction:column;gap:10px}
-.msg{display:grid;grid-template-columns:1fr 190px;gap:12px;align-items:start}
-.bub{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:10px 14px;font-size:14.5px}
-.bub .who{font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin-bottom:3px}
-.bub.m{border-color:var(--s2)}
-.becomes{font-size:13px;color:var(--ink2);padding-top:8px}
-.becomes b{display:block;color:var(--ink)}
-/* timeline */
-.tl{list-style:none;margin:0;padding:0;position:relative}
-.tl::before{content:"";position:absolute;left:11px;top:6px;bottom:6px;width:1px;background:var(--axis)}
-.tl li{position:relative;padding:0 0 18px 36px}
-.tl .k{position:absolute;left:4px;top:5px;width:15px;height:15px;border-radius:50%;border:2px solid var(--surface);box-shadow:0 0 0 1px var(--border)}
-.tl .k.agent{background:var(--s1)}.tl .k.stake{background:var(--s2)}.tl .k.verif{background:var(--s3)}.tl .k.gray{background:var(--axis)}
-.tl .who{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-right:8px}
-.tl .note{display:block;color:var(--ink2);font-size:14.5px;margin-top:2px}
-.fact{font-family:var(--mono);font-size:12.5px;background:var(--s2w);border:1px solid var(--s2);padding:1px 6px;border-radius:5px;color:var(--ink)}
-.chips{display:flex;gap:8px;flex-wrap:wrap}
-.chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:5px 11px;font-size:13.5px}
-.chip .i{font-weight:700}.chip.good .i{color:var(--good)}.chip.crit .i{color:var(--crit)}.chip.warn .i{color:var(--serious)}
+.stage .who{font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin-top:8px}
+.fun{display:grid;grid-template-columns:250px 1fr 80px;gap:8px 12px;align-items:center;font-size:14px}
+.fun .lab{color:var(--ink2)}.fun .lab b{color:var(--ink);font-weight:600}
+.fun .bar{height:20px;border-radius:0 4px 4px 0}
+.fun .val{font-variant-numeric:tabular-nums;color:var(--ink2);text-align:right}
+details summary{cursor:pointer;color:var(--ink2);font-size:14px;margin-top:10px}
 .tabs{display:flex;gap:6px;margin-bottom:12px}
 .tabs button{border:1px solid var(--border);background:var(--surface);color:var(--ink2);padding:8px 14px;border-radius:8px;font:inherit;font-size:14px;cursor:pointer}
 .tabs button[aria-selected="true"]{border-color:var(--ink);color:var(--ink);font-weight:600}
 .panel{display:none}.panel[data-active="true"]{display:block}
+.tl{list-style:none;margin:0;padding:0;position:relative}
+.tl::before{content:"";position:absolute;left:11px;top:6px;bottom:6px;width:1px;background:var(--axis)}
+.tl li{position:relative;padding:0 0 18px 36px}
+.tl .k{position:absolute;left:4px;top:4px;width:15px;height:15px;border-radius:50%;border:2px solid var(--surface);box-shadow:0 0 0 1px var(--border)}
+.tl .k.agent{background:var(--s1)}.tl .k.stake{background:var(--s2)}.tl .k.verif{background:var(--s3)}.tl .k.gray{background:var(--axis)}
+.tl b{font-weight:600}.tl .who{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-right:8px}
+.tl .note{display:block;color:var(--ink2);font-size:14px;margin-top:2px}
+.fact{font-family:var(--mono);font-size:12.5px;background:var(--s2w);border:1px solid var(--s2);padding:1px 6px;border-radius:5px;color:var(--ink)}
+.fact-row{display:grid;grid-template-columns:44px 1fr auto;gap:10px;align-items:start;padding:10px 0;border-bottom:1px solid var(--grid)}
+.fact-row:last-child{border-bottom:none}
+.fact-row .id{font-family:var(--mono);font-size:13px;color:var(--ink2);padding-top:2px}
+.fact-row .tags{white-space:nowrap}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:5px 11px;font-size:13.5px}
+.chip .i{font-weight:700}.chip.good .i{color:var(--good)}.chip.crit .i{color:var(--crit)}.chip.warn .i{color:var(--serious)}
+.callout{border-left:3px solid var(--s1);padding:10px 16px;background:var(--surface);border-radius:0 10px 10px 0;color:var(--ink2);max-width:none}
+.callout b{color:var(--ink)}
 svg text{font:13px system-ui,-apple-system,"Segoe UI",sans-serif;fill:var(--ink)}
-svg .t2{fill:var(--ink2);font-size:12.5px}svg .t3{fill:var(--muted);font-size:11.5px}svg .b{font-weight:600}
+svg .t2{fill:var(--ink2);font-size:12px}svg .t3{fill:var(--muted);font-size:11.5px}svg .b{font-weight:600}
 svg .agent rect{fill:var(--s1w);stroke:var(--s1)}svg .stake rect{fill:var(--s2w);stroke:var(--s2)}svg .verif rect{fill:var(--s3w);stroke:var(--s3)}svg .neutral rect{fill:var(--surface);stroke:var(--axis)}
 svg .arrow{stroke:var(--ink2);stroke-width:1.5;fill:none;marker-end:url(#ah)}
 svg .blocked{stroke:var(--crit);stroke-dasharray:4 4;stroke-width:1.5;fill:none}
-dl.gloss{display:grid;grid-template-columns:200px 1fr;gap:8px 18px;font-size:14.5px}
-dl.gloss dt{font-weight:600}dl.gloss dd{margin:0;color:var(--ink2)}
 footer{margin-top:80px;color:var(--muted);font-size:13.5px;border-top:1px solid var(--grid);padding-top:18px}
 </style>
 </head>
@@ -114,459 +101,347 @@ footer{margin-top:80px;color:var(--muted);font-size:13.5px;border-top:1px solid 
 <main>
 
 <header class="hero">
-  <div class="eyebrow">swesim · design explainer · written for a first-year CS student</div>
-  <h1>Teaching AI coding agents to work with messy instructions</h1>
-  <p class="lede">We are building a <b>factory for practice problems</b>. Each problem drops an AI coding agent into a real codebase with a real, incomplete bug report, gives it a pretend teammate who knows the missing details, and grades the result with tests the agent never sees. This page explains why, and how every piece works.</p>
+  <div class="eyebrow">Design explainer · spec v2 · 2026-09-12</div>
+  <h1>swesim: underspecified issues in, multi-turn gradable SWE simulations out</h1>
+  <p class="lede">SWE-bench hands an agent the issue as the reporter wrote it and grades a patch with the fix's tests. Many of those issues are underspecified; the discussion that resolved them ships in the dataset but is never shown to the agent. SWE-bench Verified removed such issues as noise. swesim keeps them as the brief, puts the resolution with a simulated stakeholder the agent can talk to, grades with the fix's tests in a clean container, and is a pipeline that produces such tasks from SWE-bench's human-annotated pool and from any GitHub repository URL.</p>
+  <div class="meta">
+    <span><b>Runtime</b> Harbor 0.23 on Modal</span>
+    <span><b>Orchestration</b> Temporal, kept thin</span>
+    <span><b>Reward</b> binary correctness, controls executed</span>
+    <span><b>Interaction</b> measured, never rewarded</span>
+    <span><b>Status</b> spec v2 after two adversarial reviews · Modal execution verified</span>
+  </div>
+  <p style="font-size:14px;color:var(--muted);margin-top:14px">A gentler walk-through for newcomers is at <a href="primer.html">primer.html</a>. The full spec is linked in the footer.</p>
 </header>
 
-<!-- 1 -->
-<section>
-  <h2><span class="num">1</span>Four words you need first</h2>
-  <p class="sub">Everything below builds on these. If you know them already, skip to section 2.</p>
-  <div class="grid g2">
+<section id="gap">
+  <h2>What existing benchmarks leave out</h2>
+  <p class="sub">Every current benchmark collapses the messy middle of software work into one instruction. The thread between "here is a bug" and "merged" is where requirements get decided, and it is exactly what is not shown to the agent.</p>
+  <div class="grid g3">
     <div class="card">
-      <h3 style="margin-top:0">Agent</h3>
-      <p style="color:var(--ink2);font-size:15px">A large language model (the same kind of thing as a chatbot) put in a loop with a terminal. It can read files, edit them, and run commands. It keeps going until it decides the job is done. Nobody types the next step; the model chooses it.</p>
-      <svg viewBox="0 0 440 130" width="100%" role="img" aria-label="An agent is a model in a loop with a terminal">
-        <g class="agent"><rect x="20" y="30" width="140" height="70" rx="10"/></g>
-        <text x="90" y="60" text-anchor="middle" class="b">language model</text>
-        <text x="90" y="80" text-anchor="middle" class="t2">"what should I do next?"</text>
-        <g class="neutral"><rect x="280" y="30" width="140" height="70" rx="10"/></g>
-        <text x="350" y="60" text-anchor="middle" class="b">terminal</text>
-        <text x="350" y="80" text-anchor="middle" class="t2">read · edit · run tests</text>
-        <path class="arrow" d="M162 50 H278"/><text x="220" y="43" text-anchor="middle" class="t3">command</text>
-        <path class="arrow" d="M278 82 H162"/><text x="220" y="100" text-anchor="middle" class="t3">output</text>
-        <text x="220" y="124" text-anchor="middle" class="t3">…repeat until it says "done"</text>
+      <div class="eyebrow">SWE-bench · DeepSWE · Terminal-Bench</div>
+      <h3 style="margin-top:8px">One shot</h3>
+      <svg viewBox="0 0 300 120" width="100%" height="120" role="img" aria-label="Instruction to agent to tests">
+        <g class="neutral"><rect x="6" y="40" width="82" height="40" rx="8"/><text x="47" y="65" text-anchor="middle">instruction</text></g>
+        <path class="arrow" d="M90 60H120"/>
+        <g class="agent"><rect x="122" y="40" width="60" height="40" rx="8"/><text x="152" y="65" text-anchor="middle">agent</text></g>
+        <path class="arrow" d="M184 60H214"/>
+        <g class="verif"><rect x="216" y="40" width="78" height="40" rx="8"/><text x="255" y="65" text-anchor="middle">tests</text></g>
+        <text x="150" y="108" text-anchor="middle" class="t3">nobody to ask · underspecified means unsolvable</text>
       </svg>
+      <p style="color:var(--ink2);font-size:14.5px;margin:6px 0 0">Verified filtered out issues rated underspecified and tests rated unfair. Cleaner exam, and it deleted the skill of working with an unclear ask.</p>
     </div>
     <div class="card">
-      <h3 style="margin-top:0">Tests</h3>
-      <p style="color:var(--ink2);font-size:15px">Small programs that check whether code behaves correctly. <code>assert add(2, 2) == 4</code> is a test. If the code is right, tests pass. If a bug is present, some fail. Most real projects have hundreds of them.</p>
-      <h3>Benchmark</h3>
-      <p style="color:var(--ink2);font-size:15px">A fixed set of problems plus an automatic grader, so different agents can be compared fairly. In coding, the grader is usually "run the tests".</p>
-      <h3>Reward</h3>
-      <p style="color:var(--ink2);font-size:15px">The number the grader gives, often just 1 (solved) or 0 (not solved). Reinforcement learning trains a model by having it try problems and nudging it toward whatever earned reward. That is why the grader must be very hard to fool: anything it rewards, the model will learn to do more of.</p>
+      <div class="eyebrow">How work actually happens</div>
+      <h3 style="margin-top:8px">A thread</h3>
+      <svg viewBox="0 0 300 120" width="100%" height="120" role="img" aria-label="Issue, question, PR, review, merge">
+        <g class="neutral"><rect x="6" y="14" width="66" height="30" rx="7"/><text x="39" y="34" text-anchor="middle" class="t2">issue</text></g>
+        <path class="arrow" d="M74 29H98"/>
+        <g class="stake"><rect x="100" y="14" width="96" height="30" rx="7"/><text x="148" y="34" text-anchor="middle" class="t2">"which error?"</text></g>
+        <path class="arrow" d="M198 29H222"/>
+        <g class="neutral"><rect x="224" y="14" width="70" height="30" rx="7"/><text x="259" y="34" text-anchor="middle" class="t2">PR opened</text></g>
+        <path class="arrow" d="M259 46V64"/>
+        <g class="stake"><rect x="150" y="66" width="144" height="30" rx="7"/><text x="222" y="86" text-anchor="middle" class="t2">"ValueError, this message"</text></g>
+        <path class="arrow" d="M148 81H124"/>
+        <g class="neutral"><rect x="56" y="66" width="66" height="30" rx="7"/><text x="89" y="86" text-anchor="middle" class="t2">merged</text></g>
+        <text x="150" y="114" text-anchor="middle" class="t3">the choices are made in conversation</text>
+      </svg>
+      <p style="color:var(--ink2);font-size:14.5px;margin:6px 0 0">Which exception, which message, which of two output shapes, what to do for an input the reporter couldn't share: decided in the thread, recorded on GitHub, unused by benchmarks.</p>
+    </div>
+    <div class="card">
+      <div class="eyebrow">swesim</div>
+      <h3 style="margin-top:8px">Brief, stakeholder, contract</h3>
+      <svg viewBox="0 0 300 120" width="100%" height="120" role="img" aria-label="Brief to agent, agent asks stakeholder, hidden tests grade">
+        <g class="neutral"><rect x="6" y="40" width="60" height="40" rx="8"/><text x="36" y="65" text-anchor="middle">brief</text></g>
+        <path class="arrow" d="M68 60H96"/>
+        <g class="agent"><rect x="98" y="40" width="60" height="40" rx="8"/><text x="128" y="65" text-anchor="middle">agent</text></g>
+        <path class="arrow" d="M128 38V18"/>
+        <g class="stake"><rect x="52" y="0" width="152" height="20" rx="6"/><text x="128" y="14" text-anchor="middle" class="t2">stakeholder · fact ledger</text></g>
+        <path class="arrow" d="M160 60H214"/>
+        <g class="verif"><rect x="216" y="40" width="78" height="40" rx="8"/><text x="255" y="59" text-anchor="middle" class="t2">hidden tests</text><text x="255" y="73" text-anchor="middle" class="t3">clean container</text></g>
+        <text x="150" y="108" text-anchor="middle" class="t3">the issue as written · the maintainer as a service</text>
+      </svg>
+      <p style="color:var(--ink2);font-size:14.5px;margin:6px 0 0">Asking is never rewarded. It pays off only when a contract-required fact is genuinely absent from the repository, which is a selection criterion, not an accident.</p>
     </div>
   </div>
 </section>
 
-<!-- 2 -->
-<section>
-  <h2><span class="num">2</span>How agents are tested today: SWE-bench</h2>
-  <p class="sub">The most used coding benchmark takes real bugs from real open-source projects on GitHub. Here is one problem, start to finish.</p>
-  <div class="card">
-    <svg viewBox="0 0 960 200" width="100%" role="img" aria-label="SWE-bench flow: issue text, agent, patch, tests, score">
-      <g class="neutral"><rect x="20" y="40" width="190" height="90" rx="10"/></g>
-      <text x="115" y="66" text-anchor="middle" class="b">1 · the bug report</text>
-      <text x="115" y="88" text-anchor="middle" class="t2">a GitHub "issue" written by</text>
-      <text x="115" y="104" text-anchor="middle" class="t2">a real user, years ago</text>
-      <path class="arrow" d="M212 85 H258"/>
-      <g class="agent"><rect x="260" y="40" width="160" height="90" rx="10"/></g>
-      <text x="340" y="66" text-anchor="middle" class="b">2 · the agent</text>
-      <text x="340" y="88" text-anchor="middle" class="t2">explores the codebase,</text>
-      <text x="340" y="104" text-anchor="middle" class="t2">edits files</text>
-      <path class="arrow" d="M422 85 H468"/>
-      <g class="neutral"><rect x="470" y="40" width="150" height="90" rx="10"/></g>
-      <text x="545" y="66" text-anchor="middle" class="b">3 · a patch</text>
-      <text x="545" y="88" text-anchor="middle" class="t2">the list of changes</text>
-      <text x="545" y="104" text-anchor="middle" class="t2">it made</text>
-      <path class="arrow" d="M622 85 H668"/>
-      <g class="verif"><rect x="670" y="40" width="270" height="90" rx="10"/></g>
-      <text x="805" y="64" text-anchor="middle" class="b">4 · hidden tests</text>
-      <text x="805" y="84" text-anchor="middle" class="t2">tests that failed before the real fix</text>
-      <text x="805" y="100" text-anchor="middle" class="t2">must now pass; old tests must still pass</text>
-      <text x="805" y="120" text-anchor="middle" class="t3">the agent never sees these</text>
-      <text x="480" y="176" text-anchor="middle" class="t2">Score: 1 if every required test passes, otherwise 0. That is the whole grade.</text>
-    </svg>
+<section id="pool">
+  <h2>Where tasks come from</h2>
+  <p class="sub">OpenAI's Verified annotation released human labels for 1,699 SWE-bench instances: underspecification severity, test fairness, and time-to-fix. The instances rejected for underspecification are the first pool. The second source is any GitHub repository URL, mined automatically. DeepSWE is a bonus after both work.</p>
+  <div class="grid g4" style="margin-bottom:18px">
+    <div class="tile"><div class="l">Instances human-annotated</div><div class="v">1,699</div><div class="d">3 annotators each, ensembled</div></div>
+    <div class="tile"><div class="l">Underspecified, severity 2 or 3</div><div class="v">650</div><div class="d">the signal Verified removed</div></div>
+    <div class="tile"><div class="l">Pool A · underspecified, tests fair</div><div class="v">109</div><div class="d">84 rated over 15 minutes</div></div>
+    <div class="tile"><div class="l">Pool B · tests encode an unstated choice</div><div class="v">245</div><div class="d">admitted per instance after classification</div></div>
   </div>
-  <p class="analogy" style="margin-top:16px"><b>Analogy.</b> It is a take-home exam. You get the question, you hand in your answer, the teacher checks it against an answer key you never saw. Fair, automatic, and completely silent: there is nobody to ask if the question is confusing.</p>
+  <div class="card">
+    <h3 style="margin:0 0 4px">From all of SWE-bench to the candidate pools</h3>
+    <p style="color:var(--ink2);font-size:14px;margin:0 0 16px">Each bar is a subset of the one above it.</p>
+    <div class="fun">
+      <div class="lab"><b>All SWE-bench test instances</b></div><div class="bar" style="width:100%;background:var(--o1)"></div><div class="val">2,294</div>
+      <div class="lab"><b>Human-annotated</b></div><div class="bar" style="width:74%;background:var(--o2)"></div><div class="val">1,699</div>
+      <div class="lab"><b>Underspecified</b> · severity 2 or 3, no other issue</div><div class="bar" style="width:28.3%;background:var(--o3)"></div><div class="val">650</div>
+      <div class="lab"><b>Pools A + B</b> · fair tests, or tests encoding a choice</div><div class="bar" style="width:15.4%;background:var(--o4)"></div><div class="val">354</div>
+    </div>
+    <details><summary>Exact predicates and counts</summary>
+      <table style="margin-top:8px"><thead><tr><th>Pool</th><th>Predicate over the ensembled CSV (all with <code>other_major_issues == 0</code>)</th><th class="n">Count</th><th>Use</th></tr></thead><tbody>
+        <tr><td>A</td><td><code>underspecified &gt;= 2 and false_negative &lt;= 1</code></td><td class="n">109</td><td>candidate pool</td></tr>
+        <tr><td>B</td><td><code>underspecified &gt;= 2 and false_negative == 2</code></td><td class="n">245</td><td>candidate pool, after clarification-vs-repair classification</td></tr>
+        <tr><td>C</td><td><code>underspecified &lt;= 1 and false_negative == 2</code></td><td class="n">276</td><td>future</td></tr>
+        <tr><td>Passed filter, not in Verified</td><td><code>filter_out == False</code> minus the 500</td><td class="n">39</td><td>subsampled out; not a rejection set</td></tr>
+      </tbody></table>
+    </details>
+  </div>
+  <p class="callout" style="margin-top:16px"><b>Non-derivability is the selection rule.</b> Being underspecified is not enough: a strong model solves SymPy's nested <code>Mod</code> simplification from mathematics alone. A task qualifies for the interactive set only if at least one contract-required fact is a choice among reasonable alternatives that neither the code nor domain knowledge determines. Pool B's "tests assume an unstated choice" is often exactly that. And the screen is empirical: a task the frontier tier passes in the <code>hidden</code> condition on every attempt leaves the interactive set, because its underspecification was not load-bearing.</p>
 </section>
 
-<!-- 3 -->
-<section>
-  <h2><span class="num">3</span>The catch: real bug reports are messy</h2>
-  <p class="sub">Here is a real SWE-bench problem from the SymPy math library. Read the report, then read what the maintainer actually wanted.</p>
+<section id="pipeline">
+  <h2>The pipeline</h2>
+  <p class="sub">Ten stage functions, one normalized record, orchestrated by Temporal. Every source produces a <code>ScenarioSpec</code>; everything after the human-approved draft consumes only that record plus a versioned <code>RunConfig</code>. New sources, including fully authored or private tasks, are one new producer.</p>
+  <div class="grid g3" style="gap:12px">
+    <div class="stage"><b>1 · mine</b><span>SWE-bench pool, or repo URL: merged PRs → linked issues → filters → candidates with reject reasons</span><div class="who">code</div></div>
+    <div class="stage"><b>2 · judge</b><span>complexity, spec gap, test behavioralness, the four questions, the non-derivable choice</span><div class="who">LLM prior · fixed prompt version</div></div>
+    <div class="stage"><b>3 · draft_spec → approve</b><span>ledger with excerpts, persona, requirements, control patches; workflow waits for the human's edited JSON</span><div class="who">LLM draft · human signal</div></div>
+    <div class="stage"><b>4 · compile</b><span>three Harbor task dirs per scenario; image digest resolved; hashes recorded</span><div class="who">code</div></div>
+    <div class="stage"><b>5 · validate</b><span>nop (base statuses), oracle, plausible-wrong, alt-correct, tamper; any mismatch = invalid</span><div class="who">code · Harbor on Modal</div></div>
+    <div class="stage"><b>6 · register</b><span>registry.json + dataset.toml, versioned, with validation evidence</span><div class="who">code</div></div>
+    <div class="stage"><b>7 · run</b><span>one TrialWorkflow per trial id; harbor run on Modal; transcript fetched by trial id</span><div class="who">Temporal · Harbor</div></div>
+    <div class="stage"><b>8 · score</b><span>outcome classes, pass@k and pass^k, code-exact interaction counts</span><div class="who">code</div></div>
+    <div class="stage"><b>9 · export · 10 · view</b><span>episode manifest (policy-visible vs evaluator-only); minimal dashboard</span><div class="who">code</div></div>
+  </div>
+  <div class="grid g3" style="margin-top:16px">
+    <div class="card"><div class="eyebrow">Code owns</div><p style="margin:8px 0 0;color:var(--ink2);font-size:14.5px">Reward, budgets and counters, session freeze, transcript, artifact policy, outcome attribution, aggregation, trial ids.</p></div>
+    <div class="card"><div class="eyebrow">LLMs draft</div><p style="margin:8px 0 0;color:var(--ink2);font-size:14.5px">Facts with excerpts, persona, requirements, control patches, priors, in-character replies, disclosure self-reports. Recorded as annotations, never reward inputs.</p></div>
+    <div class="card"><div class="eyebrow">Temporal, thin</div><p style="margin:8px 0 0;color:var(--ink2);font-size:14.5px">One pipeline workflow with a human-approval signal, one trial workflow whose id <em>is</em> the trial id so a retry cannot launch twice, persistent dev server and a systemd worker on a small VM. Its UI is the pipeline-progress screen.</p></div>
+  </div>
+</section>
+
+<section id="scenario">
+  <h2>Anatomy of one scenario</h2>
+  <p class="sub">Illustrative record for pool B instance <code>pydata__xarray-5362</code>. The issue asked that weighted operations raise an error when a passed dimension does not exist. The annotators noted the tests require a specific error type and message the issue never stated. That is a choice, and it is what the stakeholder holds. Fact wording is drafted from the annotation and the PR and would be edited by a human before compile.</p>
   <div class="grid g2">
     <div class="card">
-      <div class="eyebrow">The report, as written</div>
-      <pre style="margin-top:10px;white-space:pre-wrap"><code>Mod(Mod(x + 1, 2) + 1, 2) should simplify to Mod(x, 2)
-
-Currently it does not simplify.</code></pre>
-      <p style="color:var(--ink2);font-size:14.5px;margin:8px 0 0">One example. No general rule. No hint of where in the code the problem is, or which cases must <em>not</em> be simplified.</p>
+      <div class="eyebrow">Brief · profile <code>natural</code> · provenance original-issue</div>
+      <pre style="margin-top:10px"><code>Weighted operations don't raise an error when the dimensions
+passed don't exist. They should, to be consistent with the
+unweighted versions.</code></pre>
+      <div class="eyebrow" style="margin-top:16px">Annotator, 2024</div>
+      <p style="color:var(--ink2);font-size:14.5px;margin:6px 0 0">"The test ensures that attempting to compute a weighted mean over a dimension that does not exist raises a <code>ValueError</code> with an appropriate error message. The issue description did not mention the error type and message."</p>
+      <div class="eyebrow" style="margin-top:16px">Persona · derived from thread</div>
+      <p style="color:var(--ink2);font-size:14.5px;margin:6px 0 0">Core maintainer. Brief, consistency-minded, points at the unweighted implementation as the reference behavior. Answers what is asked.</p>
+      <div class="eyebrow" style="margin-top:16px">Operations recorded</div>
+      <p style="color:var(--ink2);font-size:14.5px;margin:6px 0 0">One <em>clarification</em> (F2, F3 from the PR). No evaluator repair needed. Nothing synthetic.</p>
     </div>
     <div class="card">
-      <div class="eyebrow">What the maintainer actually wanted, from the discussion</div>
-      <ul style="margin:10px 0 0 18px;padding:0;color:var(--ink2);font-size:14.5px;line-height:1.7">
-        <li>Nested <code>Mod</code> should collapse only when the two moduli are the <b>same</b>.</li>
-        <li>Not every operation "commutes with mod", so the rule may only apply to additive structure. The reviewer insisted on a type check.</li>
-        <li>Different moduli must be left alone.</li>
-      </ul>
-      <p style="color:var(--ink2);font-size:14.5px;margin:8px 0 0">All of that is in the GitHub thread. None of it is in the report.</p>
+      <div class="eyebrow">Ledger · stakeholder-visible view</div>
+      <div style="margin-top:8px">
+        <div class="fact-row"><div class="id">F1</div><div>Passing a nonexistent dimension to a weighted operation must raise, matching the unweighted behavior.<div class="tags"><span class="tag">behavior</span><span class="tag">issue-thread · excerpt</span><span class="tag">brief</span></div></div><div class="id">t1</div></div>
+        <div class="fact-row"><div class="id">F2</div><div>The exception type is <code>ValueError</code>, not <code>KeyError</code>, for consistency with the reduction code path.<div class="tags"><span class="tag">interface</span><span class="tag">pr-review · excerpt</span><span class="tag stake">on-request</span></div></div><div class="id">t1, t2</div></div>
+        <div class="fact-row"><div class="id">F3</div><div>The message names the missing dimension and the available dimensions.<div class="tags"><span class="tag">behavior</span><span class="tag">pr-thread · excerpt</span><span class="tag stake">on-request</span></div></div><div class="id">t2</div></div>
+        <div class="fact-row"><div class="id">F4</div><div>Weighted reductions live in <code>xarray/core/weighted.py</code> and validate dims separately from the base reductions.<div class="tags"><span class="tag">context</span><span class="tag">issue-thread</span><span class="tag">repo-derivable</span></div></div><div class="id">none</div></div>
+      </div>
+      <div class="eyebrow" style="margin-top:14px">Not in this view: author-only</div>
+      <p style="color:var(--ink2);font-size:14px;margin:6px 0 0">The private helper name the original author chose. Excluded structurally from every prompt and forbidden from carrying a test link.</p>
+      <div class="eyebrow" style="margin-top:16px">Controls · executed by <code>validate</code>, outcomes recorded</div>
+      <div class="chips" style="margin-top:8px"><span class="chip good"><span class="i">✓</span>oracle = 1</span><span class="chip crit"><span class="i">✕</span>nop = 0 · base statuses recorded</span><span class="chip crit"><span class="i">✕</span>wrong: raise KeyError = 0</span><span class="chip good"><span class="i">✓</span>alt-correct: validate in a different place = 1</span><span class="chip crit"><span class="i">✕</span>tamper: root conftest no-op = 0, or task rejected</span></div>
     </div>
   </div>
-  <h3>What SWE-bench Verified did about this</h3>
-  <p class="sub">In 2024, OpenAI paid engineers to read 1,699 SWE-bench problems and grade each one: is the report clear enough, and are the tests fair? Then they kept the clean ones. That made a fairer exam. It also removed exactly the situation a working engineer faces every day: an unclear ask, and a colleague to clarify it with.</p>
+  <p class="callout" style="margin-top:16px"><b>Discovery paths are the honesty mechanism.</b> <em>repo-derivable</em> facts cost nothing to an agent that reads carefully. <em>on-request</em> facts are absent from the repository and required by a test, so asking is necessary rather than rewarded. <em>author-only</em> facts may never be required and never enter any prompt, including the <code>full</code> brief. Every fact carries a source excerpt and URL, or an explicit authored rationale.</p>
+</section>
+
+<section id="topology">
+  <h2>Runtime topology</h2>
+  <p class="sub">One topology. The hidden material never enters the agent's sandbox. The agent's egress allowlist holds only its model API and the stakeholder host, and that allowlist is the environment baseline, so it also governs the collection phase. Grading happens in a container the agent never enters, on a tarball of its working tree, with no program of the agent's executed during collection.</p>
   <div class="card">
-    <h3 style="margin:0 0 4px">From all of SWE-bench to our starting pool</h3>
-    <p style="color:var(--ink2);font-size:14px;margin:0 0 16px">Each bar is a subset of the one above it. Hover for definitions.</p>
-    <div class="fun">
-      <div class="lab"><b>All SWE-bench problems</b></div><div class="bar" style="width:100%;background:var(--o1)" title="Every problem in the original benchmark"></div><div class="val">2,294</div>
-      <div class="lab"><b>Human-annotated</b> · read by 3 people each</div><div class="bar" style="width:74%;background:var(--o2)" title="OpenAI's annotation sample"></div><div class="val">1,699</div>
-      <div class="lab"><b>Flagged "unclear report"</b> · severity 2 or 3</div><div class="bar" style="width:28.3%;background:var(--o3)" title="Underspecified score of 2 or 3 out of 3"></div><div class="val">650</div>
-      <div class="lab"><b>Unclear report, but fair tests</b> · our pool A</div><div class="bar" style="width:4.8%;background:var(--o4)" title="Underspecified 2-3, test concern at most 1, no other problems"></div><div class="val">109</div>
-    </div>
-    <p style="color:var(--ink2);font-size:14px;margin:14px 0 0">Verified kept 500. Our first pool is the 109 problems that were thrown out <em>only</em> because the report was unclear, while the tests were judged fair. A further 245 were thrown out because the tests assumed choices the report never stated, which is often also something a teammate could tell you; we admit those one by one after checking. Every one of these comes with a human-written note saying what was missing.</p>
+  <svg viewBox="0 0 960 400" width="100%" role="img" aria-label="Topology: agent sandbox, stakeholder service, verifier, worker">
+    <rect x="16" y="16" width="928" height="300" rx="14" fill="none" stroke="var(--grid)"/>
+    <text x="30" y="40" class="t3">MODAL · sandboxes, image builds, stakeholder service</text>
+    <g class="agent"><rect x="40" y="70" width="300" height="200" rx="12"/></g>
+    <text x="56" y="96" class="b">Agent sandbox</text>
+    <text x="56" y="118" class="t2">repo at base, real branch, future history gc'd</text>
+    <text x="56" y="136" class="t2">runs as unprivileged user `agent`</text>
+    <text x="56" y="154" class="t2">root-owned receipt dir it cannot remove</text>
+    <text x="56" y="172" class="t2">root-owned shims: ask-user · request-review</text>
+    <text x="56" y="196" class="t3">baseline + agent phase: allowlist = model API + stakeholder</text>
+    <text x="56" y="212" class="t3">verified on Modal: anthropic 401 · example.com and github.com blocked</text>
+    <text x="56" y="236" class="t3">collection: Harbor tars /app (excluding .git); no agent code runs</text>
+    <g class="stake"><rect x="400" y="70" width="250" height="200" rx="12"/></g>
+    <text x="416" y="96" class="b">Stakeholder service</text>
+    <text x="416" y="118" class="t2">one session per trial, bound to</text>
+    <text x="416" y="134" class="t2">spec hash · condition · run config · attempt</text>
+    <text x="416" y="156" class="t2">serialized requests, server-owned counters,</text>
+    <text x="416" y="172" class="t2">idempotent request ids, freeze before verify</text>
+    <text x="416" y="196" class="t2">LLM context = stakeholder-visible view only</text>
+    <text x="416" y="220" class="t3">review mode frozen: diff-only, marked unverified</text>
+    <text x="416" y="236" class="t3">stochastic; config recorded, output not claimed deterministic</text>
+    <g class="verif"><rect x="690" y="70" width="230" height="200" rx="12"/></g>
+    <text x="706" y="96" class="b">Separate verifier</text>
+    <text x="706" y="118" class="t2">pristine checkout at /pristine</text>
+    <text x="706" y="136" class="t2">diff vs collected tree, path policy</text>
+    <text x="706" y="154" class="t2">protected paths dropped, signaled</text>
+    <text x="706" y="172" class="t2">exact expected-test manifest</text>
+    <text x="706" y="190" class="t2">JUnit at a per-run path, exit cross-check</text>
+    <text x="706" y="208" class="t2">reward.json numeric · report.json rich</text>
+    <text x="706" y="236" class="t3">no network · agent never enters</text>
+    <path d="M340 130 H398" stroke="var(--s2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/><text x="369" y="122" text-anchor="middle" class="t3">ask · review</text>
+    <path d="M398 160 H342" stroke="var(--s2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/><text x="369" y="176" text-anchor="middle" class="t3">replies</text>
+    <path d="M340 250 C 380 300, 640 300, 688 250" stroke="var(--s3)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+    <text x="514" y="296" text-anchor="middle" class="t3">tarball of /app, the only thing that crosses</text>
+    <path class="blocked" d="M190 270 V 330"/><text x="190" y="348" text-anchor="middle" class="t3">github · pypi · everything else: blocked in every phase</text>
+    <g class="neutral"><rect x="560" y="330" width="360" height="52" rx="10"/></g>
+    <text x="576" y="352" class="b">GCE VM · Temporal server + worker + dashboard</text>
+    <text x="576" y="370" class="t2">launches trials, freezes sessions, fetches transcripts, joins by trial id</text>
+    <path d="M805 270 V328" stroke="var(--ink2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+    <path d="M525 270 C 525 320, 560 340, 558 340" stroke="var(--s2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  </svg>
+  <div class="legend"><span><span class="dot agent"></span>agent</span><span><span class="dot stake"></span>stakeholder</span><span><span class="dot verif"></span>verifier</span><span><span class="dot gray"></span>control plane, holds no secrets the agent can reach</span></div>
+  </div>
+  <div class="grid g3" style="margin-top:16px">
+    <div class="tile"><div class="l">Why not a compose sidecar</div><div class="d" style="font-size:14px;color:var(--ink2);margin-top:6px">Harbor on Modal and Daytona disables network allowlists whenever a compose file is present; Docker Desktop on the dev Mac fails the egress kernel probe. A hosted service keeps the boundary on a single-container provider.</div></div>
+    <div class="tile"><div class="l">Why grade a tree, not a container</div><div class="d" style="font-size:14px;color:var(--ink2);margin-top:6px">The agent controls its sandbox, including git. Collection is a tar by Harbor under the allowlist baseline; the verifier diffs against its own pristine checkout and applies only policy-allowed regular-file changes. Pattern adopted from DeepSWE v1.1, tightened after review.</div></div>
+    <div class="tile"><div class="l">Why strip git history</div><div class="d" style="font-size:14px;color:var(--ink2);margin-top:6px">On SWE-bench Pro, Claude Opus 4.6 and 4.7 ran <code>git log --all</code> and copied the gold patch in over 12% of rollouts. Our images check out a real branch at base, drop remotes and non-ancestor refs, expire the reflog, gc, and <code>validate</code> checks the gold commit is unreachable.</div></div>
   </div>
 </section>
 
-<!-- 4 -->
-<section>
-  <h2><span class="num">4</span>Our idea in one picture</h2>
-  <p class="sub">Keep the messy report as the question. Add a teammate who knows the answers. Grade with the real fix's tests, hidden, in a clean room.</p>
+<section id="episode">
+  <h2>One interactive episode</h2>
+  <p class="sub">The xarray task under <code>interactive</code>. Orange tags are ledger ids the stakeholder self-reported as disclosed; they are diagnostics. Only the verifier moves the reward.</p>
   <div class="card">
-    <svg viewBox="0 0 960 300" width="100%" role="img" aria-label="swesim flow: brief to agent, agent asks stakeholder, patch to hidden tests">
-      <g class="neutral"><rect x="20" y="110" width="170" height="80" rx="10"/></g>
-      <text x="105" y="140" text-anchor="middle" class="b">the brief</text>
-      <text x="105" y="160" text-anchor="middle" class="t2">the real report, as written</text>
-      <text x="105" y="176" text-anchor="middle" class="t2">unclear on purpose</text>
-      <path class="arrow" d="M192 150 H278"/>
-      <g class="agent"><rect x="280" y="110" width="170" height="80" rx="10"/></g>
-      <text x="365" y="140" text-anchor="middle" class="b">the agent</text>
-      <text x="365" y="160" text-anchor="middle" class="t2">explores, edits, runs tests</text>
-      <text x="365" y="176" text-anchor="middle" class="t2">and can raise its hand</text>
-      <path class="arrow" d="M350 108 V58"/>
-      <path class="arrow" d="M380 58 V108"/>
-      <text x="340" y="88" text-anchor="end" class="t3">ask-user "…"</text>
-      <text x="390" y="88" class="t3">an answer, in character</text>
-      <g class="stake"><rect x="200" y="8" width="330" height="48" rx="10"/></g>
-      <text x="365" y="28" text-anchor="middle" class="b">the stakeholder</text>
-      <text x="365" y="45" text-anchor="middle" class="t2">a chatbot playing the maintainer · knows the real answers</text>
-      <path class="arrow" d="M452 150 H538"/>
-      <g class="neutral"><rect x="540" y="110" width="130" height="80" rx="10"/></g>
-      <text x="605" y="146" text-anchor="middle" class="b">a patch</text>
-      <text x="605" y="166" text-anchor="middle" class="t2">its changes only</text>
-      <path class="arrow" d="M672 150 H738"/>
-      <g class="verif"><rect x="740" y="96" width="205" height="108" rx="10"/></g>
-      <text x="842" y="122" text-anchor="middle" class="b">the grader</text>
-      <text x="842" y="142" text-anchor="middle" class="t2">a fresh, clean copy of the code</text>
-      <text x="842" y="158" text-anchor="middle" class="t2">+ the real fix's tests</text>
-      <text x="842" y="174" text-anchor="middle" class="t2">a room the agent never enters</text>
-      <text x="842" y="194" text-anchor="middle" class="t3">reward: 1 or 0</text>
-      <text x="480" y="250" text-anchor="middle" class="t2">Three things changed versus SWE-bench: the question stays messy, there is someone to ask, and the grading room is sealed.</text>
-      <text x="480" y="272" text-anchor="middle" class="t3">Asking is never rewarded by itself. It only matters when a needed fact is not in the code.</text>
-    </svg>
+  <ol class="tl">
+    <li><span class="k agent"></span><span class="who">agent</span><b>Reads the brief, finds <code>xarray/core/weighted.py</code>, reproduces: no error for a bad dim.</b><span class="note">F4 found by reading. No question needed.</span></li>
+    <li><span class="k agent"></span><span class="who">agent</span><b><code>ask-user "Should this raise KeyError like a dict lookup, or ValueError like the unweighted reductions? Any particular message?"</code></b><span class="note">Question 1 of 6. Request id recorded; a retry returns the cached reply.</span></li>
+    <li><span class="k stake"></span><span class="who">stakeholder</span><b>"ValueError, same as the unweighted path. Name the missing dim and list the ones that exist."</b><span class="note">Disclosed <span class="fact">F2</span> <span class="fact">F3</span>. Terse, consistency-minded. Delivered and recorded verbatim.</span></li>
+    <li><span class="k agent"></span><span class="who">agent</span><b>Implements validation in the weighted reduction, adds a project test, runs <code>request-review</code>.</b><span class="note">Review 1 of 2. Diff hash recorded.</span></li>
+    <li><span class="k stake"></span><span class="who">stakeholder</span><b>"Reading the diff only, not executed: you validate in <code>mean</code> but <code>sum</code> takes the same path through <code>_reduce</code>; check both. Message looks right."</b><span class="note">Grounded in the diff and recorded requirements; introduces nothing outside the ledger; marked unverified.</span></li>
+    <li><span class="k agent"></span><span class="who">agent</span><b>Moves validation to the shared reduction, re-runs tests, declares done.</b><span class="note">Harbor tars <code>/app</code>. Worker freezes the session; late calls get 410; transcript hash recorded.</span></li>
+    <li><span class="k verif"></span><span class="who">verifier</span><b>Pristine checkout, policy-filtered change set applied, JUnit at a per-run path: F2P 2/2 expected ids passed, P2P 187/187, exit code agrees, no protected-path drops.</b><span class="note"><code>reward.json</code>: reward 1, outcome valid-correct. <code>report.json</code>: patch sha, per-test rows, reviewed diff ≠ submitted diff (recorded). Interaction: 1 question, 1 review, F2 F3 disclosed.</span></li>
+  </ol>
   </div>
-  <p class="analogy" style="margin-top:16px"><b>Analogy.</b> Same take-home exam, but now the question is worded the way the original student wrote it on the forum, and a teaching assistant sits in the room. The TA will explain what the question means if you ask a good question. The TA will not do the problem for you, and does not have the answer key.</p>
 </section>
 
-<!-- 5 -->
-<section>
-  <h2><span class="num">5</span>Where the stakeholder's answers come from: the real thread</h2>
-  <p class="sub">We do not invent the missing details. Every GitHub issue has a discussion under it, and every fix has review comments. Those are where the maintainer said what they meant. Here is the SymPy thread, condensed, and what each message becomes in our system.</p>
-  <div class="card">
-    <div class="chat">
-      <div class="msg"><div class="bub"><div class="who">reporter · issue</div>Mod(Mod(x + 1, 2) + 1, 2) should simplify to Mod(x, 2). Currently it does not.</div><div class="becomes"><b>→ the brief</b>the agent sees exactly this</div></div>
-      <div class="msg"><div class="bub m"><div class="who">maintainer · issue comment</div>The reason this works is that Mod distributes over addition and is idempotent with the same modulus.</div><div class="becomes"><b>→ fact F1</b>behavior · from issue thread</div></div>
-      <div class="msg"><div class="bub"><div class="who">contributor · pull request</div>Opened PR #13581 with a fix and new tests.</div><div class="becomes"><b>→ the contract</b>the PR's new tests become the hidden grader</div></div>
-      <div class="msg"><div class="bub m"><div class="who">maintainer · code review</div>Not all operations commute with mod. There needs to be a check on the type of p here.</div><div class="becomes"><b>→ fact F2 + requirement R1</b>constraint · from PR review</div></div>
-      <div class="msg"><div class="bub m"><div class="who">maintainer · code review</div>I don't think this last check is necessary. Mod(Mod(A, c) + B, c) == Mod(A + B, c) unconditionally.</div><div class="becomes"><b>→ sharpens F1</b>same modulus, unconditional</div></div>
-      <div class="msg"><div class="bub"><div class="who">annotator · 2024, OpenAI Verified review</div>"Lacks details on why the simplification is not occurring and does not provide the expected general rule."</div><div class="becomes"><b>→ checklist</b>what the ledger must cover</div></div>
-    </div>
-  </div>
-  <p class="callout" style="margin-top:16px"><b>Every fact is tagged with where it came from.</b> Issue thread, PR thread, PR review, the human annotator's note, or "we wrote this ourselves". When we have to change something the history got wrong, for example a test that only passes if you use the exact private helper name the original author picked, we record that as an <em>evaluator repair</em>, not as a fact for the stakeholder to reveal. Nothing is quietly invented.</p>
-</section>
-
-<!-- 6 -->
-<section>
-  <h2><span class="num">6</span>The fact ledger: what the stakeholder knows, and how the agent can learn it</h2>
-  <p class="sub">The ledger is a short list of facts. The important column is the last one: it says how the agent is allowed to discover each fact. This is how we make sure we never punish an agent for being a careful reader.</p>
-  <table>
-    <thead><tr><th>Fact</th><th>What kind</th><th>Where it came from</th><th>How the agent can learn it</th></tr></thead>
-    <tbody>
-      <tr><td><b>F1</b> Nested Mod with the same modulus collapses: Mod(Mod(A,c)+B,c) = Mod(A+B,c)</td><td>behavior</td><td>issue thread + PR review</td><td><span class="tag stake">on request</span> ask the stakeholder</td></tr>
-      <tr><td><b>F2</b> Only additive structure; check the type of the inner term</td><td>constraint</td><td>PR review</td><td><span class="tag stake">on request</span> or volunteered at review</td></tr>
-      <tr><td><b>F3</b> Different moduli are never merged</td><td>behavior</td><td>annotator note</td><td><span class="tag stake">on request</span></td></tr>
-      <tr><td><b>F4</b> The distributive rules live in <code>Mod.eval</code> in <code>sympy/core/mod.py</code></td><td>context</td><td>issue thread</td><td><span class="tag">in the code</span> readable by exploring</td></tr>
-      <tr><td><b>F5</b> The original PR author's private helper was called <code>_mod_add_collapse</code></td><td>interface</td><td>the fix itself</td><td><span class="tag">author only</span> may never be required</td></tr>
-    </tbody>
-  </table>
-  <div class="grid g4" style="margin-top:16px">
-    <div class="tile"><div class="l">in the brief</div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:6px">Already written in the report. Free.</div></div>
-    <div class="tile"><div class="l">on request</div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:6px">Not in the code. The stakeholder gives it if asked a relevant question. If a hidden test needs it, asking becomes necessary.</div></div>
-    <div class="tile"><div class="l">in the code</div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:6px">Findable by reading the repository. An agent that finds it without asking gets full credit.</div></div>
-    <div class="tile"><div class="l">author only</div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:6px">Things only the original author knew, like private names. We forbid any test from requiring these.</div></div>
-  </div>
-  <p class="callout" style="margin-top:16px"><b>Why this matters for training.</b> If we gave points for asking questions, a model would learn to ask about everything. If we gave points for finding facts, it would learn to game the fact list. So the reward is <b>only</b> "did the hidden tests pass". Asking pays off exactly when a needed fact is absent from the code, which is what real engineers experience too. How much the agent asked, what it was told, and whether it used it are all recorded, for us to study, never to reward.</p>
-</section>
-
-<!-- 7 -->
-<section>
-  <h2><span class="num">7</span>Three versions of every problem</h2>
-  <p class="sub">Each problem is compiled three ways. Same code, same hidden tests, same grader. Only the instructions and the presence of the stakeholder change. Comparing the three is how we learn something.</p>
+<section id="conditions">
+  <h2>Three conditions, one contract</h2>
+  <p class="sub">Each scenario compiles to three Harbor tasks sharing the image, the contract, the grader, and the solver time budget. Only the instruction and the stakeholder session differ. Calibration runs that select tasks are labeled and frozen before comparison attempts.</p>
   <div class="tabs" role="tablist">
     <button role="tab" aria-selected="true" data-tab="full">full</button>
     <button role="tab" aria-selected="false" data-tab="hidden">hidden</button>
     <button role="tab" aria-selected="false" data-tab="interactive">interactive</button>
   </div>
-  <div class="panel card" data-active="true" data-panel="full"><b>Full.</b> The report plus every ledger fact written out. No stakeholder. <br><span style="color:var(--ink2)">Like an exam with complete, well-written instructions. This is the baseline. It is <em>not</em> a ceiling: agents sometimes do better when they can get feedback than when they get everything upfront.</span></div>
-  <div class="panel card" data-panel="hidden"><b>Hidden.</b> The report only. No stakeholder.<br><span style="color:var(--ink2)">Like the exam with half the question missing and nobody to ask. This is what the original contributor faced before they asked in the thread. The gap between full and hidden measures how much the missing information costs.</span></div>
-  <div class="panel card" data-panel="interactive"><b>Interactive.</b> The report, plus two shell commands: <code>ask-user "…"</code> and <code>request-review</code>, with a budget of questions and review rounds.<br><span style="color:var(--ink2)">Like the exam with the TA in the room. The gap between hidden and interactive measures how much asking helps, and the transcript shows whether the agent asked good questions and used the answers.</span></div>
-  <h3>Reading a failure honestly</h3>
-  <p class="sub" style="margin-bottom:12px">When an interactive run fails, we look at the transcript and the ledger and assign one of these labels. "Unresolved" is allowed. We never blame the stakeholder unless the transcript shows a good question that got a bad answer.</p>
-  <table><thead><tr><th>What we observe in the transcript</th><th>Label</th></tr></thead><tbody>
-    <tr><td>The agent asked a relevant question and the answer was withheld or wrong</td><td><span class="dot stake"></span>simulator failure</td></tr>
-    <tr><td>The task was clearly ambiguous and the agent guessed wrong without asking</td><td><span class="dot agent"></span>potential agent failure</td></tr>
-    <tr><td>The fact was delivered clearly and the code violates it anyway</td><td><span class="dot agent"></span>implementation or retention failure</td></tr>
-    <tr><td>Correct result, no questions asked</td><td><span class="dot verif"></span>success without clarification</td></tr>
-    <tr><td>The trace does not show the cause</td><td><span class="dot gray"></span>unresolved</td></tr>
+  <div class="panel card" data-active="true" data-panel="full"><b>Agent sees:</b> natural brief plus every stakeholder-visible fact, never author-only material. <b>Stakeholder:</b> none. <b>Purpose:</b> baseline with requirements upfront. Not a ceiling.</div>
+  <div class="panel card" data-panel="hidden"><b>Agent sees:</b> natural brief only. <b>Stakeholder:</b> none. <b>Purpose:</b> effect of withholding without a recovery channel; also the empirical screen for non-derivability.</div>
+  <div class="panel card" data-panel="interactive"><b>Agent sees:</b> natural brief plus the two shell commands and budgets. <b>Stakeholder:</b> live, session-bound. <b>Purpose:</b> the whole interaction treatment, reported with question, review, and stakeholder-token counts alongside.</div>
+  <h3>Reading a failure</h3>
+  <p class="sub" style="margin-bottom:12px">Labels are assigned by a human in the pilot from transcript and ledger; LLM suggestions never change outcomes or denominators; <em>unresolved</em> is allowed.</p>
+  <table><thead><tr><th>Observation</th><th>Label</th></tr></thead><tbody>
+    <tr><td>Relevant question asked; required answer withheld or wrong, with service-side evidence</td><td><span class="dot stake"></span>simulator failure</td></tr>
+    <tr><td>Clear ambiguity; agent assumed incorrectly without asking</td><td><span class="dot agent"></span>potential agent failure</td></tr>
+    <tr><td>Requirement delivered clearly; implementation violates it</td><td><span class="dot agent"></span>likely implementation or retention failure</td></tr>
+    <tr><td>Correct result without clarification</td><td><span class="dot verif"></span>success without clarification</td></tr>
+    <tr><td>Trace cannot establish cause</td><td><span class="dot gray"></span>unresolved</td></tr>
   </tbody></table>
 </section>
 
-<!-- 8 -->
-<section>
-  <h2><span class="num">8</span>One episode, step by step</h2>
-  <p class="sub">An interactive run on the SymPy problem. Orange tags are ledger facts the stakeholder noted it disclosed. The only step that changes the reward is the last one.</p>
-  <div class="card">
-  <ol class="tl">
-    <li><span class="k agent"></span><span class="who">agent</span><b>Reads the brief, opens <code>sympy/core/mod.py</code>, runs the existing tests.</b><span class="note">Finds where the rules live (F4) by reading. No question needed.</span></li>
-    <li><span class="k agent"></span><span class="who">agent</span><b><code>ask-user "Should nested Mod always collapse, or only when the moduli are equal?"</code></b><span class="note">Question 1 of a budget of 6.</span></li>
-    <li><span class="k stake"></span><span class="who">stakeholder</span><b>"Only with the same modulus. Mod(Mod(A, c) + B, c) is Mod(A + B, c). Different moduli stay."</b><span class="note">Disclosed <span class="fact">F1</span> <span class="fact">F3</span>. Terse, like the real maintainer. Recorded word for word.</span></li>
-    <li><span class="k agent"></span><span class="who">agent</span><b>Implements the collapse for any inner Mod with equal modulus, adds a test of its own, runs <code>request-review</code>.</b><span class="note">Review round 1 of 2. Its work is saved as a commit.</span></li>
-    <li><span class="k gray"></span><span class="who">review room</span><b>Applies the agent's changes to a clean copy and runs two small "review fixtures".</b><span class="note">One fails: a multiplicative term got collapsed too. These fixtures are not the hidden tests, so review cannot be used to peek at the answer key.</span></li>
-    <li><span class="k stake"></span><span class="who">stakeholder</span><b>"Not all operations commute with mod. Your change also rewrites Mod(Mod(x, c)*y, c). Check the type of the inner term."</b><span class="note">Disclosed <span class="fact">F2</span>. This is based on the agent's actual code, not copied from the 2017 review. A correct first attempt would simply have been accepted.</span></li>
-    <li><span class="k agent"></span><span class="who">agent</span><b>Restricts the rule to additive structure, re-runs tests, declares done.</b><span class="note">Its changes are exported as a patch. The stakeholder saves the transcript.</span></li>
-    <li><span class="k verif"></span><span class="who">grader</span><b>Fresh copy of the code, patch applied, its own tests run: 4 of 4 new tests pass, 212 of 212 old tests pass.</b><span class="note">Reward 1. Also recorded: 1 question, 1 review round, F1 F2 F3 disclosed, F4 found alone.</span></li>
-  </ol>
-  </div>
-</section>
-
-<!-- 9 -->
-<section>
-  <h2><span class="num">9</span>Grading, and how we stop cheating</h2>
-  <p class="sub">Remember: whatever the grader rewards, training will amplify. So the grader must be impossible to fool from inside the agent's room. The trick is that we never grade the agent's room at all.</p>
-  <div class="card">
-    <svg viewBox="0 0 960 240" width="100%" role="img" aria-label="Patch extracted from agent sandbox and applied in a clean verifier">
-      <g class="agent"><rect x="20" y="30" width="300" height="180" rx="12"/></g>
-      <text x="170" y="58" text-anchor="middle" class="b">the agent's room</text>
-      <text x="170" y="82" text-anchor="middle" class="t2">it can change anything here:</text>
-      <text x="170" y="100" text-anchor="middle" class="t2">the code, the tests, the test runner…</text>
-      <text x="170" y="132" text-anchor="middle" class="t2">so we trust none of it</text>
-      <text x="170" y="164" text-anchor="middle" class="t3">internet: only its AI API</text>
-      <text x="170" y="180" text-anchor="middle" class="t3">and the stakeholder. Nothing else.</text>
-      <path class="arrow" d="M322 120 H418"/>
-      <g class="neutral"><rect x="420" y="90" width="150" height="60" rx="10"/></g>
-      <text x="495" y="115" text-anchor="middle" class="b">the patch</text>
-      <text x="495" y="134" text-anchor="middle" class="t2">only its list of edits</text>
-      <path class="arrow" d="M572 120 H638"/>
-      <g class="verif"><rect x="640" y="30" width="300" height="180" rx="12"/></g>
-      <text x="790" y="58" text-anchor="middle" class="b">the grading room</text>
-      <text x="790" y="82" text-anchor="middle" class="t2">a brand-new clean copy of the code</text>
-      <text x="790" y="100" text-anchor="middle" class="t2">+ our own copy of every test</text>
-      <text x="790" y="118" text-anchor="middle" class="t2">+ our own test runner settings</text>
-      <text x="790" y="146" text-anchor="middle" class="t2">apply the patch · run · write the score</text>
-      <text x="790" y="176" text-anchor="middle" class="t3">no internet · the agent never enters</text>
-      <text x="790" y="192" text-anchor="middle" class="t3">every test reported by name</text>
-    </svg>
-  </div>
-  <h3>Things a clever agent might try, and why they fail</h3>
-  <table>
-    <thead><tr><th>The trick</th><th>Why it does not work</th></tr></thead>
-    <tbody>
-      <tr><td>Edit the tests so they pass, or delete them</td><td>The grading room uses its own copy of the tests. The agent's copy is ignored.</td></tr>
-      <tr><td>Add a "skip this test" marker</td><td>Same: our copy has no marker. And the report lists every test by name, so a missing test reads as a failure, not a pass.</td></tr>
-      <tr><td>Tamper with the test runner so it reports success</td><td>Runner settings are ours. Agent-added hook files are removed. The report is cross-checked against the exit code.</td></tr>
-      <tr><td>Look up the real fix in the project's git history</td><td>We erased the future: the repository is checked out at the moment before the fix, with later commits, branches and tags deleted. This exact trick was caught on SWE-bench Pro in over 12% of one model's runs.</td></tr>
-      <tr><td>Download the fix from GitHub</td><td>No internet from the agent's room except its own AI API and the stakeholder. Verified on Modal today: github.com is unreachable.</td></tr>
-      <tr><td>Ask the stakeholder for the answer</td><td>It holds facts about what is wanted, not code or tests, and refuses "author only" facts by rule, not by judgment.</td></tr>
-      <tr><td>Use review rounds to probe the hidden tests</td><td>Review runs different, smaller fixtures, and rounds are budgeted.</td></tr>
-      <tr><td>Break the patch export so nothing gets graded</td><td>A missing or broken patch counts as an invalid submission, scored 0 and kept in the statistics. It does not disappear.</td></tr>
-    </tbody>
-  </table>
-  <p class="callout" style="margin-top:16px"><b>One honest limitation.</b> The code under test runs inside the test process, so a truly malicious patch could interfere with the test run itself. Every unit-test-based grader shares this. We reduce it (unprivileged user, cross-checks, re-running failed tests in isolation) and we say so, rather than claiming it away.</p>
-</section>
-
-<!-- 10 -->
-<section>
-  <h2><span class="num">10</span>How we know the grader itself works: five test-takers</h2>
-  <p class="sub">Before any problem is accepted, we make five kinds of submission to it and check the grader reacts correctly. A problem whose grader fails any of these is not used.</p>
-  <div class="grid g3">
-    <div class="tile"><div class="l"><span class="chip good" style="padding:2px 9px"><span class="i">✓</span>the real fix</span></div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:8px">Must score 1. Proves the tests detect the historical change.</div></div>
-    <div class="tile"><div class="l"><span class="chip crit" style="padding:2px 9px"><span class="i">✕</span>doing nothing</span></div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:8px">Must score 0. Proves the tests actually fail before the fix.</div></div>
-    <div class="tile"><div class="l"><span class="chip crit" style="padding:2px 9px"><span class="i">✕</span>plausible wrong answers</span></div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:8px">Two or three tempting shortcuts, such as collapsing every nested Mod. Must score 0. Proves the tests catch shortcuts, not just the absence of a fix.</div></div>
-    <div class="tile"><div class="l"><span class="chip good" style="padding:2px 9px"><span class="i">✓</span>a different correct answer</span></div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:8px">Solves it another way. Must score 1. Proves the tests check behavior, not the original author's exact code.</div></div>
-    <div class="tile"><div class="l"><span class="chip warn" style="padding:2px 9px"><span class="i">⚠</span>cheating attempts</span></div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:8px">The tricks from section 9, as actual patches. Must score 0 or be flagged.</div></div>
-    <div class="tile"><div class="l">All five outcomes are saved</div><div class="d" style="color:var(--ink2);font-size:14px;margin-top:8px">They appear on the problem's page in the dashboard, so a reviewer can see the grader was tested, not just told it was.</div></div>
-  </div>
-  <p class="analogy" style="margin-top:16px"><b>Analogy.</b> Before trusting a new grading rubric, a teacher runs a perfect essay, a blank page, a confidently wrong essay, an unusual-but-correct essay, and a plagiarized one through it. If the rubric gets any of them wrong, the rubric is broken, not the students.</p>
-</section>
-
-<!-- 11 -->
-<section>
-  <h2><span class="num">11</span>The factory: how problems get made</h2>
-  <p class="sub">All of the above is one problem. The product is the machine that makes many. It is a nine-step pipeline, and every step after the third reads one shared file format, so adding a new source of problems means writing one new "front door".</p>
-  <div class="grid g3" style="gap:12px">
-    <div class="stage"><b>1 · mine</b><span>find candidate issue + fix pairs, fetch their threads</span></div>
-    <div class="stage"><b>2 · judge</b><span>an AI rates: how hard, how unclear, are the tests fair</span></div>
-    <div class="stage"><b>3 · spec</b><span>an AI drafts the ledger and persona; a human edits and approves</span></div>
-    <div class="stage"><b>4 · compile</b><span>build the three versions as Harbor tasks</span></div>
-    <div class="stage"><b>5 · validate</b><span>the five test-takers from section 10</span></div>
-    <div class="stage"><b>6 · register</b><span>add to the dataset with a version and provenance</span></div>
-    <div class="stage"><b>7 · run</b><span>agents attempt it in the cloud, several times each</span></div>
-    <div class="stage"><b>8 · score</b><span>pass rates, outcome counts, failure labels</span></div>
-    <div class="stage"><b>9 · view</b><span>dashboard: funnel, problem cards, run matrix, episode explainer</span></div>
-  </div>
-  <p style="color:var(--ink2);font-size:14.5px;margin:10px 0 0">Steps 1 to 3 differ per source. Steps 4 to 9 read only the shared record, so they never change.</p>
-  <h3>Three front doors</h3>
-  <div class="grid g3">
-    <div class="card"><div class="eyebrow">Starting point</div><h3 style="margin-top:6px">SWE-bench's rejected problems</h3><p style="color:var(--ink2);font-size:14.5px;margin:0">The 109-problem pool from section 3, with human notes on what is missing. Environments already exist as prebuilt images, so the first tasks come from here.</p></div>
-    <div class="card"><div class="eyebrow">Main product</div><h3 style="margin-top:6px">Any GitHub repository link</h3><p style="color:var(--ink2);font-size:14.5px;margin:0">Paste a repo URL. The pipeline finds merged fixes, follows them back to the issues they closed, keeps the pairs with real discussion and real tests, builds the environment at the right moment in history, and produces tasks. Pointing at a specific PR is optional.</p></div>
-    <div class="card"><div class="eyebrow">Bonus</div><h3 style="margin-top:6px">DeepSWE</h3><p style="color:var(--ink2);font-size:14.5px;margin:0">A 2026 benchmark of 113 original, hard tasks already in the same task format. Their detailed instructions become the ledger; a one-line summary becomes the brief.</p></div>
-  </div>
-  <div class="card" style="margin-top:16px">
-    <h3 style="margin:0 0 8px">What "mine" does with a repository link</h3>
-    <svg viewBox="0 0 960 170" width="100%" role="img" aria-label="Repo link to merged PRs to linked issues to filters to candidates">
-      <g class="neutral"><rect x="10" y="40" width="160" height="76" rx="10"/></g><text x="90" y="66" text-anchor="middle" class="b">repo URL</text><text x="90" y="86" text-anchor="middle" class="t2">github.com/org/project</text>
-      <path class="arrow" d="M172 78 H204"/>
-      <g class="neutral"><rect x="206" y="40" width="160" height="76" rx="10"/></g><text x="286" y="66" text-anchor="middle" class="b">merged fixes</text><text x="286" y="86" text-anchor="middle" class="t2">pull requests, by date</text>
-      <path class="arrow" d="M368 78 H400"/>
-      <g class="neutral"><rect x="402" y="40" width="160" height="76" rx="10"/></g><text x="482" y="66" text-anchor="middle" class="b">their issues</text><text x="482" y="86" text-anchor="middle" class="t2">"Fixes #123" links</text>
-      <path class="arrow" d="M564 78 H596"/>
-      <g class="neutral"><rect x="598" y="40" width="160" height="76" rx="10"/></g><text x="678" y="62" text-anchor="middle" class="b">filters</text><text x="678" y="82" text-anchor="middle" class="t2">tests changed · real discussion</text><text x="678" y="100" text-anchor="middle" class="t2">environment buildable</text>
-      <path class="arrow" d="M760 78 H792"/>
-      <g class="agent"><rect x="794" y="40" width="156" height="76" rx="10"/></g><text x="872" y="62" text-anchor="middle" class="b">candidates</text><text x="872" y="82" text-anchor="middle" class="t2">each accepted pair, plus</text><text x="872" y="100" text-anchor="middle" class="t2">a reason for every reject</text>
-      <text x="480" y="152" text-anchor="middle" class="t3">Every rejected pair keeps its reason, so the funnel is inspectable and the filters can be tuned.</text>
-    </svg>
-  </div>
-  <h3>Keeping the factory running: Temporal</h3>
-  <p class="sub">These steps take minutes to hours, talk to flaky external services, and one of them waits for a human. We run the pipeline on <b>Temporal</b>, a system for long-running jobs that remembers exactly where each job is, retries failures automatically, and can pause until a person approves the drafted ledger. Its built-in web page shows every problem's progress through the nine steps, which is a large part of our "see everything happen" requirement for free.</p>
-</section>
-
-<!-- 12 -->
-<section>
-  <h2><span class="num">12</span>Where it all runs</h2>
-  <p class="sub">Four separate rooms in the cloud, and one rule: the stakeholder's answers never enter the agent's room.</p>
-  <div class="card">
-  <svg viewBox="0 0 960 380" width="100%" role="img" aria-label="Cloud topology">
-    <rect x="16" y="16" width="928" height="290" rx="14" fill="none" stroke="var(--grid)"/>
-    <text x="30" y="40" class="t3">MODAL · a cloud that runs isolated containers on demand</text>
-    <g class="agent"><rect x="40" y="70" width="300" height="190" rx="12"/></g>
-    <text x="56" y="96" class="b">Agent's room</text>
-    <text x="56" y="118" class="t2">the project at the moment before the fix</text>
-    <text x="56" y="136" class="t2">history after that moment erased</text>
-    <text x="56" y="154" class="t2">the project's own tests, but not the fix's</text>
-    <text x="56" y="178" class="t2">two extra commands installed:</text>
-    <text x="56" y="196" style="font-family:var(--mono);font-size:12.5px">ask-user "…"   request-review</text>
-    <text x="56" y="224" class="t3">internet: its AI API + the stakeholder only</text>
-    <text x="56" y="240" class="t3">checked today: AI API reachable,</text>
-    <text x="56" y="254" class="t3">example.com and github.com blocked</text>
-    <g class="stake"><rect x="400" y="70" width="250" height="110" rx="12"/></g>
-    <text x="416" y="96" class="b">Stakeholder service</text>
-    <text x="416" y="116" class="t2">ledger · persona · transcript</text>
-    <text x="416" y="134" class="t2">budgets enforced by code, not the AI</text>
-    <text x="416" y="152" class="t2">an AI writes replies in character</text>
-    <text x="416" y="170" class="t3">one service, many problems at once</text>
-    <g class="neutral"><rect x="400" y="198" width="250" height="62" rx="12"/></g>
-    <text x="416" y="220" class="b">Review room</text>
-    <text x="416" y="238" class="t2">runs small fixtures on the agent's diff</text>
-    <text x="416" y="252" class="t3">knows no answers</text>
-    <g class="verif"><rect x="690" y="70" width="230" height="190" rx="12"/></g>
-    <text x="706" y="96" class="b">Grading room</text>
-    <text x="706" y="118" class="t2">clean copy, patch applied</text>
-    <text x="706" y="136" class="t2">our tests, our runner settings</text>
-    <text x="706" y="154" class="t2">every test reported by name</text>
-    <text x="706" y="172" class="t2">cheating signals recorded</text>
-    <text x="706" y="200" class="t3">no internet at all</text>
-    <text x="706" y="218" class="t3">the agent never enters</text>
-    <text x="706" y="236" class="t3">writes reward.json</text>
-    <path d="M340 118 H398" stroke="var(--s2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/><text x="369" y="110" text-anchor="middle" class="t3">questions</text>
-    <path d="M398 148 H342" stroke="var(--s2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/><text x="369" y="164" text-anchor="middle" class="t3">answers</text>
-    <path d="M525 180 V196" stroke="var(--ink2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-    <path d="M340 236 C 370 300, 640 300, 688 236" stroke="var(--s3)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-    <text x="514" y="296" text-anchor="middle" class="t3">the patch, and nothing else, crosses over</text>
-    <path class="blocked" d="M185 260 V 322"/><text x="185" y="340" text-anchor="middle" class="t3">github · pypi · everything else: blocked</text>
-    <g class="neutral"><rect x="690" y="322" width="230" height="46" rx="10"/></g>
-    <text x="706" y="342" class="b">Storage</text><text x="706" y="359" class="t2">runs · transcripts · ledgers · scores</text>
-    <path d="M805 260 V320" stroke="var(--ink2)" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
-  </svg>
-  <div class="legend"><span><span class="dot agent"></span>agent</span><span><span class="dot stake"></span>stakeholder</span><span><span class="dot verif"></span>grader</span><span><span class="dot gray"></span>holds no secrets</span></div>
-  </div>
-  <div class="grid g4" style="margin-top:16px">
-    <div class="tile"><div class="l">Real fix, graded on Modal</div><div class="v">1.0</div><div class="d">correct: full marks</div></div>
-    <div class="tile"><div class="l">Doing nothing, graded on Modal</div><div class="v">0.0</div><div class="d">correct: zero</div></div>
-    <div class="tile"><div class="l">One graded run, warm</div><div class="v">8 s</div><div class="d">21 s including the first build</div></div>
-    <div class="tile"><div class="l">Agent's internet</div><div class="v" style="font-size:20px;margin-top:10px">AI API reachable<br>GitHub blocked</div><div class="d">grader: fully offline</div></div>
-  </div>
-</section>
-
-<!-- 13 -->
-<section>
-  <h2><span class="num">13</span>What we measure, and how to read the numbers</h2>
+<section id="grading">
+  <h2>Grading and what it resists</h2>
+  <p class="sub">Reward is binary correctness on the exact expected-test manifest, computed in the separate verifier. Harbor accepts only numeric values in the reward file, so everything else lives in a report. Integrity signals never change the reward; instead, every control designated an incorrect exploit must score zero or the task is rejected.</p>
   <div class="grid g2">
     <div class="card">
-      <h3 style="margin-top:0">pass@k and pass^k</h3>
-      <p style="color:var(--ink2);font-size:15px">Agents are random: run the same problem three times and you may get pass, pass, fail. Two questions matter. <b>pass@k</b>: did at least one of k tries succeed? Good for "can it be solved". <b>pass^k</b>: did all k tries succeed? Good for "can it be relied on", which is what a teammate cares about. For pass, pass, fail: pass@3 is yes, pass^3 is no. We report both, with k = 3 as a first pilot.</p>
-      <h3>The gradient we want</h3>
-      <p style="color:var(--ink2);font-size:15px">A good problem set is not one that every model fails. It is one where weaker models mostly fail and stronger ones mostly succeed, so scores mean something. We measure this by running several model tiers and reporting pass rates per condition. A problem that everyone passes on "hidden", or nobody passes on "full", is flagged and revisited. We never call a pass rate "the difficulty"; it is the difficulty <em>for that agent, that model, that harness, that budget</em>.</p>
+      <div class="eyebrow">reward.json · numeric only</div>
+      <pre style="margin-top:10px"><code>{"reward": 1, "f2p_passed": 2, "f2p_expected": 2,
+ "p2p_passed": 187, "p2p_expected": 187,
+ "integrity_signal_count": 0, "outcome_code": 1,
+ "patch_applied": 1}</code></pre>
+      <div class="eyebrow" style="margin-top:12px">report.json · everything else</div>
+      <p style="color:var(--ink2);font-size:14px;margin:6px 0 0">outcome string, integrity signals with paths, per-test expected vs observed, patch sha256, reviewed-diff sha256, dropped paths, receipt presence, timings.</p>
+      <div class="eyebrow" style="margin-top:14px">Outcome classes · all counted</div>
+      <div class="chips" style="margin-top:8px">
+        <span class="chip good"><span class="i">✓</span>valid-correct</span>
+        <span class="chip crit"><span class="i">✕</span>valid-incorrect</span>
+        <span class="chip crit"><span class="i">✕</span>agent-invalid-submission</span>
+        <span class="chip crit"><span class="i">✕</span>agent-runtime-failure</span>
+        <span class="chip warn"><span class="i">⟳</span>collection-failure</span>
+        <span class="chip warn"><span class="i">⟳</span>simulator-failure</span>
+        <span class="chip warn"><span class="i">⟳</span>evaluator-failure</span>
+      </div>
+      <p style="color:var(--ink2);font-size:14px;margin:10px 0 0">The four agent classes stay in the denominator, including tests that crash because of submitted code and solver timeouts. The three infrastructure classes require external evidence, are retried once, and are shown as counts with lineage to the original attempt.</p>
     </div>
     <div class="card">
-      <h3 style="margin-top:0">Outcomes that are never hidden</h3>
-      <div class="chips" style="margin:8px 0 12px">
-        <span class="chip good"><span class="i">✓</span>correct</span>
-        <span class="chip crit"><span class="i">✕</span>incorrect</span>
-        <span class="chip crit"><span class="i">✕</span>submitted nothing usable</span>
-        <span class="chip warn"><span class="i">⟳</span>our collection failed</span>
-        <span class="chip warn"><span class="i">⟳</span>the stakeholder crashed</span>
-        <span class="chip warn"><span class="i">⟳</span>the grader crashed</span>
-      </div>
-      <p style="color:var(--ink2);font-size:15px">The last three are our fault, get retried once, and are shown as counts. The first three are the agent's, and stay in the denominator. This stops a hard attempt from quietly vanishing from the statistics.</p>
-      <h3>What we refuse to claim</h3>
-      <ul style="margin:6px 0 0 18px;padding:0;color:var(--ink2);font-size:14.5px;line-height:1.7">
-        <li>That a model has never seen a problem. These are public bugs from 2013 to 2023. A high score on "full" measures skill under that spec, not memory. The GitHub-link front door is how we get to fresh, and eventually private, material.</li>
-        <li>That the stakeholder is realistic beyond what its transcripts show.</li>
-        <li>That any part marked "bonus" or "future" works until it does.</li>
+      <div class="eyebrow">Attack → defense · each named attack has a tamper control</div>
+      <table style="margin-top:10px;font-size:13.5px"><thead><tr><th>Attack from inside the sandbox</th><th>Why it fails</th></tr></thead><tbody>
+        <tr><td>Edit, delete, skip, or xfail a contract test</td><td>Protected paths are dropped at apply time; exact-id manifest; missing or skipped counts as failed</td></tr>
+        <tr><td>Root <code>conftest.py</code> that no-ops tests, runner config edits</td><td>All conftest and runner config paths are protected; pristine tree supplies discovery</td></tr>
+        <tr><td>Pre-commit hook fetching the fix during collection</td><td>No agent program runs at collection; collection is a tar under the allowlist baseline</td></tr>
+        <tr><td>Read the gold patch from git history</td><td>Single branch at base, refs and reflog gone; <code>validate</code> checks unreachability in the built image</td></tr>
+        <tr><td>Fetch the upstream PR</td><td>Allowlist in every phase; github.com verified blocked</td></tr>
+        <tr><td>Ask the stakeholder for tests or the fix</td><td>Its context contains only the stakeholder-visible view, structurally</td></tr>
+        <tr><td>Replay or race requests to exhaust or reroll</td><td>Serialized sessions, server-owned counters, idempotent request ids</td></tr>
+        <tr><td>Keep talking after submitting</td><td>Freeze before verify; late calls 410; transcript hash</td></tr>
+        <tr><td>Crash the runner to get excluded</td><td>Agent-runtime-failure stays in the denominator</td></tr>
+        <tr><td>Forge the reward file</td><td>Verifier-owned; only the tarball crosses</td></tr>
+      </tbody></table>
+      <p style="color:var(--ink2);font-size:13.5px;margin:10px 0 0">Residual, stated: code under test executes in the pytest process and can in principle forge its own JUnit output. Per-run report path, exit-code cross-check, and per-process re-runs raise the bar without closing it.</p>
+    </div>
+  </div>
+</section>
+
+<section id="prior">
+  <h2>Positioning against prior work</h2>
+  <p class="sub">Stated narrowly. The interaction idea has prior art; the grading pattern is adopted; the contribution is the authoring and validation workflow from naturally underspecified issues.</p>
+  <table><thead><tr><th></th><th>SWE-bench Verified</th><th>Ambig-SWE · Ask or Assume?</th><th>DeepSWE v1.1</th><th class="mark">swesim</th></tr></thead><tbody>
+    <tr><td>Underspecified tasks</td><td>removed</td><td>benchmark variant with information deleted by an LLM, plus agent studies</td><td>no</td><td class="mark">natural, human-labeled, non-derivability screened</td></tr>
+    <tr><td>Simulated user</td><td>no</td><td>yes, holds original issue</td><td>no</td><td class="mark">yes, excerpt-backed ledger, session protocol</td></tr>
+    <tr><td>Review of current work</td><td>no</td><td>no</td><td>no</td><td class="mark">yes, diff-only, marked unverified</td></tr>
+    <tr><td>Separate clean verifier, history stripped</td><td>partly</td><td>inherits SWE-bench</td><td>yes</td><td class="mark">yes, adopted and tightened</td></tr>
+    <tr><td>Task generator + registry</td><td>no</td><td>no</td><td>no</td><td class="mark">yes, SWE-bench pool and repo URL</td></tr>
+    <tr><td>Contribution type</td><td>benchmark</td><td>benchmark variant + agent method</td><td>benchmark</td><td class="mark">environment pipeline</td></tr>
+  </tbody></table>
+</section>
+
+<section id="infra">
+  <h2>Infrastructure, verified and planned</h2>
+  <p class="sub">The pipeline must run with the laptop closed. One small GCE VM runs the Temporal server with a persistent database, the worker under systemd, and the dashboard. Modal runs every sandbox, image build, verifier, and the stakeholder service. The laptop is a thin client. The acceptance test: submit a repository URL, close the laptop, come back, and read progress from the Temporal UI.</p>
+  <div class="grid g4">
+    <div class="tile"><div class="l">Oracle reward on Modal</div><div class="v">1.0</div><div class="d">gold solution applied</div></div>
+    <div class="tile"><div class="l">No-op reward on Modal</div><div class="v">0.0</div><div class="d">nothing done</div></div>
+    <div class="tile"><div class="l">Trial wall time, image cached</div><div class="v">8 s</div><div class="d">21 s including first build</div></div>
+    <div class="tile"><div class="l">Agent-phase egress</div><div class="v" style="font-size:20px;margin-top:10px">api.anthropic.com 401<br>example.com blocked<br>github.com blocked</div><div class="d">verifier egress: blocked</div></div>
+  </div>
+  <p style="color:var(--ink2);font-size:14px;margin-top:12px">What the smoke proved: image build, per-phase allowlist enforcement, reward plumbing, oracle and no-op agents. What it did not: the separate verifier, tar collection, the stakeholder service, or an agent episode. Those are the first implementation milestones, not assumptions.</p>
+</section>
+
+<section id="scope">
+  <h2>What ships by the presentation, and what we will not claim</h2>
+  <div class="grid g2">
+    <div class="card">
+      <div class="eyebrow">Ships, in critical-path order</div>
+      <ol style="margin:10px 0 0 18px;padding:0;color:var(--ink2);font-size:14.5px;line-height:1.7">
+        <li>Separate verifier with path policy, manifest, numeric reward, report, attribution; real controls on one SWE-bench task</li>
+        <li>Stakeholder service with session protocol and diff-only review; one interactive episode with a real agent</li>
+        <li>Full SWE-bench path: mine, judge, draft, approve, compile, validate, register, run, score, export</li>
+        <li>GitHub repository URL path with bounded discovery; one task through the same stages</li>
+        <li>Temporal, thin, on the VM; worker-restart check</li>
+        <li>Tracked example task package and one sanitized run in the repo</li>
+        <li>Minimal dashboard: table plus episode page; Temporal UI; harbor view</li>
+        <li>README, grading document, architecture and realism document</li>
+      </ol>
+    </div>
+    <div class="card">
+      <div class="eyebrow">We do not claim</div>
+      <ul style="margin:10px 0 0 18px;padding:0;color:var(--ink2);font-size:14.5px;line-height:1.7">
+        <li>That any model has not seen a task. A strong full-spec baseline measures performance under that spec, not memorization.</li>
+        <li>That the simulator is deterministic, or realistic beyond its transcripts.</li>
+        <li>That DeepSWE, Pro, or rebench importers exist. They are future sources.</li>
+        <li>That pass rates rank models. Two tiers, k = 3, exact counts, a pilot.</li>
+        <li>That in-process report forgery is impossible.</li>
       </ul>
     </div>
   </div>
 </section>
 
-<!-- 14 -->
-<section>
-  <h2><span class="num">14</span>Who did what before us</h2>
-  <p class="sub">Being clear about this is part of the design.</p>
-  <table>
-    <thead><tr><th></th><th>SWE-bench Verified</th><th>Ambig-SWE · Ask or Assume? (2025-26)</th><th>DeepSWE v1.1 (2026)</th><th>swesim</th></tr></thead>
-    <tbody>
-      <tr><td>Unclear problems</td><td>removed them</td><td>made clear problems unclear with an AI</td><td>none</td><td><b>uses the ones humans flagged as unclear</b></td></tr>
-      <tr><td>Someone to ask</td><td>no</td><td>yes, a chatbot holding the original clear text</td><td>no</td><td><b>yes, holding tagged facts from the real thread</b></td></tr>
-      <tr><td>Review of the agent's work</td><td>no</td><td>no</td><td>no</td><td><b>yes, based on its actual code</b></td></tr>
-      <tr><td>Sealed grading room, history erased</td><td>partly</td><td>inherits SWE-bench</td><td>yes</td><td><b>yes, adopted from DeepSWE with credit</b></td></tr>
-      <tr><td>A factory that makes more</td><td>no</td><td>no</td><td>no</td><td><b>yes, from any repository link</b></td></tr>
-      <tr><td>Kind of thing</td><td>a test set</td><td>a smarter agent</td><td>a test set</td><td><b>an environment pipeline</b></td></tr>
-    </tbody>
-  </table>
-</section>
-
-<!-- glossary -->
-<section>
-  <h2>Glossary</h2>
-  <dl class="gloss">
-    <dt>patch / diff</dt><dd>The list of exact line changes between two versions of code. What the agent hands in.</dd>
-    <dt>base commit</dt><dd>The snapshot of the project just before the real fix was made. Every task starts there.</dd>
-    <dt>FAIL_TO_PASS / PASS_TO_PASS</dt><dd>Tests that must go from failing to passing, and tests that must keep passing. Together they are "the contract".</dd>
-    <dt>container / sandbox</dt><dd>An isolated computer-in-a-box. Each room in section 12 is one.</dd>
-    <dt>allowlist</dt><dd>A short list of internet hosts a room may talk to. Everything else is blocked.</dd>
-    <dt>ledger</dt><dd>The stakeholder's list of facts, each tagged with what kind it is, where it came from, and how the agent may learn it.</dd>
-    <dt>provenance</dt><dd>Where a fact came from: issue thread, PR review, human annotator, or us.</dd>
-    <dt>oracle</dt><dd>The real historical fix, used to prove the grader recognizes a correct answer.</dd>
-    <dt>Harbor</dt><dd>The open-source task format and runner that Terminal-Bench and DeepSWE use. We build tasks in its format so any of its 40-plus agents can attempt them.</dd>
-    <dt>Modal</dt><dd>A cloud that starts isolated containers in seconds. Where our rooms live.</dd>
-    <dt>Temporal</dt><dd>A system for running long, multi-step jobs reliably, with retries and a progress web page.</dd>
-  </dl>
-</section>
-
 <footer>
-  Full technical spec: <a href="../superpowers/specs/2026-09-12-swe-simulator-design.md">docs/superpowers/specs/2026-09-12-swe-simulator-design.md</a> · Repository: <a href="https://github.com/saahilsanganeriya/swe-sim">saahilsanganeriya/swe-sim</a><br>
-  Grading pattern adopted from DeepSWE v1.1 (Apache-2.0). Prior interaction work: Ambig-SWE (Vijayvargiya et al., ICLR 2026), Ask or Assume? (Edwards and Schuster, 2026). Human annotations: OpenAI's SWE-bench Verified release. The SymPy example is instance sympy__sympy-13581; fact wording is drafted from its real thread and marked illustrative.
+  Spec v2: <a href="../superpowers/specs/2026-09-12-swe-simulator-design.md">docs/superpowers/specs/2026-09-12-swe-simulator-design.md</a> · Reviews: <a href="../reviews/">docs/reviews/</a> · Repository: <a href="https://github.com/saahilsanganeriya/swe-sim">saahilsanganeriya/swe-sim</a><br>
+  Grading pattern adopted from DeepSWE v1.1 (Apache-2.0). Prior interaction work: Ambig-SWE (Vijayvargiya et al., ICLR 2026), Ask or Assume? (Edwards and Schuster, 2026). Annotations: OpenAI SWE-bench Verified release. The xarray example is instance pydata__xarray-5362; fact wording is drafted from its annotation and PR and marked illustrative.
 </footer>
 </main>
 <script>
