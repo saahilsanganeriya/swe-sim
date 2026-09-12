@@ -101,7 +101,7 @@ footer{margin-top:80px;color:var(--muted);font-size:13.5px;border-top:1px solid 
 <main>
 
 <header class="hero">
-  <div class="eyebrow">Design explainer · spec v2 · 2026-09-12</div>
+  <div class="eyebrow">Design explainer · spec v2.1 · 2026-09-12</div>
   <h1>swesim: underspecified issues in, multi-turn gradable SWE simulations out</h1>
   <p class="lede">SWE-bench hands an agent the issue as the reporter wrote it and grades a patch with the fix's tests. Many of those issues are underspecified; the discussion that resolved them ships in the dataset but is never shown to the agent. SWE-bench Verified removed such issues as noise. swesim keeps them as the brief, puts the resolution with a simulated stakeholder the agent can talk to, grades with the fix's tests in a clean container, and is a pipeline that produces such tasks from SWE-bench's human-annotated pool and from any GitHub repository URL.</p>
   <div class="meta">
@@ -109,7 +109,7 @@ footer{margin-top:80px;color:var(--muted);font-size:13.5px;border-top:1px solid 
     <span><b>Orchestration</b> Temporal, kept thin</span>
     <span><b>Reward</b> binary correctness, controls executed</span>
     <span><b>Interaction</b> measured, never rewarded</span>
-    <span><b>Status</b> spec v2 after two adversarial reviews · Modal execution verified</span>
+    <span><b>Status</b> spec v2.1 after two adversarial reviews · Modal execution verified end to end with a real agent</span>
   </div>
   <p style="font-size:14px;color:var(--muted);margin-top:14px">A gentler walk-through for newcomers is at <a href="primer.html">primer.html</a>. The full spec is linked in the footer.</p>
 </header>
@@ -193,7 +193,8 @@ footer{margin-top:80px;color:var(--muted);font-size:13.5px;border-top:1px solid 
       </tbody></table>
     </details>
   </div>
-  <p class="callout" style="margin-top:16px"><b>Non-derivability is the selection rule.</b> Being underspecified is not enough: a strong model solves SymPy's nested <code>Mod</code> simplification from mathematics alone. A task qualifies for the interactive set only if at least one contract-required fact is a choice among reasonable alternatives that neither the code nor domain knowledge determines. Pool B's "tests assume an unstated choice" is often exactly that. And the screen is empirical: a task the frontier tier passes in the <code>hidden</code> condition on every attempt leaves the interactive set, because its underspecification was not load-bearing.</p>
+  <p class="callout" style="margin-top:16px"><b>Complexity comes from the repository source, not from pool A.</b> Pool A's gold patches are small: median 6 source lines in one file. Measured over 6,458 merged PRs across the SWE-bench and DeepSWE upstream repos, the "complex enough" band is a feature PR of 200 to 1,500 source lines across 3 to 30 files with a negotiated review thread; 5,000-line PRs are migrations and generated code. The repository-URL source mines that band from python-statemachine, kombu, gql, narwhals, pytest, textual and pypdf.</p>
+  <p class="callout" style="margin-top:12px"><b>Non-derivability is the selection rule.</b> Being underspecified is not enough: a strong model solves SymPy's nested <code>Mod</code> simplification from mathematics alone. A task qualifies for the interactive set only if at least one contract-required fact is a choice among reasonable alternatives that neither the code nor domain knowledge determines. Pool B's "tests assume an unstated choice" is often exactly that. And the screen is empirical: a task the frontier tier passes in the <code>hidden</code> condition on every attempt leaves the interactive set, because its underspecification was not load-bearing.</p>
 </section>
 
 <section id="pipeline">
@@ -265,16 +266,16 @@ unweighted versions.</code></pre>
     <text x="56" y="172" class="t2">root-owned shims: ask-user · request-review</text>
     <text x="56" y="196" class="t3">baseline + agent phase: allowlist = model API + stakeholder</text>
     <text x="56" y="212" class="t3">verified on Modal: anthropic 401 · example.com and github.com blocked</text>
-    <text x="56" y="236" class="t3">collection: Harbor tars /app (excluding .git); no agent code runs</text>
+    <text x="56" y="236" class="t3">collection: root hook kills agent procs, tars repo to root-only dir, freezes session</text>
     <g class="stake"><rect x="400" y="70" width="250" height="200" rx="12"/></g>
     <text x="416" y="96" class="b">Stakeholder service</text>
     <text x="416" y="118" class="t2">one session per trial, bound to</text>
     <text x="416" y="134" class="t2">spec hash · condition · run config · attempt</text>
     <text x="416" y="156" class="t2">serialized requests, server-owned counters,</text>
     <text x="416" y="172" class="t2">idempotent request ids, freeze before verify</text>
-    <text x="416" y="196" class="t2">LLM context = stakeholder-visible view only</text>
-    <text x="416" y="220" class="t3">review mode frozen: diff-only, marked unverified</text>
-    <text x="416" y="236" class="t3">stochastic; config recorded, output not claimed deterministic</text>
+    <text x="416" y="196" class="t2">limited agent: read_diff · read_changed_file · run_check</text>
+    <text x="416" y="220" class="t3">review mode frozen per run: checks in a sandbox, or diff-only</text>
+    <text x="416" y="236" class="t3">patience budget spent per reply: full → terse → unavailable</text>
     <g class="verif"><rect x="690" y="70" width="230" height="200" rx="12"/></g>
     <text x="706" y="96" class="b">Separate verifier</text>
     <text x="706" y="118" class="t2">pristine checkout at /pristine</text>
@@ -322,16 +323,16 @@ unweighted versions.</code></pre>
 
 <section id="conditions">
   <h2>Three conditions, one contract</h2>
-  <p class="sub">Each scenario compiles to three Harbor tasks sharing the image, the contract, the grader, and the solver time budget. Only the instruction and the stakeholder session differ. Calibration runs that select tasks are labeled and frozen before comparison attempts.</p>
+  <p class="sub">Each scenario compiles to three Harbor tasks sharing the image, the contract, the grader, and the solver time budget. The three-setting design (full, hidden, interactive) is adopted from Ambig-SWE (Vijayvargiya et al., ICLR 2026) and named as such. What differs is the direction of manufacture: their real artifact is the complete issue and the hidden version is an LLM summary; ours is the issue as filed, optionally <em>withheld</em> further by category with every removed span recorded as a ledger fact carrying the reporter's own words. <code>hidden</code> and <code>interactive</code> always share the same brief, so their difference is the stakeholder alone.</p>
   <div class="tabs" role="tablist">
     <button role="tab" aria-selected="true" data-tab="full">full</button>
     <button role="tab" aria-selected="false" data-tab="hidden">hidden</button>
     <button role="tab" aria-selected="false" data-tab="interactive">interactive</button>
   </div>
-  <div class="panel card" data-active="true" data-panel="full"><b>Agent sees:</b> natural brief plus every stakeholder-visible fact, never author-only material. <b>Stakeholder:</b> none. <b>Purpose:</b> baseline with requirements upfront. Not a ceiling.</div>
-  <div class="panel card" data-panel="hidden"><b>Agent sees:</b> natural brief only. <b>Stakeholder:</b> none. <b>Purpose:</b> effect of withholding without a recovery channel; also the empirical screen for non-derivability.</div>
-  <div class="panel card" data-panel="interactive"><b>Agent sees:</b> natural brief plus the two shell commands and budgets. <b>Stakeholder:</b> live, session-bound. <b>Purpose:</b> the whole interaction treatment, reported with question, review, and stakeholder-token counts alongside.</div>
-  <h3>Reading a failure</h3>
+  <div class="panel card" data-active="true" data-panel="full"><b>Agent sees:</b> the natural issue plus every stakeholder-visible fact, never author-only material. The most complete statement in every scenario. <b>Stakeholder:</b> none. <b>Purpose:</b> baseline with requirements upfront. Not a ceiling.</div>
+  <div class="panel card" data-panel="hidden"><b>Agent sees:</b> the brief selected by the run config: <code>withheld</code> when present (reproduction code, tracebacks, literal expected outputs, locations, version pins and "the fix is" proposals removed, each removal a recorded fact), else <code>natural</code>. <b>Stakeholder:</b> none. <b>Purpose:</b> effect of withholding without a recovery channel; also the empirical screen for non-derivability. At least one scenario runs hidden on both profiles so the cost of withholding is measured, not assumed.</div>
+  <div class="panel card" data-panel="interactive"><b>Agent sees:</b> the same brief plus the two shell commands and the stakeholder's availability. <b>Stakeholder:</b> live, session-bound, patience budget owned by code. <b>Purpose:</b> the whole interaction treatment, reported with question, review and stakeholder-token counts alongside and conditioned on questions asked.</div>
+<h3>Reading a failure</h3>
   <p class="sub" style="margin-bottom:12px">Labels are assigned by a human in the pilot from transcript and ledger; LLM suggestions never change outcomes or denominators; <em>unresolved</em> is allowed.</p>
   <table><thead><tr><th>Observation</th><th>Label</th></tr></thead><tbody>
     <tr><td>Relevant question asked; required answer withheld or wrong, with service-side evidence</td><td><span class="dot stake"></span>simulator failure</td></tr>
@@ -407,7 +408,7 @@ unweighted versions.</code></pre>
     <div class="tile"><div class="l">Trial wall time, image cached</div><div class="v">8 s</div><div class="d">21 s including first build</div></div>
     <div class="tile"><div class="l">Agent-phase egress</div><div class="v" style="font-size:20px;margin-top:10px">api.anthropic.com 401<br>example.com blocked<br>github.com blocked</div><div class="d">verifier egress: blocked</div></div>
   </div>
-  <p style="color:var(--ink2);font-size:14px;margin-top:12px">What the smoke proved: image build, per-phase allowlist enforcement, reward plumbing, oracle and no-op agents. What it did not: the separate verifier, tar collection, the stakeholder service, or an agent episode. Those are the first implementation milestones, not assumptions.</p>
+  <p style="color:var(--ink2);font-size:14px;margin-top:12px">Verified by spikes with artifacts checked in: image build, per-phase allowlists, the separate offline verifier, root-hook tar collection with a receipt, the unprivileged agent user with a pre-baked toolchain, a real mini-swe-agent episode graded end to end in 89 seconds, and a Modal web endpoint reachable from the sandbox by hostname. Not yet exercised: the stakeholder service itself and Temporal.</p>
 </section>
 
 <section id="scope">
@@ -417,7 +418,7 @@ unweighted versions.</code></pre>
       <div class="eyebrow">Ships, in critical-path order</div>
       <ol style="margin:10px 0 0 18px;padding:0;color:var(--ink2);font-size:14.5px;line-height:1.7">
         <li>Separate verifier with path policy, manifest, numeric reward, report, attribution; real controls on one SWE-bench task</li>
-        <li>Stakeholder service with session protocol and diff-only review; one interactive episode with a real agent</li>
+        <li>Stakeholder service with session protocol, patience, and a limited tool loop; one interactive episode with a real agent</li>
         <li>Full SWE-bench path: mine, judge, draft, approve, compile, validate, register, run, score, export</li>
         <li>GitHub repository URL path with bounded discovery; one task through the same stages</li>
         <li>Temporal, thin, on the VM; worker-restart check</li>
