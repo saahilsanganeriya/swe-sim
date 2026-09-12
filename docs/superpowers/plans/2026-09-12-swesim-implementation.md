@@ -1617,7 +1617,7 @@ git commit -m "feat(agents): patch-agent for control patches and history reachab
 - Create: `tests/test_swebench_source.py`, `tests/test_tamper.py`
 
 **Interfaces:**
-- Produces: `swebench_annotated.pool_a(csv_path) -> list[str]` instance ids; `swebench_annotated.candidates(instance_ids, out_path, pytest_repos_only=True) -> int` writes `candidates.jsonl` rows `{instance_id, repo, base_commit, version, problem_statement, hints_text, fail_to_pass, pass_to_pass, patch, test_patch, image, annotation: {underspecified, underspecified_notes, false_negative, false_negative_notes, difficulty}, thread: {issue_url, issue_comments, pr_url, pr_comments, review_comments}}`; `threads.fetch_pr_thread(repo, pr_number) -> dict` and `threads.fetch_issue_thread(repo, issue_number) -> dict` via `gh api`; `judge.judge_candidate(row, model_id) -> dict` with keys `complexity, spec_gap, test_behavioralness, self_contained, missing, thread_supplies, legitimate_requirement, alternatives_accepted, non_derivable_choice, engineering_consequence, keep`; `draft_spec.draft(row, judged, model_id, out_dir) -> Path` writing `scenario.draft.json` plus `assets/` (oracle.diff, test.patch, control diffs) with sha256 manifest; `tamper.root_conftest_noop(repo_test_paths) -> str`, `tamper.skip_marker(test_patch_text) -> str`, `tamper.sitecustomize_junit_forge() -> str` (code-generated diffs).
+- Produces: `swebench_annotated.pool_a(csv_path) -> list[str]` instance ids; `swebench_annotated.candidates(instance_ids, out_path, pytest_repos_only=True) -> int` writes `candidates.jsonl` rows `{instance_id, repo, base_commit, version, problem_statement, hints_text, fail_to_pass, pass_to_pass, patch, test_patch, image, annotation: {underspecified, underspecified_notes, false_negative, false_negative_notes, difficulty}, thread: {issue_url, issue_comments, pr_url, pr_comments, review_comments}}`; `threads.fetch_pr_thread(repo, pr_number) -> dict` and `threads.fetch_issue_thread(repo, issue_number) -> dict` via `gh api`; `judge.issue_contract_delta(row) -> list[dict]` (code-extracted candidate gaps from test exceptions, asserted literals and new public names absent from the issue); `judge.judge_candidate(row, model_id) -> dict` with keys `gaps` (per-gap `derivable_from_repo`, `consequential`, `resolved_by`, `category`), `verified_rubric_score` (0-3, annotator rubric), `complexity, test_behavioralness, self_contained, alternatives_accepted, keep` where `keep` is the code-owned rule `accept()`; `judge.calibrate(csv_path, rows_by_id, model_id, n) -> dict` (agreement with the human labels at the >=2 threshold, written by `swesim judge-calibrate` to `workspace/judge_calibration.json` and reported in docs/grading.md); `draft_spec.draft(row, judged, model_id, out_dir) -> Path` writing `scenario.draft.json` plus `assets/` (oracle.diff, test.patch, control diffs) with sha256 manifest; `tamper.root_conftest_noop(repo_test_paths) -> str`, `tamper.skip_marker(test_patch_text) -> str`, `tamper.sitecustomize_junit_forge() -> str` (code-generated diffs).
 - Image name rule: `swebench/sweb.eval.x86_64.` + instance_id with `__` replaced by `_1776_`, tag `latest`. Repo dir in SWE-bench images: `/testbed`. Runner: `pytest-ra` with command `/opt/miniconda3/envs/testbed/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} <test files from test_patch>`; `single_command` same with `{nodeid}`.
 - Pytest repos in pool A (trial eligible): sphinx-doc/sphinx, pytest-dev/pytest, matplotlib/matplotlib, scikit-learn/scikit-learn, pydata/xarray, psf/requests, mwaskom/seaborn, astropy/astropy. Excluded: django (custom runner, Trac), sympy (custom runner).
 
@@ -1644,6 +1644,15 @@ def test_withheld_brief_has_no_excerpts(monkeypatch):
     result=draft_spec.withhold(issue,'fake/model')
     assert all(x['excerpt'] not in result['withheld_brief'] for x in result['removed'])
 
+def test_issue_contract_delta_finds_unmentioned_requirements():
+    from swesim.stages.judge import issue_contract_delta, accept
+    row = {"problem_statement": "weighted mean should raise when the dim does not exist",
+           "test_patch": "diff --git a/t.py b/t.py\n+    with pytest.raises(ValueError, match=\"dimension 'z' not found\"):\n+        w.mean('z')\n",
+           "patch": "diff --git a/w.py b/w.py\n+def _check_dim(d):\n+    pass\n+class WeightedError(Exception):\n+    pass\n"}
+    gaps = issue_contract_delta(row); srcs = {g["source"] for g in gaps}
+    assert {"test-exception", "test-literal", "patch-public-name"} <= srcs and all("_check_dim" not in g["text"] for g in gaps)
+    judged = {"gaps": [{"derivable_from_repo": False, "consequential": True, "resolved_by": "thread"}], "self_contained": True}
+    assert accept(judged) and not accept({"gaps": [{"derivable_from_repo": True, "consequential": True, "resolved_by": "thread"}], "self_contained": True})
 def test_test_files_from_patch():
     tp = "diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/tests/sub/test_b.py b/tests/sub/test_b.py\n"
     assert sb.test_files_from_patch(tp) == ["tests/sub/test_b.py", "tests/test_a.py"]
@@ -1802,27 +1811,66 @@ def all_controls(base_files):
 ```python
 # swesim/stages/judge.py
 from __future__ import annotations
-import json
+import csv, json, random, re
+from pathlib import Path
 from swesim.llm import chat_json
-JUDGE_PROMPT_VERSION = "judge-v1"
+JUDGE_PROMPT_VERSION = "judge-v2"
 SYSTEM = """You review a GitHub issue, its discussion, the merged fix, and the fix's tests to decide whether it makes a good
-interactive software-engineering task in which a simulated maintainer can answer an agent's questions. Be strict and concrete."""
-SCHEMA = """{"complexity": 1-5, "spec_gap": 1-5, "test_behavioralness": 1-5, "self_contained": true|false,
-"missing": "what a solver cannot know from the issue alone", "thread_supplies": true|false,
-"legitimate_requirement": true|false, "alternatives_accepted": true|false,
-"non_derivable_choice": "the specific decision (exception type, output shape, warn-vs-raise, compat rule) that neither code nor domain knowledge determines, or null",
-"engineering_consequence": "why that decision matters to callers, or null", "keep": true|false, "rationale": "2-4 sentences"}"""
+interactive software-engineering task in which a simulated maintainer can answer an agent's questions.
+You are given CANDIDATE GAPS extracted by code: things the tests or the fix require that the issue text never mentions.
+Classify each gap; never judge the issue as a whole. Also score the issue's underspecification 0-3 with the SWE-bench
+Verified annotator rubric (0: well specified; 1: minor blanks a reasonable solver fills; 2: multiple valid solutions,
+the tests accept one; 3: nearly impossible without more information). Be strict and concrete."""
+SCHEMA = """{"gaps": [{"id": "g1", "text": "...", "source": "test-literal|test-exception|patch-public-name|diff-branch|thread",
+  "derivable_from_repo": true|false, "consequential": true|false, "resolved_by": "thread|patch|none",
+  "category": "behavior|interface|constraint|reproduction|context"}],
+"verified_rubric_score": 0|1|2|3, "complexity": 1-5, "test_behavioralness": 1-5, "self_contained": true|false,
+"alternatives_accepted": true|false, "rationale": "2-4 sentences"}"""
+
+_EXC = re.compile(r"pytest\.raises\(\s*([A-Za-z_][\w.]*)")
+_LIT = re.compile(r"(?:assert[^\n]*?|match=)\s*[\"']([^\"'\n]{6,80})[\"']")
+_DEF = re.compile(r"^\+\s*(?:def|class)\s+([A-Za-z_]\w*)", re.M)
+
+def issue_contract_delta(row: dict) -> list[dict]:
+    """Code-extracted candidate gaps: items the tests or the fix require that the issue never mentions."""
+    issue = (row.get("problem_statement") or "").lower(); gaps = []
+    for name in sorted(set(_EXC.findall(row.get("test_patch", "")))):
+        if name.lower() not in issue: gaps.append({"source": "test-exception", "text": f"tests expect {name}"})
+    for lit in sorted(set(_LIT.findall(row.get("test_patch", "")))):
+        if lit.lower() not in issue: gaps.append({"source": "test-literal", "text": f"tests assert the literal {lit!r}"})
+    for name in sorted(set(_DEF.findall(row.get("patch", "")))):
+        if not name.startswith("_") and name.lower() not in issue: gaps.append({"source": "patch-public-name", "text": f"the fix introduces public name {name}"})
+    return gaps[:25]
+
+def accept(judged: dict) -> bool:
+    """Code-owned acceptance rule: at least one gap that is non-derivable, consequential and resolved by a stakeholder statement."""
+    return any(not g.get("derivable_from_repo") and g.get("consequential") and g.get("resolved_by") == "thread" for g in judged.get("gaps", [])) \
+        and bool(judged.get("self_contained"))
 
 def judge_candidate(row: dict, model_id: str) -> dict:
     thread = row.get("thread", {})
     if thread.get("fetch_errors"): raise ValueError("incomplete source evidence")
-    user=json.dumps(row,ensure_ascii=False)
-    if len(user)>120000: raise ValueError("candidate exceeds authoring context budget")
+    payload = {"candidate": row, "candidate_gaps": issue_contract_delta(row)}
+    user = json.dumps(payload, ensure_ascii=False)
+    if len(user) > 120000: raise ValueError("candidate exceeds authoring context budget")
     out = chat_json(model_id, SYSTEM, [{"role": "user", "content": user}], SCHEMA)
-    out["keep"]=bool(out.get("keep") and out.get("thread_supplies") and out.get("self_contained")
-        and out.get("legitimate_requirement") and out.get("non_derivable_choice") and out.get("engineering_consequence"))
-    out["structural_tests"]=not bool(out.get("alternatives_accepted"))
-    out["prompt_version"]=JUDGE_PROMPT_VERSION; out["model_id"]=model_id; return out
+    out["candidate_gaps"] = payload["candidate_gaps"]; out["keep"] = accept(out)
+    out["structural_tests"] = not bool(out.get("alternatives_accepted"))
+    out["prompt_version"] = JUDGE_PROMPT_VERSION; out["model_id"] = model_id; return out
+
+def calibrate(csv_path: Path, rows_by_id: dict[str, dict], model_id: str, n: int, seed: int = 0) -> dict:
+    """Agreement of the judge's verified_rubric_score with the human ensembled labels at the >=2 threshold."""
+    with open(csv_path, newline="") as f: ann = {r["instance_id"]: r for r in csv.DictReader(f)}
+    ids = [i for i in ann if i in rows_by_id]; random.Random(seed).shuffle(ids); ids = ids[:n]
+    tp = fp = tn = fn = 0; per = []
+    for iid in ids:
+        human = float(ann[iid]["underspecified"]) >= 2
+        judged = judge_candidate(rows_by_id[iid], model_id); model = int(judged.get("verified_rubric_score", 0)) >= 2
+        per.append({"instance_id": iid, "human": float(ann[iid]["underspecified"]), "model": judged.get("verified_rubric_score")})
+        tp += human and model; fp += (not human) and model; tn += (not human) and (not model); fn += human and (not model)
+    total = max(1, tp + fp + tn + fn)
+    return {"n": len(ids), "agreement": (tp + tn) / total, "precision": tp / max(1, tp + fp), "recall": tp / max(1, tp + fn),
+            "confusion": {"tp": tp, "fp": fp, "tn": tn, "fn": fn}, "model_id": model_id, "prompt_version": JUDGE_PROMPT_VERSION, "per_instance": per}
 ```
 
 ```python
@@ -2115,7 +2163,8 @@ def mine(source: str = "swebench-annotated", pool: str = "A", instance: list[str
     else: raise typer.BadParameter(source)
 
 @app.command()
-def judge(candidates: Path, model: str = "anthropic/claude-sonnet-5", limit: int = 20):
+def judge(candidates: Path, model: str = "openai/gpt-5.5", limit: int = 20):
+    """Judge model is deliberately different from the draft model so their errors are not correlated (spec section 7)."""
     from swesim.stages.judge import judge_candidate
     out = candidates.with_suffix(".judged.jsonl"); n = 0
     with open(candidates) as f, open(out, "w") as g:
@@ -2123,6 +2172,20 @@ def judge(candidates: Path, model: str = "anthropic/claude-sonnet-5", limit: int
             if n >= limit: break
             row = json.loads(line); row["judge"] = judge_candidate(row, model); g.write(json.dumps(row) + "\n"); n += 1
     typer.echo(out)
+
+@app.command(name="judge-calibrate")
+def judge_calibrate(n: int = 150, model: str = "openai/gpt-5.5", seed: int = 0):
+    """Measure the judge's agreement with the 1,699 human annotations before using it on new repositories."""
+    from datasets import load_dataset
+    from swesim.stages.judge import calibrate
+    from swesim.sources.swebench_annotated import image_for
+    ds = load_dataset("princeton-nlp/SWE-bench", split="test")
+    rows = {r["instance_id"]: {"instance_id": r["instance_id"], "repo": r["repo"], "problem_statement": r["problem_statement"], "hints_text": r["hints_text"],
+            "patch": r["patch"], "test_patch": r["test_patch"], "fail_to_pass": json.loads(r["FAIL_TO_PASS"]), "pass_to_pass": json.loads(r["PASS_TO_PASS"]),
+            "image": image_for(r["instance_id"]), "annotation": {}, "thread": {}} for r in ds}
+    out = calibrate(Path("data/annotations/ensembled_annotations_public.csv"), rows, model, n, seed)
+    Path("workspace").mkdir(exist_ok=True); Path("workspace/judge_calibration.json").write_text(json.dumps(out, indent=2))
+    typer.echo(json.dumps({k: v for k, v in out.items() if k != "per_instance"}, indent=2))
 
 @app.command()
 def draft(judged: Path, instance: str, model: str = "anthropic/claude-sonnet-5"):
