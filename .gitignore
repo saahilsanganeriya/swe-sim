@@ -1,5 +1,4 @@
 workspace/
-!workspace/registry.json
 jobs/
 .venv/
 __pycache__/

@@ -1,0 +1,11 @@
+{
+    "task": {
+        "path": "/tmp/swesim/smoke3/smoke2"
+    },
+    "trial_name": "smoke2__9hVGKxz",
+    "trials_dir": "/tmp/swesim/jobs/smoke7b-stakeholder-host",
+    "environment": {
+        "type": "modal"
+    },
+    "job_id": "0be28dc6-17e9-49f9-bc9c-b75c8f6398c6"
+}

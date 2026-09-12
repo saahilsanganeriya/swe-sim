@@ -1,0 +1,13 @@
+== verifier whoami: root
+== /logs/artifacts tree (depth 4):
+/logs/artifacts
+== /app in verifier?
+total 1
+drwxr-xr-x 1  502 root  80 Sep 12 21:51 .
+drwxr-xr-x 1 root root 180 Sep 12 21:51 ..
+-rw-r--r-- 1  502 root   6 Sep 12 21:51 hello.txt
+drwxr-xr-x 1  502 root  60 Sep 12 21:51 pkg
+== search for receipt/hello anywhere under /logs or /app:
+/app/hello.txt
+== symlink type check:
+== verifier egress: blocked

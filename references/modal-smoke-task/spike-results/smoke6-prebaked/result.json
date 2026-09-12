@@ -1,0 +1,128 @@
+{
+    "id": "eb4176f2-5d50-446a-88c3-1a0d747b844c",
+    "task_name": "swesim/smoke6",
+    "trial_name": "smoke2__MD6PUvk",
+    "trial_uri": "file:///private/tmp/swesim/jobs/smoke6-prebaked/smoke2__MD6PUvk",
+    "task_id": {
+        "path": "/tmp/swesim/smoke3/smoke2"
+    },
+    "source": null,
+    "task_checksum": "5ead4a96efeadbb5cc4316434c963b64402ffcd9c62597008a42f35715f4aa21",
+    "config": {
+        "task": {
+            "path": "/tmp/swesim/smoke3/smoke2",
+            "git_url": null,
+            "git_commit_id": null,
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": null
+        },
+        "trial_name": "smoke2__MD6PUvk",
+        "trials_dir": "/tmp/swesim/jobs/smoke6-prebaked",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "mini-swe-agent",
+            "import_path": null,
+            "model_name": "anthropic/claude-haiku-4-5-20251001",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "mcp_servers": []
+        },
+        "user_agent": null,
+        "environment": {
+            "type": "modal",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "extra_instructions": [],
+        "job_id": "f4087515-a5ee-4ba3-957b-b7ec51fd09e1",
+        "source_trial": null
+    },
+    "agent_info": {
+        "name": "mini-swe-agent",
+        "version": "2.4.6",
+        "model_info": {
+            "name": "claude-haiku-4-5-20251001",
+            "provider": "anthropic"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 8972,
+        "n_cache_tokens": 0,
+        "n_output_tokens": 564,
+        "cost_usd": 0.011791999999999997,
+        "model_usage": {
+            "anthropic/claude-haiku-4-5-20251001": {
+                "n_input_tokens": 8972,
+                "n_cache_tokens": 0,
+                "n_output_tokens": 564,
+                "cost_usd": 0.011791999999999997
+            }
+        },
+        "rollout_details": null,
+        "metadata": null
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 1,
+            "f2p_passed": 1,
+            "f2p_expected": 1,
+            "outcome_code": 1
+        }
+    },
+    "verifier_environment_mode": "separate",
+    "exception_info": null,
+    "started_at": "2026-09-12T22:03:30.104726Z",
+    "finished_at": "2026-09-12T22:04:59.392118Z",
+    "environment_setup": {
+        "started_at": "2026-09-12T22:03:30.123207Z",
+        "finished_at": "2026-09-12T22:04:37.198271Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-09-12T22:04:37.198416Z",
+        "finished_at": "2026-09-12T22:04:39.378150Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-09-12T22:04:39.378574Z",
+        "finished_at": "2026-09-12T22:04:52.631446Z"
+    },
+    "verifier": {
+        "started_at": "2026-09-12T22:04:54.776624Z",
+        "finished_at": "2026-09-12T22:04:59.392090Z"
+    },
+    "step_results": null
+}

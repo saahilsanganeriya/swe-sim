@@ -1,0 +1,118 @@
+{
+    "id": "1453f7f2-5e49-49cf-b49b-a21e847f0c7d",
+    "task_name": "swesim/smoke3",
+    "trial_name": "smoke2__aNHrSqo",
+    "trial_uri": "file:///private/tmp/swesim/jobs/smoke3-tar-collect/smoke2__aNHrSqo",
+    "task_id": {
+        "path": "/tmp/swesim/smoke3/smoke2"
+    },
+    "source": null,
+    "task_checksum": "3712e580220c9962522677d4698992392f454de29fdd25b51c9edcd4b176c772",
+    "config": {
+        "task": {
+            "path": "/tmp/swesim/smoke3/smoke2",
+            "git_url": null,
+            "git_commit_id": null,
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": null
+        },
+        "trial_name": "smoke2__aNHrSqo",
+        "trials_dir": "/tmp/swesim/jobs/smoke3-tar-collect",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "oracle",
+            "import_path": null,
+            "model_name": null,
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "mcp_servers": []
+        },
+        "user_agent": null,
+        "environment": {
+            "type": "modal",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "extra_instructions": [],
+        "job_id": "11c425e2-ed87-4b79-b665-09a8d1dc05b4",
+        "source_trial": null
+    },
+    "agent_info": {
+        "name": "oracle",
+        "version": "1.0.0",
+        "model_info": null
+    },
+    "agent_result": {
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null,
+        "model_usage": null,
+        "rollout_details": null,
+        "metadata": null
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 1,
+            "f2p_passed": 1,
+            "f2p_expected": 1,
+            "outcome_code": 1
+        }
+    },
+    "verifier_environment_mode": "separate",
+    "exception_info": null,
+    "started_at": "2026-09-12T21:54:00.574836Z",
+    "finished_at": "2026-09-12T21:54:27.717141Z",
+    "environment_setup": {
+        "started_at": "2026-09-12T21:54:00.595931Z",
+        "finished_at": "2026-09-12T21:54:02.357271Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-09-12T21:54:02.357347Z",
+        "finished_at": "2026-09-12T21:54:02.357414Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-09-12T21:54:02.357508Z",
+        "finished_at": "2026-09-12T21:54:03.404427Z"
+    },
+    "verifier": {
+        "started_at": "2026-09-12T21:54:05.427229Z",
+        "finished_at": "2026-09-12T21:54:27.717123Z"
+    },
+    "step_results": null
+}

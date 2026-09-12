@@ -1,0 +1,15 @@
+{
+    "task": {
+        "path": "/tmp/swesim/smoke3/smoke2"
+    },
+    "trial_name": "smoke2__MD6PUvk",
+    "trials_dir": "/tmp/swesim/jobs/smoke6-prebaked",
+    "agent": {
+        "name": "mini-swe-agent",
+        "model_name": "anthropic/claude-haiku-4-5-20251001"
+    },
+    "environment": {
+        "type": "modal"
+    },
+    "job_id": "f4087515-a5ee-4ba3-957b-b7ec51fd09e1"
+}

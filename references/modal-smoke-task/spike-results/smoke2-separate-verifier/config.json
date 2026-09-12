@@ -1,0 +1,11 @@
+{
+    "task": {
+        "path": "/tmp/swesim/smoke2/smoke2"
+    },
+    "trial_name": "smoke2__EMVyXRe",
+    "trials_dir": "/tmp/swesim/jobs/smoke2-separate-verifier",
+    "environment": {
+        "type": "modal"
+    },
+    "job_id": "5e983d15-9e89-4584-a693-2cebe69bb73c"
+}

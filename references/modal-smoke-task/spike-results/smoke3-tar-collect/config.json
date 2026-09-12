@@ -1,0 +1,11 @@
+{
+    "task": {
+        "path": "/tmp/swesim/smoke3/smoke2"
+    },
+    "trial_name": "smoke2__aNHrSqo",
+    "trials_dir": "/tmp/swesim/jobs/smoke3-tar-collect",
+    "environment": {
+        "type": "modal"
+    },
+    "job_id": "11c425e2-ed87-4b79-b665-09a8d1dc05b4"
+}

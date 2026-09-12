@@ -1,0 +1,21 @@
+[
+  {
+    "source": "/logs/artifacts",
+    "destination": "artifacts/logs/artifacts",
+    "type": "directory",
+    "status": "ok",
+    "service": null,
+    "exclude": []
+  },
+  {
+    "source": "/app",
+    "destination": "artifacts/app",
+    "type": "directory",
+    "status": "failed",
+    "service": null,
+    "exclude": [
+      ".git",
+      "**/.venv"
+    ]
+  }
+]

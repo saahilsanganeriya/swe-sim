@@ -1,0 +1,2 @@
+hello.txt=[hello] net.txt=[anthropic=401 example=000 github=000]
+verifier egress: 000blocked

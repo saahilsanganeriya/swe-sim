@@ -1,17 +1,32 @@
-# SWE Simulator (swesim): design spec, v2
+# SWE Simulator (swesim): design spec, v2.1
 
-Date: 2026-09-12 (v2, after the Codex adversarial review in
-`docs/reviews/2026-09-12-codex-adversarial-review.md`). Status: for review.
+Date: 2026-09-12 (v2.1, after the Codex adversarial review in
+`docs/reviews/2026-09-12-codex-adversarial-review.md` and the second review in
+`docs/reviews/2026-09-12-claude-adversarial-review-v2.md`). Status: for review.
 Author: Saahil Sanganeriya, with Claude.
 v1 is archived beside this file.
 
 ## 0. What changed from v1
 
 Blocking fixes: `reward.json` is numeric-only with a separate `report.json`
-(B1); the agent's working tree is collected as a tarball by Harbor under an
-allowlist baseline, with no git execution in the agent container (B2); any
-control designated an incorrect exploit must score zero or the task is
-rejected (B3). Major fixes: one topology (Modal single-container, hosted
+(B1); the agent's working tree is collected by a root-owned `tar` collect
+hook into a root-only directory, after the agent's processes are killed,
+under the allowlist baseline, with no git or agent code execution (B2, and
+BL1 of the second review); any control designated an incorrect exploit must
+score zero or the task is rejected (B3). Second-review fixes: session freeze
+happens in the collect hook and its transcript hash is bound into the receipt
+(BL2); outcomes are keyed on `success`, not `reward` (BL3); startup hooks
+(`sitecustomize.py`, `usercustomize.py`, `*.pth`) are protected and pytest
+runs in isolated mode (MA1); the report-path-secrecy claim is dropped and
+in-process forgery is stated as residual with a stdout cross-check (MA2);
+hook user pinned to root (MA3); disclosure granularity rule and
+questions-conditioned reporting (MA4); two-tailed calibration screen and
+existence-demonstration framing (MA5, ED5); pool A only for the first version (MA6);
+dashboard reduced to a runs table plus a post-hoc episode page with
+near-live chat polling, no Temporal visibility integration, no live agent
+stream (MA8, MA9); schedule cut to one model tier first (MA10);
+mini-swe-agent as the agent user verified by spike (MA11); spike evidence
+attached under `references/modal-smoke-task/spike-results/` (MI3, MI4). Major fixes: one topology (Modal single-container, hosted
 stakeholder, separate verifier, transcript joined on the worker) (M1); `full`
 brief excludes author-only material by construction (M2); hardened record
 with asset manifest, run config, excerpt provenance, and strict validation
@@ -61,9 +76,9 @@ In scope by the presentation, in critical-path order:
 5. Temporal orchestration, thin: one pipeline workflow, one trial workflow,
    persistent dev server on the VM, worker under systemd.
 6. Tracked example task package and one sanitized example run in the repo.
-7. Dashboard: a runs table and a trial page with the live stakeholder chat
-   while running and the full interleaved episode after completion (section
-   17), plus `harbor view` and the Temporal UI.
+7. Dashboard: a runs table and an episode page with near-live stakeholder
+   chat by polling and the full interleaved episode after completion
+   (section 17), plus `harbor view` and the Temporal UI.
 8. README, grading document, architecture and realism document.
 
 Model configurations for the pilot: two, one weaker tier and one frontier
@@ -199,10 +214,13 @@ second, DeepSWE a bonus after both work (not in trial scope).
 Pools for `swebench-annotated` (exact predicates over the ensembled CSV,
 `other_major_issues == 0` throughout): A: `underspecified >= 2 and
 false_negative <= 1` (109); B: `underspecified >= 2 and false_negative == 2`
-(245); C: `underspecified <= 1 and false_negative == 2` (276). A and B are
-both candidate pools for the first version; B instances are admitted only after the
-judge classifies the test's unstated assumption as a stakeholder choice
-(clarification) rather than an evaluator defect (repair). 539 rows pass the
+(245); C: `underspecified <= 1 and false_negative == 2` (276). Pool A is
+the trial pool. Reading pool B's test-validity notes shows most describe
+test overfitting (evaluator defects), so a pool B instance is admitted only
+with a human-written justification that the withheld fact is a genuine
+product decision and that the FAIL_TO_PASS tests do not encode an arbitrary
+implementation detail; where a test does, the operation is recorded as
+`evaluator-repair` and that test is excluded from the scored contract. 539 rows pass the
 published filter and 500 are in Verified; pools are defined by scores, not by
 set difference. django instances are deprioritized (Trac tracker).
 
@@ -210,19 +228,24 @@ Non-derivability requirement (added after review of the SymPy `Mod`
 example, which a strong model solves from mathematics alone): a candidate is
 kept for the interactive set only if at least one contract-required fact is a
 **choice among reasonable alternatives** that neither the repository nor
-domain knowledge determines: which exception type and message, which of two
-output shapes, whether to warn or raise, what to do for an input the reporter
-could not share, which public name to expose. The judge records this fact
+domain knowledge determines: which exception type, which of two output
+shapes, whether to warn or raise, what to do for an input the reporter could
+not share, which public name to expose. The judge records this fact
 and its alternatives. Facts a capable engineer could infer from the code or
 the domain are tagged `repo-derivable` and do not qualify. Non-derivability
 alone does not make a good task: prefer missing **decisions with engineering
 consequences** (backward compatibility, failure handling, output semantics,
 migration behavior) over arbitrary strings such as an exact message that is
 unknowable but inconsequential. Empirical screen:
-after calibration runs, a task the frontier tier passes in `hidden` on all
-attempts is moved out of the interactive comparison set (its underspecification
-is not load-bearing) and kept as a calibration record. Prefer annotated
-difficulty above fifteen minutes and multi-file fixes.
+after calibration runs (k as large as budget allows, at least 3), a task the
+frontier tier passes in `hidden` on all attempts (underspecification not
+load-bearing) **or** fails in `full` on all attempts (unsolvable even with
+the information) is moved out of the comparison set and kept as a
+calibration record. This screen selects on the dependent variable; the
+comparison set is therefore reported as a calibrated, biased sample with the
+thresholds stated, and results are an existence demonstration, not a
+measured gradient. Prefer annotated difficulty above fifteen minutes and
+multi-file fixes.
 
 Annotator notes describe both missing intent and evaluator defects; a note is
 never a fact's sole provenance. If a thread references a reproducer that is
@@ -279,10 +302,13 @@ without Temporal.
 7. `run`: per `TrialWorkflow`, launches `harbor run` for one trial id; on
    completion fetches the stakeholder transcript by trial id; stores both.
 8. `score`: per scenario and run config: outcome classes, pass@k and pass^k
-   over attempts with `outcome in {valid-correct}` as success, code-exact
-   interaction counts, and a placeholder for human-adjudicated labels.
+   computed by swesim over attempts using `success` (Harbor's own helper
+   requires a single binary key and is not used), mean partial `reward`,
+   code-exact interaction counts (questions, reviews, patience end, whether
+   the last reviewed diff equals the submitted patch), and a field for
+   human-adjudicated labels.
 9. `export`: writes the episode manifest (section 16).
-10. `view`: serves the minimal dashboard.
+10. `view`: serves the dashboard (section 17).
 
 ## 7a. Orchestration with Temporal (thin)
 
@@ -353,15 +379,27 @@ Session protocol:
   `request_id` returns the cached reply; counters are server-owned; over
   budget returns a fixed refusal. Replies record `generated_at`,
   `delivered: true` on successful HTTP response.
-- `POST /freeze` (worker): closes the session; later agent requests get 410;
-  the terminal transcript with `transcript_hash` is returned to the worker.
-  The worker calls freeze before starting the verifier.
+- `POST /freeze` (session token): closes the session; later requests get
+  410; returns `transcript_hash`. It is called by the root collect hook after
+  the agent's processes are killed and before the verifier starts (Harbor
+  stops the agent container before the separate verifier runs, and the
+  worker only regains control after `harbor run` returns, so the worker
+  cannot freeze at that point). The hash is written into the collection
+  receipt; the worker later fetches the transcript by trial id and checks it.
 - The LLM context contains only the stakeholder-visible view; author-only and
   evaluator material are excluded structurally, not by instruction.
 
 Disclosure policy: any `on-request` fact may be given when a related question
-is asked; broad legitimate questions may receive broad answers (no forced
-drip). The reply carries `disclosed_fact_ids` as a self-report annotation.
+is asked, at the level of specificity asked. A broad question ("what exactly
+do you need?") receives the requirement list at requirement level; specific
+facts such as an exact exception type or message need a specific question.
+No forced drip beyond that granularity rule, which mirrors how a maintainer
+answers "what do you want?" versus "which exception?". Because a single broad
+question can still unlock much of the ledger, interactive results are
+reported conditioned on the number of questions asked, and the experiment is
+described as measuring willingness to ask and ability to use answers, not
+calibrated questioning. The reply carries `disclosed_fact_ids` as a
+self-report annotation.
 The simulator is stochastic and is labeled so; temperature 0 and the
 recorded model id are for reproducibility of configuration, not of output.
 
@@ -427,19 +465,31 @@ hostname is in the allowlist.
   `timeout_sec` from `RunConfig`.
 - `[verifier] network_mode = "no-network"`, `environment_mode = "separate"`,
   `[verifier.environment]` builds from `tests/Dockerfile`.
-- Collection (verified on Modal 2026-09-12, spike `smoke3-tar-collect`):
-  one `[[verifier.collect]]` hook, run by Harbor as root in the agent
-  container after the agent phase, under the allowlist baseline:
-  `du` size check (over 500 MB writes `oversized` and stops), then
-  `tar --numeric-owner --exclude=./.git --exclude=./.venv ... -cf
-  /logs/artifacts/app.tar -C /app .`, then writes `/logs/artifacts/collect.status`
-  with tar's exit code, file count, size, sha256 and the executing user. Only
-  root-owned binaries run; no agent code executes. `/logs/artifacts` is
-  collected by Harbor by default and transferred to the separate verifier
-  reliably (manifest status `ok`). Harbor's own directory-artifact path is
-  **not** used: its host-side `extractall(filter="data")` aborts the whole
-  download on the first absolute symlink and silently truncates the tree
-  (observed: manifest `failed`, partial files delivered).
+- Collection (verified on Modal 2026-09-12, spikes `smoke3-tar-collect` and
+  `smoke6-prebaked`; hardened after the second review): one
+  `[[verifier.collect]]` hook with `user = "root"` pinned explicitly (Harbor
+  otherwise runs hooks as the image's default user). The hook, with absolute
+  binary paths throughout: (1) `/usr/bin/pkill -KILL -u agent` so no agent
+  process survives into collection; (2) `rm -rf /var/swesim-collect && mkdir
+  -m 700 /var/swesim-collect` (root-only; `/logs/artifacts` is world-writable
+  and therefore never used as a trust anchor); (3) `du` size check, over
+  500 MB writes `oversized` to the receipt and stops; (4) `/usr/bin/tar
+  --numeric-owner --exclude=./.git --exclude=./.venv ... -cf
+  /var/swesim-collect/app.tar -C <repo_dir> .`; (5) in `interactive`, `curl`
+  `POST /freeze` on the stakeholder host with the session token, receiving
+  `transcript_hash` (the agent is dead, so no later request can change the
+  transcript; the hash binds it to this collection); (6) writes
+  `/var/swesim-collect/collect.status` with tar exit code, file count, size,
+  sha256 of `app.tar`, executing user, and `transcript_hash`. `task.toml`
+  declares both as **file** artifacts: `artifacts =
+  ["/var/swesim-collect/app.tar", "/var/swesim-collect/collect.status"]`,
+  which Harbor downloads with its single-file path (no host-side
+  `extractall`) and places at the same absolute path in the separate
+  verifier. Harbor's directory-artifact path is **not** used for the tree:
+  its host-side `extractall(filter="data")` aborts on the first absolute
+  symlink and silently truncates (observed: manifest `failed`, partial files).
+  The earlier `/app/.swesim` receipt idea is dropped: the agent owns the repo
+  directory and can rename a root-owned subdirectory out of it.
 - Metadata: source, spec hash, condition, run config hash, annotated
   difficulty, image digest.
 
@@ -470,10 +520,12 @@ distinctive lines across the filesystem outside `.git` must be empty) runs in
 
 ### 9.4 `tests/Dockerfile` and verifier contents
 
-FROM the same image digest. Copies: pristine checkout at `/pristine` (the
-same tree as the agent's `/app` at build), verifier-owned test assets,
-`expected_tests.json` (exact ids, expected statuses), `grader.py`, runner
-config, `policy.json` (protected paths, allowed path types). No network.
+FROM the same image digest. Creates the unprivileged test user `tester`
+(`useradd -m tester`). Copies: pristine checkout at `/pristine` (the same
+tree as the agent's repo directory at build), verifier-owned test assets,
+`expected_tests.json` (exact ids, expected statuses), `grader.py`,
+`policy.py`, `parsers.py`, runner config, `policy.json` (protected paths).
+No network.
 
 ### 9.5 `solution/solve.sh`
 
@@ -486,9 +538,10 @@ applies a named asset).
 
 ### 10.1 Inputs and outputs
 
-Input: `/logs/artifacts/app.tar` and `/logs/artifacts/collect.status`
-(the receipt), `/pristine`, `expected_tests.json`, `policy.json`, and
-`groups.json` (requirement groups, 10.5). Outputs in `/logs/verifier/`:
+Input: `/var/swesim-collect/app.tar` and `/var/swesim-collect/collect.status`
+(the receipt, written by the root hook into a root-only directory),
+`/pristine`, `expected_tests.json`, `policy.json`, and `groups.json`
+(requirement groups, 10.5). Outputs in `/logs/verifier/`:
 
 - `reward.json`, numeric only (Harbor rejects any non-numeric value):
   `reward` (partial credit in [0, 1], 10.5), `success` (0 or 1: the whole
@@ -514,21 +567,25 @@ Input: `/logs/artifacts/app.tar` and `/logs/artifacts/collect.status`
    `rejected_members`. Compute the change set against `/pristine`: added,
    modified, deleted regular files, compared by content hash. Policy: drop
    changes to `protected_paths` (contract test files, `conftest.py` at any
-   depth, `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, CI config,
+   depth, `sitecustomize.py`, `usercustomize.py`, `*.pth` at any depth,
+   `pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, CI config,
    `.gitattributes`, `.gitignore`, dependency lockfiles) and record each drop
-   as an integrity signal; globs are matched on normalized, case-folded
+   as an integrity signal; globs are matched on NFC-normalized, case-folded
    paths. If nothing remains, outcome `agent-invalid-submission`.
 3. Apply the remaining change set onto `/pristine` as a fresh copy; record
    `patch_sha256` over the canonical change set.
 4. Chown the applied tree to the unprivileged test user (the verifier runs
    as root on Harbor's Modal backend; files arrive owned by the host uid).
-   Run the contract as the unprivileged user with the verifier-owned runner
-   config: one pytest invocation producing JUnit XML at a path chosen per run
-   and not known to the code under test in advance; parse per-test statuses;
-   require every expected id exactly once; missing, skipped, xfailed, or
-   errored count as failed. Cross-check the process exit code with the parsed
-   result; on disagreement re-run each F2P test in a fresh process and take
-   the per-process result.
+   Run the contract as `tester` with the verifier-owned runner config and an
+   isolated interpreter (`python -I`, `PYTHONSAFEPATH=1`, `PYTHON*` variables
+   cleared) so the repository root is not a site directory and startup hooks
+   in it are not imported; one invocation producing JUnit XML; parse per-test
+   statuses; require every expected id exactly once; missing, skipped,
+   xfailed, or errored count as failed. Cross-check three signals: the JUnit
+   statuses, pytest's own terminal summary line, and the process exit code;
+   on any disagreement re-run each F2P test in a fresh process and take the
+   per-process result. No claim is made that the report path is secret: the
+   test process can read its own arguments.
 5. `success = 1` iff every F2P id observed `passed` and every P2P id observed
    `passed`, else 0. `reward` is the partial credit of 10.5. Integrity signals
    never change either; controls (7.5) decide whether a task whose exploit
@@ -559,8 +616,8 @@ earn `reward 0`; `benign-edit` controls earn 1 with their expected signals.
 
 | Outcome | Rule | In pass-rate denominator | Retry |
 |---|---|---|---|
-| `valid-correct` | reward 1 | yes | no |
-| `valid-incorrect` | reward 0 with a valid patch | yes | no |
+| `valid-correct` | `success == 1` | yes | no |
+| `valid-incorrect` | `success == 0` with a valid, applied patch (any partial `reward`) | yes | no |
 | `agent-invalid-submission` | receipt present, no applicable changes or patch fails to apply | yes | no |
 | `agent-runtime-failure` | tests could not complete because of submitted code (crash, resource exhaustion, timeout during tests) | yes | no |
 | `collection-failure` | receipt missing or tree absent | no | once |
@@ -582,18 +639,26 @@ baseline, no program executed at collection), recovering it from history
 (stripped, checked), asking the stakeholder for it (structural exclusion),
 budget evasion (server-owned counters, serialized sessions, idempotent
 request ids), late transcript mutation (freeze before verify), denominator
-gaming (attribution table). Residual and documented: code under test executes
-in the pytest process and can in principle forge its own JUnit output; the
-random report path, exit-code cross-check, and per-process re-run raise the
-bar but do not close it. Model API calls from the agent are not metered by
+gaming (attribution table), receipt forgery (root-only collection directory,
+agent processes killed before collection, file artifacts). Residual and
+documented: code under test executes in the pytest process and can in
+principle forge its own JUnit output and terminal summary; isolated-mode
+startup, protected startup hooks, the three-way cross-check, and
+per-process re-runs raise the bar but do not close it. Model API calls from the agent are not metered by
 swesim; solver budgets are time-based in the pilot.
 
 ## 11. Experimental design
 
 Three conditions on a fixed contract, grader, image, solver time budget, and
 `RunConfig`. `interactive` adds the stakeholder and review; its effect is
-reported as the whole interaction treatment, with stakeholder token counts
-and review counts alongside. `full` is a baseline, not a ceiling.
+reported as the whole interaction treatment, with question, review, and
+stakeholder token counts alongside, and conditioned on questions asked.
+`full` is the practical ceiling of disclosable information (author-only
+material is excluded from every condition), so the experiment cannot
+separate "interaction helped" from "the model only needed the facts"; it
+measures whether the agent obtains and uses the facts through interaction.
+With two tasks and k = 3 the tier comparison is an existence demonstration,
+not a measured gradient; no ranking claim is made.
 
 Calibration versus comparison: runs used to select or re-profile tasks are
 labeled `calibration` in the registry; accepted tasks and configs are frozen;
@@ -653,11 +718,12 @@ only, never graded results.
 
 ## 15. Agents and models
 
-Reference agent: `mini-swe-agent` through Harbor. Pilot models: one weaker
-tier (Haiku 4.5) and one frontier tier (Sonnet 5 or Opus 5, chosen by cost
-after a first run). The GPT small tier and additional agents are added only
-after the scope in section 2 exists. Claims about agent compatibility are
-limited to agents actually run.
+Reference agent: `mini-swe-agent` through Harbor, verified running as the
+`agent` user on Modal with a pre-baked toolchain (spike `smoke6-prebaked`).
+Pilot models: one tier first (Haiku 4.5) through everything; the frontier
+tier (Sonnet 5 or Opus 5) is added when the first pass is complete. Two
+tasks by three conditions by one model by k = 3 is 18 trials. Claims about
+agent compatibility are limited to agents actually run.
 
 ## 16. Registry, traces, tracked example, export
 
@@ -668,8 +734,9 @@ limited to agents actually run.
   SWE-bench scenario (all three conditions, assets, controls), plus one
   sanitized run: transcript, patch, `reward.json`, `report.json`, and the
   episode manifest. A reviewer can run it with the README alone.
-- `.gitignore` ignores `workspace/*` only; `examples/` and `registry.json`
-  are tracked.
+- `.gitignore` ignores `workspace/` (no re-include lines inside an ignored
+  directory, which git does not honor); `examples/` and `registry.json` at
+  the repo root are tracked.
 - Episode manifest (`swesim export`): `policy_visible` (instruction, agent
   trajectory as recorded by Harbor, stakeholder replies delivered),
   `evaluator_only` (ledger, oracle path, hidden test asset names, report),
@@ -682,27 +749,24 @@ limited to agents actually run.
 ## 17. Viewing
 
 Three surfaces. The Temporal UI shows pipeline and trial workflow state,
-pending approvals, retries. `harbor view` shows raw trajectories. The swesim
-dashboard has two pages:
+pending approvals, retries; no swesim code integrates with Temporal's
+visibility API. `harbor view` shows raw trajectories. The swesim dashboard
+is a small FastAPI app reading job directories and the stakeholder service's
+transcript endpoint, with two pages:
 
-1. **Runs table**: scenarios by condition by model with live status from
-   Temporal, outcome counts, pass@k and pass^k, calibration versus comparison
-   labels, links to each trial.
-2. **Trial page**, the primary screen. While the trial runs: status, elapsed
-   solver time, and the stakeholder chat streamed live from the service
-   (questions, replies, disclosed-fact annotations, patience remaining,
-   review rounds). Agent actions are shown live only if Harbor's output
-   subscription hooks (`trial.py` logging callbacks) can be wired to the
-   worker in time; otherwise the page says the agent trajectory arrives at
-   the end of the run. After the trial: the complete timeline interleaving agent
-   actions (from Harbor's trajectory), questions and replies by timestamp,
-   the patch with dropped protected paths marked, per-test expected versus
-   observed, outcome, integrity signals, the human label field, and links to
-   the episode manifest and raw Harbor directory.
-
-Implementation: a small FastAPI app on the VM reading the workspace, job
-directories, Temporal's visibility API, and the stakeholder service's
-transcript endpoint; polling, no websockets.
+1. **Runs table**: scenarios by condition by model with outcome counts,
+   pass@k and pass^k, mean partial reward, calibration versus comparison
+   labels, and links to each trial. Trial status comes from the worker's
+   per-trial status file, not from Temporal.
+2. **Episode page**: brief, requirements, the stakeholder chat with
+   disclosed-fact annotations, patience trajectory, tool calls and their
+   observations, review rounds; the patch with dropped protected paths
+   marked; per-test expected versus observed; outcome, integrity signals;
+   the human label field; links to the episode manifest and raw Harbor
+   directory. While a trial is running the page polls the transcript
+   endpoint so the chat is near-live; the agent's own actions appear when
+   Harbor writes the trajectory at the end of the run. No live agent
+   streaming.
 
 ## 18. Repository layout
 
@@ -749,6 +813,10 @@ conditions, k = 3); tracked example; dashboard table and episode page; docs;
 presentation. A third task only if everything above is done.
 
 ## 21. Unresolved, with the smallest verification
+
+Evidence for the resolved items below is attached under
+`references/modal-smoke-task/spike-results/` (Harbor `result.json`, verifier
+probe output, `collect.status`, agent trajectory summary per spike).
 
 - Resolved 2026-09-12 by spikes `smoke2*` and `smoke3-tar-collect`: the
   separate verifier receives `/logs/artifacts` reliably at the same path;

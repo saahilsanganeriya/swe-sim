@@ -1,0 +1,11 @@
+{
+    "task": {
+        "path": "/tmp/swesim/smoke2/smoke2"
+    },
+    "trial_name": "smoke2__bZQK36H",
+    "trials_dir": "/tmp/swesim/jobs/smoke2b-dotfiles",
+    "environment": {
+        "type": "modal"
+    },
+    "job_id": "a149f6ec-d1ad-4515-91de-2dd22c28a1e7"
+}

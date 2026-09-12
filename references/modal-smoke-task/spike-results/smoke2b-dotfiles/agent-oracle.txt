@@ -1,0 +1,23 @@
+whoami=agent uid=1001
+rm: cannot remove '/app/.swesim/receipt': Permission denied
+receipt delete failed (expected)
+/app:
+total 4
+drwxr-xr-x 1 agent agent 100 Sep 12 21:52 .
+drwxr-xr-x 1 root  root  180 Sep 12 21:52 ..
+drwxr-xr-x 1 agent agent  40 Sep 12 21:52 .agentdotdir
+-rw-r--r-- 1 agent agent   9 Sep 12 21:52 .agentdotfile
+drwxr-xr-x 1 agent agent  43 Sep 12 21:52 .git
+drwxr-xr-x 1 root  root   46 Sep 12 21:52 .swesim
+drwxr-xr-x 1 agent agent  42 Sep 12 21:52 .venv
+lrwxrwxrwx 1 agent agent  11 Sep 12 21:52 evil_link -> /etc/passwd
+-rw-rw-r-- 1 agent agent   6 Sep 12 21:52 hello.txt
+drwxrwxr-x 1 agent agent  60 Sep 12 21:52 pkg
+drwxr-xr-x 1 root  root   46 Sep 12 21:52 swesim-receipt
+
+/app/.swesim:
+total 1
+drwxr-xr-x 1 root  root   46 Sep 12 21:52 .
+drwxr-xr-x 1 agent agent 100 Sep 12 21:52 ..
+-rw-r--r-- 1 root  root   13 Sep 12 21:52 receipt
+net: 000blocked

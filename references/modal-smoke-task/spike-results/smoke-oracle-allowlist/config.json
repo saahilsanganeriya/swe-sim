@@ -1,0 +1,11 @@
+{
+    "task": {
+        "path": "/tmp/swesim/smoke/smoke"
+    },
+    "trial_name": "smoke__ZhGNFRa",
+    "trials_dir": "/tmp/swesim/jobs/smoke-oracle-allowlist",
+    "environment": {
+        "type": "modal"
+    },
+    "job_id": "9f3c9da2-7e58-486f-abd8-7812f959ec49"
+}

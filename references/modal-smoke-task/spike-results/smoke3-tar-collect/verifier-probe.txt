@@ -1,0 +1,36 @@
+== verifier whoami: root
+== /logs/artifacts:
+total 11
+drwxr-xr-x 1  502 root    80 Sep 12 21:54 .
+drwxr-xr-x 1 root root    80 Sep 12 21:54 ..
+-rw-r--r-- 1  502 root 10240 Sep 12 21:54 app.tar
+-rw-r--r-- 1  502 root   103 Sep 12 21:54 collect.status
+== collect.status:
+rc=0 size_kb=5 files=12 sha=29ded5fe5829012940a2ab7ca934529bab2e99c7ecdbe9b94625619b48a6725f user=root
+== tar listing (types):
+  dir   uid=1001  .
+  file  uid=1001  ./hello.txt
+  dir   uid=1001  ./pkg
+  file  uid=1001  ./pkg/mod.py
+  sym   uid=1001  ./evil_link -> /etc/passwd
+  dir   uid=1001  ./.agentdotdir
+  file  uid=1001  ./.agentdotdir/f
+  file  uid=1001  ./.agentdotfile
+  dir   uid=0     ./.swesim
+  file  uid=0     ./.swesim/receipt
+  dir   uid=0     ./swesim-receipt
+  file  uid=0     ./swesim-receipt/receipt
+== safe extract with filter=data (symlinks rejected?):
+extracted 11 rejected [('./evil_link', 'AbsoluteLinkError')]
+== /work tree:
+d root /work/.agentdotdir
+d root /work/.swesim
+d root /work/pkg
+d root /work/swesim-receipt
+f root /work/.agentdotdir/f
+f root /work/.agentdotfile
+f root /work/.swesim/receipt
+f root /work/hello.txt
+f root /work/pkg/mod.py
+f root /work/swesim-receipt/receipt
+== verifier egress: 000blocked

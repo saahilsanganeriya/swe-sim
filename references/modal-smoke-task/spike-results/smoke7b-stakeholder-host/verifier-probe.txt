@@ -1,0 +1,21 @@
+== verifier whoami: root
+== /logs/artifacts:
+total 11
+drwxr-xr-x 1  502 root    80 Sep 12 22:06 .
+drwxr-xr-x 1 root root    80 Sep 12 22:06 ..
+-rw-r--r-- 1  502 root 10240 Sep 12 22:06 app.tar
+-rw-r--r-- 1  502 root   102 Sep 12 22:06 collect.status
+== collect.status:
+rc=0 size_kb=2 files=4 sha=d7c499a7307c0b442950fc79dff978c7b7ff48896bfdb99f92f78a3583a98dc6 user=root
+== tar listing (types):
+  dir   uid=1001  .
+  file  uid=1001  ./hello.txt
+  dir   uid=0     ./swesim-receipt
+  file  uid=0     ./swesim-receipt/receipt
+== safe extract with filter=data (symlinks rejected?):
+extracted 4 rejected []
+== /work tree:
+d root /work/swesim-receipt
+f root /work/hello.txt
+f root /work/swesim-receipt/receipt
+== verifier egress: 000blocked
