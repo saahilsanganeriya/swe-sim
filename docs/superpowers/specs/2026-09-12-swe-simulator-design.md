@@ -241,7 +241,15 @@ after calibration runs (k as large as budget allows, at least 3), a task the
 frontier tier passes in `hidden` on all attempts (underspecification not
 load-bearing) **or** fails in `full` on all attempts (unsolvable even with
 the information) is moved out of the comparison set and kept as a
-calibration record. This screen selects on the dependent variable; the
+calibration record.
+
+Pool A skews small (measured 2026-09-12 over the 109 gold patches: median 6
+source additions in one file, 90th percentile 32, maximum 189 in sympy):
+underspecified issues whose tests survived the fairness filter are mostly
+small bug fixes. Pool A is therefore the right first source for proving the
+interaction mechanism on prebuilt environments, not for demonstrating complex
+implementation; prefer its 1-to-4-hour instances, and take complexity from
+the `github-repo` `feature` band. This screen selects on the dependent variable; the
 comparison set is therefore reported as a calibrated, biased sample with the
 thresholds stated, and results are an existence demonstration, not a
 measured gradient. Prefer annotated difficulty above fifteen minutes and
@@ -253,15 +261,32 @@ not publicly available, the candidate is rejected or the reconstruction is
 marked `authored` with rationale.
 
 `github-repo` discovery, bounded: parameters `--since`, `--max-prs` (default
-200), `--max-candidates` (default 20), `--max-builds` (default 3),
+400), `--max-candidates` (default 20), `--max-builds` (default 3),
 `--build-profile python-pytest` (the only supported profile: Python package
 installable with `uv pip install -e .` or the repo's declared extras, tests
-run with pytest). Steps: list merged PRs in the window; resolve linked issues
-from PR body keywords and issue timeline cross-references; keep pairs where
-the PR changes both source and test files, source diff is within the size
-band, the issue plus PR thread has at least `--min-comments` (default 4)
-non-bot comments, and the issue predates the PR; fetch threads; write
-`candidates.jsonl` with a reason per reject. If no candidate survives, the
+run with pytest), and `--kind bugfix|feature` (default `feature`). Steps: list
+merged PRs in the window; resolve linked issues from PR body keywords and
+issue timeline cross-references; keep pairs where the PR changes both source
+and test files, the source diff is within the kind's band, the issue plus PR
+thread has at least `--min-comments` non-bot comments, and the issue predates
+the PR; fetch threads; write `candidates.jsonl` with a reason per reject.
+
+Complexity bands (decided 2026-09-12 after measuring merged-PR sizes in
+pypdf, xarray and sqlglot: median 14 to 32 additions, 90th percentile 80 to
+132, and PRs above 5,000 lines essentially absent or mechanical):
+
+| kind | source additions | source files | thread comments | issue labels preferred |
+|---|---|---|---|---|
+| `bugfix` | 20 to 300 | 1 to 10 | >= 4 | bug |
+| `feature` | 200 to 1,500 | 3 to 30 | >= 8 | enhancement, feature, RFC, proposal |
+
+"Complex enough" means the `feature` band: a feature request or RFC whose
+design (API shape, defaults, backward compatibility, error semantics) was
+negotiated in review. Line count above that band is not pursued: very large
+PRs are migrations, generated or vendored code, and their tests cover a
+sliver of the change. Very long horizons of the CodeClash kind (15 rounds of
+up to 30 turns, goal-oriented competition without a fixed spec) are a
+different research question and out of scope. If no candidate survives, the
 workflow ends in `no-valid-candidate` with the reject histogram. Environment
 build: clone at base, install, run the PR's test files once and require that
 at least one fails on base and passes after the gold patch; then strip
