@@ -1,0 +1,45 @@
+schema_version = "1.4"
+artifacts = []
+
+[task]
+name = "swesim/smoke7"
+version = "1.0.0"
+description = ""
+authors = []
+keywords = []
+
+[metadata]
+
+[verifier]
+timeout_sec = 600.0
+network_mode = "no-network"
+environment_mode = "separate"
+
+[verifier.environment]
+build_timeout_sec = 600.0
+
+[[verifier.collect]]
+command = "set -e; mkdir -p /logs/artifacts; cd /app; SZ=$(du -sk --exclude=.git --exclude=.venv . | cut -f1); if [ \"$SZ\" -gt 512000 ]; then echo oversized > /logs/artifacts/collect.status; exit 0; fi; tar --numeric-owner --exclude=./.git --exclude=./.venv -cf /logs/artifacts/app.tar . ; echo \"rc=$? size_kb=$SZ files=$(tar -tf /logs/artifacts/app.tar | wc -l) sha=$(sha256sum /logs/artifacts/app.tar | cut -d' ' -f1) user=$(id -un)\" > /logs/artifacts/collect.status; cat /logs/artifacts/collect.status"
+timeout_sec = 120.0
+
+[verifier.env]
+
+[agent]
+timeout_sec = 600.0
+user = "agent"
+network_mode = "allowlist"
+allowed_hosts = ["api.anthropic.com", "example--swesim-stakeholder-probe-ping.modal.run"]
+
+[environment]
+network_mode = "allowlist"
+allowed_hosts = ["api.anthropic.com", "example--swesim-stakeholder-probe-ping.modal.run"]
+build_timeout_sec = 600.0
+os = "linux"
+mcp_servers = []
+
+[environment.env]
+UV_OFFLINE = "1"
+UV_CACHE_DIR = "/tmp/uv-cache"
+UV_NO_PROGRESS = "1"
+
+[solution.env]

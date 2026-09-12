@@ -761,12 +761,17 @@ presentation. A third task only if everything above is done.
   toolchain; ATIF trajectory (`agent/trajectory.json`) and the native
   trajectory are written; the collect hook and separate verifier work with a
   real agent run.
-- Modal web endpoint reachable from a Harbor Modal sandbox under allowlist
-  by hostname: one probe from the smoke task.
+- Resolved 2026-09-12 (spike `smoke7b-stakeholder-host`): a Modal web
+  endpoint hostname in the allowlist is reachable from the sandbox (HTTP
+  200) while github.com stays blocked. Reference recipe checked in at
+  `references/modal-smoke-task/`.
 - Temporal `TrialWorkflow` id dedup and worker restart: the restart check in
   7a.
-- Token file injection at container start under Harbor's Modal backend:
-  environment variable path versus a mounted file; one probe.
+- Per-trial session token delivery: `[environment.env]` values reach the
+  sandbox (verified with the UV variables), so the worker passes the token
+  per trial via Harbor's environment-kwarg/agent-env flags or a per-trial
+  task.toml variant; the shim reads it from the environment. Which flag: one
+  probe at implementation.
 - SWE-bench image sizes and pull times on Modal for django and sympy.
 
 ## 22. Claims, and the presentation's questions
