@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Callable
 
@@ -120,9 +121,19 @@ def migrate_index_if_enabled(settings: Settings) -> dict:
     return {"migrated": True}
 
 
+def executor_size(settings: Settings) -> int:
+    """Threads for `asyncio.to_thread` / `blocking()`: every concurrent activity may hold one for minutes (LLM calls, Modal
+    builds, gh scans). Python's default is cpu_count + 4 (5 on a 1-vCPU Cloud Run instance), which queues blocking stages
+    behind each other; a bare `to_thread` waiting in that queue sends no heartbeat and the attempt times out (measured
+    2026-09-13 on discover_activity). Size the pool to the sum of the queues' concurrency plus headroom."""
+    total = sum(concurrency(settings, q) for q in settings.task_queues)
+    return max(8, total + 8)
+
+
 async def run_workers(client: Client, settings: Settings, stop: asyncio.Event | None = None) -> None:
     """Run one worker per configured queue until `stop` is set (forever when None)."""
     configure_logging()
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=executor_size(settings), thread_name_prefix="swesim-stage"))
     A.configure(settings)
     if queues.TRIALS in settings.task_queues:
         A.launcher()  # fail closed now, not at the first trial
