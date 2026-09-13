@@ -341,8 +341,12 @@ def render_runs_page() -> str:
         parts.append("<p class='muted'>No scores.json yet (run <code>swesim score &lt;id&gt;</code>).</p>")
     for sf in score_files:
         sid = sf.parent.name
-        groups = read_json(sf)
+        groups = read_json(sf, default="unreadable")
         parts.append(f"<h3 id='scores-{h(sid)}'>{h(sid)} <span class='muted mono'>{h(sf)}</span></h3>")
+        if not isinstance(groups, dict):
+            parts.append("<p class='muted'>unreadable scores.json (not a JSON object of groups); re-run <code>swesim score</code>.</p>")
+            continue
+        groups = {k: g for k, g in groups.items() if isinstance(g, dict)}
         if not groups:
             parts.append("<p class='muted'>No finished trials.</p>")
             continue

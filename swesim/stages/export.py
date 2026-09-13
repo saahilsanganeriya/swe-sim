@@ -1,22 +1,37 @@
 """Export stage: one ``workspace/exports/<trial_id>.episode.json`` manifest per finished trial.
 
 ``policy_visible`` holds only what the agent actually observed: the instruction text, the ATIF trajectory
-from Harbor's ``agent/trajectory.json`` and the stakeholder replies as they appeared in the agent's own tool
-observations. The stakeholder service's generated transcript (with fact annotations and tool audit) is
-evidence for the evaluator and lives under ``evaluator_only``: a generated reply is not proof the policy
-received it. Interactive episodes stay ``simulator_validity: unadjudicated`` and are never marked
-``training_eligible`` until adjudicated.
+from Harbor's ``agent/trajectory.json`` and, for interactive trials, the stakeholder replies as they
+appeared in the agent's own tool observations (a shim actually invoked as a command, not merely mentioned).
+The stakeholder service's generated transcript (with fact annotations and tool audit) is evidence for the
+evaluator and lives under ``evaluator_only``: a generated reply is not proof the policy received it.
+
+Lineage comes from the frozen record: ``lineage.spec_hash`` is the record's; the spec used to fill
+``evaluator_only`` is the trial's frozen ``spec.json`` when present, else the scenario's current
+``scenario.json`` with ``lineage.spec_mismatch`` set when its hash differs. Interactive episodes stay
+``simulator_validity: unadjudicated`` and are never ``training_eligible`` until adjudicated; episodes with
+infrastructure outcomes (5-7) or a spec mismatch are never training-eligible in any condition.
 """
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from swesim.models import Discovery, ScenarioSpec
 from swesim.paths import Workspace, atomic_json
-from swesim.stages.score import count_exchanges, load_trial_records, message_events
+from swesim.stages.score import (
+    VALID,
+    count_exchanges,
+    load_trial_records,
+    message_events,
+    outcome_code,
+)
 
 SHIMS = ("ask-user", "request-review")
+# First token of a command segment, with an optional path prefix, followed by end or whitespace.
+_SHIM_RE = re.compile(r"^\s*(?:\S*/)?(ask-user|request-review)(?:\s+(.*))?$", re.DOTALL)
+_SEGMENTS = re.compile(r"&&|\|\||;|\n")
 
 
 def _read_json(path: Path, default=None):
@@ -24,6 +39,21 @@ def _read_json(path: Path, default=None):
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return default
+
+
+def shim_invocation(command: str) -> str | None:
+    """Name of the stakeholder shim a shell command actually invokes, or None.
+
+    Anchored to the first token of a command segment (segments split on ``&&``, ``||``, ``;`` and newlines, so
+    ``cd /app && ask-user 'q'`` counts), allowing a path prefix (``/usr/local/bin/ask-user``). Mentions inside
+    arguments (``cat /usr/local/bin/ask-user``, ``grep request-review README.md``) and bare ``--help``/``-h``
+    calls are not invocations.
+    """
+    for segment in _SEGMENTS.split(command or ""):
+        m = _SHIM_RE.match(segment)
+        if m and (m.group(2) or "").strip() not in ("--help", "-h"):
+            return m.group(1)
+    return None
 
 
 def _observations(step: dict) -> dict[str | None, str]:
@@ -40,7 +70,7 @@ def _observations(step: dict) -> dict[str | None, str]:
 
 
 def delivered_replies(traj: dict) -> list[dict]:
-    """Stakeholder replies the policy actually saw: shim invocations in the agent's tool calls paired with the
+    """Stakeholder replies the policy actually saw: shim commands in the agent's tool calls paired with the
     observation returned for that call. Empty when there is no trajectory."""
     replies = []
     for step in traj.get("steps") or []:
@@ -53,7 +83,7 @@ def delivered_replies(traj: dict) -> list[dict]:
             args = call.get("arguments")
             command = args.get("command") if isinstance(args, dict) and isinstance(args.get("command"), str) else None
             text = command if command is not None else (args if isinstance(args, str) else json.dumps(args or {}))
-            shim = next((s for s in SHIMS if s in text), None)
+            shim = shim_invocation(text)
             if not shim:
                 continue
             call_id = call.get("tool_call_id")
@@ -70,16 +100,23 @@ def _instruction(rec: dict, tdir: Path) -> str | None:
     return None
 
 
-def _spec_for(rec: dict, tdir: Path, ws: Workspace, scenario_id: str) -> ScenarioSpec:
-    for p in (tdir / "spec.json", ws.scenario_dir(scenario_id) / "scenario.json"):
-        if p.exists():
-            return ScenarioSpec.model_validate_json(p.read_text())
+def _spec_for(rec: dict, tdir: Path, ws: Workspace, scenario_id: str) -> tuple[ScenarioSpec, str]:
+    """(spec, source): the trial's frozen ``spec.json`` when present, else the scenario's current ``scenario.json``."""
+    frozen = tdir / "spec.json"
+    if frozen.exists():
+        return ScenarioSpec.model_validate_json(frozen.read_text()), "trial-spec.json"
+    current = ws.scenario_dir(scenario_id) / "scenario.json"
+    if current.exists():
+        return ScenarioSpec.model_validate_json(current.read_text()), "scenario.json"
     raise ValueError(f"no frozen spec for trial {rec.get('trial_id')}")
 
 
 def episode_manifest(ws: Workspace, rec: dict, scenario_id: str) -> dict:
+    if not rec.get("spec_hash"):
+        raise ValueError(f"missing frozen lineage for trial {rec.get('trial_id')}")
     tdir = ws.root / "trials" / rec["trial_id"]
-    spec = _spec_for(rec, tdir, ws, scenario_id)
+    spec, spec_source = _spec_for(rec, tdir, ws, scenario_id)
+    spec_mismatch = spec.spec_hash != rec["spec_hash"]
     traj: dict = {}
     trial_dir = Path(rec["trial_dir"]) if rec.get("trial_dir") else None
     if trial_dir is not None:
@@ -89,14 +126,17 @@ def episode_manifest(ws: Workspace, rec: dict, scenario_id: str) -> dict:
     audit = message_events(rec)
     interactive = rec["condition"] == "interactive"
     simulator_validity = report.get("simulator_validity") or ("unadjudicated" if interactive else "n/a")
-    eligible = bool(traj.get("steps")) and report.get("training_eligible") is not False
+    # Training eligibility: a real trajectory, an agent-attributable outcome (1-4), a spec that matches the record,
+    # no explicit veto from the run stage, and for interactive trials a bound transcript adjudicated "ok".
+    eligible = (bool(traj.get("steps")) and outcome_code(rec) in VALID and not spec_mismatch
+                and report.get("training_eligible") is not False)
     if interactive:
         eligible = eligible and report.get("transcript_binding_valid") is True and simulator_validity == "ok"
-    replies = delivered_replies(traj)
+    replies = delivered_replies(traj) if interactive else []
     label = rec.get("label") if isinstance(rec.get("label"), dict) else None
     return {
-        "trial_id": rec["trial_id"], "scenario_id": spec.id, "family_id": spec.source_ref, "condition": rec["condition"],
-        "brief_profile": rec.get("brief_profile"), "model": rec.get("model"),
+        "trial_id": rec["trial_id"], "scenario_id": rec.get("scenario_id") or spec.id, "family_id": spec.source_ref,
+        "condition": rec["condition"], "brief_profile": rec.get("brief_profile"), "model": rec.get("model"),
         "policy_visible": {"instruction": _instruction(rec, tdir), "agent_trajectory": traj,
                            "stakeholder_replies": replies, "stakeholder_replies_source": "agent-trajectory-observations"},
         "training_eligible": eligible,
@@ -104,7 +144,8 @@ def episode_manifest(ws: Workspace, rec: dict, scenario_id: str) -> dict:
                            "author_only_fact_ids": [f.id for f in spec.ledger if f.discovery == Discovery.AUTHOR_ONLY],
                            "oracle_asset": spec.controls.oracle, "test_assets": list(spec.contract.test_assets),
                            "report": report, "stakeholder_audit": audit, "reviewer_label": label},
-        "lineage": {"spec_hash": spec.spec_hash, "run_config_hash": rec.get("run_config_hash"),
+        "lineage": {"spec_hash": rec["spec_hash"], "spec_source": spec_source, "spec_mismatch": spec_mismatch,
+                    "loaded_spec_hash": spec.spec_hash, "run_config_hash": rec.get("run_config_hash"),
                     "compiled_hash": rec.get("compiled_hash"), "image_digest": report.get("image_digest"),
                     "purpose": rec.get("purpose"), "patch_sha256": report.get("patch_sha256"),
                     "transcript_hash": transcript.get("transcript_hash"), "harbor_trial_dir": rec.get("trial_dir"),

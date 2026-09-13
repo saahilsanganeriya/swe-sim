@@ -175,6 +175,10 @@ def summarize(records: list[dict], k: int) -> dict:
             if name:
                 labels[name] = labels.get(name, 0) + 1
         cfg_k = {(r.get("run_config") or {}).get("k") for r in recs} - {None}
+        # reward.json must agree with itself: success == 1 exactly when outcome_code == 1. `success` still drives
+        # pass@k (contract); disagreement is flagged per trial so a skewed success_count is never silent.
+        inconsistent = [r.get("trial_id") or f"#{i}" for i, (r, code) in enumerate(zip(recs, codes))
+                        if (int((r.get("reward") or {}).get("success", 0) or 0) == 1) != (code == 1)]
         condition, profile, rch = key.split("|", 2)
         out[key] = {
             "condition": condition, "brief_profile": profile, "run_config_hash": rch,
@@ -185,7 +189,7 @@ def summarize(records: list[dict], k: int) -> dict:
             "n": n, "n_valid": n, "n_total": len(recs),
             "n_agent_failures": sum(1 for code in codes if code in AGENT_FAILURE),
             "n_infra_failures": sum(1 for code in codes if code in INFRA),
-            "success_count": c,
+            "success_count": c, "inconsistent_reward": inconsistent,
             "pass_at_k": pass_at_k(n, c, k), "pass_pow_k": pass_pow_k(n, c, k),
             "mean_reward": (sum(float((r.get("reward") or {}).get("reward", 0) or 0) for r in valid) / n) if n else None,
             "outcomes": counts,

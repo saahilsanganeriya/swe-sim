@@ -97,7 +97,7 @@ def write_trial(ws: Workspace, spec: ScenarioSpec, *, condition: str = "interact
                 purpose: str = "calibration", attempt: int = 0, outcome_code: int = 1, success: int = 1,
                 reward: float = 1.0, events: list[dict] | None = None, traj: bool = True, shape: str = "flat",
                 brief_profile: str = "withheld", label: dict | None = None, status: str = "completed",
-                harbor_exception: str | None = None) -> str:
+                harbor_exception: str | None = None, trajectory: dict | None = None) -> str:
     rc = RunConfig(condition=condition, model=model, purpose=purpose, compiled_hash=COMPILED,
                    brief_profile="natural" if condition == "full" else brief_profile)
     tid = trial_id(spec.spec_hash, rc.condition, rc.run_config_hash, attempt)
@@ -108,7 +108,7 @@ def write_trial(ws: Workspace, spec: ScenarioSpec, *, condition: str = "interact
     (harbor / "agent").mkdir(parents=True)
     (harbor / "verifier").mkdir()
     if traj:
-        (harbor / "agent" / "trajectory.json").write_text(json.dumps(TRAJ))
+        (harbor / "agent" / "trajectory.json").write_text(json.dumps(trajectory or TRAJ))
     interactive = condition == "interactive"
     events = list(events or [])
     asks = sum(1 for e in events if e.get("role") == "user" and e.get("exchange") == "ask")
@@ -208,6 +208,18 @@ def test_agent_failure_lowers_pass_at_1_but_infra_failure_does_not_change_n():
     s6 = summarize(base + [_rec(3, 0, 0.0, trial_id="c" * 24), _rec(6, 0, 0.0, trial_id="d" * 24)], k=1)["hidden|withheld|r"]
     assert s6["n"] == 3 and s6["pass_at_k"] == pytest.approx(2 / 3) and s6["n_total"] == 4
     assert s6["outcomes"]["simulator-failure"] == 1 and s6["n_infra_failures"] == 1 and s6["success_count"] == 2
+    assert s6["inconsistent_reward"] == []
+
+
+def test_summarize_flags_reward_files_where_success_disagrees_with_outcome():
+    ok = summarize([_rec(1, 1, 1.0, trial_id="a" * 24), _rec(2, 0, 0.5, trial_id="b" * 24), _rec(5, 0, 0.0, trial_id="c" * 24)], k=1)["hidden|withheld|r"]
+    assert ok["inconsistent_reward"] == [] and ok["success_count"] == 1
+    bad = summarize([_rec(2, 1, 1.0, trial_id="a" * 24),   # valid-incorrect yet success 1
+                     _rec(1, 0, 1.0, trial_id="b" * 24),   # valid-correct yet success 0
+                     _rec(6, 1, 0.0, trial_id="c" * 24),   # infrastructure failure yet success 1
+                     _rec(1, 1, 1.0)], k=1)["hidden|withheld|r"]  # consistent, no trial_id
+    assert bad["inconsistent_reward"] == ["a" * 24, "b" * 24, "c" * 24]
+    assert bad["success_count"] == 2 and bad["n"] == 3  # `success` still drives the metric; the flag makes the skew visible
 
 
 def test_summarize_never_pools_purposes_or_configs():
@@ -387,7 +399,8 @@ def test_export_scenario_manifest(tmp_path):
     assert eo["stakeholder_audit"][1]["disclosed_fact_ids"] == ["f01"] and eo["stakeholder_audit"][1]["delivery"] == "generated"
     assert eo["reviewer_label"] == {"label": "unresolved", "note": "n"}
     ln = m["lineage"]
-    assert ln == {"spec_hash": spec.spec_hash, "run_config_hash": rc.run_config_hash, "compiled_hash": COMPILED,
+    assert ln == {"spec_hash": spec.spec_hash, "spec_source": "trial-spec.json", "spec_mismatch": False,
+                  "loaded_spec_hash": spec.spec_hash, "run_config_hash": rc.run_config_hash, "compiled_hash": COMPILED,
                   "image_digest": IMAGE, "purpose": "calibration", "patch_sha256": "p" * 64, "transcript_hash": "h" * 64,
                   "harbor_trial_dir": str(ws.jobs_dir / "runs" / tid / f"{spec.id}__interactive__1"), "attempt_index": 0}
     assert m["reward"]["outcome_code"] == 1 and m["simulator_validity"] == "unadjudicated" and m["training_eligible"] is False
@@ -395,9 +408,110 @@ def test_export_scenario_manifest(tmp_path):
                                 "questions_observed_by_policy": 1, "reviews_observed_by_policy": 0}
     f = json.loads((ws.root / "exports" / f"{full}.episode.json").read_text())
     assert f["simulator_validity"] == "n/a" and f["training_eligible"] is True and f["interaction"]["questions"] == 0
-    assert f["evaluator_only"]["reviewer_label"] is None and f["policy_visible"]["stakeholder_replies"] == [
-        {"step_id": 2, "ts": "2026-09-13T10:00:05Z", "shim": "ask-user", "command": "ask-user 'Which exception should be raised?'",
-         "observation": "ValueError.\n[availability remaining: 5]"}]  # shared fixture trajectory; full condition has no shim
+    # full condition has no stakeholder: nothing is exported as a reply even though the shared fixture trajectory
+    # contains an ask-user command, and the policy-observed counters stay 0
+    assert f["evaluator_only"]["reviewer_label"] is None and f["policy_visible"]["stakeholder_replies"] == []
+    assert f["interaction"]["questions_observed_by_policy"] == 0 and f["interaction"]["reviews_observed_by_policy"] == 0
+
+
+NOISY_TRAJ = {"steps": [
+    {"step_id": 1, "timestamp": "2026-09-13T10:00:00Z", "source": "user", "message": "ask-user is available."},
+    {"step_id": 2, "timestamp": "2026-09-13T10:00:01Z", "source": "agent", "message": "inspect",
+     "tool_calls": [{"tool_call_id": "a", "function_name": "bash", "arguments": {"command": "cat /usr/local/bin/ask-user"}}],
+     "observation": {"results": [{"source_call_id": "a", "content": "#!/bin/sh\ncurl ..."}]}},
+    {"step_id": 3, "timestamp": "2026-09-13T10:00:02Z", "source": "agent", "message": "grep",
+     "tool_calls": [{"tool_call_id": "b", "function_name": "bash", "arguments": {"command": "grep -rn request-review README.md"}}],
+     "observation": {"results": [{"source_call_id": "b", "content": "README.md:3: run request-review"}]}},
+    {"step_id": 4, "timestamp": "2026-09-13T10:00:03Z", "source": "agent", "message": "help",
+     "tool_calls": [{"tool_call_id": "c", "function_name": "bash", "arguments": {"command": "ask-user --help"}}],
+     "observation": {"results": [{"source_call_id": "c", "content": "usage: ask-user QUESTION"}]}},
+    {"step_id": 5, "timestamp": "2026-09-13T10:00:04Z", "source": "agent", "message": "ask",
+     "tool_calls": [{"tool_call_id": "d", "function_name": "bash", "arguments": {"command": "cd /app && ask-user 'Which exception?'"}}],
+     "observation": {"results": [{"source_call_id": "d", "content": "ValueError.\n[availability remaining: 5]"}]}},
+    {"step_id": 6, "timestamp": "2026-09-13T10:00:05Z", "source": "agent", "message": "review",
+     "tool_calls": [{"tool_call_id": "e", "function_name": "bash", "arguments": {"command": "/usr/local/bin/request-review"}}],
+     "observation": {"results": [{"source_call_id": "e", "content": "Looks right.\n[availability remaining: 3]"}]}},
+    {"step_id": 7, "timestamp": "2026-09-13T10:00:06Z", "source": "agent", "message": "mention only",
+     "tool_calls": [{"tool_call_id": "f", "function_name": "bash", "arguments": {"command": "echo 'call ask-user later'; ls ask-user-notes"}}],
+     "observation": {"results": [{"source_call_id": "f", "content": "call ask-user later"}]}},
+]}
+
+
+def test_shim_detection_is_anchored_to_the_command_token():
+    from swesim.stages.export import delivered_replies, shim_invocation
+    for cmd in ("cat /usr/local/bin/ask-user", "grep -rn request-review README.md", "ask-user --help", "ask-user -h",
+                "echo 'call ask-user later'", "ls ask-user-notes", "ask-userx q", "", "  "):
+        assert shim_invocation(cmd) is None, cmd
+    assert shim_invocation("ask-user 'Which exception?'") == "ask-user"
+    assert shim_invocation("cd /app && ask-user 'q'") == "ask-user"
+    assert shim_invocation("/usr/local/bin/request-review") == "request-review"
+    assert shim_invocation("ask-user") == "ask-user" and shim_invocation("request-review; ls") == "request-review"
+    replies = delivered_replies(NOISY_TRAJ)
+    assert [(r["step_id"], r["shim"]) for r in replies] == [(5, "ask-user"), (6, "request-review")]
+    assert replies[0]["observation"] == "ValueError.\n[availability remaining: 5]" and replies[1]["observation"].startswith("Looks right.")
+    assert delivered_replies({}) == [] and delivered_replies({"steps": [{"source": "user", "message": "ask-user q"}]}) == []
+
+
+def test_export_counts_only_real_shim_invocations_and_only_when_interactive(tmp_path):
+    spec = make_spec()
+    ws = make_workspace(tmp_path, spec)
+    inter = write_trial(ws, spec, condition="interactive", trajectory=NOISY_TRAJ, events=ask_events(T0 + 4, "Which exception?", "ValueError.", ["f01"], 5))
+    hidden = write_trial(ws, spec, condition="hidden", trajectory=NOISY_TRAJ)
+    export_scenario(ws, spec.id)
+    read = lambda t: json.loads((ws.root / "exports" / f"{t}.episode.json").read_text())
+    m = read(inter)
+    assert [r["step_id"] for r in m["policy_visible"]["stakeholder_replies"]] == [5, 6]
+    assert m["interaction"]["questions_observed_by_policy"] == 1 and m["interaction"]["reviews_observed_by_policy"] == 1
+    assert m["interaction"]["questions"] == 1  # service-side count reported alongside, not merged
+    hm = read(hidden)
+    assert hm["policy_visible"]["stakeholder_replies"] == [] and hm["interaction"]["questions_observed_by_policy"] == 0
+    assert hm["policy_visible"]["agent_trajectory"]["steps"][4]["message"] == "ask"  # trajectory itself is still exported
+
+
+def test_export_lineage_spec_hash_comes_from_record_and_flags_mismatch(tmp_path):
+    spec = make_spec()
+    ws = make_workspace(tmp_path, spec)
+    frozen = write_trial(ws, spec, condition="full", attempt=0)
+    fallback = write_trial(ws, spec, condition="full", attempt=1)
+    (ws.root / "trials" / fallback / "spec.json").unlink()  # no frozen spec: export must use scenario.json
+    changed = make_spec(with_author_only=True)  # scenario.json is now a newer version of the scenario
+    (ws.scenario_dir(spec.id) / "scenario.json").write_text(changed.model_dump_json())
+    export_scenario(ws, spec.id)
+    read = lambda t: json.loads((ws.root / "exports" / f"{t}.episode.json").read_text())
+    fz = read(frozen)
+    assert fz["lineage"]["spec_source"] == "trial-spec.json" and fz["lineage"]["spec_mismatch"] is False
+    assert fz["lineage"]["spec_hash"] == spec.spec_hash == fz["lineage"]["loaded_spec_hash"] and fz["training_eligible"] is True
+    fb = read(fallback)
+    assert fb["lineage"]["spec_hash"] == spec.spec_hash  # the record's hash, never the loaded spec's
+    assert fb["lineage"]["spec_source"] == "scenario.json" and fb["lineage"]["spec_mismatch"] is True
+    assert fb["lineage"]["loaded_spec_hash"] == changed.spec_hash and fb["training_eligible"] is False
+    assert fb["evaluator_only"]["author_only_fact_ids"] == ["f09"]  # what was actually loaded is visible, and flagged
+    # matching scenario.json: fallback without mismatch
+    (ws.scenario_dir(spec.id) / "scenario.json").write_text(spec.model_dump_json())
+    export_scenario(ws, spec.id)
+    assert read(fallback)["lineage"]["spec_mismatch"] is False and read(fallback)["training_eligible"] is True
+    # a record without a frozen spec hash cannot be exported
+    p = ws.root / "trials" / fallback / "record.json"
+    rec = json.loads(p.read_text())
+    rec.pop("spec_hash")
+    p.write_text(json.dumps(rec))
+    with pytest.raises(ValueError, match="lineage"):
+        export_scenario(ws, spec.id)
+
+
+def test_export_infrastructure_outcomes_are_never_training_eligible(tmp_path):
+    spec = make_spec()
+    ws = make_workspace(tmp_path, spec)
+    collection = write_trial(ws, spec, condition="full", attempt=0, outcome_code=5, success=0, reward=0.0)
+    simulator = write_trial(ws, spec, condition="hidden", attempt=0, outcome_code=6, success=0, reward=0.0)
+    evaluator = write_trial(ws, spec, condition="full", attempt=1, outcome_code=7, success=0, reward=0.0)
+    wrong = write_trial(ws, spec, condition="full", attempt=2, outcome_code=2, success=0, reward=0.0)
+    timeout = write_trial(ws, spec, condition="hidden", attempt=1, outcome_code=3, success=0, reward=0.0)
+    export_scenario(ws, spec.id)
+    read = lambda t: json.loads((ws.root / "exports" / f"{t}.episode.json").read_text())
+    for t in (collection, simulator, evaluator):
+        assert read(t)["training_eligible"] is False and read(t)["policy_visible"]["agent_trajectory"]["steps"]
+    assert read(wrong)["training_eligible"] is True and read(timeout)["training_eligible"] is True  # agent-attributable failures are signal
 
 
 def test_export_without_trajectory_or_binding_is_not_training_eligible(tmp_path):

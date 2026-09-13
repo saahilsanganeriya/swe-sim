@@ -253,3 +253,24 @@ def test_timestamps_read_from_status_then_record_with_flagged_fallback(site):
     body = c.get(f'/api/trial/{tid}/timeline').json()
     assert body['timeline'][-1]['actor'] == 'verifier' and body['timeline'][-1]['no_timestamp'] is True
     assert 'no timestamp' in c.get(f'/trial/{tid}').text
+
+
+def test_runs_page_tolerates_malformed_scores_files(site):
+    c, ws = site['client'], site['ws']
+    (ws.scenario_dir(site['spec'].id) / 'scores.json').write_text('[1, 2, 3]')  # not an object of groups
+    other = ws.root / 'scenarios' / 'broken-scenario'
+    other.mkdir(parents=True)
+    (other / 'scores.json').write_text('{not json')
+    mixed = ws.root / 'scenarios' / 'mixed-scenario'
+    mixed.mkdir(parents=True)
+    (mixed / 'scores.json').write_text(json.dumps({'interactive|withheld|r': {'condition': 'interactive', 'brief_profile': 'withheld',
+                                                                             'model': HAIKU, 'purpose': 'calibration', 'requested_k': 3,
+                                                                             'n_valid': 1, 'n_total': 1, 'success_count': 1,
+                                                                             'pass_at_k': None, 'pass_pow_k': None, 'mean_reward': 1.0,
+                                                                             'outcomes': {'valid-correct': 1}, 'trial_ids': ['a' * 24]},
+                                                   'garbage': 'not a group'}))
+    r = c.get('/')
+    assert r.status_code == 200
+    assert r.text.count('unreadable scores.json') == 2 and 'mixed-scenario' in r.text and 'valid-correct 1' in r.text
+    for tid in (site['done'], site['wrong'], site['full'], site['running']):
+        assert f'href="/trial/{tid}"' in r.text  # the trials table still renders
