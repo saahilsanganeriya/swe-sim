@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import dataclass
 
 from swesim.costs import Usage
@@ -75,6 +76,23 @@ def _openai_kwargs(name: str, temperature: float | None, max_tokens: int, effort
     return kwargs
 
 
+_THREAD = threading.local()
+
+
+def note_usage(usage: Usage) -> None:
+    """Record the usage of the call just made on this thread. `chat_json_with_usage` does this on every exit (a failed
+    call was billed too); a caller that only has the `chat_json` seam (judge.py, whose seam other suites replace) reads it
+    back with `take_last_usage` right after the call."""
+    _THREAD.usage = usage
+
+
+def take_last_usage() -> Usage | None:
+    """The usage recorded on this thread since the last take, then None until the next call records one."""
+    usage = getattr(_THREAD, "usage", None)
+    _THREAD.usage = None
+    return usage
+
+
 def _int(obj, name: str) -> int:
     return int(getattr(obj, name, 0) or 0)
 
@@ -138,8 +156,10 @@ def chat_json_with_usage(model_id: str, system: str, messages: list[dict], schem
             used = used + _anthropic_usage(r)
             text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
             if text.strip():
+                note_usage(used)
                 return ChatResult(_extract_json(text), used)
             last = f"stop_reason={r.stop_reason} blocks={[getattr(b, 'type', '?') for b in r.content]} thinking={a['thinking']['type']}"
+        note_usage(used)
         raise LLMError(f"no text block from {model_id}: {last}")
     from openai import OpenAI
     client = OpenAI(api_key=_secret("OPENAI_API_KEY", settings), timeout=120, max_retries=1)
@@ -150,8 +170,10 @@ def chat_json_with_usage(model_id: str, system: str, messages: list[dict], schem
         used = used + _openai_usage(r)
         text = r.choices[0].message.content or ""
         if text.strip():
+            note_usage(used)
             return ChatResult(_extract_json(text), used)
         last = f"finish_reason={r.choices[0].finish_reason} effort={effort}"
+    note_usage(used)
     raise LLMError(f"no text from {model_id}: {last}")
 
 
