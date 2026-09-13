@@ -76,11 +76,11 @@ tfvars: tf-init
 # Every plan/apply leaves its full output under EVIDENCE_DIR (terraform-plan-<UTC>.txt / terraform-apply-<UTC>.txt).
 plan:
 	mkdir -p $(EVIDENCE_DIR)
-	$(TF) plan -input=false -no-color $(TF_ARGS) 2>&1 | tee $(EVIDENCE_DIR)/terraform-plan-$$(date -u +%Y%m%dT%H%M%SZ).txt
+	set -euo pipefail; $(TF) plan -input=false -no-color $(TF_ARGS) 2>&1 | tee $(EVIDENCE_DIR)/terraform-plan-$$(date -u +%Y%m%dT%H%M%SZ).txt
 
 apply:
 	mkdir -p $(EVIDENCE_DIR)
-	$(TF) apply -input=false -auto-approve -no-color $(TF_ARGS) 2>&1 | tee $(EVIDENCE_DIR)/terraform-apply-$$(date -u +%Y%m%dT%H%M%SZ).txt
+	set -euo pipefail; $(TF) apply -input=false -auto-approve -no-color $(TF_ARGS) 2>&1 | tee $(EVIDENCE_DIR)/terraform-apply-$$(date -u +%Y%m%dT%H%M%SZ).txt
 	$(MAKE) outputs
 
 outputs:
@@ -104,14 +104,14 @@ build: require-project
 # The pinned digest is persisted in the git-ignored infra/image.auto.tfvars.json, so a later plain `make apply`
 # keeps the pools on that digest instead of silently reverting them to :latest.
 pin-image: require-project
-	digest=$$(bash scripts/cloud/build.sh $(PROJECT) $(REGION) $(SHA) | tail -n1); \
+	set -euo pipefail; digest=$$(bash scripts/cloud/build.sh $(PROJECT) $(REGION) $(SHA) | tail -n1); \
 	case "$$digest" in *@sha256:*) ;; *) echo "build did not yield a digest; not applying"; exit 1 ;; esac; \
 	printf '{"image": "%s"}\n' "$$digest" > infra/image.auto.tfvars.json; \
 	echo "pinned $$digest"
 
 open-executions:
 	mkdir -p $(EVIDENCE_DIR)
-	@report=$(EVIDENCE_DIR)/open-types-$$(date -u +%Y%m%dT%H%M%SZ).txt; \
+	@set -euo pipefail; report=$(EVIDENCE_DIR)/open-types-$$(date -u +%Y%m%dT%H%M%SZ).txt; \
 	$(UV) swesim workflows open-types > "$$report"; \
 	if [ -s "$$report" ]; then \
 	  cat "$$report"; \
@@ -152,7 +152,7 @@ cloud-bootstrap: require-project tf-init
 	$(MAKE) open-executions
 	$(MAKE) deploy-stakeholder
 	$(MAKE) tfvars
-	state=$$($(TF) state list); \
+	set -euo pipefail; state=$$($(TF) state list); \
 	if printf '%s\n' "$$state" | grep -q '^module\.run\['; then \
 	  echo "workloads already exist; preserving them during bootstrap"; \
 	else $(MAKE) apply TF_ARGS="-var deploy_workloads=false"; fi

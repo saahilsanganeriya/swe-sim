@@ -155,7 +155,7 @@ Notification channels are also operator configuration. An alert with an empty `n
 
 ## Historical VM fallback
 
-The preserved `scripts/vm/` backend uses systemd trial units and a local Temporal development server. Its old checks remain in ops as historical evidence. A deliberate fallback must keep `origin=vm-systemd`, preserve workflow/run ids and avoid mixing its trials with the hosted matrix. Do not redirect open Cloud workflows to a different namespace or queue as an improvised recovery step.
+The preserved `scripts/vm/` backend uses systemd trial units and a local Temporal development server. Its old checks remain in ops as historical evidence. A deliberate fallback must keep `origin=vm-systemd`, preserve workflow/run ids and avoid mixing its trials with the hosted matrix. Do not redirect open Cloud workflows to a different namespace or queue as an improvised recovery step. The VM's own update path is `scripts/vm/update.sh` (fast-forward only: `git pull --ff-only`, then a worker/dashboard restart; it never restarts the Temporal server or trial units).
 
 ## Acceptance checklist
 

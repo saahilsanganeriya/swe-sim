@@ -57,6 +57,15 @@ variable "iap_members" {
   type = list(string)
 }
 
+variable "iap_programmatic_clients" {
+  type    = list(string)
+  default = []
+}
+
+variable "iap_resource_name" {
+  type = string
+}
+
 variable "evaluators" {
   type = list(string)
 }

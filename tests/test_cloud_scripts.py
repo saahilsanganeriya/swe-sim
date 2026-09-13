@@ -171,6 +171,7 @@ def test_build_tfvars_has_the_terraform_inputs_and_no_secret(tmp_path: Path):
         "temporal_address": "region.gcp.api.temporal.io:7233", "temporal_namespace": "ns.abcde",
         "stakeholder_url": "https://stakeholder.example",
         "iap_members": ["user:op@example.com"], "evaluators": ["op@example.com"],
+        "iap_programmatic_clients": [],
         "github_repository": "acme/swesim",
     }
     assert not (set(doc) & SECRET_NAMES)
@@ -268,3 +269,24 @@ def test_local_deploy_checks_open_workflows_before_build(tmp_path: Path, overrid
     evidence = next((tmp_path / "evidence").glob("open-types-*.txt")).read_text()
     assert "TrialWorkflow\t1" in evidence
     assert ("Explicit operator override" in evidence) is override
+
+
+@pytest.mark.parametrize("target", ["apply", "open-executions"])
+def test_make_propagates_cloud_failures_with_legacy_make(tmp_path: Path, target: str):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name, body in {"gcloud": "exit 0", "terraform": "echo cloud-failed >&2; exit 7", "uv": "exit 9"}.items():
+        tool = fake / name
+        tool.write_text("#!/bin/bash\n" + body + "\n")
+        tool.chmod(0o755)
+    after = tmp_path / "after"
+    override = tmp_path / "override.mk"
+    override.write_text("outputs:\n\t@touch $(AFTER)\n")
+    root = SCRIPTS.parents[1]
+    result = subprocess.run(["make", "--no-print-directory", "-f", str(root / "Makefile"), "-f", str(override), target,
+                             "PROJECT=test", "UV=uv", "TF=terraform", f"PATH={fake}:/usr/bin:/bin", f"AFTER={after}",
+                             f"EVIDENCE_DIR={tmp_path / 'evidence'}",
+                             f"MAKE=make --no-print-directory -f {root / 'Makefile'} -f {override}"],
+                            cwd=root, capture_output=True, text=True)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not after.exists(), "a failed apply cannot continue as a successful deployment"

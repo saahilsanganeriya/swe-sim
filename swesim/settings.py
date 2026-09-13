@@ -56,6 +56,7 @@ ENV_VARS: tuple[EnvVar, ...] = (
     EnvVar(name="SWESIM_WORKER_SERVICE_ACCOUNT", purpose="Service account email the trial Jobs run as.", where="Terraform output `worker_service_account`."),
     EnvVar(name="SWESIM_SQL_CONNECTION_NAME", purpose="Cloud SQL connection mounted in trial and maintenance Jobs.", where="Terraform output `sql_connection_name`."),
     EnvVar(name="SWESIM_IAP_AUDIENCE", purpose="IAP JWT audience of the console service (/projects/<num>/locations/<region>/services/<name>); empty = no IAP.", where="Terraform output `iap_audience`."),
+    EnvVar(name="SWESIM_IAP_PROGRAMMATIC_CLIENTS", purpose="Optional comma-separated OAuth client IDs for authenticated console automation; IAP still checks user access.", where="Your OAuth client ID or the audience of your Google Cloud CLI identity token."),
     EnvVar(name="SWESIM_EVALUATORS", purpose="Comma list of Google account emails allowed to see evaluator-only material in the console.", where="Your own IAP-allowlisted accounts."),
     EnvVar(name="SWESIM_SPEND_CAP_USD", purpose="RunTasksWorkflow stops planning new trials when recorded spend exceeds this (USD)."),
     EnvVar(name="SWESIM_STAKEHOLDER_URL", purpose="Base URL of the stakeholder service deployed to Modal.", where="Printed by `bash scripts/deploy_stakeholder.sh`."),
@@ -97,6 +98,7 @@ class Settings(BaseModel):
     worker_service_account: str | None = None
     sql_connection_name: str | None = None
     iap_audience: str | None = None
+    iap_programmatic_clients: tuple[str, ...] = ()
     evaluators: frozenset[str] = frozenset()
     spend_cap_usd: Decimal | None = Field(default=None, ge=0)
     stakeholder_url: str = ""
@@ -152,6 +154,7 @@ class Settings(BaseModel):
             worker_service_account=env.get("SWESIM_WORKER_SERVICE_ACCOUNT") or None,
             sql_connection_name=env.get("SWESIM_SQL_CONNECTION_NAME") or None,
             iap_audience=env.get("SWESIM_IAP_AUDIENCE") or None,
+            iap_programmatic_clients=tuple(x.strip() for x in env.get("SWESIM_IAP_PROGRAMMATIC_CLIENTS", "").split(",") if x.strip()),
             evaluators=frozenset(e.strip().lower() for e in env.get("SWESIM_EVALUATORS", "").split(",") if e.strip()),
             spend_cap_usd=Decimal(env["SWESIM_SPEND_CAP_USD"]) if env.get("SWESIM_SPEND_CAP_USD") else None,
             stakeholder_url=env.get("SWESIM_STAKEHOLDER_URL", ""),

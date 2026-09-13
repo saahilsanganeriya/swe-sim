@@ -1719,17 +1719,24 @@ def test_update_script_contract():
     assert cp.stdout == "username=x-access-token\npassword=fake-token-value\n"
     # the refusal really triggers on an "ahead" status line (function-level check of the guard logic)
     doc = (ROOT / "docs/ops.md").read_text()
-    assert "scripts/vm/update.sh" in doc and "git pull --ff-only" in doc
+    # Cloud era: the VM path is the documented historical fallback; the runbook names the script and the deploy path
+    runbook = (ROOT / "docs/runbook.md").read_text()
+    assert "## Historical VM fallback" in runbook and "scripts/vm/update.sh" in runbook and "git pull --ff-only" in runbook
+    assert "## Deploy a commit" in runbook and "make deploy" in runbook
 
 
 def test_ops_doc_has_required_sections():
-    text = (ROOT / "docs/ops.md").read_text()
-    for section in ("## Topology", "## Deploy (VM)", "## Laptop-off acceptance test", "## Worker restart test", "## Model probe and fallbacks", "## Known failures and residuals", "## Manual retry lineage"):
+    """Cloud era: ops.md is the evidence ledger; the runbook is the procedure. Both keep the sections operators rely on and
+    the historical VM evidence stays labelled as such (brief §10: VM-era records are never pooled with hosted ones)."""
+    text = (ROOT / "docs/ops.md").read_text(); runbook = (ROOT / "docs/runbook.md").read_text()
+    for section in ("## Preserved record inventory", "## Outstanding hosted acceptance", "## Historical VM evidence",
+                    "## Historical failures and resulting fixes", "## Retry and evidence rules"):
         assert section in text, section
-    assert "workspace/evidence/ops.json" in text and "systemctl --user restart swesim-worker" in text and "swesim-trial-" in text
-    # Fix round 1, Important 4: the launch-count evidence must match systemd >= 250's "Started <unit>.service - <description>." line.
-    assert text.count("Started swesim-trial-") >= 2 and "Started swesim trial'" not in text and 'count("Started swesim trial")' not in text
-    assert "complete-with-failures" in text and "complete-no-trials" in text and "withholding-leak" in text
+    for section in ("## Deploy a commit", "## Diagnose a missing or stuck trial", "## Change capacity and test restart recovery",
+                    "## Import and rebuild the record", "## Historical VM fallback", "## Acceptance checklist"):
+        assert section in runbook, section
+    assert "26f3304d9caedfe10cd75ebf" in text and "systemd unit per trial" in text            # the measured VM restart proof, labelled historical
+    assert "swesim-trial-TRIAL_ID" in runbook and "origin=vm-systemd" in runbook               # one Job per trial; VM records keep their origin
 
 
 def _bash_functions(text, names):

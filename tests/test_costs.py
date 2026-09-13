@@ -45,16 +45,19 @@ def test_cost_of_prices_uncached_input_cached_input_and_output_separately():
 
 # ------------------------------------------------------------------ usage from the agent's artifacts
 
-def mini_traj(costs_per_call=(0.0011, 0.0012), or_costs=None, model="anthropic/claude-haiku-4-5-20251001"):
-    """A mini-swe-agent 2.4.6 trajectory shaped like workspace/jobs/runs/*/*/agent/mini-swe-agent.trajectory.json."""
+def mini_traj(costs_per_call=(0.0011, 0.0012), or_costs=None, model="anthropic/claude-haiku-4-5-20251001", served=None):
+    """A mini-swe-agent 2.4.6 trajectory shaped like workspace/jobs/runs/*/*/agent/mini-swe-agent.trajectory.json. `served`
+    names the upstream per call the way OpenRouter's top-level `provider` reaches the dumped litellm ModelResponse."""
     msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
     for i, c in enumerate(costs_per_call):
         usage = {"prompt_tokens": 1000 * (i + 1), "completion_tokens": 50, "total_tokens": 1000 * (i + 1) + 50,
                  "prompt_tokens_details": {"cached_tokens": 800 * i, "cache_creation_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 0}}
         if or_costs is not None:
             usage["cost"] = or_costs[i]
-        msgs.append({"role": "assistant", "content": "a", "extra": {"actions": [], "cost": c, "timestamp": 1.0,
-                                                                     "response": {"id": "x", "model": model.split("/", 1)[1], "usage": usage}}})
+        response = {"id": "x", "model": model.split("/", 1)[1], "usage": usage}
+        if served is not None and served[i] is not None:
+            response["provider"] = served[i]
+        msgs.append({"role": "assistant", "content": "a", "extra": {"actions": [], "cost": c, "timestamp": 1.0, "response": response}})
         msgs.append({"role": "tool", "content": "o", "extra": {"returncode": 0}})
     return {"info": {"model_stats": {"instance_cost": sum(costs_per_call), "api_calls": len(costs_per_call)},
                      "config": {"model": {"model_name": model}}, "exit_status": "Submitted", "submission": ""},
@@ -75,6 +78,49 @@ def test_solver_usage_prefers_openrouters_per_generation_cost_only_when_every_ca
     assert partial.reported_cost_usd is None and partial.reported_cost_source is None   # a sum over some calls would under-report
     free = costs.solver_usage_from_trajectory(mini_traj(or_costs=(0.0, 0.0)))
     assert free.reported_cost_usd == Decimal("0") and free.reported_cost_source == "openrouter-generation"   # a free model is a real zero
+
+
+def test_solver_usage_records_every_upstream_openrouter_names_in_the_response():
+    """OpenRouter's top-level `provider` survives litellm's ModelResponse dump (verified against litellm 1.100.1), so the
+    native trajectory says which upstream served each call; Anthropic/OpenAI responses name none."""
+    one = costs.solver_usage_from_trajectory(mini_traj(or_costs=(0.000012, 0.00002), served=("DeepInfra", "DeepInfra"), model="openrouter/deepseek/deepseek-v3.2"))
+    assert one.served_providers == ("DeepInfra",)
+    mixed = costs.solver_usage_from_trajectory(mini_traj(or_costs=(0.000012, 0.00002), served=("DeepInfra", "Fireworks")))
+    assert mixed.served_providers == ("DeepInfra", "Fireworks")                 # every upstream that served a call, first appearance first
+    partial = costs.solver_usage_from_trajectory(mini_traj(served=("DeepInfra", None)))
+    assert partial.served_providers == ("DeepInfra",)                           # a call without the field adds nothing, and hides nothing
+    assert costs.solver_usage_from_trajectory(mini_traj()).served_providers == ()
+    odd = costs.solver_usage_from_trajectory(mini_traj(served=("Google (Vertex), EU", 7)))
+    assert odd.served_providers == ("Google Vertex EU",)                        # names are made safe for the price-source detail; non-strings are ignored
+
+
+def test_usage_addition_merges_served_providers_without_duplicates():
+    a = costs.Usage(input_tokens=1, output_tokens=1, calls=1, served_providers=("DeepInfra",))
+    b = costs.Usage(input_tokens=1, output_tokens=1, calls=1, served_providers=("Fireworks", "DeepInfra"))
+    assert (a + b).served_providers == ("DeepInfra", "Fireworks") and (a + costs.Usage()).served_providers == ("DeepInfra",)
+    assert costs.Usage.model_validate({"input_tokens": 1, "output_tokens": 1}).served_providers == ()   # stakeholder usage payloads predate the field
+    assert "served_providers" not in costs.Usage(input_tokens=1).model_dump(mode="json")                  # and stay byte-identical when none is named
+    dumped = a.model_dump(mode="json")
+    assert dumped["served_providers"] == ["DeepInfra"] and costs.Usage.model_validate(dumped) == a
+
+
+def test_served_provider_is_surfaced_in_the_price_source_detail_and_parses_back(tmp_path):
+    ws = Workspace(tmp_path / "ws")
+    usage = costs.solver_usage_from_trajectory(mini_traj(or_costs=(0.000012, 0.00002), served=("DeepInfra", "DeepInfra")))
+    usd, source = costs.usd_for("openrouter/deepseek/deepseek-v3.2", usage)
+    assert usd == Decimal("0.000032") and source == "openrouter-generation (served by DeepInfra)"
+    assert costs.price_source_key(source) == "openrouter-generation" and costs.served_providers_of(source) == ("DeepInfra",)
+    rec = costs.record_cost(ws, "a" * 24, None, "solver", "openrouter/deepseek/deepseek-v3.2", usage, idempotency_key="solver-final")
+    assert rec.price_source == source and costs.price_source_key(rec.price_source) in costs.PRICE_SOURCES
+    assert costs.read_costs(ws.root / "trials" / ("a" * 24) / "costs.json")[0].price_source == source          # the detail reaches the ledger
+    # the catalog's default-route price is not necessarily the served upstream's price, so table-priced calls carry the detail too
+    table = costs.Usage(input_tokens=1000, output_tokens=100, served_providers=("Fireworks", "DeepInfra"))
+    _, src = costs.usd_for("openrouter/deepseek/deepseek-v3.2", table)
+    assert src == "openrouter-models-api (served by Fireworks, DeepInfra)" and costs.served_providers_of(src) == ("Fireworks", "DeepInfra")
+    # an unknown price stays the bare documented sentinel: knowing who served the call does not price it
+    assert costs.usd_for("openrouter/vendor/unlisted-model", costs.Usage(input_tokens=1, output_tokens=1, served_providers=("X",))) == (None, "unknown")
+    assert costs.price_source_key("unknown") == "unknown" and costs.served_providers_of("anthropic-pricing-page") == ()
+    assert costs.price_source_key("anthropic-pricing-page") == "anthropic-pricing-page"
 
 
 def test_solver_usage_reads_atif_final_metrics_and_harbor_agent_result():

@@ -95,6 +95,12 @@ async def _execute(layout, identifier: str, judge: Judge, *, trial: bool):
         raise
     if ledger is not None:
         summary = ledger.summary(retained_without_receipt=not written and audit.model is not None and not ledger.receipts())
+        if not written:
+            audit = audit.model_copy(update={**summary, "cost_recorded": True})
+            value = audit.model_dump(mode="json")
+            if json.loads(path.read_text()) != value:
+                atomic_json(path, value)
+            return audit, written
         audit = audit.model_copy(update={**summary, "cost_recorded": False})
         atomic_json(path, audit.model_dump(mode="json"))
         await blocking(ledger.replay)

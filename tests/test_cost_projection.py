@@ -42,3 +42,33 @@ def test_accounting_summary_is_a_known_total_and_rejects_missing_measurement_as_
     summary = costs.accounting_summary(ws)
     assert summary['known_usd'] == Decimal('0.006000') and summary['unpriced_rows'] == 1
     assert summary['unknown_usage_attempts'] == 1 and summary['complete'] is False and summary['records'] == 2
+
+
+def test_preserved_trial_without_solver_ledger_is_not_claimed_complete(tmp_path):
+    ws = Workspace(tmp_path)
+    atomic_json(ws.root / 'trials' / ('a' * 24) / 'record.json', {'model': 'openai/gpt-5.6-sol', 'status': 'completed', 'cost_usd': None})
+    assert costs.accounting_status(ws)['incomplete_solver_records'] == 1
+    assert costs.accounting_summary(ws)['complete'] is False
+
+
+def test_preserved_draft_without_accounting_is_not_claimed_free(tmp_path):
+    ws = Workspace(tmp_path)
+    atomic_json(ws.root / 'scenarios' / 'x' / 'draft.meta.json', {'model_id': 'openai/gpt-5.6-sol', 'usage': {'recorded': False}})
+    assert costs.accounting_status(ws)['incomplete_draft_records'] == 1
+    assert costs.accounting_summary(ws)['complete'] is False
+
+
+def test_legacy_record_without_ledger_is_incomplete_never_zero_spend(tmp_path):
+    """A VM-era record.json that names a model and carries `cost_usd: 0.0`, with no costs.json and no accounting identity:
+    the summary's known total covers only what ledgers prove and the workspace is explicitly incomplete, so no reader
+    may present the legacy trial as a measured $0. (Interfaces section 6: unknown is never recorded as zero.)"""
+    ws = Workspace(tmp_path)
+    atomic_json(ws.root / 'trials' / ('b' * 24) / 'record.json',
+                {'model': 'anthropic/claude-haiku-4-5-20251001', 'status': 'completed', 'cost_usd': 0.0, 'price_source': None})
+    summary = costs.accounting_summary(ws)
+    assert summary['known_usd'] == Decimal(0) and summary['records'] == 0 and summary['unpriced_rows'] == 0
+    assert summary['complete'] is False
+    status = costs.accounting_status(ws)
+    assert status['incomplete_solver_records'] == 1 and status['usage_complete'] is False
+    for key in ('known_usd', 'unpriced_rows', 'unknown_usage_attempts', 'complete'):
+        assert key in summary and key in costs.__doc__          # the documented contract names every field a reader needs
