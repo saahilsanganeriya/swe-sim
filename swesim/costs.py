@@ -23,9 +23,9 @@ import hashlib
 import json
 from collections.abc import Iterable
 from datetime import date, datetime, timezone
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Literal, TypedDict, get_args
 
 from pydantic import field_serializer
 from ulid import ULID
@@ -425,20 +425,61 @@ def accounting_status(layout: Any) -> dict:
                 record = json.loads(path.read_text())
                 if record.get('model') is not None or record.get('status') == 'pending':
                     incomplete_audits += not (record.get('usage_complete') is True and record.get('cost_recorded') is True)
-            except (OSError, ValueError, TypeError):
+            except (OSError, ValueError, TypeError, AttributeError):
                 unreadable += 1
         for path in (root / group).glob('*/audit-usage/*.json'):
             try:
-                unknown_calls += json.loads(path.read_text()).get('usage') is None
-            except (OSError, ValueError, TypeError):
+                receipt = json.loads(path.read_text())
+                unknown_calls += receipt.get('usage') is None or receipt.get('usage_complete') is False
+            except (OSError, ValueError, TypeError, AttributeError):
                 unreadable += 1
     for path in (root / 'trials').glob('*/costs.status.json'):
         try:
             for status in json.loads(path.read_text()).values():
                 unknown_calls += int(status.get('unknown_usage_count') or 0)
                 incomplete_stakeholders += status.get('usage_complete') is not True
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, AttributeError):
             unreadable += 1
     return {'unknown_usage_count': unknown_calls, 'incomplete_audits': incomplete_audits,
             'incomplete_stakeholder_records': incomplete_stakeholders, 'unreadable_accounting_records': unreadable,
             'usage_complete': not (unknown_calls or incomplete_audits or incomplete_stakeholders or unreadable)}
+
+
+class AccountingSummary(TypedDict):
+    known_usd: Decimal
+    unpriced_rows: int
+    unknown_usage_attempts: int
+    complete: bool
+    records: int
+    unreadable_cost_files: int
+
+
+def accounting_summary(layout: Any) -> AccountingSummary:
+    """Pure known-spend total and completeness across workflow/trial ledgers and unknown usage receipts."""
+    root = Path(getattr(getattr(layout, 'layout', layout), 'root'))
+    total = Decimal(0); unpriced = records = unreadable = 0
+    seen: set[str] = set()
+    for path in [*sorted((root / 'trials').glob('*/costs.json')), *sorted((root / 'costs').glob('*.json'))]:
+        try:
+            rows = json.loads(path.read_text())
+            if isinstance(rows, dict):
+                rows = rows['records']
+            if not isinstance(rows, list):
+                raise ValueError('cost ledger is not a list')
+            for index, row in enumerate(rows):
+                identity = str(row.get('cost_id') or f'{path}:{index}')
+                if identity in seen:
+                    continue
+                seen.add(identity); records += 1
+                if row.get('usd') is None:
+                    unpriced += 1
+                else:
+                    amount = Decimal(str(row['usd']))
+                    if not amount.is_finite():
+                        raise ValueError('nonfinite cost')
+                    total += amount
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, InvalidOperation):
+            unreadable += 1
+    status = accounting_status(layout)
+    return {'known_usd': total, 'unpriced_rows': unpriced, 'unknown_usage_attempts': status['unknown_usage_count'],
+            'complete': status['usage_complete'] and not (unpriced or unreadable), 'records': records, 'unreadable_cost_files': unreadable}

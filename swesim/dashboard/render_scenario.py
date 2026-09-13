@@ -100,6 +100,8 @@ def scenario_sections(d: dict, row, versions: list, trials_html: str, evaluator:
                  f"<span class='muted small'>audited {dash(ts.get('audited_at'))} by <span class='mono'>{dash(ts.get('model'))}</span></span></p>")
         if evaluator and isinstance(ts.get("reasons"), dict):
             sense += "<div data-evaluator-only><dl class='kv'>" + "".join(f"<dt>{h(k)}</dt><dd>{h(v)}</dd>" for k, v in ts["reasons"].items()) + "</dl></div>"
+        if ts.get("usage_complete") is not True or ts.get("cost_recorded") is not True:
+            sense += "<p class='notice'>Audit cost accounting is incomplete; missing usage remains unknown.</p>"
     else:
         sense = "<h2>Task sense</h2><p class='empty'>No audit labels yet; the task-sense audit writes <code>audit.json</code> after validation.</p>"
     # briefs

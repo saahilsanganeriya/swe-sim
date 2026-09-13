@@ -19,6 +19,7 @@ import json
 import re
 import shlex
 from datetime import datetime
+from typing import Literal
 
 from pydantic import ConfigDict, Field
 
@@ -133,7 +134,15 @@ class PatienceSummary(Label):
     sensible: bool
 
 
-class ScenarioAudit(Label):
+class Accounting(Label):
+    status: Literal["completed", "pending"] = "completed"
+    usage_complete: bool | None = None
+    unknown_usage_count: int = 0
+    usage_receipts: list[str] = Field(default_factory=list)
+    cost_recorded: bool | None = None
+
+
+class ScenarioAudit(Accounting):
     scenario_id: str
     spec_hash: str | None
     coherent: bool | None
@@ -147,7 +156,7 @@ class ScenarioAudit(Label):
     inputs_hash: str
 
 
-class TrialAudit(Label):
+class TrialAudit(Accounting):
     trial_id: str
     scenario_id: str | None
     spec_hash: str | None
