@@ -25,6 +25,17 @@ def read(path):
     if not p.is_file(): raise ValueError('missing '+str(p))
     return json.loads(p.read_text())
 def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+WSROOT=Path('workspace').resolve()
+def local(path):
+    # Recorded paths are absolute on the machine that produced them (the VM writes /opt/swesim/workspace/...). When the
+    # recorded path is absent here, re-root it onto this checkout's workspace (scripts/vm/pull.sh mirrors the record).
+    p=Path(path)
+    if p.exists(): return p
+    s=str(p); i=s.find('/workspace/')
+    if i>=0:
+        q=WSROOT/s[i+len('/workspace/'):]
+        if q.exists(): return q
+    return p
 def tests_by_id(report):
     rows=report.get('per_test',[])
     if len({r['id'] for r in rows})!=len(rows): raise ValueError('duplicate test evidence')
@@ -53,7 +64,7 @@ def check_validation(path):
     ok,why=evaluate_controls(v['controls'],spec.controls.model_dump()); assert ok,why
     assert v['probe']['raw'] and not v['probe']['gold_hits']
     for name, td in v['trial_dirs'].items():
-        td=Path(td); raw=read(td/'result.json'); r=read(td/'verifier/reward.json'); report=read(td/'verifier/report.json')
+        td=local(td); raw=read(td/'result.json'); r=read(td/'verifier/reward.json'); report=read(td/'verifier/report.json')
         assert reward_ok(r) and r['outcome_code'] in {1,2,3,4}
         assert not raw.get('exception_info'),name+' did not execute cleanly'
         if name=='oracle': assert r['success']==r['reward']==1 and tests_by_id(report)==v['expected_gold']
@@ -61,7 +72,7 @@ def check_validation(path):
         # The job config, rather than folder spelling, establishes the environment provider.
         cfg=read(td/'config.json'); assert cfg.get('environment',{}).get('type')=='modal',name+' not Modal'
     for c in ('full','hidden','interactive'):
-        task=Path(comp['task_dirs'][c]); t=tomllib.loads((task/'task.toml').read_text())
+        task=local(comp['task_dirs'][c]); t=tomllib.loads((task/'task.toml').read_text())
         assert t['environment']['network_mode']=='allowlist' and t['agent']['network_mode']=='allowlist'
         assert t['verifier']['network_mode']=='no-network' and t['verifier']['environment_mode']=='separate'
         assert t['agent']['user']=='agent' and t['verifier']['collect'][0]['user']=='root'
@@ -104,7 +115,7 @@ def check_interactive(r,d):
     qs=[e for e in t['events'] if e.get('kind')=='message' and e.get('role')=='user' and e.get('exchange')=='ask']
     replies=[e for e in t['events'] if e.get('kind')=='message' and e.get('role')=='assistant']
     assert qs and any(a.get('request_id')==q.get('request_id') and a.get('content') for a in replies for q in qs)
-    trajectory=read(Path(r['trial_dir'])/'agent/trajectory.json'); assert trajectory.get('steps')
+    trajectory=read(local(r['trial_dir'])/'agent/trajectory.json'); assert trajectory.get('steps')
     assert r['status']=='completed'
 if N>=5:
     matches=[]

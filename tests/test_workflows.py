@@ -1599,3 +1599,15 @@ def test_create_pr_kind_reaches_the_mine_activity_params(monkeypatch):
     params, errors = console.validate_create({**body, "pr_kind": "feature"})
     assert errors == [] and console.create_sources(params)[0]["pr_kind"] == "feature"
     assert console.validate_create({**body, "pr_kind": "docs"})[1] == ["pr_kind must be bugfix or feature"]
+
+
+def test_connect_kwargs_falls_back_to_the_env_file_for_temporal_keys(tmp_path, monkeypatch):
+    """The CLI submits from a shell that has no TEMPORAL_* exported; the values come from the dotenv file (never exported)."""
+    from swesim.workflows import client as C
+    envf = tmp_path / ".env"; envf.write_text("TEMPORAL_ADDRESS=x.gcp.api.temporal.io:7233\nTEMPORAL_NAMESPACE=ns.acct\nTEMPORAL_API_KEY=tmprl_from_file\nOTHER=ignored\n")
+    for k in C.TEMPORAL_KEYS: monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("SWESIM_ENV_FILE", str(envf))
+    kw = C.connect_kwargs()
+    assert kw["target_host"] == "x.gcp.api.temporal.io:7233" and kw["namespace"] == "ns.acct" and kw["api_key"] == "tmprl_from_file" and kw["tls"] is True
+    monkeypatch.setenv("TEMPORAL_ADDRESS", "localhost:7233"); monkeypatch.setenv("TEMPORAL_NAMESPACE", "default")
+    assert C.connect_kwargs() == {"target_host": "localhost:7233", "namespace": "default"}   # process env wins; no key -> plain

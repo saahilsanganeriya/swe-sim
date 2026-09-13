@@ -16,11 +16,31 @@ TYPES = {"create": "CreateTasksWorkflow", "candidate": "CandidateWorkflow", "run
 REJECT_DUP = WorkflowIDReusePolicy.REJECT_DUPLICATE
 
 
+TEMPORAL_KEYS = ("TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE", "TEMPORAL_API_KEY", "TEMPORAL_TLS_CERT", "TEMPORAL_TLS_KEY")
+
+
+def _connection_env() -> dict:
+    """Process environment first; for the Temporal keys only, fall back to the python-dotenv file named by SWESIM_ENV_FILE
+    (default ~/Documents/.env, becoming ./.env), so the CLI reaches the same namespace as the worker without exporting anything."""
+    e = dict(os.environ)
+    if not all(k in e for k in ("TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE")):
+        try:
+            from dotenv import dotenv_values
+            path = Path(os.environ.get("SWESIM_ENV_FILE", str(Path.home() / "Documents" / ".env")))
+            if path.is_file():
+                for k, v in dotenv_values(path).items():
+                    if k in TEMPORAL_KEYS and v and k not in e:
+                        e[k] = v
+        except ImportError:  # dotenv is a project dependency; keep the client importable without it
+            pass
+    return e
+
+
 def connect_kwargs(env: dict | None = None) -> dict:
     """Connection settings from the environment. Local dev server by default; Temporal Cloud with `TEMPORAL_API_KEY` (TLS on,
     address like `us-central1.gcp.api.temporal.io:7233`, namespace like `swesim.abcde`) or mTLS with `TEMPORAL_TLS_CERT` /
     `TEMPORAL_TLS_KEY` (PEM file paths). The key value never appears in logs: `describe_connection` reports only the mode."""
-    e = os.environ if env is None else env
+    e = _connection_env() if env is None else env
     kw: dict = {"target_host": e.get("TEMPORAL_ADDRESS", "localhost:7233"), "namespace": e.get("TEMPORAL_NAMESPACE", "default")}
     if e.get("TEMPORAL_API_KEY"):
         # Temporal Cloud regional endpoints route by this header; measured 2026-09-13: without it the same key is "Request unauthorized".
