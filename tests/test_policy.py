@@ -1,4 +1,4 @@
-import io, os, tarfile, pathlib, shutil
+import io, os, tarfile, shutil
 import pytest
 from swesim.verifier import policy
 
