@@ -76,9 +76,9 @@ def test_review_records_sha_and_unverified_tool_call():
     ev = [e for e in s.events if e["kind"] == "message"]
     assert ev[0]["role"] == "user" and ev[0]["exchange"] == "review" and ev[1]["role"] == "assistant"
     assert ev[1]["reviewed_diff_sha256"] == r.reviewed_diff_sha256 and ev[1]["tool_calls"] == r.tool_calls
-    # Public reply shape: no fact annotations, no tool audit; sha only for reviews.
-    assert set(r.public()) == {"reply", "patience_remaining", "tier", "reviewed_diff_sha256"}
-    a = asyncio.run(s.ask("q1", "Which exception?", llm)); assert set(a.public()) == {"reply", "patience_remaining", "tier"}
+    # Public reply shape: no fact annotations, no tool audit, no tier (A-P1-3); sha only for reviews.
+    assert set(r.public()) == {"reply", "patience_remaining", "reviewed_diff_sha256"}
+    a = asyncio.run(s.ask("q1", "Which exception?", llm)); assert set(a.public()) == {"reply", "patience_remaining"}
     with pytest.raises(ValueError): asyncio.run(s.review("v2", "x" * 200_001, {}, llm))
     with pytest.raises(ValueError): asyncio.run(s.review("v3", diff, {}, llm, tools=object()))   # checks review deferred
 
@@ -236,7 +236,7 @@ def test_forbidden_reply_is_regenerated_then_redacted():
     assert r.regenerated is True and r.redaction_count == 1 and r.redacted_terms == ["Continuous", "Series"]   # "._setup on": no "(" so the literal does not fire
     assert r.withheld_sentences == ["I'd want the regression to cover calling Continuous()._setup on a boolean pandas Series and observing mapped output [1, 0, 0]."]
     for t in ("Continuous", "IntervalProperty", "_setup(", "Series"): assert t not in r.reply
-    assert set(r.public()) == {"reply", "patience_remaining", "tier"} and r.disclosed_fact_ids == ["f01"] and r.patience_remaining == 5
+    assert set(r.public()) == {"reply", "patience_remaining"} and r.disclosed_fact_ids == ["f01"] and r.patience_remaining == 5
     ev = [e for e in s.events if e["kind"] == "message" and e["role"] == "assistant"][0]
     assert ev["content"] == r.reply and ev["redacted_terms"] == r.redacted_terms and ev["redaction_count"] == 1 and ev["regenerated"] is True
     assert ev["withheld_sentences"] == r.withheld_sentences
@@ -332,7 +332,7 @@ def test_confirm_costs_review_cost_is_filtered_and_recorded_as_confirm():
     ev = [e for e in s.events if e["kind"] == "message"]
     assert ev[0]["exchange"] == "confirm" and ev[0]["role"] == "user" and ev[0]["content"].endswith("raised an error.") and "reviewed_diff_sha256" not in ev[0]
     assert ev[1]["exchange"] == "confirm" and set(ev[1]) >= {"disclosed_fact_ids", "tool_calls", "redacted_terms", "redaction_count", "regenerated", "withheld_sentences"}
-    assert ev[1]["tool_calls"] == [] and set(r.public()) == {"reply", "patience_remaining", "tier"}
+    assert ev[1]["tool_calls"] == [] and set(r.public()) == {"reply", "patience_remaining"}
     assert "do not name code" in llm.seen[0][1][-1]["content"]                    # confirmation framing precedes the description
     cached = asyncio.run(s.confirm("c1", "Boolean values now act like 0 and 1 on a continuous scale; before, plotting them raised an error.", llm))
     assert cached.reply == r.reply and llm.calls == 2
@@ -340,6 +340,61 @@ def test_confirm_costs_review_cost_is_filtered_and_recorded_as_confirm():
     with pytest.raises(Session.BadRequest): asyncio.run(s.confirm("c2", "x" * 4001, llm))
     with pytest.raises(Session.BadRequest): asyncio.run(s.confirm("c3", "   ", llm))
     assert llm.calls == 2 and s.remaining == 2
+
+
+def test_public_reply_never_exposes_the_patience_tier():
+    """A-P1-3 ruling: remaining patience is the availability signal and stays public; the tier is a worker-only annotation."""
+    s = Session("t1", VIEW, cfg(start=2, terse_below=2)); llm = FakeLLM()
+    r = asyncio.run(s.ask("q1", "Which exception?", llm))
+    assert r.tier == "terse" and "tier" not in r.public() and r.public()["patience_remaining"] == 1
+    refused = asyncio.run(Session("t2", VIEW, cfg(start=0, terse_below=0)).ask("q1", "x", llm))
+    assert refused.tier == "refused" and "tier" not in refused.public() and refused.public()["reply"] == REFUSAL
+    ev = [e for e in s.events if e["kind"] == "message" and e["role"] == "assistant"][0]
+    assert ev["tier"] == "terse"                                                        # the transcript keeps it for the evaluator
+    assert "tier" not in json.dumps(Reply(**s.cache["q1"]["reply"]).public())            # cached replies go through the same shape
+
+
+def test_confirm_rejects_code_looking_descriptions_without_spending():
+    """A-P1-4: confirm-behavior is a plain-language channel; fenced blocks, def/class/import lines, brace-heavy lines and diff
+    headers are rejected with a hint (422 at the service) before any model call."""
+    from swesim.stakeholder.session import looks_like_code
+    code_inputs = ["Now it works:\n```python\nx = 1\n```",
+                   "def _setup(self, data):\n    return data.astype(float)",
+                   "class Continuous:\n    pass",
+                   "import numpy as np\nnp.asarray(x, dtype=float)",
+                   "from seaborn._core import scales",
+                   "diff --git a/seaborn/_core/scales.py b/seaborn/_core/scales.py\n--- a/x\n+++ b/x",
+                   "@@ -351,2 +351,3 @@ class ContinuousBase\n+    vmin, vmax = map(float, axis.convert_units((vmin, vmax)))",
+                   "result = mapper(values)[0]; assert result == [1, 0, 0]",
+                   "    vmin, vmax = map(float, axis.convert_units((vmin, vmax)))"]
+    for text in code_inputs:
+        assert looks_like_code(text), text
+    prose = ["Boolean values now act like 0 and 1 on a continuous color scale; before, plotting them raised an error.",
+             "Before: passing color=[True, False] raised a TypeError. After: True draws as the high end of the scale (1) and False as the low end (0).",
+             "The exception message now names the missing dimension, e.g. \"dimension 'z' not found\".",
+             "Nothing else changed (the other scales behave exactly as before)."]
+    for text in prose:
+        assert looks_like_code(text) is None, text
+    s = Session("t1", VIEW_F, cfg(start=4, terse_below=1)); llm = SeqLLM(CLEAN)
+    for text in code_inputs:
+        with pytest.raises(Session.BadRequest) as ei:
+            asyncio.run(s.confirm("c1", text, llm))
+        assert "plain-language" in str(ei.value) and "code" in str(ei.value)
+    assert llm.calls == 0 and s.events == [] and s.cache == {} and s.remaining == 4
+    ok = asyncio.run(s.confirm("c2", prose[1], llm)); assert ok.reply == CLEAN and s.remaining == 2
+
+
+def test_identifier_hits_do_not_depend_on_option_letters():
+    """A-P1-4: naming a hidden-asset identifier is redacted whether or not the agent's request offered lettered options."""
+    view = {**VIEW, "forbidden_terms": ["IntervalProperty", "ContinuousBase"]}
+    reply = "Booleans should act like 0 and 1. Cast them in ContinuousBase before the scale sees them. Nothing else changes."
+    no_options = Session("t1", view, cfg(start=6, terse_below=0)); r1 = asyncio.run(no_options.ask("q1", "What should happen with booleans?", SeqLLM(reply)))
+    with_options = Session("t2", view, cfg(start=6, terse_below=0)); r2 = asyncio.run(with_options.ask("q1", "(a) cast early or (b) cast late?", SeqLLM(reply)))
+    for r in (r1, r2):
+        assert r.redacted_terms == ["ContinuousBase"] and "ContinuousBase" not in r.reply and r.reply.startswith("Booleans should act like 0 and 1. [withheld]")
+    # the letter filter is additive: a pick plus an identifier are both recorded
+    r3 = asyncio.run(Session("t3", view, cfg(start=6, terse_below=0)).ask("q1", "(a) cast early or (b) cast late?", SeqLLM("Go with (a): cast in ContinuousBase.")))
+    assert r3.redacted_terms == ["(a)", "ContinuousBase"] and r3.reply == "[withheld]"
 
 
 def test_diff_review_is_disabled_unless_review_mode_is_diff_only():

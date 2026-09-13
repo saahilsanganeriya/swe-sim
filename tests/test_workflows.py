@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+import contextlib
 import json
 import os
 import re
@@ -23,10 +24,29 @@ from temporalio.common import WorkflowIDReusePolicy
 
 from swesim.models import RunConfig, ScenarioSpec, minimal_spec_dict, trial_id
 from swesim.paths import Workspace, atomic_json
+from swesim.settings import QUEUES
 from swesim.workflows import activities as A
+from swesim.workflows import queues as Q
 from swesim.workflows import workflows as W
+from swesim.workflows.launchers import systemd as SYS
+from test_launchers import FakeSystemd
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def stamped(d: dict) -> dict:
+    """Every activity result carries the worker's image digest and origin (interfaces §3)."""
+    return {**d, "worker_image_digest": A.SETTINGS.worker_image_digest, "origin": A.SETTINGS.origin}
+
+
+@contextlib.asynccontextmanager
+async def workers(env, workflows, activities):
+    """One Worker per swesim queue: `act()` routes each activity to its queue, so every queue needs a poller (fakes everywhere)."""
+    from temporalio.worker import Worker  # noqa: PLC0415 - kept local so the offline tests import without a worker
+    async with contextlib.AsyncExitStack() as stack:
+        for q in QUEUES:
+            await stack.enter_async_context(Worker(env.client, task_queue=q, workflows=workflows, activities=activities))
+        yield
 BIG = {"candidates_path": "c", "judged_path": "j", "instance_ids": ["a"], "scenario_id": "aaa", "draft_path": "d",
        "status": "valid", "failures": [], "trials": [], "spec_hash": "h"}
 
@@ -36,7 +56,7 @@ BIG = {"candidates_path": "c", "judged_path": "j", "instance_ids": ["a"], "scena
 def test_approval_wait_none_is_success(monkeypatch):
     async def scenario():
         w = W.PipelineWorkflow(); calls = []
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             calls.append(name); return dict(BIG)
         async def wait(predicate, timeout):
             w.approve_spec({"scenario_id": "aaa", "spec_hash": "h"}); assert predicate(); return None
@@ -50,7 +70,7 @@ def test_approval_wait_none_is_success(monkeypatch):
 def test_auto_approval_never_waits_and_rejection_stops_validation(monkeypatch, approved):
     async def scenario():
         w = W.PipelineWorkflow(); calls = []
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             calls.append(name)
             if name == "auto_approve_activity":
                 return {"approved": approved, "spec_hash": "h", "reasons": [] if approved else ["gate rejected"]}
@@ -86,7 +106,7 @@ def test_matrix_uses_precomputed_distinct_model_ids(monkeypatch):
 def test_signal_mode_verifies_the_signalled_hash_and_times_out_cleanly(monkeypatch):
     async def scenario():
         w = W.PipelineWorkflow(); seen = {}
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             if name == "verify_approval_activity": seen.update(p)
             return dict(BIG)
         async def wait(predicate, timeout):
@@ -107,7 +127,7 @@ def test_signal_mode_verifies_the_signalled_hash_and_times_out_cleanly(monkeypat
 def test_unknown_approval_mode_fails_fast_instead_of_waiting(monkeypatch):
     from temporalio.exceptions import ApplicationError
     async def scenario():
-        async def act(name, p, minutes=10): raise AssertionError("no activity may run with an invalid approval mode")
+        async def act(name, p, minutes=10, **kw): raise AssertionError("no activity may run with an invalid approval mode")
         monkeypatch.setattr(W, "act", act)
         with pytest.raises(ApplicationError, match="approval_mode"): await W.PipelineWorkflow().run({"approval_mode": "atuo"})
     asyncio.run(scenario())
@@ -116,7 +136,7 @@ def test_unknown_approval_mode_fails_fast_instead_of_waiting(monkeypatch):
 def test_invalid_validation_skips_register_and_trials(monkeypatch):
     async def scenario():
         w = W.PipelineWorkflow(); calls = []
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             calls.append(name)
             if name == "auto_approve_activity": return {"approved": True, "spec_hash": "h", "reasons": []}
             if name == "validate_activity": return {"status": "invalid", "failures": ["oracle earned 0"]}
@@ -130,7 +150,7 @@ def test_invalid_validation_skips_register_and_trials(monkeypatch):
 def test_auto_rejection_for_withholding_leak_redrafts_once_then_moves_on(monkeypatch):
     async def scenario():
         w = W.PipelineWorkflow(); calls = []
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             calls.append((name, p.get("force", False)))
             if name == "auto_approve_activity": return {"approved": False, "spec_hash": "h", "reasons": ["withheld brief still contains excerpt of f01"]}
             if name == "judge_activity": return {"judged_path": "j", "instance_ids": ["a", "b", "c", "d"]}
@@ -155,7 +175,7 @@ def test_redraft_trigger_is_structured(monkeypatch, reasons, gate, redraft):
     # Fix round 1, Minor 7.
     async def scenario():
         w = W.PipelineWorkflow(); calls = []
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             calls.append(name)
             if name == "auto_approve_activity":
                 out = {"approved": False, "spec_hash": "h", "reasons": reasons}
@@ -172,7 +192,7 @@ def test_redraft_trigger_is_structured(monkeypatch, reasons, gate, redraft):
 def test_pipeline_result_counts_and_failure_status(monkeypatch):
     # Fix round 1, Minor 8.
     async def scenario():
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             if name == "judge_activity": return {"judged_path": "j", "instance_ids": ["a", "b", "c"]}
             if name == "draft_activity": return {"scenario_id": p["instance_id"], "draft_path": "d"}
             if name == "auto_approve_activity": return {"approved": p["scenario_id"] != "a", "spec_hash": "h", "reasons": ["judge did not accept"]}
@@ -192,7 +212,7 @@ def test_solver_unavailable_registers_but_launches_nothing(monkeypatch):
     # Fix round 1, Minor 9.
     async def scenario():
         w = W.PipelineWorkflow(); calls = []
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             calls.append(name)
             if name == "probe_models_activity":
                 return {"substitutions": {}, "solver_unavailable": ["openai/gpt-5.5"], "needs_human": ["solver model openai/gpt-5.5 unavailable; no silent substitution"]}
@@ -211,7 +231,7 @@ def test_solver_unavailable_registers_but_launches_nothing(monkeypatch):
 def test_probe_substitutions_flow_into_later_activities(monkeypatch):
     async def scenario():
         w = W.PipelineWorkflow(); seen = {}
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             if name == "probe_models_activity": return {"substitutions": {"judge_model": "anthropic/claude-sonnet-5"}}
             if name == "judge_activity": seen["judge_model"] = p.get("judge_model")
             if name == "auto_approve_activity": return {"approved": False, "spec_hash": "h", "reasons": ["x"]}
@@ -229,7 +249,7 @@ def test_matrix_records_duplicate_rejection_and_still_scores(monkeypatch):
         async def child(fn, p, **kw):
             if p["trial_id"] == "dup": raise WorkflowAlreadyStartedError("dup", "TrialWorkflow", run_id=None)
             return {"trial_id": p["trial_id"], "status": "completed"}
-        async def act(name, p, minutes=10): acts.append(name); return {}
+        async def act(name, p, minutes=10, **kw): acts.append(name); return {}
         monkeypatch.setattr(W.workflow, "execute_child_workflow", child); monkeypatch.setattr(W, "act", act)
         r = await W.RunMatrixWorkflow().run({"scenario_id": "aaa", "trials": [{"trial_id": "dup"}, {"trial_id": "ok"}]})
         assert [t["status"] for t in r["trials"]] == ["duplicate-rejected", "completed"]
@@ -240,13 +260,13 @@ def test_matrix_records_duplicate_rejection_and_still_scores(monkeypatch):
 def test_trial_workflow_launch_failure_is_swallowed_and_await_decides(monkeypatch):
     async def scenario():
         calls = []
-        async def act(name, p, minutes=10):
-            calls.append(name); raise RuntimeError("launch requires reconciliation")
-        async def execute_activity(name, p, **kw):
-            calls.append(name); return {"trial_id": p["trial_id"], "status": "launch-failed"}
-        monkeypatch.setattr(W, "act", act); monkeypatch.setattr(W.workflow, "execute_activity", execute_activity)
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, kw.get("retry")))
+            if name == "launch_trial_activity": raise RuntimeError("launch requires reconciliation")
+            return {"trial_id": p["trial_id"], "status": "launch-failed"}
+        monkeypatch.setattr(W, "act", act)
         w = W.TrialWorkflow(); r = await w.run({"trial_id": "t1"})
-        assert calls == ["launch_trial_activity", "await_trial_activity"] and r["status"] == "launch-failed"
+        assert calls == [("launch_trial_activity", W.retries.ONCE), ("await_trial_activity", W.retries.READ)] and r["status"] == "launch-failed"
         prog = w.progress()
         assert prog["stage"] == "done" and prog["trial_id"] == "t1" and prog["status"] == "launch-failed" and prog["launch"]["launched"] is False
     asyncio.run(scenario())
@@ -254,48 +274,18 @@ def test_trial_workflow_launch_failure_is_swallowed_and_await_decides(monkeypatc
 
 # ---------------------------------------------------------------- fixtures for activities
 
-SCRIPT_WRITE_RECORD = (
-    "import json,sys,pathlib,time\n"
-    "req=pathlib.Path(sys.argv[1]); p=json.loads(req.read_text()); d=req.parent\n"
-    "(d/'status.json').write_text(json.dumps({'status':'running','trial_id':p['trial_id']}))\n"
-    "time.sleep(0.2)\n"
-    "(d/'record.json').write_text(json.dumps({'trial_id':p['trial_id'],'status':'completed','reward':{'reward':1.0,'success':1}}))\n"
-    "(d/'status.json').write_text(json.dumps({'status':'completed','trial_id':p['trial_id']}))\n")
-
-
-class FakeSystemd:
-    """Fake `systemctl --user show` and `systemd-run --user`. Units live in .units."""
-    def __init__(self, run_returncode=0):
-        self.units: dict[str, dict] = {}; self.calls: list[list[str]] = []; self.run_returncode = run_returncode
-        self.systemctl_failure = None; self.systemctl_rc = 0; self.systemctl_stdout_override = None
-    def __call__(self, argv):
-        self.calls.append(list(argv))
-        if argv[0] == "systemctl":
-            if self.systemctl_failure: return subprocess.CompletedProcess(argv, 1, "", self.systemctl_failure)
-            unit = next(a for a in argv[3:] if not a.startswith("--"))
-            st = self.units.get(unit, {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "Result": "success"})
-            stdout = self.systemctl_stdout_override if self.systemctl_stdout_override is not None else "".join(f"{k}={v}\n" for k, v in st.items())
-            return subprocess.CompletedProcess(argv, self.systemctl_rc, stdout, "")
-        if argv[0] == "systemd-run":
-            unit = next(a for a in argv if a.startswith("--unit=")).split("=", 1)[1]
-            if self.run_returncode: return subprocess.CompletedProcess(argv, self.run_returncode, "", "Failed to start transient service unit")
-            self.units[unit] = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running", "Result": "success"}
-            return subprocess.CompletedProcess(argv, 0, "", f"Running as unit: {unit}\n")
-        raise AssertionError(f"unexpected command {argv}")
-
-
 @pytest.fixture
 def ws(tmp_path, monkeypatch):
     w = Workspace(tmp_path / "workspace", tmp_path / "registry.json")
-    monkeypatch.setattr(A, "WS", w); monkeypatch.setattr(A, "LAUNCHER", "systemd")
+    monkeypatch.setattr(A, "WS", w)
+    monkeypatch.setattr(A, "LAUNCHER", SYS.SystemdLauncher(workspace=w.root, registry_path=w.registry_path, env_file=tmp_path / "env", repo_root=tmp_path))
     monkeypatch.setattr(A, "POLL_SECONDS", 0.0); monkeypatch.setattr(A, "LAUNCH_GRACE_POLLS", 2)
-    monkeypatch.setattr(A, "REPO_ROOT", tmp_path)
     return w
 
 
 @pytest.fixture
 def systemd(monkeypatch):
-    fake = FakeSystemd(); monkeypatch.setattr(A, "RUN", fake); return fake
+    fake = FakeSystemd(); monkeypatch.setattr(SYS, "RUN", fake); return fake
 
 
 def frozen_scenario(ws: Workspace, sid="example-scenario", compiled_hash="c" * 64):
@@ -313,100 +303,30 @@ def trial_request(ws, spec, model="anthropic/claude-haiku-4-5-20251001", conditi
                 run_config=rc.model_dump(mode="json"), run_config_hash=rc.run_config_hash, attempt_index=attempt, stakeholder_url="https://stake.example")
 
 
-# ---------------------------------------------------------------- pure decision function
+# ---------------------------------------------------------------- launch once through the activities module (the launcher protocol itself: tests/test_launchers.py)
 
-def ev(**kw):
-    base = dict(has_record=False, has_runner_error=False, status=None, launch_phase=None, launch_returncode=None,
-                load_state="not-found", active_state="inactive", sub_state="dead")
-    base.update(kw); return A.TrialEvidence(**base)
-
-
-@pytest.mark.parametrize("evidence,decision", [
-    (ev(), "launch"),
-    (ev(has_record=True), "ingest"),
-    (ev(has_record=True, load_state="loaded", active_state="active", sub_state="running"), "ingest"),
-    (ev(status="completed"), "ingest"),
-    (ev(has_runner_error=True), "runner-error"),
-    (ev(load_state="loaded", active_state="active", sub_state="running"), "reconcile"),
-    (ev(load_state="loaded", active_state="failed", sub_state="failed"), "reconcile"),
-    (ev(load_state="loaded", active_state="active", sub_state="exited"), "reconcile"),
-    (ev(launch_phase="intent"), "unresolved"),
-    (ev(launch_phase="acknowledged", launch_returncode=0), "unresolved"),
-    (ev(status="running"), "unresolved"),
-    (ev(launch_phase="acknowledged", launch_returncode=1), "launch-failed"),
-    (ev(launch_phase="failed"), "launch-failed"),
-])
-def test_decide_launch(evidence, decision):
-    assert A.decide_launch(evidence) == decision
-
-
-def test_decision_never_launches_when_any_launch_evidence_exists():
-    for phase in ("intent", "acknowledged", "failed"):
-        for load in ("loaded", "not-found"):
-            assert A.decide_launch(ev(launch_phase=phase, load_state=load)) != "launch"
-
-
-# ---------------------------------------------------------------- launch once, then reconcile (fake systemd)
-
-def test_launch_once_then_reconcile_never_runs_systemd_run_twice(ws, systemd):
+def test_activities_launch_once_uses_the_configured_launcher_and_stamps(ws, systemd):
     spec = frozen_scenario(ws); p = trial_request(ws, spec)
     first = A.launch_once(p)
-    assert first["decision"] == "launch" and first["launched"] is True and first["unit"] == "swesim-trial-" + p["trial_id"]
-    runs = [c for c in systemd.calls if c[0] == "systemd-run"]
-    assert len(runs) == 1
-    argv = runs[0]
-    assert argv[:2] == ["systemd-run", "--user"] and f"--unit=swesim-trial-{p['trial_id']}" in argv and "--property=RemainAfterExit=yes" in argv
-    assert "--collect" not in argv                     # a failed unit must stay visible for reconciliation
+    assert first["decision"] == "launch" and first["launched"] is True and first["launcher"] == "systemd" and first["unit"] == "swesim-trial-" + p["trial_id"]
+    assert first["worker_image_digest"] == A.SETTINGS.worker_image_digest and first["origin"] == A.SETTINGS.origin
     launch = json.loads((ws.root / "trials" / p["trial_id"] / "launch.json").read_text())
-    assert launch["phase"] == "acknowledged" and launch["returncode"] == 0 and launch["launcher"] == "systemd"
-    request = json.loads((ws.root / "trials" / p["trial_id"] / "request.json").read_text())
-    assert request == p
-    second = A.launch_once(p)
-    assert second["decision"] == "reconcile" and second["launched"] is False
-    assert len([c for c in systemd.calls if c[0] == "systemd-run"]) == 1
+    assert launch["phase"] == "acknowledged" and launch["launcher"] == "systemd" and launch["origin"] == A.SETTINGS.origin
+    assert A.launch_once(p)["decision"] == "reconcile" and len([c for c in systemd.calls if c[0] == "systemd-run"]) == 1
+    assert A.trial_dir(p["trial_id"]) == ws.root / "trials" / p["trial_id"]
+    r = asyncio.run(A.launch_trial_activity({**p}))            # the activity wrapper stamps the result too
+    assert r["decision"] == "reconcile" and r["origin"] == A.SETTINGS.origin
 
 
-def test_launch_argv_carries_paths_only_never_secret_values(ws, systemd, monkeypatch):
-    # Fake values deliberately do not match real credential prefixes (verify.sh scans tracked files for those).
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-anthropic-value-123456"); monkeypatch.setenv("SWESIM_WORKER_SECRET", "fake-worker-secret-xyz")
-    monkeypatch.setenv("GH_TOKEN", "fake-github-token-value"); monkeypatch.setenv("SWESIM_ENV_FILE", str(ws.root.parent / "env"))
-    spec = frozen_scenario(ws); p = trial_request(ws, spec); A.launch_once(p)
-    argv = next(c for c in systemd.calls if c[0] == "systemd-run"); joined = " ".join(argv)
-    for secret in ("fake-anthropic-value-123456", "fake-worker-secret-xyz", "fake-github-token-value"):
-        assert secret not in joined
-    assert f"--setenv=SWESIM_ENV_FILE={ws.root.parent / 'env'}" in argv and f"--setenv=SWESIM_WORKSPACE={ws.root}" in argv
-    # the command inside the unit is the trial runner module with the request path, no inline code
-    assert "-m" in argv and "swesim.workflows.activities" in argv and argv[-1].endswith("request.json") and "-c" not in argv
-
-
-def test_launch_failure_is_recorded_and_raised_not_retried(ws, monkeypatch):
-    fake = FakeSystemd(run_returncode=1); monkeypatch.setattr(A, "RUN", fake)
-    spec = frozen_scenario(ws); p = trial_request(ws, spec)
-    with pytest.raises(A.LaunchFailed): A.launch_once(p)
-    launch = json.loads((ws.root / "trials" / p["trial_id"] / "launch.json").read_text())
-    assert launch["phase"] == "acknowledged" and launch["returncode"] == 1 and "Failed" in launch["stderr"]
-    # a second call reconciles the failed launch rather than launching again
-    assert A.launch_once(p)["decision"] == "launch-failed" and len([c for c in fake.calls if c[0] == "systemd-run"]) == 1
-
-
-def test_launch_intent_without_unit_is_unresolved_never_relaunched(ws, systemd):
-    spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]
-    atomic_json(d / "request.json", p); atomic_json(d / "launch.json", {"trial_id": p["trial_id"], "unit": "swesim-trial-" + p["trial_id"], "phase": "intent", "launcher": "systemd"})
-    r = A.launch_once(p)
-    assert r["decision"] == "unresolved" and not [c for c in systemd.calls if c[0] == "systemd-run"]
-
-
-def test_request_binding_conflict_is_rejected(ws, systemd):
+def test_activity_wrapper_turns_value_errors_into_non_retryable_failures(ws, systemd):
+    from temporalio.exceptions import ApplicationError
     spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]
     atomic_json(d / "request.json", {**p, "model": "someone-else"})
-    with pytest.raises(A.TrialBindingConflict): A.launch_once(p)
-    assert not [c for c in systemd.calls if c[0] == "systemd-run"]
-
-
-def test_existing_record_is_ingested_without_launch(ws, systemd):
-    spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]
-    atomic_json(d / "record.json", {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 0.5, "success": 0}})
-    assert A.launch_once(p)["decision"] == "ingest" and not [c for c in systemd.calls if c[0] == "systemd-run"]
+    with pytest.raises(ApplicationError) as info: asyncio.run(A.launch_trial_activity(p))
+    assert info.value.non_retryable is True and info.value.type == "TrialBindingConflict"
+    # infrastructure failures stay retryable (a RuntimeError subclass propagates unchanged)
+    systemd.systemctl_failure = "Failed to connect to bus"; atomic_json(d / "request.json", p)
+    with pytest.raises(A.UnitStateUnavailable): asyncio.run(A.launch_trial_activity(p))
 
 
 # ---------------------------------------------------------------- await_trial_activity outcomes
@@ -415,7 +335,7 @@ def test_await_returns_record_when_present(ws, systemd):
     spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]
     atomic_json(d / "record.json", {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}})
     r = asyncio.run(A.await_trial_activity(p))
-    assert r == {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}}
+    assert r == stamped({"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}})
 
 
 def test_await_reports_runner_error_launch_failed_and_unresolved(ws, systemd):
@@ -505,20 +425,37 @@ def test_await_tolerates_a_partially_written_record_while_the_unit_runs(ws, syst
     assert r2["status"] == "unknown" and "record.json unreadable" in r2["reason"] and r2["reward"] == {}
 
 
-def test_systemctl_failure_is_retryable_error_not_unit_gone(ws, systemd):
+def test_await_systemctl_failure_is_retryable_error_not_unit_gone(ws, systemd):
     # Fix round 1, Important 2: a failing systemctl must never read as "unit not found".
     spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]; unit = "swesim-trial-" + p["trial_id"]
     atomic_json(d / "launch.json", {"trial_id": p["trial_id"], "unit": unit, "phase": "acknowledged", "returncode": 0, "launcher": "systemd"})
     systemd.systemctl_failure = "Failed to connect to bus: No medium found"
     with pytest.raises(A.UnitStateUnavailable, match="Failed to connect to bus"): A.read_evidence(p["trial_id"])
     with pytest.raises(A.UnitStateUnavailable): asyncio.run(A.await_trial_activity(p))
-    with pytest.raises(A.UnitStateUnavailable): A.launch_once(p)      # launch never guesses either
     assert not [c for c in systemd.calls if c[0] == "systemd-run"]
-    systemd.systemctl_failure = None
-    systemd.systemctl_rc = 1                                          # nonzero exit but an explicit not-found is trusted
-    assert A.systemd_unit_state(unit)["load_state"] == "not-found"
-    systemd.systemctl_rc = 0; systemd.systemctl_stdout_override = "Result=success\n"
-    with pytest.raises(A.UnitStateUnavailable): A.systemd_unit_state(unit)   # LoadState missing from the output
+
+
+def test_await_launch_by_another_runtime_is_unresolved_not_relaunched(ws, systemd):
+    # A VM-era record (launcher systemd) read by a worker configured for another launcher: reconcile by hand, never relaunch.
+    spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]
+    atomic_json(d / "launch.json", {"trial_id": p["trial_id"], "phase": "acknowledged", "returncode": 0, "launcher": "cloudrun", "handle": "swesim-trial-x"})
+    r = asyncio.run(A.await_trial_activity(p))
+    assert r["status"] == "unresolved" and "cannot be seen" in r["reason"] and "launched by cloudrun" in r["runtime"]
+    assert A.launch_once(p)["decision"] == "reconcile" and not [c for c in systemd.calls if c[0] == "systemd-run"]
+
+
+def test_cancel_and_cleanup_activities_follow_the_evidence(ws, systemd):
+    spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]; unit = "swesim-trial-" + p["trial_id"]
+    assert asyncio.run(A.cancel_trial_activity(p))["cancelled"] is False                       # nothing launched: nothing to stop
+    A.launch_once(p)
+    r = asyncio.run(A.cleanup_trial_activity(p))
+    assert r["cleaned"] is False and "decision=reconcile" in r["reason"] and "runtime=running" in r["reason"]   # the runtime is still the evidence
+    c = asyncio.run(A.cancel_trial_activity(p))
+    assert c["cancelled"] is True and c["launcher"] == "systemd" and c["handle"] == unit and ["systemctl", "--user", "stop", unit] in systemd.calls
+    assert asyncio.run(A.cleanup_trial_activity(p))["cleaned"] is False                        # stopped without a record: still reconcile-by-hand evidence
+    atomic_json(d / "record.json", {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}})
+    done = asyncio.run(A.cleanup_trial_activity(p))
+    assert done["cleaned"] is True and done["launcher"] == "systemd" and done["origin"] == A.SETTINGS.origin
 
 
 def test_register_activity_result_is_json_serializable(ws, monkeypatch):
@@ -527,21 +464,8 @@ def test_register_activity_result_is_json_serializable(ws, monkeypatch):
     def register_scenario(ws_, spec_): return {"id": spec_.id, "validation_path": Path("/x/validation.json"), "runs": [], "nested": {"p": Path("/y")}}
     monkeypatch.setitem(sys.modules, "swesim.stages.register", fake_module("swesim.stages.register", register_scenario=register_scenario))
     r = asyncio.run(A.register_activity({"scenario_id": spec.id}))
-    assert r == {"registry_entry": {"id": spec.id, "validation_path": "/x/validation.json", "runs": [], "nested": {"p": "/y"}}}
+    assert r == stamped({"registry_entry": {"id": spec.id, "validation_path": "/x/validation.json", "runs": [], "nested": {"p": "/y"}}})
     json.dumps(r)
-
-
-# ---------------------------------------------------------------- subprocess launcher (non-production local smoke)
-
-def test_subprocess_launcher_end_to_end_and_reconcile(ws, monkeypatch):
-    monkeypatch.setattr(A, "LAUNCHER", "subprocess")
-    monkeypatch.setattr(A, "build_trial_command", lambda request_path: [sys.executable, "-c", SCRIPT_WRITE_RECORD, str(request_path)])
-    spec = frozen_scenario(ws); p = trial_request(ws, spec)
-    first = A.launch_once(p)
-    assert first["launched"] is True and json.loads((ws.root / "trials" / p["trial_id"] / "launch.json").read_text())["launcher"] == "subprocess"
-    r = asyncio.run(A.await_trial_activity(p))
-    assert r["status"] == "completed" and r["reward"]["success"] == 1
-    assert A.launch_once(p)["decision"] == "ingest"
 
 
 # ---------------------------------------------------------------- plan_trials, verify_approval, judge, probe
@@ -567,7 +491,7 @@ def test_plan_trials_distinct_ids_per_model_and_profile_rule(ws):
 def test_verify_approval_matches_frozen_spec_hash(ws):
     spec = frozen_scenario(ws)
     r = asyncio.run(A.verify_approval_activity({"scenario_id": spec.id, "spec_hash": spec.spec_hash}))
-    assert r == {"scenario_id": spec.id, "spec_hash": spec.spec_hash}
+    assert r == stamped({"scenario_id": spec.id, "spec_hash": spec.spec_hash})
     with pytest.raises(Exception, match="approval hash differs"): asyncio.run(A.verify_approval_activity({"scenario_id": spec.id, "spec_hash": "0" * 64}))
     (ws.scenario_dir(spec.id) / "approval.json").unlink()
     with pytest.raises(Exception, match="approval.json"): asyncio.run(A.verify_approval_activity({"scenario_id": spec.id, "spec_hash": spec.spec_hash}))
@@ -680,7 +604,7 @@ def test_plan_trials_carries_resolved_stakeholder_model_into_run_config(ws):
 def test_resolved_models_reach_judge_draft_and_plan_trials(monkeypatch):
     async def scenario():
         seen = {}
-        async def act(name, p, minutes=10):
+        async def act(name, p, minutes=10, **kw):
             if name == "probe_models_activity":
                 return {"resolved": {"judge_model": OPUS, "draft_model": SONNET, "stakeholder_model": SONNET}, "substitutions": {"judge_model": OPUS, "stakeholder_model": SONNET}, "needs_human": []}
             if name in ("judge_activity", "draft_activity", "plan_trials_activity"): seen[name] = {k: p.get(k) for k in ("judge_model", "draft_model", "stakeholder_model")}
@@ -736,26 +660,24 @@ def _run_in_env(scenario):
 def test_env_trial_workflow_rejects_duplicate_id_and_launches_once():
     from temporalio import activity
     from temporalio.exceptions import WorkflowAlreadyStartedError
-    from temporalio.worker import Worker
     launches = []
     @activity.defn(name="launch_trial_activity")
     async def launch(p): launches.append(p["trial_id"]); return {"trial_id": p["trial_id"], "unit": "swesim-trial-" + p["trial_id"], "decision": "launch", "launched": True}
     @activity.defn(name="await_trial_activity")
     async def collect(p): return {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}}
     async def scenario(env):
-        async with Worker(env.client, task_queue="swesim", workflows=[W.TrialWorkflow], activities=[launch, collect]):
+        async with workers(env, workflows=[W.TrialWorkflow], activities=[launch, collect]):
             tid = trial_id("s", "interactive", "r", 0)
-            r = await env.client.execute_workflow(W.TrialWorkflow.run, {"trial_id": tid}, id=tid, task_queue="swesim", id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE)
+            r = await env.client.execute_workflow(W.TrialWorkflow.run, {"trial_id": tid}, id=tid, task_queue=Q.AUTHORING, id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE)
             assert r["status"] == "completed" and launches == [tid]
             with pytest.raises(WorkflowAlreadyStartedError):
-                await env.client.start_workflow(W.TrialWorkflow.run, {"trial_id": tid}, id=tid, task_queue="swesim", id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE)
+                await env.client.start_workflow(W.TrialWorkflow.run, {"trial_id": tid}, id=tid, task_queue=Q.AUTHORING, id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE)
             assert launches == [tid]
     _run_in_env(scenario)
 
 
 def test_env_pipeline_signal_mode_waits_then_verifies_signalled_hash():
     from temporalio import activity
-    from temporalio.worker import Worker
     calls = []
     def fake(name, result):
         @activity.defn(name=name)
@@ -769,9 +691,9 @@ def test_env_pipeline_signal_mode_waits_then_verifies_signalled_hash():
             fake("register_activity", {"registry_entry": {}}), fake("plan_trials_activity", {"scenario_id": "a--1", "trials": []}),
             fake("score_activity", {"scores_path": "s"}), fake("export_activity", {"manifest_paths": []})]
     async def scenario(env):
-        async with Worker(env.client, task_queue="swesim", workflows=[W.PipelineWorkflow, W.TrialWorkflow], activities=acts):
+        async with workers(env, workflows=[W.PipelineWorkflow, W.TrialWorkflow], activities=acts):
             h = await env.client.start_workflow(W.PipelineWorkflow.run, {"approval_mode": "signal", "judge_model": "m", "draft_model": "m", "models": ["m"], "stakeholder_url": "https://s"},
-                                                id="pipeline-test", task_queue="swesim", id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE)
+                                                id="pipeline-test", task_queue=Q.AUTHORING, id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE)
             for _ in range(200):
                 state = await h.query(W.PipelineWorkflow.progress)
                 if state.get("stage") == "awaiting-approval": break
@@ -788,7 +710,6 @@ def test_env_pipeline_signal_mode_waits_then_verifies_signalled_hash():
 
 def test_env_matrix_runs_children_serially_with_trial_ids_then_scores():
     from temporalio import activity
-    from temporalio.worker import Worker
     order = []
     @activity.defn(name="launch_trial_activity")
     async def launch(p): order.append(("launch", p["trial_id"])); return {"launched": True}
@@ -800,27 +721,46 @@ def test_env_matrix_runs_children_serially_with_trial_ids_then_scores():
     async def export(p): order.append(("export", p["scenario_id"])); return {"manifest_paths": []}
     trials = [{"trial_id": trial_id("s", "hidden", "r", i), "scenario_id": "a--1"} for i in range(2)]
     async def scenario(env):
-        async with Worker(env.client, task_queue="swesim", workflows=[W.RunMatrixWorkflow, W.TrialWorkflow], activities=[launch, collect, score, export]):
-            r = await env.client.execute_workflow(W.RunMatrixWorkflow.run, {"scenario_id": "a--1", "trials": trials}, id="matrix-test", task_queue="swesim")
+        async with workers(env, workflows=[W.RunMatrixWorkflow, W.TrialWorkflow], activities=[launch, collect, score, export]):
+            r = await env.client.execute_workflow(W.RunMatrixWorkflow.run, {"scenario_id": "a--1", "trials": trials}, id="matrix-test", task_queue=Q.AUTHORING)
             assert [t["status"] for t in r["trials"]] == ["completed", "completed"]
             assert order == [("launch", trials[0]["trial_id"]), ("await", trials[0]["trial_id"]), ("launch", trials[1]["trial_id"]), ("await", trials[1]["trial_id"]), ("score", "a--1"), ("export", "a--1")]
             # Re-running the matrix cannot relaunch: the child ids are already used.
-            r2 = await env.client.execute_workflow(W.RunMatrixWorkflow.run, {"scenario_id": "a--1", "trials": trials}, id="matrix-test-2", task_queue="swesim")
+            r2 = await env.client.execute_workflow(W.RunMatrixWorkflow.run, {"scenario_id": "a--1", "trials": trials}, id="matrix-test-2", task_queue=Q.AUTHORING)
             assert [t["status"] for t in r2["trials"]] == ["duplicate-rejected", "duplicate-rejected"] and len([o for o in order if o[0] == "launch"]) == 2
     _run_in_env(scenario)
 
 
 # ---------------------------------------------------------------- worker and client surface
 
-def test_worker_registers_all_workflows_and_activities_serial_trials():
+def test_worker_registers_all_workflows_and_partitions_activities_by_queue(monkeypatch):
+    from temporalio import activity
+    from swesim.settings import Settings
     from swesim.workflows import worker as WK
-    assert WK.TASK_QUEUE == "swesim" and WK.MAX_CONCURRENT_ACTIVITIES >= 8   # 8 parallel validations; launches stay behind LAUNCH_SLOTS
-    names = {a.__name__ for a in A.ALL}
+    names = {WK.activity_name(a) for a in A.ALL}
     assert {"mine_activity", "judge_activity", "draft_activity", "auto_approve_activity", "verify_approval_activity", "compile_activity", "validate_activity",
             "register_activity", "plan_trials_activity", "launch_trial_activity", "await_trial_activity", "score_activity", "export_activity", "probe_models_activity",
             "list_candidates_activity", "judge_one_activity", "probe_candidate_activity", "precheck_draft_activity", "human_approve_activity"} <= names
     assert set(WK.WORKFLOWS) == {W.TrialWorkflow, W.RunMatrixWorkflow, W.PipelineWorkflow, W.CandidateWorkflow, W.CreateTasksWorkflow, W.RunTasksWorkflow}
     assert A.LAUNCH_SLOTS._value == 1                        # one launch at a time per worker
+    # activities are partitioned by queue: the union is everything registered, the parts are disjoint
+    parts = {q: {WK.activity_name(a) for a in WK.activities_for_queue(q)} for q in QUEUES}
+    assert set().union(*parts.values()) == names and sum(len(v) for v in parts.values()) == len(names)
+    assert {"launch_trial_activity", "await_trial_activity"} <= parts[Q.TRIALS] and {"compile_activity", "probe_candidate_activity"} <= parts[Q.BUILD]
+    assert "judge_one_activity" in parts[Q.AUTHORING] and parts[Q.CONTROL] <= {"record_cost_activity", "spend_check_activity"}
+    # optional streams' modules register when importable and are skipped when not
+    @activity.defn(name="index_trial_activity")
+    async def fake_index(p): return {}
+    monkeypatch.setitem(sys.modules, "swesim.index.activities", fake_module("swesim.index.activities", ALL=[fake_index]))
+    assert "index_trial_activity" in {WK.activity_name(a) for a in WK.activities_for_queue(Q.CONTROL)}
+    monkeypatch.delitem(sys.modules, "swesim.index.activities")
+    assert "index_trial_activity" not in {WK.activity_name(a) for a in WK.registered_activities()}
+    # concurrency: the per-queue default unless the pool overrides it; the startup line carries queues and digest, no secret
+    s = Settings.from_env({"SWESIM_TASK_QUEUE": "swesim-build,swesim-control", "SWESIM_WORKER_IMAGE_DIGEST": "sha256:abc", "TEMPORAL_API_KEY": "tmprl_x",
+                           "SWESIM_ENV_FILE": "/nonexistent/.env"})
+    assert WK.concurrency(s, Q.BUILD) == 8 and WK.concurrency(s.model_copy(update={"max_concurrent_activities": 3}), Q.BUILD) == 3
+    line = WK.startup_line(s)
+    assert "queues=swesim-build,swesim-control" in line and "worker_image_digest=sha256:abc" in line and "tmprl_x" not in line
 
 
 def test_client_ids_and_signal_payload(monkeypatch):
@@ -838,7 +778,7 @@ def test_client_ids_and_signal_payload(monkeypatch):
     async def connect(): return fc
     monkeypatch.setattr(C, "connect", connect)
     wid = asyncio.run(C.start_pipeline({"source": "github-repo"}))
-    assert wid.startswith("pipeline-") and fc.started[0][2]["id"] == wid and fc.started[0][2]["task_queue"] == "swesim"
+    assert wid.startswith("pipeline-") and fc.started[0][2]["id"] == wid and fc.started[0][2]["task_queue"] == Q.AUTHORING
     assert fc.started[0][2]["id_reuse_policy"] == WorkflowIDReusePolicy.REJECT_DUPLICATE
     asyncio.run(C.approve(wid, "a--1", "h"))
     assert fc.wids[-1] == wid and fc.handle.signals == [(W.PipelineWorkflow.approve_spec, {"scenario_id": "a--1", "spec_hash": "h"})]
@@ -941,7 +881,7 @@ def test_list_candidates_and_judge_one_per_candidate_files(ws, monkeypatch):
     cand = ws.candidates_dir / "github-repo--x__y.jsonl"; cand.parent.mkdir(parents=True)
     cand.write_text("".join(json.dumps({"instance_id": i, "repo": "x/y"}) + "\n" for i in ("a__1", "b__2", "c__3")))
     listed = asyncio.run(A.list_candidates_activity({"candidates_path": str(cand), "max_candidates": 2}))
-    assert listed == {"candidates": [{"instance_id": "a__1", "scenario_id": "a--1"}, {"instance_id": "b__2", "scenario_id": "b--2"}]}
+    assert listed == stamped({"candidates": [{"instance_id": "a__1", "scenario_id": "a--1"}, {"instance_id": "b__2", "scenario_id": "b--2"}]})
     j = asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "a__1", "judge_model": "jm"}))
     assert j["keep"] is True and j["scenario_id"] == "a--1" and j["judge_model"] == "jm" and Path(j["judged_path"]) == cand.parent / "judged" / "a--1.judged.jsonl"
     assert json.loads(Path(j["judged_path"]).read_text())["judge"]["keep"] is True
@@ -1041,12 +981,12 @@ def test_precheck_and_human_approve_activities(ws, monkeypatch):
     pre = asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id}))
     assert pre["ok"] is False and pre["reasons"] == ["withheld brief still contains excerpt of f01"] and pre["spec_hash"] == spec.spec_hash   # only leak gates pre-check
     gates["reasons"] = []
-    assert asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id})) == {"ok": True, "reasons": [], "scenario_id": spec.id, "spec_hash": spec.spec_hash}
+    assert asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id})) == stamped({"ok": True, "reasons": [], "scenario_id": spec.id, "spec_hash": spec.spec_hash})
     assert not (sdir / "approval.json").exists()                                     # pre-check writes nothing
     with pytest.raises(Exception, match="differs from the draft"): asyncio.run(A.human_approve_activity({"scenario_id": spec.id, "spec_hash": "0" * 64}))
     assert approvals == [] and not (sdir / "approval.json").exists()                 # a mismatched hash never approves
     r = asyncio.run(A.human_approve_activity({"scenario_id": spec.id, "spec_hash": spec.spec_hash, "note": "reviewed"}))
-    assert r == {"approved": True, "scenario_id": spec.id, "spec_hash": spec.spec_hash, "approved_by": "human-command"} and approvals == [False]
+    assert r == stamped({"approved": True, "scenario_id": spec.id, "spec_hash": spec.spec_hash, "approved_by": "human-command"}) and approvals == [False]
     assert json.loads((sdir / "approval.note.json").read_text())["note"] == "reviewed"
     (sdir / "scenario.draft.json").write_text("{not json")
     bad = asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id}))
@@ -1100,13 +1040,12 @@ def _create_fakes(conc, judge_calls, validate_invalid=("a--5",), judge_error=("a
 
 
 def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress():
-    from temporalio.worker import Worker
     conc = {"cur": 0, "max": 0}; judge_calls = []
     params = {"sources": [{"kind": "github-repo", "repo": "https://github.com/x/a", "since": "2026-06-01"}, {"kind": "swebench-annotated", "pool": "A"}],
               "judge_model": "j", "draft_model": "d", "stakeholder_url": "https://s", "max_parallel": 2}
     async def scenario(env):
-        async with Worker(env.client, task_queue="swesim", workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow], activities=_create_fakes(conc, judge_calls)):
-            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, params, id="create-test-1", task_queue="swesim")
+        async with workers(env, workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow], activities=_create_fakes(conc, judge_calls)):
+            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, params, id="create-test-1", task_queue=Q.AUTHORING)
             r = await h.result()
             assert r["counts"] == {"candidates": 6, "valid": 2, "invalid": 1, "rejected": 1, "error": 1, "duplicate-rejected": 0, "duplicate-in-batch": 1, "not-reproducible-offline": 1}
             assert r["status"] == "complete" and {s for s, c in r["candidates"].items() if c["status"] == "valid"} == {"a--1", "b--1"}
@@ -1125,7 +1064,7 @@ def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress()
             assert {s["status"] for s in prog["sources"].values()} == {"mined"} and prog["probe"]["resolved"]["judge_model"] == "j"
             # the same candidates again: terminal outcomes are duplicate-rejected and never redone; the errored (failed)
             # candidate is the only one that runs again (ALLOW_DUPLICATE_FAILED_ONLY) and still errors here
-            r2 = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-test-2", task_queue="swesim")
+            r2 = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-test-2", task_queue=Q.AUTHORING)
             assert r2["counts"]["duplicate-rejected"] == 5 and r2["counts"]["error"] == 1 and r2["counts"]["valid"] == 0 and r2["status"] == "complete-with-failures"
             assert r2["candidates"]["a--3"]["status"] == "error" and judge_calls.count("a__3") == 2 and len(judge_calls) == 7
     _run_in_env(scenario)
@@ -1133,7 +1072,6 @@ def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress()
 
 def test_env_create_tasks_rebuild_uses_versioned_child_ids_and_archives_only_existing_scenarios():
     from temporalio import activity
-    from temporalio.worker import Worker
     conc = {"cur": 0, "max": 0}; judge_calls = []; seen_ids = {}; archived = []; draft_versions = {}; existing = {}
     lists = {"/c/R.jsonl": ["r__1", "r__2"]}
     @activity.defn(name="scenario_version_activity")
@@ -1151,12 +1089,12 @@ def test_env_create_tasks_rebuild_uses_versioned_child_ids_and_archives_only_exi
     acts = [a for a in base if a.__name__ not in ("judge", "draft")] + [version, archive, judge, draft]
     params = {"sources": [{"kind": "swebench-annotated", "pool": "R"}], "judge_model": "j", "draft_model": "d", "stakeholder_url": "https://s"}
     async def scenario(env):
-        async with Worker(env.client, task_queue="swesim", workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow], activities=acts):
-            first = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-first", task_queue="swesim")
+        async with workers(env, workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow], activities=acts):
+            first = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-first", task_queue=Q.AUTHORING)
             assert first["counts"]["valid"] == 2 and seen_ids == {"r__1": ["create:r--1"], "r__2": ["create:r--2"]} and archived == [] and draft_versions == {"r__1": 1, "r__2": 1}
             # r--1 now exists as version 1 (scenario.json / registry); r--2 does not (say its registration was rolled back)
             existing["r--1"] = 1
-            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, {**params, "rebuild": True}, id="create-rebuild", task_queue="swesim")
+            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, {**params, "rebuild": True}, id="create-rebuild", task_queue=Q.AUTHORING)
             r = await h.result()
             assert r["candidates"]["r--1"]["status"] == "valid" and r["candidates"]["r--2"]["status"] == "duplicate-rejected"   # unchanged id for a non-existing scenario
             assert seen_ids["r__1"] == ["create:r--1", "create:r--1@v2"] and seen_ids["r__2"] == ["create:r--2"]
@@ -1168,13 +1106,12 @@ def test_env_create_tasks_rebuild_uses_versioned_child_ids_and_archives_only_exi
             child = await env.client.get_workflow_handle("create:r--1@v2").query(W.CandidateWorkflow.progress)
             assert child["status"] == "valid"
             # a non-rebuild run keeps today's behavior: ids unchanged, everything duplicate-rejected
-            plain = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-plain-again", task_queue="swesim")
+            plain = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-plain-again", task_queue=Q.AUTHORING)
             assert plain["counts"]["duplicate-rejected"] == 2 and plain["candidates"]["r--1"]["status"] == "duplicate-rejected" and len(archived) == 1
     _run_in_env(scenario)
 
 
 def test_env_create_tasks_hold_mode_review_queue_approve_reject_and_refused_hash(monkeypatch):
-    from temporalio.worker import Worker
     from swesim.workflows import client as C
     conc = {"cur": 0, "max": 0}; judge_calls = []; hold = {}
     lists = {"/c/H.jsonl": ["h__1", "h__2", "h__3"]}
@@ -1182,9 +1119,9 @@ def test_env_create_tasks_hold_mode_review_queue_approve_reject_and_refused_hash
     async def scenario(env):
         async def connect(): return env.client
         monkeypatch.setattr(C, "connect", connect)
-        async with Worker(env.client, task_queue="swesim", workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow],
+        async with workers(env, workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow],
                           activities=_create_fakes(conc, judge_calls, validate_invalid=(), judge_error=(), judge_drop=(), lists=lists, hold=hold, not_reproducible=())):
-            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, params, id="create-hold", task_queue="swesim")
+            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, params, id="create-hold", task_queue=Q.AUTHORING)
             for _ in range(400):
                 prog = await h.query(W.CreateTasksWorkflow.progress)
                 if len(prog["awaiting_approval"]) == 3: break
@@ -1266,7 +1203,7 @@ def test_candidate_failure_message_names_the_failing_stage(monkeypatch):
     from temporalio.exceptions import ApplicationError
     async def scenario():
         monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None))
-        async def act(name, p, minutes=10): raise RuntimeError("judge provider down")
+        async def act(name, p, minutes=10, **kw): raise RuntimeError("judge provider down")
         monkeypatch.setattr(W, "act", act)
         w = W.CandidateWorkflow()
         with pytest.raises(ApplicationError, match="failed at stage judging: RuntimeError: judge provider down"):
@@ -1364,16 +1301,17 @@ def test_probe_candidate_activity_fallback_probe_tests_maps_value_error(ws, monk
 def test_env_run_tasks_two_scenarios_bounded_and_progress():
     from temporalio import activity
     from temporalio.exceptions import ApplicationError
-    from temporalio.worker import Worker
     conc = {"cur": 0, "max": 0}; scored = []; exported = []; planned = []
     @activity.defn(name="plan_trials_activity")
     async def plan(p):
         planned.append(p)
         if p["scenario_id"] == "bad": raise ApplicationError("scenario/build not validated", non_retryable=True)
         return {"scenario_id": p["scenario_id"], "trials": [{"trial_id": f"{p['scenario_id']}-t{i}", "scenario_id": p["scenario_id"], "model": p["models"][0], "condition": "hidden", "attempt_index": i} for i in range(2)]}
+    run_ids = set()
     @activity.defn(name="launch_trial_activity")
     async def launch(p):
         conc["cur"] += 1; conc["max"] = max(conc["max"], conc["cur"]); await asyncio.sleep(0.05); conc["cur"] -= 1
+        run_ids.add(p.get("run_workflow_id"))
         return {"trial_id": p["trial_id"], "launched": True}
     @activity.defn(name="await_trial_activity")
     async def collect(p): return {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}}
@@ -1384,20 +1322,21 @@ def test_env_run_tasks_two_scenarios_bounded_and_progress():
     params = {"scenario_ids": ["s1", "s2", "bad"], "models": ["m"], "conditions": ["hidden"], "k": 2, "purpose": "comparison", "stakeholder_model": "anthropic/claude-sonnet-5",
               "attempt_offset": 0, "stakeholder_url": "https://s", "max_parallel_trials": 1}
     async def scenario(env):
-        async with Worker(env.client, task_queue="swesim", workflows=[W.RunTasksWorkflow, W.TrialWorkflow], activities=[plan, launch, collect, score, export]):
-            h = await env.client.start_workflow(W.RunTasksWorkflow.run, params, id="run-test-1", task_queue="swesim")
+        async with workers(env, workflows=[W.RunTasksWorkflow, W.TrialWorkflow], activities=[plan, launch, collect, score, export]):
+            h = await env.client.start_workflow(W.RunTasksWorkflow.run, params, id="run-test-1", task_queue=Q.AUTHORING)
             r = await h.result()
             assert r["status"] == "complete-with-failures" and r["scenarios"]["bad"]["status"] == "error" and "not validated" in r["scenarios"]["bad"]["error"]
             for sid in ("s1", "s2"):
                 assert r["scenarios"][sid]["status"] == "complete" and [t["status"] for t in r["scenarios"][sid]["trials"]] == ["completed", "completed"]
             assert conc["max"] == 1 and sorted(scored) == ["s1", "s2"] == sorted(exported)              # trials one at a time; score+export per scenario
+            assert run_ids == {"run-test-1"}                                                              # the parent's id reaches every trial request (Job label)
             assert all(p["stakeholder_model"] == "anthropic/claude-sonnet-5" and p["purpose"] == "comparison" for p in planned)
             prog = await h.query(W.RunTasksWorkflow.progress)
             assert prog["stage"] == "complete" and set(prog["trials"]) == {"s1-t0", "s1-t1", "s2-t0", "s2-t1"}
             assert prog["trials"]["s1-t0"] == {"scenario_id": "s1", "model": "m", "condition": "hidden", "attempt_index": 0, "status": "completed"}
             assert prog["scenarios"] == {"s1": {"status": "complete", "trials": 2}, "s2": {"status": "complete", "trials": 2}, "bad": {"status": "error", "error": prog["scenarios"]["bad"]["error"], "trials": 0}}
             # running the same selection again cannot relaunch: every trial id is already used
-            r2 = await env.client.execute_workflow(W.RunTasksWorkflow.run, {**params, "scenario_ids": ["s1"]}, id="run-test-2", task_queue="swesim")
+            r2 = await env.client.execute_workflow(W.RunTasksWorkflow.run, {**params, "scenario_ids": ["s1"]}, id="run-test-2", task_queue=Q.AUTHORING)
             assert [t["status"] for t in r2["scenarios"]["s1"]["trials"]] == ["duplicate-rejected", "duplicate-rejected"] and r2["status"] == "complete"
     _run_in_env(scenario)
 
@@ -1533,20 +1472,18 @@ def test_worker_env_is_rendered_with_only_the_five_keys(tmp_path):
     assert cp.returncode != 0 and "single quote" in cp.stderr
 
 
-def test_connect_kwargs_local_api_key_and_mtls(tmp_path):
-    """Local dev server by default; Temporal Cloud API key turns TLS on; mTLS reads the PEM files; the key never enters the log line."""
+def test_connect_kwargs_local_and_api_key(tmp_path):
+    """Local dev server by default; a Temporal Cloud API key turns TLS on and sets the routing header; the key never enters the log line."""
     from swesim.workflows import client as C
-    assert C.connect_kwargs({}) == {"target_host": "localhost:7233", "namespace": "default"}
-    kw = C.connect_kwargs({"TEMPORAL_ADDRESS": "us-central1.gcp.api.temporal.io:7233", "TEMPORAL_NAMESPACE": "swesim.abcde", "TEMPORAL_API_KEY": "tmprl_secret"})
+    none = {"SWESIM_ENV_FILE": str(tmp_path / "absent.env")}
+    assert C.connect_kwargs(none) == {"target_host": "localhost:7233", "namespace": "default"}
+    kw = C.connect_kwargs({**none, "TEMPORAL_ADDRESS": "us-central1.gcp.api.temporal.io:7233", "TEMPORAL_NAMESPACE": "swesim.abcde", "TEMPORAL_API_KEY": "tmprl_secret"})
     assert kw == {"target_host": "us-central1.gcp.api.temporal.io:7233", "namespace": "swesim.abcde", "api_key": "tmprl_secret", "tls": True,
                   "rpc_metadata": {"temporal-namespace": "swesim.abcde"}}   # the routing header Temporal Cloud requires with API keys
-    line = C.describe_connection({"TEMPORAL_ADDRESS": "x:7233", "TEMPORAL_NAMESPACE": "n", "TEMPORAL_API_KEY": "tmprl_secret"})
+    line = C.describe_connection({**none, "TEMPORAL_ADDRESS": "x:7233", "TEMPORAL_NAMESPACE": "n", "TEMPORAL_API_KEY": "tmprl_secret"})
     assert line == "temporal=x:7233 namespace=n auth=api-key" and "tmprl_secret" not in line
-    cert = tmp_path / "c.pem"; key = tmp_path / "k.pem"; cert.write_bytes(b"CERT"); key.write_bytes(b"KEY")
-    kw = C.connect_kwargs({"TEMPORAL_ADDRESS": "y:7233", "TEMPORAL_TLS_CERT": str(cert), "TEMPORAL_TLS_KEY": str(key)})
-    assert kw["tls"].client_cert == b"CERT" and kw["tls"].client_private_key == b"KEY" and "api_key" not in kw
-    assert C.describe_connection({"TEMPORAL_TLS_CERT": str(cert), "TEMPORAL_TLS_KEY": str(key)}).endswith("auth=mtls")
-    assert C.describe_connection({}).endswith("auth=plain")
+    assert C.describe_connection(none).endswith("auth=plain")
+    assert C.TASK_QUEUE == Q.AUTHORING
 
 
 def test_plan_trials_uses_the_same_scaffold_identity_as_run_trial(ws):
@@ -1604,10 +1541,15 @@ def test_create_pr_kind_reaches_the_mine_activity_params(monkeypatch):
 def test_connect_kwargs_falls_back_to_the_env_file_for_temporal_keys(tmp_path, monkeypatch):
     """The CLI submits from a shell that has no TEMPORAL_* exported; the values come from the dotenv file (never exported)."""
     from swesim.workflows import client as C
+    from swesim.settings import reset_settings
     envf = tmp_path / ".env"; envf.write_text("TEMPORAL_ADDRESS=x.gcp.api.temporal.io:7233\nTEMPORAL_NAMESPACE=ns.acct\nTEMPORAL_API_KEY=tmprl_from_file\nOTHER=ignored\n")
     for k in C.TEMPORAL_KEYS: monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("SWESIM_ENV_FILE", str(envf))
-    kw = C.connect_kwargs()
-    assert kw["target_host"] == "x.gcp.api.temporal.io:7233" and kw["namespace"] == "ns.acct" and kw["api_key"] == "tmprl_from_file" and kw["tls"] is True
-    monkeypatch.setenv("TEMPORAL_ADDRESS", "localhost:7233"); monkeypatch.setenv("TEMPORAL_NAMESPACE", "default")
-    assert C.connect_kwargs() == {"target_host": "localhost:7233", "namespace": "default"}   # process env wins; no key -> plain
+    monkeypatch.setenv("SWESIM_ENV_FILE", str(envf)); reset_settings()
+    try:
+        kw = C.connect_kwargs()
+        assert kw["target_host"] == "x.gcp.api.temporal.io:7233" and kw["namespace"] == "ns.acct" and kw["api_key"] == "tmprl_from_file" and kw["tls"] is True
+        monkeypatch.setenv("TEMPORAL_ADDRESS", "localhost:7233"); monkeypatch.setenv("TEMPORAL_NAMESPACE", "default"); reset_settings()
+        envf.write_text("OTHER=ignored\n")
+        assert C.connect_kwargs() == {"target_host": "localhost:7233", "namespace": "default"}   # process env wins; no key -> plain
+    finally:
+        reset_settings()

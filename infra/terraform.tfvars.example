@@ -1,0 +1,11 @@
+# Copy to infra/terraform.tfvars (git-ignored), or let `make tfvars` generate infra/env.auto.tfvars.json from your env file.
+project            = "my-gcp-project"
+region             = "us-central1"
+temporal_address   = "us-central1.gcp.api.temporal.io:7233"
+temporal_namespace = "swesim.abcde"
+stakeholder_url    = "https://my-stakeholder.modal.run"
+iap_members        = ["user:operator@example.com"]
+evaluators         = ["operator@example.com"]
+github_repository  = "owner/swesim"
+spend_cap_usd      = 200
+pool_instances     = { authoring = 2, build = 2, trials = 1, control = 1 }

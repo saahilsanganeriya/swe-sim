@@ -20,8 +20,13 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlreadyStartedError
 
-ONE = RetryPolicy(maximum_attempts=1)
-READ = RetryPolicy(maximum_attempts=3)
+from swesim.workflows import queues, retries
+
+ONE = RetryPolicy(maximum_attempts=1)          # pre-patch command shape, kept for replay of executions started before PATCH_QUEUES
+LEGACY_READ = RetryPolicy(maximum_attempts=3)  # idem, for await_trial_activity
+# Versioning discipline (brief §2.8 item 4): every change to a workflow's command sequence ships behind a patch id
+# until no pre-change execution remains; `_patched` answers True for new executions and for direct (non-Temporal) calls.
+PATCH_QUEUES = "20260913-queues"               # act(): task queue per activity + retry classes (items 1-2)
 APPROVAL_TIMEOUT = timedelta(hours=24)   # PipelineWorkflow signal mode
 HOLD_TIMEOUT = timedelta(days=7)         # CreateTasksWorkflow approval_mode="hold"
 APPROVAL_MODES = {"auto", "signal", "human"}  # PipelineWorkflow; "human" is the brief's older spelling of "signal"
@@ -52,9 +57,19 @@ def _leak_rejection(approved: dict) -> bool:
     return approved.get("gate") == LEAK_GATE or any(_is_leak_reason(r) for r in approved.get("reasons", []) or [])
 
 
-async def act(name: str, p: dict, minutes: int = 10):
-    return await workflow.execute_activity(name, p, start_to_close_timeout=timedelta(minutes=minutes),
-                                           heartbeat_timeout=timedelta(minutes=2), retry_policy=ONE)
+def _patched(name: str) -> bool:
+    """`workflow.patched` inside a workflow. A workflow body run as a plain coroutine (direct tests) is always new code."""
+    return workflow.patched(name) if workflow.in_workflow() else True
+
+
+async def act(name: str, p: dict, minutes: int = 10, *, retry: RetryPolicy = retries.LLM):
+    """One activity on its queue (`queues.queue_for`) with its retry class. Call sites pick the class: LLM for judge /
+    draft / approve / stakeholder-bound work, BUILD for probe / compile / validate, READ for polls and local reads,
+    ONCE for launch. The pre-patch shape (inherited queue, one attempt) is kept for replay."""
+    timeouts = dict(start_to_close_timeout=timedelta(minutes=minutes), heartbeat_timeout=timedelta(minutes=2))
+    if _patched(PATCH_QUEUES):
+        return await workflow.execute_activity(name, p, task_queue=queues.queue_for(name), retry_policy=retry, **timeouts)
+    return await workflow.execute_activity(name, p, retry_policy=LEGACY_READ if name == "await_trial_activity" else ONE, **timeouts)
 
 
 def _auto(p: dict) -> bool:
@@ -88,18 +103,23 @@ async def draft_and_auto_approve(set_stage, p: dict, judged: dict, iid: str) -> 
 
 async def build_scenario(set_stage, p: dict, sid: str, spec_hash: str) -> dict:
     """verify the approval hash -> compile -> validate -> register. Returns status valid | invalid with reasons."""
-    accepted = await act("verify_approval_activity", {"scenario_id": sid, "spec_hash": spec_hash})
+    accepted = await act("verify_approval_activity", {"scenario_id": sid, "spec_hash": spec_hash}, retry=retries.READ)
     step = {**p, **accepted}
     await set_stage("compiling", **accepted)
-    await act("compile_activity", step, 30)
+    await act("compile_activity", step, 30, retry=retries.BUILD)
     await set_stage("validating", **accepted)
-    validation = await act("validate_activity", step, 180)
+    validation = await act("validate_activity", step, 180, retry=retries.BUILD)
     if validation["status"] != "valid":
         return {"scenario_id": sid, "spec_hash": accepted["spec_hash"], "status": "invalid", "reasons": list(validation.get("failures", [])),
                 "validation": validation, "step": step}
     await set_stage("registering", **accepted)
-    await act("register_activity", step)
+    await act("register_activity", step, retry=retries.READ)
     return {"scenario_id": sid, "spec_hash": accepted["spec_hash"], "status": "valid", "reasons": [], "validation": validation, "step": step}
+
+
+def _run_workflow_id() -> str | None:
+    """This RunTasksWorkflow's id, carried into each trial request for the Job label `swesim-run-workflow-id`."""
+    return workflow.info().workflow_id if workflow.in_workflow() else None
 
 
 async def run_trials(set_trial_status, trials: list[dict], sem: asyncio.Semaphore) -> list[dict]:
@@ -108,7 +128,8 @@ async def run_trials(set_trial_status, trials: list[dict], sem: asyncio.Semaphor
         async with sem:
             await set_trial_status(trial, "running")
             try:
-                r = await workflow.execute_child_workflow(TrialWorkflow.run, trial, id=trial["trial_id"], id_reuse_policy=REJECT_DUP)
+                child = {**trial, "run_workflow_id": _run_workflow_id()}
+                r = await workflow.execute_child_workflow(TrialWorkflow.run, child, id=trial["trial_id"], id_reuse_policy=REJECT_DUP)
             except WorkflowAlreadyStartedError:
                 r = {"trial_id": trial["trial_id"], "status": "duplicate-rejected"}
             except Exception as e:  # noqa: BLE001 - one failed child never stops its siblings
@@ -134,14 +155,13 @@ class TrialWorkflow:
         launch = None
         self.state = {"stage": "launching", "trial_id": p.get("trial_id")}
         try:
-            launch = await act("launch_trial_activity", p, 5)
+            launch = await act("launch_trial_activity", p, 5, retry=retries.ONCE)
         except Exception as e:  # noqa: BLE001 - a lost launch acknowledgement is ambiguous by design
             # Poll the same unit/id; never relaunch it. The await activity reads the recorded evidence.
             launch = {"trial_id": p.get("trial_id"), "launched": False, "error": str(e)[:500]}
         self.state = {"stage": "awaiting", "trial_id": p.get("trial_id"), "launch": launch}
         try:
-            result = await workflow.execute_activity("await_trial_activity", p, start_to_close_timeout=timedelta(hours=3),
-                                                     heartbeat_timeout=timedelta(minutes=2), retry_policy=READ)
+            result = await act("await_trial_activity", p, 180, retry=retries.READ)
         except Exception as e:  # noqa: BLE001 - deadline or repeated read failures: unresolved, not relaunched
             self.state = {"stage": "done", "trial_id": p.get("trial_id"), "status": "unresolved", "launch": launch}
             return {"trial_id": p.get("trial_id"), "status": "unresolved", "error": str(e)[:500], "launch": launch}
@@ -161,8 +181,8 @@ class RunMatrixWorkflow:
             except WorkflowAlreadyStartedError:
                 r = {"trial_id": trial["trial_id"], "status": "duplicate-rejected"}
             results.append(r)
-        await act("score_activity", {"scenario_id": p["scenario_id"]})
-        await act("export_activity", {"scenario_id": p["scenario_id"]})
+        await act("score_activity", {"scenario_id": p["scenario_id"]}, retry=retries.READ)
+        await act("export_activity", {"scenario_id": p["scenario_id"]}, retry=retries.READ)
         return {"scenario_id": p["scenario_id"], "trials": results}
 
 
@@ -193,7 +213,7 @@ class RunTasksWorkflow:
         async def one_scenario(sid: str) -> None:
             self.scenarios[sid] = {"status": "planning", "trials": 0}
             try:
-                planned = await act("plan_trials_activity", {**plan_p, "scenario_id": sid}, 5)
+                planned = await act("plan_trials_activity", {**plan_p, "scenario_id": sid}, 5, retry=retries.READ)
             except Exception as e:  # noqa: BLE001 - an unplannable scenario (not validated) never stops the others
                 self.scenarios[sid] = {"status": "error", "error": _err(e), "trials": 0}
                 results[sid] = {"status": "error", "error": _err(e), "trials": []}
@@ -206,8 +226,8 @@ class RunTasksWorkflow:
             trial_results = await run_trials(set_trial_status, trials, sem)
             self.scenarios[sid]["status"] = "scoring"
             try:
-                await act("score_activity", {"scenario_id": sid})
-                await act("export_activity", {"scenario_id": sid})
+                await act("score_activity", {"scenario_id": sid}, retry=retries.READ)
+                await act("export_activity", {"scenario_id": sid}, retry=retries.READ)
                 self.scenarios[sid]["status"] = "complete"
             except Exception as e:  # noqa: BLE001
                 self.scenarios[sid].update(status="score-export-error", error=_err(e))
@@ -258,11 +278,11 @@ class CandidateWorkflow:
         Returns (sid, approved-or-None, terminal-result-if-not-approved)."""
         draft = await act("draft_activity", {**p, **judged, "instance_id": iid}, 30); sid = draft["scenario_id"]
         await self._stage("pre-checking", **draft)
-        pre = await act("precheck_draft_activity", {"scenario_id": sid}, 5)
+        pre = await act("precheck_draft_activity", {"scenario_id": sid}, 5, retry=retries.READ)
         if not pre["ok"] and p.get("redraft_on_leak", True) and any(_is_leak_reason(r) for r in pre.get("reasons", [])):
             await self._stage("re-drafting", **draft, reasons=pre.get("reasons", []))
             await act("draft_activity", {**p, **judged, "instance_id": iid, "force": True, "reject_reasons": pre.get("reasons", [])}, 30)
-            pre = await act("precheck_draft_activity", {"scenario_id": sid}, 5)
+            pre = await act("precheck_draft_activity", {"scenario_id": sid}, 5, retry=retries.READ)
         if not pre["ok"]:
             return sid, None, self._done(sid, "rejected", list(pre.get("reasons", [])), pre.get("spec_hash"))
         draft_hash = pre["spec_hash"]; refusal = None
@@ -287,7 +307,8 @@ class CandidateWorkflow:
                 try:
                     # The activity re-reads the draft on disk, compares its hash to the signalled one and writes approval.json
                     # (approved_by human-command, review_needed false). A mismatch is refused and the candidate keeps waiting.
-                    approved = await act("human_approve_activity", {"scenario_id": sid, "spec_hash": d.get("spec_hash"), "note": d.get("note")}, 5)
+                    approved = await act("human_approve_activity", {"scenario_id": sid, "spec_hash": d.get("spec_hash"), "note": d.get("note")}, 5,
+                                         retry=retries.READ)
                     return sid, approved, {}
                 except Exception as e:
                     if not _refusable(e):  # cancellation or infrastructure failure: propagate, never re-enter the wait
@@ -310,7 +331,7 @@ class CandidateWorkflow:
             # published lists do not always reproduce offline. One attempt; harbor_cli reconciles an existing job.
             await self._stage("probing", scenario_id=sid)
             probed = await act("probe_candidate_activity", {"judged_path": judged["judged_path"], "instance_id": iid, "scenario_id": sid,
-                                                            "max_builds": p.get("max_builds", 1)}, 160)  # probe_tests' Harbor deadline is 150 min
+                                                            "max_builds": p.get("max_builds", 1)}, 160, retry=retries.BUILD)  # probe_tests' Harbor deadline is 150 min
             if not probed.get("fail_to_pass"):
                 return self._done(sid, "not-reproducible-offline", [probed.get("reason") or "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold"], None)
             judged = {**judged, "judged_path": probed["judged_path"]}  # the probed row (measured lists) is what draft reads
@@ -319,7 +340,7 @@ class CandidateWorkflow:
                 # move to archive/v<previous>/ so draft (with version=next), approve, compile, validate and register run afresh.
                 # Judged rows and probe outputs are retained. (The force/reject_reasons re-draft path is unchanged.)
                 await self._stage("archiving", scenario_id=sid)
-                await act("archive_scenario_activity", {"scenario_id": sid, "previous_version": p["previous_version"]}, 5)
+                await act("archive_scenario_activity", {"scenario_id": sid, "previous_version": p["previous_version"]}, 5, retry=retries.READ)
             if p.get("approval_mode", "auto") == "hold":
                 sid, approved, terminal = await self._hold_for_reviewer(p, judged, iid)
                 if approved is None:
@@ -437,7 +458,7 @@ class CreateTasksWorkflow:
                     # Rebuild: an existing scenario (scenario.json or registry entry) is re-created as version n+1 under a new
                     # child id; nothing existing behaves like a first build (version 1, plain id).
                     try:
-                        ver = await act("scenario_version_activity", {"scenario_id": sid}, 5)
+                        ver = await act("scenario_version_activity", {"scenario_id": sid}, 5, retry=retries.READ)
                     except Exception as e:  # noqa: BLE001 - one unreadable scenario never stops its siblings
                         r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "error", "reasons": [_err(e)], "spec_hash": None}
                         self.candidates[sid].update(status="error", stage="done", reasons=r["reasons"]); self.counts["error"] = self.counts.get("error", 0) + 1
@@ -464,7 +485,7 @@ class CreateTasksWorkflow:
             try:
                 mined = await act("mine_activity", {**p, **_mine_params(src)}, 180)
                 listed = await act("list_candidates_activity", {"candidates_path": mined["candidates_path"],
-                                                                "max_candidates": src.get("max_candidates") or src.get("limit")}, 5)
+                                                                "max_candidates": src.get("max_candidates") or src.get("limit")}, 5, retry=retries.READ)
             except Exception as e:  # noqa: BLE001 - a failed source never stops the others
                 self.state["sources"][key] = {"status": "error", "error": _err(e)}
                 return
@@ -559,7 +580,7 @@ class PipelineWorkflow:
                             "needs_human": probe.get("needs_human") or []})
                 counts["completed"] += 1
                 continue
-            trials = await act("plan_trials_activity", step); results = []
+            trials = await act("plan_trials_activity", step, retry=retries.READ); results = []
             for trial in trials["trials"]:
                 self.state = {"stage": "trial", **accepted, "trial_id": trial["trial_id"]}
                 try:
@@ -568,8 +589,8 @@ class PipelineWorkflow:
                     r = {"trial_id": trial["trial_id"], "status": "duplicate-rejected"}
                 results.append(r)
             self.state = {"stage": "scoring", **accepted}
-            await act("score_activity", step)
-            await act("export_activity", step)
+            await act("score_activity", step, retry=retries.READ)
+            await act("export_activity", step, retry=retries.READ)
             out.append({"scenario_id": sid, "status": "complete", "trials": results})
             counts["completed"] += 1
         status = "complete" if counts["completed"] else "complete-with-failures"

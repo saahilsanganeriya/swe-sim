@@ -4,6 +4,16 @@ Materializes a per-trial copy of the compiled condition task with the session to
 ``[environment.env]``, launches Harbor through ``swesim.harbor_cli``, then fetches the frozen stakeholder
 transcript and binds its hash to the collector receipt recorded in the grader report. Writes
 ``workspace/trials/<trial_id>/{run_config,spec,reward,report,transcript,record,status}.json``.
+
+Providers: the solver id follows `swesim.roles.parse_model_id` (``anthropic/…``, ``openai/…``, ``openrouter/<vendor>/<model>``);
+the provider's API host is added to both allowlists of the materialized task (`PROVIDER_HOSTS`) and the id is passed to
+Harbor verbatim (mini-swe-agent/litellm form). Harbor's mini-swe-agent adapter reads the provider key named by
+`agent_env_names` from the launcher's process environment and forwards it into the agent container under the same
+name, so `run_trial` refuses to start (`ProviderKeyMissing`, before any session or file) when that key is unavailable.
+
+Cost: after Harbor returns, the solver's usage is read from the trial directory (`costs.usage_from_trial_dir`) and
+recorded to ``trials/<trial_id>/costs.json``; ``record.json`` carries ``cost_usd/input_tokens/output_tokens/price_source``
+(all None when the trial left no usage evidence: unknown is never written as zero).
 """
 from __future__ import annotations
 
@@ -16,15 +26,23 @@ from urllib.parse import urlparse
 
 import tomli_w
 
-from swesim import harbor_cli
+from swesim import costs, harbor_cli
 from swesim.models import RunConfig, ScenarioSpec
 from swesim.models import trial_id as make_trial_id
 from swesim.paths import Workspace
+from swesim.roles import PROVIDERS, parse_model_id
+from swesim.settings import Settings
+from swesim.settings import has_secret as _has_secret
 from swesim.stakeholder.view import forbidden_terms, visible_view
 
-PROVIDER_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
+PROVIDER_HOSTS = {name: p.host for name, p in PROVIDERS.items()}   # anthropic, openai, openrouter -> API host for the sandbox allowlist
 OUTCOME_NAMES = {3: "agent-invalid-submission", 4: "agent-runtime-failure", 7: "evaluator-failure"}
 HTTP_TIMEOUT = 120
+
+
+class ProviderKeyMissing(ValueError):
+    """The solver's provider credential is neither in the launcher's environment nor in its env file. Configuration, not a
+    transient failure: nothing is launched and no trial state is created."""
 
 
 @dataclass
@@ -33,10 +51,35 @@ class TrialRecord:
     reward: dict; report: dict; transcript: dict; status: str
     spec_hash: str = ""; model: str = ""; purpose: str = "demonstration"; compiled_hash: str = ""; brief_profile: str = "natural"
     started_at: str = ""; finished_at: str | None = None      # ISO-8601 UTC; appended last so positional construction is unchanged
+    # Solver cost (interfaces section 6), appended after the timestamps; None = no usage evidence or no verified price.
+    cost_usd: float | None = None; input_tokens: int | None = None; output_tokens: int | None = None; price_source: str | None = None
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def has_secret(name: str, settings: Settings | None = None) -> bool:
+    """Whether the launcher holds this credential (process environment, then the env file). Tests stub this seam."""
+    return _has_secret(name, settings)
+
+
+def agent_env_names(model: str) -> tuple[str, ...]:
+    """The environment variable names Harbor must forward into the agent container for this solver.
+
+    Harbor 0.23's mini-swe-agent adapter takes the provider from the id's first segment, looks the key up in its own
+    process environment under the provider table's name (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY) and
+    forwards it under the same name (`ModelConnectionSpec.passthrough`); `harbor_cli.run_task` hands the launcher's
+    environment to Harbor, so the launcher must hold it."""
+    return (PROVIDERS[parse_model_id(model).provider].key_env,)
+
+
+def require_provider_key(model: str, settings: Settings | None = None) -> str:
+    """The provider key name for `model`, after checking the launcher holds it; `ProviderKeyMissing` otherwise."""
+    name = agent_env_names(model)[0]
+    if not has_secret(name, settings):
+        raise ProviderKeyMissing(f"{name} is not available to the launcher (environment or env file); the solver {model!r} cannot run")
+    return name
 
 
 def materialize_trial_task(ws: Workspace, compiled_task_dir: Path, tid: str, token: str) -> Path:
@@ -87,6 +130,21 @@ def render_instruction(spec: ScenarioSpec, rc: RunConfig, compiled_task_dir: Pat
     raise FileNotFoundError(f"no compiled instruction in {compiled_task_dir}")
 
 
+def _solver_cost(ws: Workspace, tid: str, model: str, trial_dir: Path | None, report: dict) -> costs.CostRecord | None:
+    """Record the solver's cost from the usage evidence Harbor left; None (unknown) when there is none. A corrupt
+    trajectory is noted in the report and never loses the graded result."""
+    if trial_dir is None:
+        return None
+    try:
+        usage = costs.usage_from_trial_dir(trial_dir)
+    except ValueError as e:  # unreadable agent trajectory: the reward stands, the cost is unknown and the reason is recorded
+        report["usage_error"] = str(e)[:300]
+        return None
+    if usage is None:
+        return None
+    return costs.record_cost(ws, tid, None, "solver", model, usage)
+
+
 def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: int, stakeholder_url: str, worker_secret: str) -> TrialRecord:
     started_at = _now()
     sdir = ws.scenario_dir(spec.id)
@@ -109,9 +167,8 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     if rc.condition == "interactive" and (not expected_host or expected_host not in tc["environment"]["allowed_hosts"]):
         raise ValueError("recompile and validate for actual stakeholder endpoint")
     if int(tc["agent"]["timeout_sec"]) != rc.solver_timeout_sec: raise ValueError("compiled timeout differs from run config")
-    provider = rc.model.split("/")[0]
-    if provider not in PROVIDER_HOSTS: raise ValueError(f"unknown model provider {provider!r}")
-    provider_host = PROVIDER_HOSTS[provider]
+    provider_host = PROVIDER_HOSTS[parse_model_id(rc.model).provider]   # ModelIdError (a ValueError) for an id outside the grammar
+    require_provider_key(rc.model)                                        # fail fast: no session, no files, nothing to reconcile
 
     if rc.condition == "interactive":
         view = visible_view(spec)
@@ -178,11 +235,15 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     report["image_digest"] = comp.get("image_digest")
     report["agent_config_sha256"] = agent_config_sha  # interactive scaffold config, None for other conditions/agents
     report["simulator_validity"] = "unadjudicated" if rc.condition == "interactive" else "n/a"
+    cost = _solver_cost(ws, tid, rc.model, trial_dir, report)
 
     finished_at = _now()
     rec = TrialRecord(tid, spec.id, rc.condition, attempt_index, rc.run_config_hash, str(task), str(trial_dir) if trial_dir else None,
                       reward, report, transcript, status, spec.spec_hash, rc.model, rc.purpose, rc.compiled_hash, rc.brief_profile,
-                      started_at, finished_at)
+                      started_at, finished_at,
+                      cost_usd=None if cost is None or cost.usd is None else float(cost.usd),
+                      input_tokens=None if cost is None else cost.input_tokens, output_tokens=None if cost is None else cost.output_tokens,
+                      price_source=None if cost is None else cost.price_source)
     for name, obj in (("run_config.json", rc.model_dump(mode="json")), ("spec.json", spec.model_dump(mode="json")), ("reward.json", reward),
                       ("report.json", report), ("transcript.json", transcript), ("record.json", asdict(rec))):
         (tdir / name).write_text(json.dumps(obj, indent=2))

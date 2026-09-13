@@ -1,29 +1,35 @@
 """Temporal activities. Payloads carry ids, paths, hashes and model ids; never secrets.
 
-Stage modules owned by other streams are imported lazily inside activity bodies so this module
-imports without them (tests inject fakes into sys.modules).
+Stage modules owned by other streams are imported lazily inside activity bodies so this module imports without them
+(tests inject fakes into sys.modules).
 
-Trial lifecycle (the part that must be exactly-once in effect, not merely by workflow id):
-  launch_once   -> read evidence (trial dir + unit state), decide, and only on "launch" write
-                   request.json, a launch intent, run `systemd-run --user --unit swesim-trial-<id>`
-                   and record the acknowledgement. Any prior launch evidence means: never relaunch.
-  await_trial   -> heartbeating poll of record.json / runner-error.json / unit state; returns a
-                   terminal status dict (completed, runner-error, launch-failed, unit-failed,
-                   unresolved). Retryable and idempotent: it only reads.
-Run as a program (`python -m swesim.workflows.activities run-trial <request.json>`) this module is
-the per-trial process inside the unit; it survives Temporal worker restarts because systemd, not
-the worker, owns it.
+Every activity is declared with `@swesim_activity`, which adds two rules to `@activity.defn`: a `ValueError` (invalid
+input, business rejection, schema failure) becomes a non-retryable ApplicationError typed by the exception class, so
+the retry classes in `swesim.workflows.retries` retry only transient failures; and every result dict carries
+`worker_image_digest` and `origin` from `Settings`, so a result names the code that produced it.
+
+Configuration enters through `SETTINGS` (one `Settings` built at import, rebound by `configure(settings)` in the
+worker); `WS` is the workspace and `LAUNCHER` the trial launcher derived from it. No `os.environ` reads for
+configuration; the environment is only scanned to redact secret-looking values from error text.
+
+Trial lifecycle (exactly-once in effect, not merely by workflow id) lives in `swesim.workflows.launchers`:
+  launch_once   -> read evidence (trial dir + runtime state), decide, and only on "launch" write request.json, a launch
+                   intent, start the runtime (systemd unit | Cloud Run Job | subprocess) and record the acknowledgement.
+                   Any prior launch evidence means: never relaunch.
+  await_trial   -> heartbeating poll of record.json / runner-error.json / runtime state; returns a terminal status dict
+                   (completed, runner-error, launch-failed, unit-failed, unresolved). Retryable and idempotent: it only reads.
+Run as a program (`python -m swesim.workflows.activities run-trial <request.json>`) this module is the per-trial
+process inside the unit or Job; it survives Temporal worker restarts because the runtime, not the worker, owns it.
 """
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import json
 import os
-import subprocess
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from temporalio import activity
@@ -31,15 +37,21 @@ from temporalio.exceptions import ApplicationError
 
 from swesim.models import ID_RE, RunConfig, ScenarioSpec, trial_id
 from swesim.paths import Workspace, atomic_json
+from swesim.settings import Settings, get_settings, has_secret, secret
+from swesim.workflows import retries
+from swesim.workflows.launchers.base import (Launcher, LaunchFailed, TrialBindingConflict, TrialEvidence, TrialLayout,  # noqa: F401 - re-exported
+                                             WorkspaceLayout, decide_launch, get_launcher, unit_name)
+from swesim.workflows.launchers.base import launch_once as _launch_once
+from swesim.workflows.launchers.base import read_evidence as _read_evidence
+from swesim.workflows.launchers.systemd import UnitStateUnavailable, secret_values  # noqa: F401 - re-exported
 
-WS = Workspace(os.environ.get("SWESIM_WORKSPACE", "workspace"))
+SETTINGS: Settings = get_settings()
+WS = Workspace(SETTINGS.workspace, SETTINGS.registry_path)
+LAUNCHER: Launcher | None = None  # built from SETTINGS on first use (`launcher()`); tests assign one directly
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CSV = REPO_ROOT / "data" / "annotations" / "ensembled_annotations_public.csv"
-# "systemd": production (transient user unit per trial). "subprocess": detached child process for
-# macOS/local smoke only; it is NOT production and loses the unit-state evidence across worker restarts.
-LAUNCHER = os.environ.get("SWESIM_TRIAL_LAUNCHER", "systemd")
 HEARTBEAT_SECONDS = 30.0
-POLL_SECONDS = float(os.environ.get("SWESIM_TRIAL_POLL_SEC", "10"))
+POLL_SECONDS = 10.0
 AWAIT_DEADLINE_SEC = 3 * 3600
 LAUNCH_GRACE_POLLS = 6  # polls without any launch evidence before await reports launch-failed
 # Per-role fallback chains (CLAUDE.md, unattended-run rules): the configured id is probed first, then the chain in order.
@@ -49,26 +61,35 @@ FALLBACK_CHAINS = {
     "draft_model": ["anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"],
     "stakeholder_model": ["openai/gpt-5.5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"],
 }
-RUNNING_STATES = {"active", "activating", "reloading", "deactivating"}
-SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
 LAUNCH_SLOTS = asyncio.Semaphore(1)  # pilot trials launch serially per worker
-_CHILDREN: dict[int, subprocess.Popen] = {}
 
 
-class TrialBindingConflict(ValueError):
-    """request.json for this trial id already binds a different request."""
+def configure(settings: Settings) -> None:
+    """Rebind SETTINGS and WS to one `Settings` (worker start, CLI overrides) and drop the launcher so it is rebuilt lazily."""
+    global SETTINGS, WS, LAUNCHER
+    SETTINGS = settings
+    WS = Workspace(settings.workspace, settings.registry_path)
+    LAUNCHER = None
 
 
-class LaunchFailed(RuntimeError):
-    """The launcher did not create the unit. Never retried automatically; reconcile first."""
+def stamp(result):
+    """`worker_image_digest` and `origin` on every dict result (never overriding a value the record supplied)."""
+    if isinstance(result, dict):
+        result.setdefault("worker_image_digest", SETTINGS.worker_image_digest)
+        result.setdefault("origin", SETTINGS.origin)
+    return result
 
 
-class UnitStateUnavailable(RuntimeError):
-    """systemctl could not report the unit (no bus, missing XDG_RUNTIME_DIR, killed). Retryable; never read as 'unit gone'."""
-
-
-def RUN(argv: list[str]) -> subprocess.CompletedProcess:  # injectable process runner (tests substitute a fake)
-    return subprocess.run(argv, capture_output=True, text=True, timeout=120, check=False)
+def swesim_activity(fn):
+    """`@activity.defn` plus the module's two rules: ValueError -> non-retryable ApplicationError; results are stamped."""
+    @functools.wraps(fn)
+    async def wrapper(p: dict) -> dict:
+        try:
+            result = await fn(p)
+        except ValueError as e:
+            raise retries.non_retryable(f"{type(e).__name__}: {str(e)[:1500]}", kind=type(e).__name__) from e
+        return stamp(result)
+    return activity.defn(name=fn.__name__)(wrapper)
 
 
 # ------------------------------------------------------------------ helpers
@@ -101,8 +122,8 @@ def _read_json(path: Path) -> dict:
 
 def _redact(text: str) -> str:
     """Replace the values of secret-looking environment variables inside error text before it is stored."""
-    for k, v in os.environ.items():
-        if len(v) >= 8 and any(m in k.upper() for m in SECRET_MARKERS) and v in text:
+    for k, v in secret_values().items():
+        if v in text:
             text = text.replace(v, f"[redacted:{k}]")
     return text
 
@@ -185,12 +206,12 @@ def probe_models(p: dict) -> dict:
     return out
 
 
-@activity.defn
+@swesim_activity
 async def probe_models_activity(p: dict) -> dict:
     return await blocking(lambda: probe_models(p))
 
 
-@activity.defn
+@swesim_activity
 async def mine_activity(p: dict) -> dict:
     import importlib
 
@@ -209,7 +230,7 @@ async def mine_activity(p: dict) -> dict:
     return {"candidates_path": str(path)}
 
 
-@activity.defn
+@swesim_activity
 async def judge_activity(p: dict) -> dict:
     from swesim.stages.judge import judge_candidate
 
@@ -235,7 +256,7 @@ def is_leak_reason(reason) -> bool:
     return r.startswith("withholding") or "leak" in r or "withheld" in r
 
 
-@activity.defn
+@swesim_activity
 async def list_candidates_activity(p: dict) -> dict:
     """Candidate identifiers from a candidates.jsonl (for CreateTasksWorkflow's fan-out); ids only, no row bodies."""
     lines = [line for line in Path(p["candidates_path"]).read_text().splitlines() if line.strip()]
@@ -293,17 +314,17 @@ def archive_scenario(sid: str, previous_version: int) -> dict:
     return record
 
 
-@activity.defn
+@swesim_activity
 async def scenario_version_activity(p: dict) -> dict:
     return scenario_version(p["scenario_id"])
 
 
-@activity.defn
+@swesim_activity
 async def archive_scenario_activity(p: dict) -> dict:
     return await blocking(lambda: archive_scenario(p["scenario_id"], int(p["previous_version"])))
 
 
-@activity.defn
+@swesim_activity
 async def judge_one_activity(p: dict) -> dict:
     """Judge one candidate row into its own one-row `<candidates_dir>/judged/<scenario_id>.judged.jsonl`
     (parallel-safe; retained on rerun). draft_activity reads that file unchanged."""
@@ -325,7 +346,7 @@ async def judge_one_activity(p: dict) -> dict:
             "reasons": [] if judge.get("keep") else ["judge did not keep the candidate"], "judge_model": judge.get("model_id", p.get("judge_model"))}
 
 
-@activity.defn
+@swesim_activity
 async def probe_candidate_activity(p: dict) -> dict:
     """Measure FAIL_TO_PASS / PASS_TO_PASS on base and gold for one judged row (Harbor on Modal; one attempt, and
     harbor_cli reconciles an existing job dir instead of relaunching). The probed row replaces the row in the
@@ -410,7 +431,7 @@ def _read_row(path: Path, iid: str) -> dict | None:
     return None
 
 
-@activity.defn
+@swesim_activity
 async def precheck_draft_activity(p: dict) -> dict:
     """Hold mode: schema, asset and withholding-leak checks on scenario.draft.json; writes nothing, approves nothing."""
     import importlib
@@ -433,7 +454,7 @@ async def precheck_draft_activity(p: dict) -> dict:
     return {"ok": not reasons, "reasons": reasons, "scenario_id": spec.id, "spec_hash": spec.spec_hash}
 
 
-@activity.defn
+@swesim_activity
 async def human_approve_activity(p: dict) -> dict:
     """Hold mode approve: the signalled spec_hash must equal the draft on disk; then approve_scenario(auto=False)
     writes scenario.json + approval.json (approved_by human-command, review_needed false). Mismatch -> non-retryable."""
@@ -454,7 +475,7 @@ async def human_approve_activity(p: dict) -> dict:
     return {"approved": True, "scenario_id": sid, "spec_hash": spec.spec_hash, "approved_by": "human-command"}
 
 
-@activity.defn
+@swesim_activity
 async def draft_activity(p: dict) -> dict:
     from swesim.stages.draft_spec import draft
 
@@ -477,7 +498,7 @@ async def draft_activity(p: dict) -> dict:
     return {"scenario_id": sid, "draft_path": str(path), "version": int(p.get("version") or 1)}
 
 
-@activity.defn
+@swesim_activity
 async def auto_approve_activity(p: dict) -> dict:
     from swesim.stages.approve import approve_scenario
 
@@ -485,7 +506,7 @@ async def auto_approve_activity(p: dict) -> dict:
     return await blocking(lambda: approve_scenario(WS, p["scenario_id"], auto=True))
 
 
-@activity.defn
+@swesim_activity
 async def verify_approval_activity(p: dict) -> dict:
     if not (WS.scenario_dir(p["scenario_id"]) / "scenario.json").exists():
         raise ApplicationError(f"scenario.json missing for {p['scenario_id']}; run `swesim approve` before signalling", non_retryable=True)
@@ -498,7 +519,7 @@ async def verify_approval_activity(p: dict) -> dict:
     return {"scenario_id": spec.id, "spec_hash": spec.spec_hash}
 
 
-@activity.defn
+@swesim_activity
 async def compile_activity(p: dict) -> dict:
     from swesim.stages.compile import compile_scenario
 
@@ -507,7 +528,7 @@ async def compile_activity(p: dict) -> dict:
     return {"compile_path": str(r.compile_json), "image_digest": getattr(r, "image_digest", None), "task_dirs": {k: str(v) for k, v in dict(task_dirs).items()}}
 
 
-@activity.defn
+@swesim_activity
 async def validate_activity(p: dict) -> dict:
     from swesim.stages.validate import validate_scenario
 
@@ -515,7 +536,7 @@ async def validate_activity(p: dict) -> dict:
     return {"status": r["status"], "failures": r.get("failures", [])}
 
 
-@activity.defn
+@swesim_activity
 async def register_activity(p: dict) -> dict:
     from swesim.stages.register import register_scenario
 
@@ -551,212 +572,82 @@ def plan_trials(p: dict) -> dict:
     return {"scenario_id": spec.id, "trials": trials}
 
 
-@activity.defn
+@swesim_activity
 async def plan_trials_activity(p: dict) -> dict:
     return plan_trials(p)
 
 
-@activity.defn
+@swesim_activity
 async def score_activity(p: dict) -> dict:
     from swesim.stages.score import score_scenario
 
     return {"scores_path": str(await blocking(lambda: score_scenario(WS, p["scenario_id"])))}
 
 
-@activity.defn
+@swesim_activity
 async def export_activity(p: dict) -> dict:
     from swesim.stages.export import export_scenario
 
     return {"manifest_paths": [str(x) for x in await blocking(lambda: export_scenario(WS, p["scenario_id"]))]}
 
 
-# ------------------------------------------------------------------ trial lifecycle: evidence and decision
+# ------------------------------------------------------------------ trial lifecycle: evidence, launch once, await
 
-def unit_name(tid: str) -> str:
-    return "swesim-trial-" + tid
+_LAYOUT_CLS = None
+
+
+def _layout() -> TrialLayout:
+    """`swesim.storage.layout.Layout` over the workspace root once the storage stream is merged; the same-shaped adapter until then."""
+    global _LAYOUT_CLS
+    if _LAYOUT_CLS is None:
+        try:
+            from swesim.storage import layout as storage_layout
+            _LAYOUT_CLS = storage_layout.Layout
+        except ImportError:
+            _LAYOUT_CLS = WorkspaceLayout
+    return _LAYOUT_CLS(root=WS.root)
 
 
 def trial_dir(tid: str) -> Path:
-    return WS.root / "trials" / tid
+    return _layout().trial_dir(tid)
 
 
-@dataclass(frozen=True)
-class TrialEvidence:
-    has_record: bool
-    has_runner_error: bool
-    status: str | None          # status.json written by swesim.stages.run (running | completed | launch-failed)
-    launch_phase: str | None    # launch.json written here: intent | acknowledged | failed
-    launch_returncode: int | None
-    load_state: str             # systemd LoadState: loaded | not-found
-    active_state: str           # systemd ActiveState: active | activating | inactive | failed | ...
-    sub_state: str              # systemd SubState: running | exited | dead | failed | ...
-
-
-def decide_launch(ev: TrialEvidence) -> str:
-    """Pure decision. Returns one of: ingest | runner-error | reconcile | unresolved | launch-failed | launch.
-    Only "launch" may start a solver; every other branch reads existing state."""
-    if ev.has_record or (ev.status and ev.status != "running"):
-        return "ingest"
-    if ev.has_runner_error:
-        return "runner-error"
-    if ev.load_state == "loaded":
-        return "reconcile"  # the unit exists (running, exited or failed): inspect it, never start another
-    if ev.launch_phase == "acknowledged" and ev.launch_returncode not in (None, 0):
-        return "launch-failed"  # systemd-run refused; nothing ran
-    if ev.launch_phase in ("intent", "acknowledged") or ev.status == "running":
-        return "unresolved"  # a launch was attempted and the unit is gone (VM loss, reboot, manual cleanup): reconcile by hand
-    if ev.launch_phase == "failed":
-        return "launch-failed"
-    return "launch"
-
-
-def systemd_unit_state(unit: str) -> dict:
-    """Only an explicit `LoadState=not-found` means the unit is gone; a failing systemctl raises (retryable)."""
-    cp = RUN(["systemctl", "--user", "show", unit, "--property=LoadState,ActiveState,SubState,Result"])
-    props = dict(line.split("=", 1) for line in (cp.stdout or "").splitlines() if "=" in line)
-    load = props.get("LoadState")
-    if load is None or (cp.returncode != 0 and load != "not-found"):
-        raise UnitStateUnavailable(f"systemctl --user show {unit} failed (rc={cp.returncode}): {((cp.stderr or '') + (cp.stdout or ''))[-300:]}")
-    return {"load_state": load, "active_state": props.get("ActiveState", "inactive"),
-            "sub_state": props.get("SubState", "dead"), "result": props.get("Result", "")}
-
-
-def subprocess_unit_state(launch: dict) -> dict:
-    """Non-production: liveness of the detached child recorded in launch.json (pid reuse is possible)."""
-    pid = launch.get("pid")
-    if not pid:
-        return {"load_state": "not-found", "active_state": "inactive", "sub_state": "dead", "result": ""}
-    proc = _CHILDREN.get(pid)
-    if proc is not None:
-        rc = proc.poll()
-        if rc is None:
-            return {"load_state": "loaded", "active_state": "active", "sub_state": "running", "result": ""}
-        return {"load_state": "loaded", "active_state": "active" if rc == 0 else "failed", "sub_state": "exited" if rc == 0 else "failed", "result": str(rc)}
-    try:
-        os.kill(pid, 0)
-        return {"load_state": "loaded", "active_state": "active", "sub_state": "running", "result": ""}
-    except ProcessLookupError:
-        return {"load_state": "loaded", "active_state": "inactive", "sub_state": "dead", "result": "unknown"}
-    except PermissionError:
-        return {"load_state": "loaded", "active_state": "active", "sub_state": "running", "result": ""}
-
-
-def unit_state(tid: str, launch: dict | None = None) -> dict:
-    launch = launch if launch is not None else _read_json(trial_dir(tid) / "launch.json")
-    if launch.get("launcher", LAUNCHER) == "subprocess":
-        return subprocess_unit_state(launch)
-    return systemd_unit_state(unit_name(tid))
+def launcher() -> Launcher:
+    """The configured launcher, built once from `SETTINGS` (tests assign `LAUNCHER` directly)."""
+    global LAUNCHER
+    if LAUNCHER is None:
+        LAUNCHER = get_launcher(SETTINGS)
+    return LAUNCHER
 
 
 def read_evidence(tid: str) -> TrialEvidence:
-    d = trial_dir(tid); launch = _read_json(d / "launch.json"); state = unit_state(tid, launch)
-    return TrialEvidence(has_record=(d / "record.json").exists(), has_runner_error=(d / "runner-error.json").exists(),
-                         status=_read_json(d / "status.json").get("status"), launch_phase=launch.get("phase"),
-                         launch_returncode=launch.get("returncode"), load_state=state["load_state"],
-                         active_state=state["active_state"], sub_state=state["sub_state"])
-
-
-# ------------------------------------------------------------------ trial lifecycle: launch once
-
-def build_trial_command(request_path: Path) -> list[str]:
-    python = os.environ.get("SWESIM_TRIAL_PYTHON") or sys.executable
-    return [python, "-m", "swesim.workflows.activities", "run-trial", str(request_path)]
-
-
-def _assert_no_secret_values(parts: list[str]) -> None:
-    joined = "\x00".join(parts)
-    for k, v in os.environ.items():
-        if len(v) >= 8 and any(m in k.upper() for m in SECRET_MARKERS) and v in joined:
-            raise RuntimeError(f"refusing to launch: the value of {k} would appear in the unit command line")
-
-
-def build_systemd_run_argv(unit: str, command: list[str], cwd: Path, env: dict[str, str]) -> list[str]:
-    argv = ["systemd-run", "--user", f"--unit={unit}", f"--description=swesim trial {unit}", "--property=RemainAfterExit=yes",
-            f"--working-directory={cwd}"]
-    argv += [f"--setenv={k}={v}" for k, v in sorted(env.items())]
-    argv += list(command)
-    _assert_no_secret_values(argv)
-    return argv
-
-
-def _boot_id() -> str | None:
-    try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    except OSError:
-        return None
-
-
-def _unit_env() -> dict[str, str]:
-    """The only variables a trial unit receives: paths and PATH. Secrets come from the env file via python-dotenv."""
-    return {"SWESIM_WORKSPACE": str(WS.root),
-            "SWESIM_ENV_FILE": os.environ.get("SWESIM_ENV_FILE", str(Path.home() / "Documents" / ".env")),
-            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "PYTHONUNBUFFERED": "1"}
-
-
-def _launch_systemd(unit: str, command: list[str]) -> tuple[int, str, str]:
-    cp = RUN(build_systemd_run_argv(unit, command, REPO_ROOT, _unit_env()))
-    return cp.returncode, cp.stdout or "", cp.stderr or ""
-
-
-def _launch_subprocess(command: list[str], d: Path, intent: dict) -> tuple[int, str, str]:
-    log = open(d / "launcher.log", "ab")  # noqa: SIM115 - inherited by the detached child
-    env = {k: os.environ[k] for k in ("HOME", "USER", "LANG", "TMPDIR") if k in os.environ}  # same shape as the systemd path
-    env.update(_unit_env())
-    proc = subprocess.Popen(command, cwd=str(REPO_ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
-    log.close(); _CHILDREN[proc.pid] = proc; intent["pid"] = proc.pid
-    return 0, "", f"detached pid {proc.pid} via subprocess launcher (NOT production)"
+    return _read_evidence(_layout(), launcher(), tid)
 
 
 def launch_once(p: dict) -> dict:
-    """Launch the trial unit exactly once; otherwise report the reconciliation decision without side effects."""
-    tid = p["trial_id"]; unit = unit_name(tid); d = trial_dir(tid); d.mkdir(parents=True, exist_ok=True)
-    request = d / "request.json"
-    if request.exists() and json.loads(request.read_text()) != p:
-        raise TrialBindingConflict(f"trial {tid} already bound to a different request")
-    decision = decide_launch(read_evidence(tid))
-    out = {"trial_id": tid, "unit": unit, "decision": decision, "launched": False, "launcher": LAUNCHER}
-    if decision != "launch":
-        return out
-    atomic_json(request, p)
-    intent = {"trial_id": tid, "unit": unit, "phase": "intent", "launcher": LAUNCHER, "started_at": time.time(), "boot_id": _boot_id()}
-    atomic_json(d / "launch.json", intent)  # written before systemd-run: a lost acknowledgement is reconciled, never relaunched
-    command = build_trial_command(request)
-    try:
-        if LAUNCHER == "systemd":
-            rc, stdout, stderr = _launch_systemd(unit, command)
-        elif LAUNCHER == "subprocess":
-            rc, stdout, stderr = _launch_subprocess(command, d, intent)
-        else:
-            raise LaunchFailed(f"unknown launcher {LAUNCHER!r}")
-    except Exception as e:
-        atomic_json(d / "launch.json", {**intent, "phase": "failed", "error": repr(e)})
-        raise LaunchFailed(f"launcher failed for {unit}: {e}") from e
-    atomic_json(d / "launch.json", {**intent, "phase": "acknowledged", "returncode": rc, "stdout": stdout[-500:], "stderr": stderr[-1000:]})
-    if rc:
-        raise LaunchFailed(f"launch of {unit} returned {rc}; reconcile before any new attempt")
-    return {**out, "launched": True}
+    return _launch_once(_layout(), launcher(), p, image_digest=SETTINGS.worker_image_digest, origin=SETTINGS.origin)
 
 
-@activity.defn
+@swesim_activity
 async def launch_trial_activity(p: dict) -> dict:
     async with LAUNCH_SLOTS:
         return await blocking(lambda: launch_once(p))
 
 
-@activity.defn
+@swesim_activity
 async def await_trial_activity(p: dict) -> dict:
     """Read-only, retryable, heartbeating poll until terminal evidence exists. Never launches."""
     tid = p["trial_id"]; d = trial_dir(tid); unit = unit_name(tid); deadline = time.monotonic() + AWAIT_DEADLINE_SEC; polls = 0
     while True:
         polls += 1
         ev = read_evidence(tid)
-        _heartbeat({"trial_id": tid, "poll": polls, "unit": f"{ev.load_state}/{ev.active_state}/{ev.sub_state}", "status": ev.status})
+        _heartbeat({"trial_id": tid, "poll": polls, "runtime": f"{ev.runtime_state}: {ev.runtime_detail}", "status": ev.status})
         if ev.has_record:
             r = _read_json(d / "record.json")
             if r.get("status") is not None:
                 return {"trial_id": r.get("trial_id", tid), "status": r["status"], "reward": r.get("reward", {})}
             # record.json exists but is empty/partial: the run stage writes it non-atomically, so the writer may still be
-            # flushing. Fall through: keep polling while the unit runs; report incomplete evidence once it has stopped.
+            # flushing. Fall through: keep polling while the runtime runs; report incomplete evidence once it has stopped.
         if ev.has_runner_error:
             return {"trial_id": tid, "status": "runner-error", "unit": unit, "error": _read_json(d / "runner-error.json").get("error")}
         decision = decide_launch(ev)
@@ -764,33 +655,62 @@ async def await_trial_activity(p: dict) -> dict:
             return {"trial_id": tid, "status": "launch-failed", "unit": unit, "reason": "launcher refused or returned nonzero; nothing ran; never relaunch automatically"}
         if decision == "unresolved":
             return {"trial_id": tid, "status": "unresolved", "unit": unit,
-                    "reason": "launch evidence exists but the unit is gone without a terminal record (VM loss or manual cleanup); inspect the unit journal and Harbor job; never relaunch"}
+                    "reason": "launch evidence exists but the runtime is gone without a terminal record (VM loss or manual cleanup); inspect the runtime's logs and Harbor job; never relaunch"}
         if decision == "launch" and polls >= LAUNCH_GRACE_POLLS:
             return {"trial_id": tid, "status": "launch-failed", "unit": unit, "reason": "no launch evidence for this trial; the launch activity did not reach the launcher"}
-        if decision == "ingest" and not (ev.active_state in RUNNING_STATES and ev.sub_state != "exited"):
-            # Terminal status.json without a readable record.json and the unit is not running: nothing more will appear.
+        if decision == "ingest" and ev.runtime_state != "running":
+            # Terminal status.json without a readable record.json and the runtime is not running: nothing more will appear.
             return {"trial_id": tid, "status": ev.status or "unknown", "unit": unit, "reward": {},
-                    "reason": "terminal evidence incomplete (status.json terminal without record.json, or record.json unreadable) and the unit is not running; read the unit journal; never relaunch"}
+                    "reason": "terminal evidence incomplete (status.json terminal without record.json, or record.json unreadable) and the runtime is not running; read its logs; never relaunch"}
         if decision == "reconcile":
-            if ev.active_state == "failed":
-                return {"trial_id": tid, "status": "unit-failed", "unit": unit, "reason": "unit failed without a terminal record; read its journal; never relaunch"}
-            if ev.active_state not in RUNNING_STATES or ev.sub_state == "exited":
-                return {"trial_id": tid, "status": "unresolved", "unit": unit, "reason": "unit finished without terminal evidence; inspect its journal; never relaunch"}
+            if ev.runtime_state == "failed":
+                return {"trial_id": tid, "status": "unit-failed", "unit": unit, "runtime": ev.runtime_detail,
+                        "reason": "runtime failed without a terminal record; read its logs; never relaunch"}
+            if ev.runtime_state in ("succeeded", "unknown"):
+                return {"trial_id": tid, "status": "unresolved", "unit": unit, "runtime": ev.runtime_detail,
+                        "reason": "runtime finished (or cannot be seen from this worker) without terminal evidence; inspect its logs; never relaunch"}
         if time.monotonic() >= deadline:
-            raise ApplicationError("no terminal evidence before the await deadline; inspect the same unit; never relaunch", non_retryable=True)
+            raise ApplicationError("no terminal evidence before the await deadline; inspect the same runtime; never relaunch", non_retryable=True)
         await asyncio.sleep(POLL_SECONDS)
 
 
-# ------------------------------------------------------------------ the per-trial process (runs inside the unit)
+CLEANUP_DECISIONS = ("ingest", "runner-error", "launch-failed")  # terminal evidence exists; the runtime resource is no longer the evidence
+
+
+@swesim_activity
+async def cancel_trial_activity(p: dict) -> dict:
+    """Ask the launcher to stop the trial's runtime (workflow cancellation). Without launch evidence there is nothing to stop.
+    The trial id stays consumed: a later run is a new attempt index, never a relaunch."""
+    tid = p["trial_id"]; launch = _read_json(trial_dir(tid) / "launch.json")
+    if not launch:
+        return {"trial_id": tid, "cancelled": False, "reason": "no launch evidence"}
+    await blocking(lambda: launcher().cancel(tid, launch))
+    return {"trial_id": tid, "cancelled": True, "launcher": launcher().name, "handle": launch.get("handle")}
+
+
+@swesim_activity
+async def cleanup_trial_activity(p: dict) -> dict:
+    """Release the trial's runtime resource (Cloud Run: delete the Job; systemd/subprocess: nothing) once terminal evidence
+    exists and nothing is running. Refuses otherwise: until the record is written the runtime is the evidence."""
+    tid = p["trial_id"]; ev = read_evidence(tid); decision = decide_launch(ev)
+    if ev.runtime_state == "running" or decision not in CLEANUP_DECISIONS:
+        return {"trial_id": tid, "cleaned": False, "reason": f"not terminal: decision={decision} runtime={ev.runtime_state}"}
+    launch = _read_json(trial_dir(tid) / "launch.json")
+    await blocking(lambda: launcher().cleanup(tid, launch))
+    return {"trial_id": tid, "cleaned": True, "launcher": launcher().name, "handle": launch.get("handle")}
+
+
+# ------------------------------------------------------------------ the per-trial process (runs inside the unit or Job)
 
 def execute_trial_request(request_path: Path) -> dict:
-    """Body of the trial unit: load the frozen spec and the exact RunConfig, check identity, run the trial.
-    Secrets come from the env file through python-dotenv, never from arguments."""
+    """Body of the trial process: load the frozen spec and the exact RunConfig, check identity, run the trial.
+    Configuration is the process's own `Settings` (the unit or Job sets SWESIM_WORKSPACE, SWESIM_ENV_FILE, ...); secrets
+    come from the environment or the env file through `swesim.settings.secret`, never from arguments."""
     p = json.loads(Path(request_path).read_text())
-    ws = Workspace(os.environ.get("SWESIM_WORKSPACE", str(WS.root)))
+    s = Settings.from_env(); ws = Workspace(s.workspace, s.registry_path)
     from dotenv import load_dotenv
 
-    load_dotenv(os.environ.get("SWESIM_ENV_FILE", str(Path.home() / "Documents" / ".env")))
+    load_dotenv(s.env_file)  # provider keys for the solver and stakeholder clients; a missing file is a no-op (Cloud Run sets them directly)
     d = ws.root / "trials" / p["trial_id"]
     try:
         from swesim.stages.run import run_trial
@@ -802,10 +722,10 @@ def execute_trial_request(request_path: Path) -> dict:
         expected = trial_id(spec.spec_hash, rc.condition, rc.run_config_hash, p["attempt_index"])
         if expected != p["trial_id"]:
             raise ValueError("trial id does not match its run config; refusing to run under another identity")
-        secret = os.environ.get("SWESIM_WORKER_SECRET", "")
-        if rc.condition == "interactive" and not secret:
-            raise ValueError("SWESIM_WORKER_SECRET missing from the env file")
-        rec = run_trial(ws, spec, rc, p["attempt_index"], p["stakeholder_url"], secret)
+        worker_secret = secret("SWESIM_WORKER_SECRET", s) if has_secret("SWESIM_WORKER_SECRET", s) else ""
+        if rc.condition == "interactive" and not worker_secret:
+            raise ValueError("SWESIM_WORKER_SECRET missing from the environment and the env file")
+        rec = run_trial(ws, spec, rc, p["attempt_index"], p["stakeholder_url"], worker_secret)
         return {"trial_id": rec.trial_id, "status": rec.status, "reward": rec.reward}
     except Exception as e:
         atomic_json(d / "runner-error.json", {"trial_id": p["trial_id"], "error": _redact(repr(e)), "type": type(e).__name__, "at": time.time()})
@@ -824,8 +744,8 @@ def main(argv: list[str] | None = None) -> int:
 ALL = [probe_models_activity, mine_activity, judge_activity, list_candidates_activity, judge_one_activity, probe_candidate_activity,
        scenario_version_activity, archive_scenario_activity, draft_activity,
        auto_approve_activity, precheck_draft_activity, human_approve_activity, verify_approval_activity, compile_activity,
-       validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity, score_activity,
-       export_activity]
+       validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity, cancel_trial_activity,
+       cleanup_trial_activity, score_activity, export_activity]
 
 if __name__ == "__main__":
     raise SystemExit(main())
