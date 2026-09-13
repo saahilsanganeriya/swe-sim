@@ -23,7 +23,7 @@ from swesim import tamper
 from swesim.llm import chat_json
 from swesim.paths import atomic_json
 from swesim.sources import threads
-from swesim.sources.github_repo import probe_binding, runner_prefix
+from swesim.sources.github_repo import is_code_path, probe_binding, runner_prefix
 from swesim.sources.swebench_annotated import TEST_PYTHON, test_files_from_patch
 import keyword
 
@@ -461,11 +461,15 @@ def _test_blocks(test_patch: str) -> list[tuple[str | None, str | None, list[str
             continue
         if raw.startswith("@@"):
             trailer = raw.split("@@", 2)[2] if raw.count("@@") >= 2 else ""
+            trailer = trailer[1:] if trailer.startswith(" ") else trailer  # the single separator space after "@@" is not indentation
             c = _CLASS_DEF.match(trailer.strip())
             if c:
                 current_class = c.group(1)
             d = _TEST_DEF.match(trailer.strip())
-            blocks.append((current_file, qualified(d.group(1), trailer != trailer.lstrip()) if d else None, []))
+            indented = d is not None and trailer != trailer.lstrip()
+            if d and not indented:
+                current_class = None  # a top-level test function: we have left any class
+            blocks.append((current_file, qualified(d.group(1), indented) if d else None, []))
             continue
         if raw.startswith(DIFF_HEADER_PREFIXES) or raw[:1] == "-":
             continue
@@ -475,7 +479,10 @@ def _test_blocks(test_patch: str) -> list[tuple[str | None, str | None, list[str
             current_class = c.group(1)
         d = _TEST_DEF.match(line)
         if d:
-            blocks.append((current_file, qualified(d.group(1), line != line.lstrip()), []))
+            indented = line != line.lstrip()
+            if not indented:
+                current_class = None
+            blocks.append((current_file, qualified(d.group(1), indented), []))
         if blocks:
             blocks[-1][2].append(line)
     return blocks
@@ -489,15 +496,18 @@ def _qualname(nodeid: str) -> tuple[str, str]:
 
 def _f2p_for_block(file: str | None, fn: str | None, fail_to_pass: list[str]) -> set[str]:
     """Ids of `fail_to_pass` in `file` whose qualified name matches the block's function: exact when the block knows its class
-    (`TestA::test_x`), by bare function name when it does not."""
-    out = set()
+    (`TestA::test_x`); by bare function name when it does not, or when the qualified match finds nothing (a class context the
+    diff mis-tracked must not unlink a real test)."""
+    exact, bare = set(), set()
     for t in fail_to_pass:
         path, qual = _qualname(t)
         if path != file:
             continue
-        if fn is None or qual == fn or ("::" not in fn and qual.split("::")[-1] == fn):
-            out.add(t)
-    return out
+        if fn is None or qual == fn:
+            exact.add(t)
+        if fn is not None and qual.split("::")[-1] == fn.split("::")[-1]:
+            bare.add(t)
+    return exact or bare
 
 
 _KEYWORDS = set(keyword.kwlist) | set(getattr(keyword, "softkwlist", []))
@@ -664,7 +674,6 @@ CONTROL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 ASSET_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_BASE_FILES = 8
 MAX_BASE_BYTES = 400_000
-FALLBACK_COMMENT = "# swesim plausible-wrong control: no functional change (the model's control patch did not apply)\n"
 
 
 def slugify_control_name(label, fallback: str, taken: set[str]) -> str:
@@ -714,27 +723,37 @@ def fetch_base_files(row: dict, paths, cache: dict[str, str | None] | None = Non
     return files, skipped
 
 
+def safe_repo_path(path) -> bool:
+    """Repository-relative, no absolute or `..` components (model-supplied `files` keys and diff paths are written into a temp repo)."""
+    return isinstance(path, str) and bool(path.strip()) and not path.startswith(("/", "\\")) and ".." not in path.split("/") and "\\" not in path
+
+
 def verify_diff_applies(base_files: dict[str, str | None], diff: str) -> tuple[bool | None, str]:
-    """`git apply --check` of `diff` against a temporary git repo holding `base_files`. (True, ""), (False, git error) or
-    (None, reason) when it cannot be verified locally (no git, or a touched file outside the fetched base set)."""
+    """`git apply --check` of `diff` against a temporary git repo holding `base_files` (a key with None = confirmed absent on
+    base; a key that is missing = never fetched). (True, ""), (False, git error), or (None, reason) when it cannot be verified
+    locally: reason starts with "unfetched:" when a touched file was not fetched (callers treat that as unusable) and with
+    "no-git:" when git is unavailable (callers accept unverified)."""
     if shutil.which("git") is None:
-        return None, "git unavailable locally; the Modal sweep verifies application"
-    missing = sorted(p for p in patch_paths(diff) if p not in base_files)
+        return None, "no-git: git unavailable locally; the Modal sweep verifies application"
+    touched = patch_paths(diff)
+    unsafe = sorted(p for p in touched if not safe_repo_path(p))
+    if unsafe:
+        return False, f"patch touches a path outside the repository: {unsafe}"
+    missing = sorted(p for p in touched if p not in base_files)
     if missing:
-        return None, f"base content not fetched for {missing}"
+        return None, f"unfetched: base content not fetched for {missing} (fetch bound)"
     with tempfile.TemporaryDirectory() as td:
         repo = Path(td) / "repo"
         repo.mkdir()
         for path, text in base_files.items():
-            if text is None:
+            if text is None or not safe_repo_path(path):
                 continue
             target = repo / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text)
-        git = ["git", "-c", "user.name=swesim", "-c", "user.email=swesim@localhost", "-c", "init.defaultBranch=main"]
+        git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", "-c", "init.defaultBranch=main"]
         subprocess.run([*git, "init", "-q"], cwd=repo, capture_output=True, text=True)
         subprocess.run([*git, "add", "-A"], cwd=repo, capture_output=True, text=True)
-        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "base"], cwd=repo, capture_output=True, text=True)
         patch = Path(td) / "control.diff"
         patch.write_text(diff)
         proc = subprocess.run([*git, "apply", "--check", str(patch)], cwd=repo, capture_output=True, text=True)
@@ -743,14 +762,21 @@ def verify_diff_applies(base_files: dict[str, str | None], diff: str) -> tuple[b
 
 def build_control_diff(ctrl: dict, base_files: dict[str, str | None]) -> tuple[str | None, str]:
     """(diff, method). Primary path: `files` = complete modified text per touched file -> well-formed diff via difflib against
-    the fetched base ('difflib'); fallback: the model's own unified diff ('model-diff'); (None, 'missing') otherwise."""
+    the fetched base ('difflib'); fallback: the model's own unified diff ('model-diff'); (None, 'missing') otherwise. A
+    `files` path that was never fetched (missing key) is a violation — only a key holding None means the base tree confirmed
+    the file is absent, and only then is a new-file diff emitted."""
     files = ctrl.get("files") if isinstance(ctrl.get("files"), dict) else None
     if files:
         parts = []
         for path, text in files.items():
             if not isinstance(path, str) or not isinstance(text, str) or not path.strip():
                 continue
-            base = base_files.get(path)
+            if not safe_repo_path(path):
+                raise DraftViolation(f"control path must be repository-relative without `..`: {path!r}")
+            if path not in base_files:
+                raise DraftViolation(f"control touches {path!r}, whose base-commit content could not be fetched (fetch bound: {MAX_BASE_FILES} files, "
+                                     f"{MAX_BASE_BYTES} bytes); change only these fetched files: {sorted(base_files)}")
+            base = base_files[path]
             if base is not None and text == base:
                 continue  # unchanged file: nothing to diff
             parts.append(tamper.file_diff(path, base, text if text.endswith("\n") else text + "\n"))
@@ -763,27 +789,81 @@ def build_control_diff(ctrl: dict, base_files: dict[str, str | None]) -> tuple[s
     return None, "missing"
 
 
+_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
+_INVERSIONS = ((" == ", " != "), (" != ", " == "), (" is not ", " is "), (" not in ", " in "), (" >= ", " < "), (" <= ", " > "),
+               ("True", "False"), ("False", "True"))
+
+
+def _is_code_line(text: str) -> bool:
+    s = text.strip()
+    return bool(s) and not s.startswith("#") and s not in ('"""', "'''")
+
+
+def _split_hunks(chunk: str) -> tuple[str, list[list[str]]]:
+    head, hunks = [], []
+    for line in chunk.splitlines(keepends=True):
+        if line.startswith("@@"):
+            hunks.append([line])
+        elif hunks:
+            hunks[-1].append(line)
+        else:
+            head.append(line)
+    return "".join(head), hunks
+
+
+def _incorrect_variants(head: str, hunks: list[list[str]]):
+    """Real incorrect changes derived from one code chunk of the gold patch: first, one added code line with a comparison or
+    boolean inverted (counts unchanged); then, one added code line dropped (hunk recounted, an emptied hunk removed and later
+    new-side starts shifted). Yields (method, diff)."""
+    for hi, hunk in enumerate(hunks):
+        for li, line in enumerate(hunk[1:], start=1):
+            if not (line.startswith("+") and _is_code_line(line[1:])):
+                continue
+            for old, new in _INVERSIONS:
+                if old in line[1:]:
+                    new_hunk = list(hunk)
+                    new_hunk[li] = "+" + line[1:].replace(old, new, 1)
+                    yield "fallback-inverted-comparison", head + "".join("".join(h) for h in [*hunks[:hi], new_hunk, *hunks[hi + 1:]])
+                    break
+    for hi, hunk in enumerate(hunks):
+        m = _HUNK.match(hunk[0].rstrip("\n"))
+        if not m:
+            continue
+        a, b, c, d, trailer = m.groups()
+        b, d = int(b) if b is not None else 1, int(d) if d is not None else 1
+        for li, line in enumerate(hunk[1:], start=1):
+            if not (line.startswith("+") and _is_code_line(line[1:])) or (li + 1 < len(hunk) and hunk[li + 1].startswith("\\")):
+                continue
+            body = hunk[1:li] + hunk[li + 1:]
+            still_changes = any(x[:1] in "+-" for x in body if not x.startswith("\\"))
+            new_hunk = [f"@@ -{a},{b} +{c},{d - 1} @@{trailer}\n", *body]
+            rest = [list(h) for h in hunks[hi + 1:]]
+            if not still_changes:  # the hunk became pure context: remove it and shift the new-side starts that followed it
+                for h in rest:
+                    hm = _HUNK.match(h[0].rstrip("\n"))
+                    if hm:
+                        ha, hb, hc, hd, ht = hm.groups()
+                        h[0] = f"@@ -{ha},{hb if hb is not None else 1} +{int(hc) - (d - b)},{hd if hd is not None else 1} @@{ht}\n"
+            new_hunks = [*hunks[:hi], *([new_hunk] if still_changes else []), *rest]
+            if new_hunks:
+                yield "fallback-dropped-line", head + "".join("".join(h) for h in new_hunks)
+            break
+
+
 def fallback_plausible_wrong(gold_patch: str, base_files: dict[str, str | None]) -> tuple[str, str] | None:
     """Code-generated stand-in when the model's plausible-wrong patch is unusable after the correction round (ScenarioSpec
-    requires one plausible-wrong control): the gold fix cut to its first file or first hunk (an incomplete fix), else a
-    comment-only edit of a gold-touched file (no functional change). Both apply by construction. Returns (diff, method)."""
-    chunks = [c for c in re.split(r"(?=^diff --git )", gold_patch or "", flags=re.M) if c.strip()]
-    candidates = []
-    if len(chunks) >= 2:
-        candidates.append((chunks[0], "fallback-partial-gold"))
-    elif len(chunks) == 1:
-        head, *hunks = re.split(r"(?=^@@ )", chunks[0], flags=re.M)
-        if len(hunks) >= 2:
-            candidates.append((head + hunks[0], "fallback-partial-gold"))
-    for path in sorted(base_files):
-        if base_files[path] is not None:
-            text = base_files[path]
-            candidates.append((tamper.file_diff(path, text, text + ("" if text.endswith("\n") else "\n") + FALLBACK_COMMENT), "fallback-comment-only"))
-            break
-    for diff, method in candidates:
-        ok, _ = verify_diff_applies(base_files, diff)
-        if ok is not False:
-            return diff, method
+    requires one plausible-wrong control). It must be a real incorrect change: from the first CODE chunk of the gold patch
+    (`is_code_path`; changelogs, docs and non-code paths skipped) invert one added comparison/boolean, else drop one added code
+    line. None when no such change exists — the draft then fails rather than carrying a meaningless control."""
+    for chunk in (c for c in re.split(r"(?=^diff --git )", gold_patch or "", flags=re.M) if c.strip()):
+        m = re.match(r"diff --git a/(\S+)", chunk)
+        if not m or not is_code_path(m.group(1)):
+            continue
+        head, hunks = _split_hunks(chunk)
+        for method, diff in _incorrect_variants(head, hunks):
+            ok, _ = verify_diff_applies(base_files, diff)
+            if ok is not False:
+                return diff, method
     return None
 
 
@@ -826,8 +906,8 @@ def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | No
             d = {}
         single = link_single_target(d, f2p)
         bad = ledger_violations(d, row, extra_facts)
-        if not bad and validate:
-            bad = validate(d)
+        if validate:
+            bad = bad + validate(d)  # both violation kinds reach the single correction round
         if not bad:
             return d, {"auto_linked": single, "auto_linked_single_target": bool(single)}
         if attempt == 0:
@@ -938,7 +1018,10 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
             return None, None
         try:
             paths = set(ctrl.get("files") or {}) if isinstance(ctrl.get("files"), dict) else patch_paths(ctrl.get("diff") or "")
-            files, _ = fetch_base_files(row, paths, base_cache)
+            unsafe = sorted(p for p in paths if not safe_repo_path(p))
+            if unsafe:
+                raise DraftViolation(f"{key} touches paths that are not repository-relative: {unsafe}")
+            files, _ = fetch_base_files(row, paths, base_cache)  # unfetched paths stay out of `files` (never mistaken for absent)
             diff, method = build_control_diff(ctrl, files)
         except DraftViolation as e:
             if lenient:
@@ -948,10 +1031,10 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
         if diff is None:
             return None, None
         ok, msg = verify_diff_applies(files, diff)
-        if ok is False:
+        if ok is False or (ok is None and msg.startswith("unfetched:")):
             if not lenient:
-                raise DraftViolation(f"{key} patch does not apply to the base commit (git apply --check): {msg}. Prefer `files` with the complete "
-                                     "modified text of each touched file so the diff is built for you.")
+                raise DraftViolation(f"{key} patch cannot be applied to the base commit (git apply --check): {msg}. Prefer `files` with the complete "
+                                     "modified text of each touched, fetched file so the diff is built for you.")
             control_notes.setdefault("controls_dropped", []).append({"control": key, "label": ctrl.get("name"), "reason": f"does not apply: {msg}", "method": method})
             return None, None
         record = {"label": ctrl.get("name"), "rationale": ctrl.get("rationale") or "", "method": method, "verified": ok}
@@ -969,8 +1052,9 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
             if not lenient:
                 raise DraftViolation("plausible-wrong control needs a patch: give `files` with the complete modified text of each touched file")
             fb = fallback_plausible_wrong(row["patch"], base_sources)
-            if fb is None:
-                raise ValueError("drafter error: no usable plausible-wrong control and no base content for a code fallback")
+            if fb is None:  # never write a meaningless control; re-draft or take the next candidate
+                raise ValueError("no usable plausible-wrong control: the model's patch was unusable after the correction round and the gold "
+                                 "patch has no code change a fallback can make incorrect")
             diff, method = fb
             pw_rec, pw_bytes = {"label": method, "rationale": "code fallback: the model's plausible-wrong patch was unusable after the correction round",
                                 "method": method, "verified": True}, diff.encode()

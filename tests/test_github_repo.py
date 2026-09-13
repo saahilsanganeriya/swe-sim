@@ -395,6 +395,7 @@ def test_probe_is_grading_faithful_exact_ids_in_definition_order(monkeypatch, tm
     probe_py = (tmp_path / "ws" / "probes" / "pydata--xarray-5362" / "tests" / "probe.py").read_text()
     assert "test_exact" in probe_py and "gold_exact" in probe_py and "run(exact,contract)" in probe_py and "results['order']=contract" in probe_py
     assert "git_apply('/tests/oracle.diff','-R')" in probe_py and "before[t] in ('failed','error') and after.get(t)=='passed'" in probe_py   # contract ids, oracle reverted for test_exact
+    assert "oracle revert failed" in probe_py and "results.pop('test_exact',None)" in probe_py   # a failed revert keeps the whole-file evidence and records the skip
     # the exact stages must cover exactly the contract ids: a non-contract id in them, or a missing one, is unreliable
     extra = {**data, "order": order, "test_exact": {**data["test_exact"], "statuses": {**exact_test, f + "test_not_in_contract": "passed"}}}
     _setup_probe(monkeypatch, tmp_path, extra)
@@ -418,6 +419,15 @@ def test_probe_is_grading_faithful_exact_ids_in_definition_order(monkeypatch, tm
     out = gr.probe_tests(dict(row), Workspace(tmp_path / "ws3"))
     assert out["probe"]["runner"]["exact"] == "command exceeds argv budget" and out["dropped"]["order_dependent"] == [] and out["pass_to_pass"] == [order[0], order[3]]
     assert gr.PROBE_VERIFIER_TIMEOUT_SEC >= 5 * gr.PROBE_TIMEOUT_SEC + 300
+    # a bound probe with a terminal skip reason is passed through by probe_candidates, never re-probed on later runs
+    from swesim.stages.mine import probe_candidates
+    over = {**row, "instance_id": "pydata__xarray-9", "judge": {"keep": True, "gaps": []}, "probe": dict(out["probe"])}
+    over["probe"]["binding"] = gr.probe_binding(over)
+    judged = tmp_path / "over.judged.jsonl"; judged.write_text(json.dumps(over) + "\n")
+    monkeypatch.setattr(gr, "probe_tests", lambda r, ws: pytest.fail("a terminal skip reason must not be re-probed"))
+    out_path = probe_candidates(Workspace(tmp_path / "ws_over"), judged, max_builds=3)
+    assert json.loads(out_path.with_suffix(".summary.json").read_text()) == {"rows": 1, "probed": 0, "already-probed-whole-file-only": 1}
+    assert json.loads(out_path.read_text().splitlines()[0])["probe"]["runner"]["exact"] == "command exceeds argv budget"
 
 
 def test_classify_probe_buckets():

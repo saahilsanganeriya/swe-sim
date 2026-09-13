@@ -274,11 +274,15 @@ contract=[t for t in before if (before[t] in ('failed','error') and after.get(t)
 results['order']=contract
 exact=(prefix or '')+' '.join(shlex.quote(t) for t in contract)
 if prefix and contract and len(exact)<=max_chars and not results['test']['error'] and not results['gold']['error']:
-    results['exact_command']=exact
-    git_apply('/tests/oracle.diff','-R')
-    results['test_exact']=run(exact,contract)
-    git_apply('/tests/oracle.diff')
-    results['gold_exact']=run(exact,contract)
+    try:
+        git_apply('/tests/oracle.diff','-R')
+        results['exact_command']=exact
+        results['test_exact']=run(exact,contract)
+        git_apply('/tests/oracle.diff')
+        results['gold_exact']=run(exact,contract)
+    except Exception as e:  # keep the whole-file evidence; the exact stages are recorded as skipped
+        results.pop('test_exact',None); results.pop('gold_exact',None); results.pop('exact_command',None)
+        results['exact_skipped']='oracle revert failed: '+str(e)[:300]
 else:
     results['exact_skipped']='no contract tests' if not contract else ('no prefix' if not prefix else ('whole-file stage errored' if (results['test']['error'] or results['gold']['error']) else 'command exceeds argv budget'))
 Path('/logs/verifier').mkdir(parents=True,exist_ok=True)

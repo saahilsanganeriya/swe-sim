@@ -1047,6 +1047,12 @@ def test_schema_errors_are_fed_back_in_the_correction_round(monkeypatch, tmp_pat
     assert len(author) == 2
     correction = author[1]["messages"][-1]["content"]
     assert "Correct these violations" in correction and "schema:" in correction and "author-only" in correction
+    # a ledger violation and a schema error in the same output both reach the single correction round
+    both = _draft_llm(); both["requirements"][0]["fact_id"] = "f02"; both["ledger"][0]["source_excerpt"] = "raise a TypeError when the dim is missing"
+    outputs = iter([both, _draft_llm()]); calls.clear()
+    draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s_both")
+    correction = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]][1]["messages"][-1]["content"]
+    assert "f01: source_excerpt is not a verbatim span" in correction and "schema:" in correction and "author-only" in correction
     # still invalid after the correction round: fails with the schema message and writes nothing
     outputs = iter([first, first]); calls.clear()
     with pytest.raises(ValueError, match="grounding validation after two attempts.*schema:.*author-only"):
@@ -1109,7 +1115,16 @@ def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
     assert draft_spec.verify_diff_applies(base, good) == (True, "")
     ok, msg = draft_spec.verify_diff_applies(base, corrupt)
     assert ok is False and "corrupt" in msg.lower() or ok is False and msg
-    assert draft_spec.verify_diff_applies({}, good)[0] is None                                    # touched file not fetched: unverifiable, not a failure
+    ok, msg = draft_spec.verify_diff_applies({}, good)
+    assert ok is None and msg.startswith("unfetched:")                                            # touched file not fetched: marked, and controls treat it as unusable
+    assert draft_spec.verify_diff_applies(base, good.replace("a/xarray/core/weighted.py", "a/../etc/passwd").replace("b/xarray/core/weighted.py", "b/../etc/passwd"))[0] is False
+    # a `files` path that was never fetched is a violation, never a new-file diff; None (confirmed absent) is the only new-file case
+    with pytest.raises(draft_spec.DraftViolation, match="could not be fetched"):
+        draft_spec.build_control_diff({"files": {"pkg/unfetched.py": "x\n"}}, base)
+    with pytest.raises(draft_spec.DraftViolation, match="repository-relative"):
+        draft_spec.build_control_diff({"files": {"../escape.py": "x\n"}}, {**base, "../escape.py": None})
+    newfile, method = draft_spec.build_control_diff({"files": {"pkg/new.py": "print(1)\n"}}, {**base, "pkg/new.py": None})
+    assert method == "difflib" and "new file mode" in newfile and "--- /dev/null" in newfile
     # primary path: complete file text -> well-formed diff
     ctrl = {"name": "keyerror", "rationale": "r", "files": {"xarray/core/weighted.py": "x\nraise KeyError\n"}}
     diff, method = draft_spec.build_control_diff(ctrl, base)
@@ -1131,26 +1146,46 @@ def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
     p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
     spec = ScenarioSpec.model_validate_json(p.read_text())
     author = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
-    assert len(author) == 2 and "does not apply to the base commit (git apply --check)" in author[1]["messages"][-1]["content"]
+    assert len(author) == 2 and "cannot be applied to the base commit (git apply --check)" in author[1]["messages"][-1]["content"]
     assert spec.controls.plausible_wrong[0].name == "keyerror" and "+raise KeyError" in (tmp_path / "s" / "assets" / "plausible-wrong.diff").read_text()
     meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
     assert meta["controls"]["plausible_wrong"] == {"name": "keyerror", "label": "keyerror", "rationale": "wrong exception type", "method": "difflib", "verified": True}
     assert meta["controls_dropped"] == [] and meta["controls_fallback"] == {} and meta["oracle_apply"]["verified"] is True and meta["oracle_apply"]["base_files_fetched"] == ["xarray/core/weighted.py"]
-    # still corrupt after the correction round: plausible-wrong is replaced by a code fallback, a corrupt alternative-correct is dropped
+    # still corrupt after the correction round: plausible-wrong is replaced by a REAL incorrect change (an inverted comparison
+    # in the gold's first code chunk), a corrupt alternative-correct is dropped
+    gold_two = ("diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n"
+                "@@ -1 +1,3 @@\n x\n+if dim == 'z':\n+    raise ValueError(dim)\n")
     bad_alt = {"name": "alt", "rationale": "r", "diff": corrupt.replace("+raise KeyError", "+z")}
     outputs = iter([{**first, "alternative_correct": bad_alt}, {**first, "alternative_correct": bad_alt}]); calls.clear()
-    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s2")
+    p = draft_spec.draft(_row(patch=gold_two), _judged(), "fake/model", tmp_path / "s2")
     spec = ScenarioSpec.model_validate_json(p.read_text())
     meta = json.loads((tmp_path / "s2" / "draft.meta.json").read_text())
-    assert spec.controls.plausible_wrong[0].name == "fallback-comment-only" and spec.controls.alternative_correct == []
-    assert meta["controls_fallback"] == {"plausible_wrong": "fallback-comment-only"}
+    assert spec.controls.plausible_wrong[0].name == "fallback-inverted-comparison" and spec.controls.alternative_correct == []
+    assert meta["controls_fallback"] == {"plausible_wrong": "fallback-inverted-comparison"}
     assert [(x["control"], x["method"]) for x in meta["controls_dropped"]] == [("plausible_wrong", "model-diff"), ("alternative_correct", "model-diff")]
-    assert draft_spec.verify_diff_applies(base, (tmp_path / "s2" / "assets" / "plausible-wrong.diff").read_text()) == (True, "")
-    # a multi-hunk gold patch yields a partial-gold fallback instead
-    gold2 = ("diff --git a/pkg/a.py b/pkg/a.py\n--- a/pkg/a.py\n+++ b/pkg/a.py\n@@ -1,2 +1,3 @@\n a\n+b\n c\n@@ -8,2 +9,3 @@\n h\n+i\n j\n")
+    fallback_diff = (tmp_path / "s2" / "assets" / "plausible-wrong.diff").read_text()
+    assert "+if dim != 'z':" in fallback_diff and "+    raise ValueError(dim)" in fallback_diff and draft_spec.verify_diff_applies(base, fallback_diff) == (True, "")
+    # no comparison to invert: one added code line is dropped, the emptied hunk removed and the following hunk re-based
+    gold2 = ("diff --git a/pkg/a.py b/pkg/a.py\n--- a/pkg/a.py\n+++ b/pkg/a.py\n@@ -1,2 +1,3 @@\n a\n+b\n c\n@@ -7,2 +8,3 @@\n h\n+i\n j\n")
     base2 = {"pkg/a.py": "a\nc\nd\ne\nf\ng\nh\nj\n"}
     fb = draft_spec.fallback_plausible_wrong(gold2, base2)
-    assert fb is not None and fb[1] == "fallback-partial-gold" and "+b" in fb[0] and "+i" not in fb[0] and draft_spec.verify_diff_applies(base2, fb[0]) == (True, "")
+    assert fb is not None and fb[1] == "fallback-dropped-line" and "+i" in fb[0] and "+b" not in fb[0] and "@@ -7,2 +7,3 @@" in fb[0]
+    assert draft_spec.verify_diff_applies(base2, fb[0]) == (True, "")
+    # changelog/docs chunks are skipped; a gold with no code chunk or no droppable change yields no fallback
+    gold3 = "diff --git a/CHANGES b/CHANGES\n--- a/CHANGES\n+++ b/CHANGES\n@@ -1 +1,2 @@\n old\n+new entry\n" + gold2
+    fb = draft_spec.fallback_plausible_wrong(gold3, {**base2, "CHANGES": "old\n"})
+    assert fb is not None and "CHANGES" not in fb[0] and fb[1] == "fallback-dropped-line"
+    assert draft_spec.fallback_plausible_wrong("diff --git a/CHANGES b/CHANGES\n--- a/CHANGES\n+++ b/CHANGES\n@@ -1 +1,2 @@\n old\n+new\n", {"CHANGES": "old\n"}) is None
+    assert draft_spec.fallback_plausible_wrong(_row()["patch"], base) is None                     # a single added line: dropping it leaves no change
+    # a fetch-bound (unfetched) file: the model control is dropped with the reason, never turned into a bogus new-file diff
+    monkeypatch.setattr(draft_spec, "MAX_BASE_FILES", 0)
+    outputs = iter([second, second]); calls.clear()
+    p = draft_spec.draft(_row(patch=gold_two), _judged(), "fake/model", tmp_path / "s5")
+    meta = json.loads((tmp_path / "s5" / "draft.meta.json").read_text())
+    assert meta["controls_dropped"][0]["control"] == "plausible_wrong" and "could not be fetched" in meta["controls_dropped"][0]["reason"]
+    assert meta["controls_fallback"] == {"plausible_wrong": "fallback-inverted-comparison"} and meta["oracle_apply"]["verified"] is None
+    assert "new file mode" not in (tmp_path / "s5" / "assets" / "plausible-wrong.diff").read_text()
+    monkeypatch.setattr(draft_spec, "MAX_BASE_FILES", 8)
     # an oracle that does not apply to its base is a drafter error, not a correction
     outputs = iter([_draft_llm(), _draft_llm()])
     with pytest.raises(ValueError, match="oracle patch does not apply"):
@@ -1188,6 +1223,18 @@ def test_single_f2p_function_links_every_on_request_fact(monkeypatch, tmp_path):
     assert [fn for _, fn, _ in draft_spec._test_blocks(class_patch) if fn] == ["TestA::test_x", "TestB::test_x"]
     assert draft_spec.tests_for_excerpt(class_patch, "assert beta_value == 2", ["t.py::TestA::test_x", "t.py::TestB::test_x"]) == ["t.py::TestB::test_x"]
     assert draft_spec.definition_order(["t.py::TestB::test_x", "t.py::TestA::test_x"], None, class_patch) == (["t.py::TestA::test_x", "t.py::TestB::test_x"], "diff")
+    # review v6: a mixed file (top-level tests after a class); git's hunk-header separator space is not indentation
+    mixed = ("diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
+             "@@ -1,3 +1,4 @@ class TestA:\n     def test_x(self):\n+        assert alpha_value == 1\n         pass\n"
+             "@@ -10,2 +11,4 @@ def test_top():\n     first = 1\n+    assert gridspec_value == 2\n+    assert figure_value == 3\n"
+             "+def test_tail():\n+    assert tail_value == 4\n")
+    ids = ["t.py::TestA::test_x", "t.py::test_top", "t.py::test_tail"]
+    assert [fn for _, fn, _ in draft_spec._test_blocks(mixed) if fn] == ["TestA::test_x", "test_top", "test_tail"]
+    assert draft_spec.tests_for_excerpt(mixed, "assert gridspec_value == 2", ids) == ["t.py::test_top"]
+    assert draft_spec.tests_for_excerpt(mixed, "assert tail_value == 4", ids) == ["t.py::test_tail"]
+    assert draft_spec.auto_link_tests("The gridspec value and the figure value", mixed, ids) == ["t.py::test_top"]
+    assert draft_spec._f2p_for_block("t.py", "TestZ::test_top", ids) == {"t.py::test_top"}                       # bare-name fallback when the class was mis-tracked
+    assert draft_spec.definition_order(["t.py::test_tail", "t.py::test_top", "t.py::TestA::test_x"], None, mixed) == (ids, "diff")
     tp = ("diff --git a/testing/test_unittest.py b/testing/test_unittest.py\n--- a/testing/test_unittest.py\n+++ b/testing/test_unittest.py\n"
           "@@ -1 +1,5 @@\n x\n+@pytest.mark.parametrize(\"mark\", [\"@unittest.skip\", \"@pytest.mark.skip\"])\n+def test_pdb_teardown_skipped(pytester, mark):\n"
           "+    with pytest.raises(ValueError, match=\"dimension 'z' not found\"):\n+        pytester.runpytest(\"--pdb\")\n")
@@ -1243,13 +1290,11 @@ def test_draft_rejects_leaky_withholding_and_empty_controls(monkeypatch, tmp_pat
     assert [b.profile for b in spec.briefs] == ["natural"] and not any(f.id.startswith("withheld-") for f in spec.ledger) and not any(o.type == "withholding" for o in spec.operations)
     meta = json.loads((tmp_path / "s1" / "draft.meta.json").read_text())
     assert meta["withholding"]["removed"] == 0 and meta["withholding"]["reason"].startswith("all selections rejected") and meta["withholding"]["spans"] == []
-    d = _draft_llm(); d["plausible_wrong"]["diff"] = ""                                                            # no usable control twice: code fallback, recorded
+    d = _draft_llm(); d["plausible_wrong"]["diff"] = ""                    # no usable control twice and a gold with a single added line: no real incorrect change exists -> the draft fails
     calls = _patch_llm(monkeypatch, d, _withhold_llm())
-    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s2")
-    spec = ScenarioSpec.model_validate_json(p.read_text())
-    meta = json.loads((tmp_path / "s2" / "draft.meta.json").read_text())
-    assert spec.controls.plausible_wrong[0].name == "fallback-comment-only" and meta["controls_fallback"] == {"plausible_wrong": "fallback-comment-only"}
-    assert (tmp_path / "s2" / "assets" / "plausible-wrong.diff").read_text().endswith(draft_spec.FALLBACK_COMMENT)
+    with pytest.raises(ValueError, match="no usable plausible-wrong control"):
+        draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s2")
+    assert not (tmp_path / "s2" / "scenario.draft.json").exists()
     assert len([c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]) == 2 and "needs a patch" in [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]][1]["messages"][-1]["content"]
     d = _draft_llm(); d["ledger"][0]["tests"] = ["not/a/test.py::nope"]
     _patch_llm(monkeypatch, d, _withhold_llm())
