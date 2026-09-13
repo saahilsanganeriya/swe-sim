@@ -1,6 +1,7 @@
 import hashlib
 import json
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
@@ -655,6 +656,7 @@ def test_withhold_retries_once_with_violations_then_returns_zero_removals(monkey
     assert res["removed"] == [] and res["withheld_brief"] is None and res["deleted"] == [] and res["kept"] == [(0, len(issue))]
     assert res["stats"]["attempts"] == 2 and res["stats"]["reason"].startswith("all selections rejected") and "not a verbatim span" in res["stats"]["reason"]
     assert len(attempts) == 2 and "Correct these violations" in attempts[1][-1]["content"] and "ERROR99" in attempts[1][-1]["content"]
+    assert "closest lines" in attempts[1][-1]["content"] and "Traceback: ERROR42 raised in importer" in attempts[1][-1]["content"]   # the issue line to quote exactly
     monkeypatch.setattr(draft_spec, 'chat_json', lambda *a, **k: {"removed": []})
     res = draft_spec.withhold(issue, 'fake/model')
     assert res["removed"] == [] and res["stats"] == {"sentences_total": 3, "sentences_removed": 0, "fraction_removed": 0.0, "duplicate_selections": 0,
@@ -927,8 +929,17 @@ def _patch_llm(monkeypatch, draft_out, withhold_out):
         calls.append({"model": model_id, "system": system, "messages": messages, "kw": kw})
         return withhold_out if WITHHOLD_PROMPT_MARK in system else draft_out
     monkeypatch.setattr(draft_spec, "chat_json", fake_chat)
-    monkeypatch.setattr(threads, "base_text", lambda repo, commit, path: "def test_weighted_sum():\n    assert True\n" if path.endswith(".py") and "tests" in path else None)
+    monkeypatch.setattr(threads, "base_text", _fake_base_text)
     return calls
+
+
+def _fake_base_text(repo, commit, path):
+    """Base-commit content the drafter fetches: hidden test files, and the source file the fixture's gold/control diffs touch."""
+    if path == "xarray/core/weighted.py":
+        return "x\n"
+    if path.endswith(".py") and "tests" in path:
+        return "def test_weighted_sum():\n    assert True\n"
+    return None
 
 
 def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
@@ -1015,6 +1026,172 @@ def test_draft_structural_tests_require_alternative_correct(monkeypatch, tmp_pat
         draft_spec.draft(_row(), _judged(alternatives_accepted=False, structural_tests=True), "fake/model", tmp_path / "s2")
 
 
+def test_schema_errors_are_fed_back_in_the_correction_round(monkeypatch, tmp_path):
+    """sphinx-10097: a requirement depended on an author-only fact and the pydantic _integrity error killed the draft with no
+    feedback. Schema errors are now violations for the correction round; a still-invalid second output fails as before."""
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    first = _draft_llm(); first["requirements"][0]["fact_id"] = "f02"                                     # f02 is author-only
+    outputs = iter([first, _draft_llm()])
+    calls = []
+
+    def fake_chat(model_id, system, messages, schema, **kw):
+        calls.append({"system": system, "messages": messages})
+        return _withhold_llm() if WITHHOLD_PROMPT_MARK in system else next(outputs)
+    monkeypatch.setattr(draft_spec, "chat_json", fake_chat)
+    monkeypatch.setattr(threads, "base_text", _fake_base_text)
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert spec.requirements[0].fact_id == "f01" and (tmp_path / "s" / "assets" / "oracle.diff").exists()
+    author = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
+    assert len(author) == 2
+    correction = author[1]["messages"][-1]["content"]
+    assert "Correct these violations" in correction and "schema:" in correction and "author-only" in correction
+    # a ledger violation and a schema error in the same output both reach the single correction round
+    both = _draft_llm(); both["requirements"][0]["fact_id"] = "f02"; both["ledger"][0]["source_excerpt"] = "raise a TypeError when the dim is missing"
+    outputs = iter([both, _draft_llm()]); calls.clear()
+    draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s_both")
+    correction = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]][1]["messages"][-1]["content"]
+    assert "f01: source_excerpt is not a verbatim span" in correction and "schema:" in correction and "author-only" in correction
+    # still invalid after the correction round: fails with the schema message and writes nothing
+    outputs = iter([first, first]); calls.clear()
+    with pytest.raises(ValueError, match="grounding validation after two attempts.*schema:.*author-only"):
+        draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s2")
+    assert not (tmp_path / "s2" / "scenario.draft.json").exists() and not (tmp_path / "s2" / "assets" / "oracle.diff").exists()
+    # a missing persona or an empty groups list is a schema violation the model can fix, not a KeyError
+    broken = _draft_llm(); del broken["persona"]
+    outputs = iter([broken, _draft_llm()]); calls.clear()
+    draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s3")
+    assert "schema: persona" in [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]][1]["messages"][-1]["content"]
+    broken = _draft_llm(); broken["groups"] = []                                                         # field errors come first; _integrity runs once fields validate
+    outputs = iter([broken, _draft_llm()]); calls.clear()
+    draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s3b")
+    assert "groups must cover fail_to_pass" in [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]][1]["messages"][-1]["content"]
+    # an unknown test id on a fact is caught the same way
+    unknown = _draft_llm(); unknown["ledger"][0]["tests"] = [F2P, "xarray/tests/test_weighted.py::test_missing"]
+    outputs = iter([unknown, _draft_llm()]); calls.clear()
+    draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s4")
+    assert "links unknown test" in [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]][1]["messages"][-1]["content"]
+
+
+def test_control_names_are_code_owned_slugs(monkeypatch, tmp_path):
+    """matplotlib-24189: a control label with spaces and slashes became a file path at compile time."""
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    label = "strip only width/height ratios from gridspec_kw before passing to inner"
+    taken = set()
+    slug = draft_spec.slugify_control_name(label, "plausible-wrong", taken)
+    assert slug == "strip-only-width-height-ratios-from-gridspec_kw-before-passing-to-inner"[:64].rstrip("-._") and draft_spec.CONTROL_NAME_RE.match(slug) and "/" not in slug
+    second = draft_spec.slugify_control_name(label, "alternative-correct", taken)                                 # collision suffix, still <= 64 chars
+    assert second == slug[:62].rstrip("-._") + "-2" and len(second) <= 64
+    assert draft_spec.slugify_control_name("  ", "plausible-wrong", set()) == "plausible-wrong" and draft_spec.slugify_control_name("Ab", "x-y-z", set()) == "x-y-z"
+    assert draft_spec.slugify_control_name("Wrong Exception Type!!", "p", set()) == "wrong-exception-type"
+    d = _draft_llm(); d["plausible_wrong"]["name"] = label
+    alt = {"name": label, "rationale": "same behaviour", "diff": "diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n@@ -1 +1,2 @@\n x\n+z\n"}
+    d["alternative_correct"] = alt
+    _patch_llm(monkeypatch, d, _withhold_llm())
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert spec.controls.plausible_wrong[0].name == slug and spec.controls.alternative_correct[0].name == second
+    assert all(draft_spec.CONTROL_NAME_RE.match(c.name) for c in [*spec.controls.plausible_wrong, *spec.controls.alternative_correct, *spec.controls.tamper])
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert meta["controls"]["plausible_wrong"]["label"] == label and meta["controls"]["plausible_wrong"]["name"] == slug and meta["controls"]["alternative_correct"]["name"] == second
+    assert all(all(draft_spec.ASSET_COMPONENT_RE.match(part) for part in a.path.split("/")) for a in spec.assets.values())
+    with pytest.raises(ValueError, match="asset path component"):
+        draft_spec.check_asset_paths(["ok.diff", "bad name.diff"])
+    with pytest.raises(ValueError, match="asset path component"):
+        draft_spec.check_asset_paths(["../escape.diff"])
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
+    """py-pdf__pypdf-3826: a corrupt model plausible-wrong diff reached the Modal sweep. Now: `files` (complete text) -> difflib
+    diff that applies by construction; a model diff is git-apply-checked; a failing one is corrected once, then dropped/replaced."""
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    base = {"xarray/core/weighted.py": "x\n"}
+    good = _draft_llm()["plausible_wrong"]["diff"]
+    corrupt = good.replace("@@ -1 +1,2 @@", "@@ -1 +1,9 @@")                                   # wrong hunk counts: "corrupt patch"
+    assert draft_spec.verify_diff_applies(base, good) == (True, "")
+    ok, msg = draft_spec.verify_diff_applies(base, corrupt)
+    assert ok is False and "corrupt" in msg.lower() or ok is False and msg
+    ok, msg = draft_spec.verify_diff_applies({}, good)
+    assert ok is None and msg.startswith("unfetched:")                                            # touched file not fetched: marked, and controls treat it as unusable
+    assert draft_spec.verify_diff_applies(base, good.replace("a/xarray/core/weighted.py", "a/../etc/passwd").replace("b/xarray/core/weighted.py", "b/../etc/passwd"))[0] is False
+    # a `files` path that was never fetched is a violation, never a new-file diff; None (confirmed absent) is the only new-file case
+    with pytest.raises(draft_spec.DraftViolation, match="could not be fetched"):
+        draft_spec.build_control_diff({"files": {"pkg/unfetched.py": "x\n"}}, base)
+    with pytest.raises(draft_spec.DraftViolation, match="repository-relative"):
+        draft_spec.build_control_diff({"files": {"../escape.py": "x\n"}}, {**base, "../escape.py": None})
+    newfile, method = draft_spec.build_control_diff({"files": {"pkg/new.py": "print(1)\n"}}, {**base, "pkg/new.py": None})
+    assert method == "difflib" and "new file mode" in newfile and "--- /dev/null" in newfile
+    # primary path: complete file text -> well-formed diff
+    ctrl = {"name": "keyerror", "rationale": "r", "files": {"xarray/core/weighted.py": "x\nraise KeyError\n"}}
+    diff, method = draft_spec.build_control_diff(ctrl, base)
+    assert method == "difflib" and diff.startswith("diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n") and "+raise KeyError" in diff
+    assert draft_spec.verify_diff_applies(base, diff) == (True, "")
+    assert draft_spec.build_control_diff({"diff": good}, base) == (good, "model-diff") and draft_spec.build_control_diff({}, base) == (None, "missing")
+    with pytest.raises(draft_spec.DraftViolation, match="changes nothing"):
+        draft_spec.build_control_diff({"files": {"xarray/core/weighted.py": "x\n"}}, base)
+    # end to end: first output has a corrupt diff -> correction names the git error; second output uses `files` -> success
+    first = _draft_llm(); first["plausible_wrong"]["diff"] = corrupt
+    second = _draft_llm(); second["plausible_wrong"] = {"name": "keyerror", "rationale": "wrong exception type", "files": {"xarray/core/weighted.py": "x\nraise KeyError\n"}}
+    outputs = iter([first, second]); calls = []
+
+    def fake_chat(model_id, system, messages, schema, **kw):
+        calls.append({"system": system, "messages": messages})
+        return _withhold_llm() if WITHHOLD_PROMPT_MARK in system else next(outputs)
+    monkeypatch.setattr(draft_spec, "chat_json", fake_chat)
+    monkeypatch.setattr(threads, "base_text", _fake_base_text)
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    author = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
+    assert len(author) == 2 and "cannot be applied to the base commit (git apply --check)" in author[1]["messages"][-1]["content"]
+    assert spec.controls.plausible_wrong[0].name == "keyerror" and "+raise KeyError" in (tmp_path / "s" / "assets" / "plausible-wrong.diff").read_text()
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert meta["controls"]["plausible_wrong"] == {"name": "keyerror", "label": "keyerror", "rationale": "wrong exception type", "method": "difflib", "verified": True}
+    assert meta["controls_dropped"] == [] and meta["controls_fallback"] == {} and meta["oracle_apply"]["verified"] is True and meta["oracle_apply"]["base_files_fetched"] == ["xarray/core/weighted.py"]
+    # still corrupt after the correction round: plausible-wrong is replaced by a REAL incorrect change (an inverted comparison
+    # in the gold's first code chunk), a corrupt alternative-correct is dropped
+    gold_two = ("diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n"
+                "@@ -1 +1,3 @@\n x\n+if dim == 'z':\n+    raise ValueError(dim)\n")
+    bad_alt = {"name": "alt", "rationale": "r", "diff": corrupt.replace("+raise KeyError", "+z")}
+    outputs = iter([{**first, "alternative_correct": bad_alt}, {**first, "alternative_correct": bad_alt}]); calls.clear()
+    p = draft_spec.draft(_row(patch=gold_two), _judged(), "fake/model", tmp_path / "s2")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    meta = json.loads((tmp_path / "s2" / "draft.meta.json").read_text())
+    assert spec.controls.plausible_wrong[0].name == "fallback-inverted-comparison" and spec.controls.alternative_correct == []
+    assert meta["controls_fallback"] == {"plausible_wrong": "fallback-inverted-comparison"}
+    assert [(x["control"], x["method"]) for x in meta["controls_dropped"]] == [("plausible_wrong", "model-diff"), ("alternative_correct", "model-diff")]
+    fallback_diff = (tmp_path / "s2" / "assets" / "plausible-wrong.diff").read_text()
+    assert "+if dim != 'z':" in fallback_diff and "+    raise ValueError(dim)" in fallback_diff and draft_spec.verify_diff_applies(base, fallback_diff) == (True, "")
+    # no comparison to invert: one added code line is dropped, the emptied hunk removed and the following hunk re-based
+    gold2 = ("diff --git a/pkg/a.py b/pkg/a.py\n--- a/pkg/a.py\n+++ b/pkg/a.py\n@@ -1,2 +1,3 @@\n a\n+b\n c\n@@ -7,2 +8,3 @@\n h\n+i\n j\n")
+    base2 = {"pkg/a.py": "a\nc\nd\ne\nf\ng\nh\nj\n"}
+    fb = draft_spec.fallback_plausible_wrong(gold2, base2)
+    assert fb is not None and fb[1] == "fallback-dropped-line" and "+i" in fb[0] and "+b" not in fb[0] and "@@ -7,2 +7,3 @@" in fb[0]
+    assert draft_spec.verify_diff_applies(base2, fb[0]) == (True, "")
+    # changelog/docs chunks are skipped; a gold with no code chunk or no droppable change yields no fallback
+    gold3 = "diff --git a/CHANGES b/CHANGES\n--- a/CHANGES\n+++ b/CHANGES\n@@ -1 +1,2 @@\n old\n+new entry\n" + gold2
+    fb = draft_spec.fallback_plausible_wrong(gold3, {**base2, "CHANGES": "old\n"})
+    assert fb is not None and "CHANGES" not in fb[0] and fb[1] == "fallback-dropped-line"
+    assert draft_spec.fallback_plausible_wrong("diff --git a/CHANGES b/CHANGES\n--- a/CHANGES\n+++ b/CHANGES\n@@ -1 +1,2 @@\n old\n+new\n", {"CHANGES": "old\n"}) is None
+    assert draft_spec.fallback_plausible_wrong(_row()["patch"], base) is None                     # a single added line: dropping it leaves no change
+    # a fetch-bound (unfetched) file: the model control is dropped with the reason, never turned into a bogus new-file diff
+    monkeypatch.setattr(draft_spec, "MAX_BASE_FILES", 0)
+    outputs = iter([second, second]); calls.clear()
+    p = draft_spec.draft(_row(patch=gold_two), _judged(), "fake/model", tmp_path / "s5")
+    meta = json.loads((tmp_path / "s5" / "draft.meta.json").read_text())
+    assert meta["controls_dropped"][0]["control"] == "plausible_wrong" and "could not be fetched" in meta["controls_dropped"][0]["reason"]
+    assert meta["controls_fallback"] == {"plausible_wrong": "fallback-inverted-comparison"} and meta["oracle_apply"]["verified"] is None
+    assert "new file mode" not in (tmp_path / "s5" / "assets" / "plausible-wrong.diff").read_text()
+    monkeypatch.setattr(draft_spec, "MAX_BASE_FILES", 8)
+    # an oracle that does not apply to its base is a drafter error, not a correction
+    outputs = iter([_draft_llm(), _draft_llm()])
+    with pytest.raises(ValueError, match="oracle patch does not apply"):
+        draft_spec.draft(_row(patch=corrupt.replace("+raise KeyError", "+y")), _judged(), "fake/model", tmp_path / "s3")
+
+
 def test_draft_with_zero_removals_keeps_only_the_natural_brief(monkeypatch, tmp_path):
     """seaborn-3190: a short issue with nothing safely removable is a valid scenario with the natural brief only."""
     from swesim.models import ScenarioSpec
@@ -1037,6 +1214,27 @@ def test_single_f2p_function_links_every_on_request_fact(monkeypatch, tmp_path):
     from swesim.stages import draft_spec
     f2p = ["testing/test_unittest.py::test_pdb_teardown_skipped[@unittest.skip]", "testing/test_unittest.py::test_pdb_teardown_skipped[@pytest.mark.skip]"]
     assert draft_spec.f2p_functions(f2p) == {("testing/test_unittest.py", "test_pdb_teardown_skipped")}
+    # the same method name in two classes is two functions; parametrizations of a class method are one
+    assert draft_spec.f2p_functions(["t.py::TestA::test_x", "t.py::TestB::test_x[1]"]) == {("t.py", "TestA::test_x"), ("t.py", "TestB::test_x")}
+    assert draft_spec.f2p_functions(["t.py::TestA::test_x[1]", "t.py::TestA::test_x[2]"]) == {("t.py", "TestA::test_x")}
+    assert draft_spec.link_single_target({"ledger": [{"discovery": "on-request", "tests": []}]}, ["t.py::TestA::test_x", "t.py::TestB::test_x"]) == []   # ambiguous: no single target
+    class_patch = ("diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1 +1,7 @@\n x\n+class TestA:\n+    def test_x(self):\n+        assert alpha_value == 1\n"
+                   "+class TestB:\n+    def test_x(self):\n+        assert beta_value == 2\n")
+    assert [fn for _, fn, _ in draft_spec._test_blocks(class_patch) if fn] == ["TestA::test_x", "TestB::test_x"]
+    assert draft_spec.tests_for_excerpt(class_patch, "assert beta_value == 2", ["t.py::TestA::test_x", "t.py::TestB::test_x"]) == ["t.py::TestB::test_x"]
+    assert draft_spec.definition_order(["t.py::TestB::test_x", "t.py::TestA::test_x"], None, class_patch) == (["t.py::TestA::test_x", "t.py::TestB::test_x"], "diff")
+    # review v6: a mixed file (top-level tests after a class); git's hunk-header separator space is not indentation
+    mixed = ("diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
+             "@@ -1,3 +1,4 @@ class TestA:\n     def test_x(self):\n+        assert alpha_value == 1\n         pass\n"
+             "@@ -10,2 +11,4 @@ def test_top():\n     first = 1\n+    assert gridspec_value == 2\n+    assert figure_value == 3\n"
+             "+def test_tail():\n+    assert tail_value == 4\n")
+    ids = ["t.py::TestA::test_x", "t.py::test_top", "t.py::test_tail"]
+    assert [fn for _, fn, _ in draft_spec._test_blocks(mixed) if fn] == ["TestA::test_x", "test_top", "test_tail"]
+    assert draft_spec.tests_for_excerpt(mixed, "assert gridspec_value == 2", ids) == ["t.py::test_top"]
+    assert draft_spec.tests_for_excerpt(mixed, "assert tail_value == 4", ids) == ["t.py::test_tail"]
+    assert draft_spec.auto_link_tests("The gridspec value and the figure value", mixed, ids) == ["t.py::test_top"]
+    assert draft_spec._f2p_for_block("t.py", "TestZ::test_top", ids) == {"t.py::test_top"}                       # bare-name fallback when the class was mis-tracked
+    assert draft_spec.definition_order(["t.py::test_tail", "t.py::test_top", "t.py::TestA::test_x"], None, mixed) == (ids, "diff")
     tp = ("diff --git a/testing/test_unittest.py b/testing/test_unittest.py\n--- a/testing/test_unittest.py\n+++ b/testing/test_unittest.py\n"
           "@@ -1 +1,5 @@\n x\n+@pytest.mark.parametrize(\"mark\", [\"@unittest.skip\", \"@pytest.mark.skip\"])\n+def test_pdb_teardown_skipped(pytester, mark):\n"
           "+    with pytest.raises(ValueError, match=\"dimension 'z' not found\"):\n+        pytester.runpytest(\"--pdb\")\n")
@@ -1092,10 +1290,12 @@ def test_draft_rejects_leaky_withholding_and_empty_controls(monkeypatch, tmp_pat
     assert [b.profile for b in spec.briefs] == ["natural"] and not any(f.id.startswith("withheld-") for f in spec.ledger) and not any(o.type == "withholding" for o in spec.operations)
     meta = json.loads((tmp_path / "s1" / "draft.meta.json").read_text())
     assert meta["withholding"]["removed"] == 0 and meta["withholding"]["reason"].startswith("all selections rejected") and meta["withholding"]["spans"] == []
-    d = _draft_llm(); d["plausible_wrong"]["diff"] = ""
-    _patch_llm(monkeypatch, d, _withhold_llm())
-    with pytest.raises(ValueError, match="plausible-wrong"):
+    d = _draft_llm(); d["plausible_wrong"]["diff"] = ""                    # no usable control twice and a gold with a single added line: no real incorrect change exists -> the draft fails
+    calls = _patch_llm(monkeypatch, d, _withhold_llm())
+    with pytest.raises(ValueError, match="no usable plausible-wrong control"):
         draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s2")
+    assert not (tmp_path / "s2" / "scenario.draft.json").exists()
+    assert len([c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]) == 2 and "needs a patch" in [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]][1]["messages"][-1]["content"]
     d = _draft_llm(); d["ledger"][0]["tests"] = ["not/a/test.py::nope"]
     _patch_llm(monkeypatch, d, _withhold_llm())
     with pytest.raises(ValueError):
@@ -1207,7 +1407,7 @@ def test_draft_trims_an_oversized_candidate_for_the_model_but_grounds_against_th
     from swesim.models import ScenarioSpec
     from swesim.stages import draft_spec
     calls = _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
-    big = _row(patch=_row()["patch"] + "\n" + "+# " + "x" * 130000 + "\n")            # oversized fix: trimmed in the prompt only
+    big = _row(patch=_row()["patch"].replace("+y\n", "+# " + "x" * 130000 + "\n"))    # oversized (but well-formed) fix: trimmed in the prompt only
     p = draft_spec.draft(big, _judged(), "fake/model", tmp_path / "s")
     spec = ScenarioSpec.model_validate_json(p.read_text())
     assert (tmp_path / "s" / "assets" / "oracle.diff").read_text() == big["patch"] and spec.assets["oracle.diff"].bytes == len(big["patch"].encode())

@@ -316,7 +316,7 @@ def test_probe_tests_measures_swebench_image_rows_offline(monkeypatch, tmp_path)
     assert out["dropped"] == {"network_or_env": [f + "test_needs_network"], "gold_regressions": [f + "test_flaky"], "other": [], "order_dependent": []}
     assert out["probe"]["swebench"] == {"fail_to_pass_not_reproduced": [f + "test_needs_network"], "pass_to_pass_not_reproduced": [f + "test_flaky"], "fail_to_pass_new": []}
     assert out["probe"]["counts"] == {"fail_to_pass": 1, "pass_to_pass": 2, "network_or_env": 1, "gold_regressions": 1, "other": 0, "order_dependent": 0, "measured": 5}
-    assert out["probe"]["runner"]["exact"] == "missing" and out["probe"]["order"] == list(_swebench_statuses()["test"]["statuses"])   # no exact stages in this fixture
+    assert out["probe"]["runner"]["exact"] == "missing" and out["probe"]["order"] == [f + "test_new", f + "test_old", f + "test_extra"]   # contract ids in collected order; no exact stages in this fixture
     assert out["probe"]["errors"] == {"base": "no tests collected", "test": None, "gold": None}   # the base collect error is expected and kept for audit
     assert sum(v for k, v in out["probe"]["counts"].items() if k != "measured") == out["probe"]["counts"]["measured"]
     assert out["probe"]["kind"] == "image" and out["test_python"] == gr.SWEBENCH_PYTHON and out["probe"]["repo_dir"] == "/testbed"
@@ -393,7 +393,20 @@ def test_probe_is_grading_faithful_exact_ids_in_definition_order(monkeypatch, tm
     cfg = json.loads((tmp_path / "ws" / "probes" / "pydata--xarray-5362" / "tests" / "probe_config.json").read_text())
     assert cfg["prefix"] == gr.runner_prefix(gr.SWEBENCH_PYTHON) and cfg["max_command_chars"] == gr.MAX_COMMAND_CHARS and cfg["command"].startswith(cfg["prefix"])
     probe_py = (tmp_path / "ws" / "probes" / "pydata--xarray-5362" / "tests" / "probe.py").read_text()
-    assert "test_exact" in probe_py and "gold_exact" in probe_py and "run(exact,order)" in probe_py and "results['order']=order" in probe_py
+    assert "test_exact" in probe_py and "gold_exact" in probe_py and "run(exact,contract)" in probe_py and "results['order']=contract" in probe_py
+    assert "git_apply('/tests/oracle.diff','-R')" in probe_py and "before[t] in ('failed','error') and after.get(t)=='passed'" in probe_py   # contract ids, oracle reverted for test_exact
+    assert "oracle revert failed" in probe_py and "results.pop('test_exact',None)" in probe_py   # a failed revert keeps the whole-file evidence and records the skip
+    # the exact stages must cover exactly the contract ids: a non-contract id in them, or a missing one, is unreliable
+    extra = {**data, "order": order, "test_exact": {**data["test_exact"], "statuses": {**exact_test, f + "test_not_in_contract": "passed"}}}
+    _setup_probe(monkeypatch, tmp_path, extra)
+    with pytest.raises(ValueError, match="unreliable exact-id probe"):
+        gr.probe_tests(dict(row), Workspace(tmp_path / "ws_extra"))
+    # whole-file stages decide the contract; `order` only orders it (an id absent from the contract is ignored)
+    reorder = {**data, "order": [f + "test_n_max_elements", f + "test_basic", f + "test_deeply_nested", f + "test_changed_only", f + "not_collected"]}
+    reorder["test_exact"] = {**data["test_exact"], "statuses": full_test}; reorder["gold_exact"] = {**data["gold_exact"], "statuses": full_gold}
+    _setup_probe(monkeypatch, tmp_path, reorder)
+    out2 = gr.probe_tests(dict(row), Workspace(tmp_path / "ws_reorder"))
+    assert out2["probe"]["order"] == [f + "test_n_max_elements", f + "test_basic", f + "test_deeply_nested", f + "test_changed_only"] and out2["dropped"]["order_dependent"] == []
     # an exact stage that errors (e.g. collection differs from the manifest) makes the probe unreliable
     bad = {**data, "gold_exact": {**data["gold_exact"], "error": "collection differs from manifest"}}
     _setup_probe(monkeypatch, tmp_path, bad)
@@ -406,6 +419,15 @@ def test_probe_is_grading_faithful_exact_ids_in_definition_order(monkeypatch, tm
     out = gr.probe_tests(dict(row), Workspace(tmp_path / "ws3"))
     assert out["probe"]["runner"]["exact"] == "command exceeds argv budget" and out["dropped"]["order_dependent"] == [] and out["pass_to_pass"] == [order[0], order[3]]
     assert gr.PROBE_VERIFIER_TIMEOUT_SEC >= 5 * gr.PROBE_TIMEOUT_SEC + 300
+    # a bound probe with a terminal skip reason is passed through by probe_candidates, never re-probed on later runs
+    from swesim.stages.mine import probe_candidates
+    over = {**row, "instance_id": "pydata__xarray-9", "judge": {"keep": True, "gaps": []}, "probe": dict(out["probe"])}
+    over["probe"]["binding"] = gr.probe_binding(over)
+    judged = tmp_path / "over.judged.jsonl"; judged.write_text(json.dumps(over) + "\n")
+    monkeypatch.setattr(gr, "probe_tests", lambda r, ws: pytest.fail("a terminal skip reason must not be re-probed"))
+    out_path = probe_candidates(Workspace(tmp_path / "ws_over"), judged, max_builds=3)
+    assert json.loads(out_path.with_suffix(".summary.json").read_text()) == {"rows": 1, "probed": 0, "already-probed-whole-file-only": 1}
+    assert json.loads(out_path.read_text().splitlines()[0])["probe"]["runner"]["exact"] == "command exceeds argv budget"
 
 
 def test_classify_probe_buckets():
@@ -443,26 +465,34 @@ def test_reconstruct_probe_from_job_dir_and_probe_candidates_reuses_measurements
     assert rec["probe"]["binding"] == gr.probe_binding(row) and rec["probe"]["job_dir"] == row["probe_dir"] and rec["probe"]["probed_at"]
     assert rec["probe"]["command"] == "/usr/local/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} tests/test_writer.py"
     assert gr.reconstruct_probe({**row, "probe_dir": str(tmp_path / "nowhere")}) is None and gr.reconstruct_probe({**row, "probe_dir": None}) is None
-    # probe_candidates attaches the metadata from disk (no Modal run), passes valid probes through, and re-probes only stale ones
-    fresh = {**_old_style_repo_row(tmp_path), "instance_id": "py-pdf__pypdf-1", "probe_dir": None, "probe": {**rec["probe"]}}
-    fresh["probe"]["binding"] = gr.probe_binding(fresh)
-    stale = {**_old_style_repo_row(tmp_path), "instance_id": "py-pdf__pypdf-2", "probe_dir": None, "probe": {**rec["probe"], "binding": "0" * 64}}
+    assert rec["probe"]["runner"]["exact"] == "missing"                                                            # an old job dir has no exact-id stages
+    # probe_candidates: a bound probe WITH exact-stage evidence passes through; whole-file-only or stale probes are re-run while
+    # budget allows; with no budget left an old-style row is reconstructed from disk and marked whole-file-only
+    exact_ok = {**_old_style_repo_row(tmp_path), "instance_id": "py-pdf__pypdf-1", "probe_dir": None, "probe": {**rec["probe"], "runner": {**rec["probe"]["runner"], "exact": "exact"}}}
+    exact_ok["probe"]["binding"] = gr.probe_binding(exact_ok)
+    whole_only = {**_old_style_repo_row(tmp_path), "instance_id": "py-pdf__pypdf-2", "probe_dir": None, "probe": {**rec["probe"]}}
+    whole_only["probe"]["binding"] = gr.probe_binding(whole_only)
+    stale = {**_old_style_repo_row(tmp_path), "instance_id": "py-pdf__pypdf-3", "probe_dir": None, "probe": {**rec["probe"], "binding": "0" * 64}}
     judged = tmp_path / "github-repo--py-pdf__pypdf.judged.jsonl"
-    judged.write_text("".join(json.dumps(r) + "\n" for r in (row, fresh, stale)))
+    judged.write_text("".join(json.dumps(r) + "\n" for r in (row, exact_ok, whole_only, stale)))
     probed = []
 
     def fake_probe(r, ws):
         probed.append(r["instance_id"])
-        return {**rec, "probe": {**rec["probe"], "reconstructed": False, "binding": gr.probe_binding(r)}}
+        return {**rec, "probe": {**rec["probe"], "reconstructed": False, "binding": gr.probe_binding(r), "runner": {**rec["probe"]["runner"], "exact": "exact"}}}
     monkeypatch.setattr(gr, "probe_tests", fake_probe)
-    out = probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=1)
+    out = probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=2)
     got = {r["instance_id"]: r for r in (json.loads(l) for l in out.read_text().splitlines())}
-    assert probed == ["py-pdf__pypdf-2"]                                                                          # only the stale row cost a build
-    assert got["py-pdf__pypdf-3826"]["probe"]["reconstructed"] is True and got["py-pdf__pypdf-3826"]["judge"]["keep"] is True
-    assert got["py-pdf__pypdf-3826"]["swebench_fail_to_pass"] == [f + "test_new_a", f + "test_new_b"] and got["py-pdf__pypdf-3826"]["fail_to_pass"] == [f + "test_new_a", f + "test_new_b"]
-    assert got["py-pdf__pypdf-1"]["probe"]["binding"] == gr.probe_binding(fresh) and got["py-pdf__pypdf-2"]["probe"]["binding"] == gr.probe_binding(stale)
-    summary = json.loads(out.with_suffix(".summary.json").read_text())
-    assert summary == {"rows": 3, "probed": 1, "already-probed": 1, "reconstructed": 1, "reproducible": 2}
+    assert probed == ["py-pdf__pypdf-3826", "py-pdf__pypdf-2"]                                                  # old-style and whole-file-only rows cost the two builds
+    assert got["py-pdf__pypdf-1"]["probe"]["runner"]["exact"] == "exact" and got["py-pdf__pypdf-2"]["probe"]["runner"]["exact"] == "exact"
+    assert got["py-pdf__pypdf-3826"]["probe"]["reconstructed"] is False and got["py-pdf__pypdf-3826"]["swebench_fail_to_pass"] == [f + "test_new_a", f + "test_new_b"]
+    assert "py-pdf__pypdf-3" not in got                                                                             # stale, no budget left, nothing on disk
+    assert json.loads(out.with_suffix(".summary.json").read_text()) == {"rows": 4, "probed": 2, "already-probed": 1, "reproducible": 2, "build-budget-exhausted": 1}
+    probed.clear()
+    out = probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=0)
+    got = {r["instance_id"]: r for r in (json.loads(l) for l in out.read_text().splitlines())}
+    assert probed == [] and got["py-pdf__pypdf-3826"]["probe"]["reconstructed"] is True and got["py-pdf__pypdf-3826"]["probe"]["runner"]["exact"] == "missing"
+    assert json.loads(out.with_suffix(".summary.json").read_text()) == {"rows": 4, "probed": 0, "already-probed": 1, "reconstructed-whole-file-only": 1, "reproducible": 1, "build-budget-exhausted": 2}
 
 
 def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_rows(monkeypatch, tmp_path):
@@ -479,7 +509,7 @@ def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_row
 
     def fake_probe(row, ws):
         probed.append(row["instance_id"])
-        bound = {"kind": "image", "statuses": {"test": {"x": "failed"}, "gold": {"x": "passed"}}, "binding": gr.probe_binding(row)}
+        bound = {"kind": "image", "statuses": {"test": {"x": "failed"}, "gold": {"x": "passed"}}, "binding": gr.probe_binding(row), "runner": {"exact": "exact"}}
         if row["instance_id"] == "pydata__xarray-2":
             return {"fail_to_pass": [], "pass_to_pass": [f + "test_old"], "dropped": {"network_or_env": [f + "test_new"], "gold_regressions": [], "other": [], "order_dependent": []}, "statuses": {},
                     "dockerfile": "FROM x", "probe_dir": "/j/2", "test_python": gr.SWEBENCH_PYTHON, "probe": {**bound, "probe_dir": "/j/2"}}

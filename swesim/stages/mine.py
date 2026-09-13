@@ -97,17 +97,23 @@ def probe_candidates(ws: Workspace, judged_path: Path | str, instance_ids: list[
                 summary["skipped-not-accepted"] += 1
                 continue
             existing = row.get("probe") or {}
+            exact = (existing.get("runner") or {}).get("exact")
             if existing.get("statuses") and existing.get("binding") == gr.probe_binding(row):
-                summary["already-probed"] += 1  # a valid measurement bound to this row: no second Modal run
-                f.write(json.dumps(row) + "\n")
-                continue
-            reconstructed = gr.reconstruct_probe(row)
-            if reconstructed is not None:  # probed before `probe` metadata existed: rebuild it from the job dir on disk
-                summary["reconstructed"] += 1
-                apply(row, reconstructed)
-                f.write(json.dumps(row) + "\n")
-                continue
+                if exact == "exact":
+                    summary["already-probed"] += 1  # a grading-faithful measurement bound to this row: no second Modal run
+                    f.write(json.dumps(row) + "\n")
+                    continue
+                if exact and exact != "missing":  # a terminal skip reason (argv budget, no contract tests, ...): re-probing cannot change it
+                    summary["already-probed-whole-file-only"] += 1
+                    f.write(json.dumps(row) + "\n")
+                    continue
             if built >= max_builds:
+                reconstructed = gr.reconstruct_probe(row)
+                if reconstructed is not None:  # no budget left: rebuild whole-file-only evidence from the job dir, marked as such in probe.runner.exact
+                    summary["reconstructed-whole-file-only"] += 1
+                    apply(row, reconstructed)
+                    f.write(json.dumps(row) + "\n")
+                    continue
                 summary["build-budget-exhausted"] += 1
                 continue
             built += 1
