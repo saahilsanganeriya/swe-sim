@@ -14,16 +14,18 @@ Contract
 """
 from __future__ import annotations
 
+import builtins
 import json
 import re
 import shlex
 from datetime import datetime
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 
 from swesim.models import Strict
 from swesim.stages.export import shim_invocation
 from swesim.stakeholder.session import REFUSAL, find_forbidden
+from swesim.stakeholder.view import FIXED_FORBIDDEN
 
 RUBRIC_VERSION = "2026-09-13.1"
 
@@ -51,6 +53,8 @@ RUBRIC: dict[str, str] = {
                                     "brief, or a behaviour that only the hidden tests pin.",
     "behaviour_level": "The reply speaks in terms of what the software should do and not do; it does not pick among the "
                        "agent's implementation options, prescribe code paths, or describe how the change will be checked.",
+    "ungrounded": "Ids of requirements that have no grounding fact (they rest on the hidden tests alone) whose content the "
+                  "reply conveys: a test-derived expectation reaching the agent through the requirement list.",
     "patience_sensible": "No exchange was refused for exhausted patience and no question repeated an earlier one.",
 }
 
@@ -114,8 +118,9 @@ class ReplyLabel(Label):
     test_or_identifier_disclosed: bool | None
     behaviour_level: bool | None
     reason: str
-    hits: list[str] = []            # forbidden terms the reply filter would have caught (mechanical evidence)
-    undeclared: list[str] = []      # visible facts the reply conveys without declaring them in disclosed_fact_ids
+    hits: list[str] = Field(default_factory=list)        # forbidden terms the reply filter would have caught (mechanical evidence)
+    undeclared: list[str] = Field(default_factory=list)  # visible facts the reply conveys without declaring them in disclosed_fact_ids
+    ungrounded: list[str] = Field(default_factory=list)  # requirements without a grounding fact (test-derived by construction) the reply conveys
 
 
 class PatienceSummary(Label):
@@ -135,7 +140,7 @@ class ScenarioAudit(Label):
     fair_tests: bool | None
     plausible_withholding: bool | None
     reasons: dict[str, str]
-    unfair_tests: list[str] = []
+    unfair_tests: list[str] = Field(default_factory=list)
     model: str | None
     audited_at: str
     rubric_version: str
@@ -146,7 +151,7 @@ class TrialAudit(Label):
     trial_id: str
     scenario_id: str | None
     spec_hash: str | None
-    stakeholder_version: str | None     # "v1" | "v2" | None (no exchange to tell from)
+    stakeholder_version: str | None     # "v1" | "v2" | "v3" ... | None (no exchange to tell from); versions never pool
     legacy: bool                        # stakeholder v1: labelled, never pooled with v2, not read by the model
     questions: list[QuestionLabel]
     replies: list[ReplyLabel]
@@ -507,10 +512,39 @@ def disclosure_targeted(reply: str, question: str, disclosed_fact_ids: list[str]
     return DisclosureCheck(targeted=targeted, volunteered=volunteered, undeclared=undeclared)
 
 
+def conveyed_requirements(reply: str, requirements: list[dict], *, ungrounded_only: bool = False) -> list[str]:
+    """Ids of requirements whose distinctive words the reply covers (>= ``UNDECLARED_COVERAGE``); with ``ungrounded_only``
+    just those with ``fact_id`` None, i.e. expectations that rest on the hidden tests alone."""
+    rt = content_tokens(reply)
+    out = []
+    for r in requirements or []:
+        if not isinstance(r, dict) or not r.get("id"):
+            continue
+        if ungrounded_only and r.get("fact_id") is not None:
+            continue
+        toks = content_tokens(r.get("text", ""))
+        if len(toks) >= MIN_UNDECLARED_TOKENS and len(toks & rt) / len(toks) >= UNDECLARED_COVERAGE:
+            out.append(r["id"])
+    return out
+
+
+BUILTIN_NAMES = frozenset(dir(builtins))          # ValueError, TypeError, all, print...: generic names, never test-derived
+_CODE_LIKE = re.compile(r"[_./()]|[a-z][A-Z]|^[A-Z][A-Za-z0-9]*[A-Z]")   # snake_case, dotted, paths, camelCase, CapWords
+
+
 def test_or_identifier_disclosed(reply_text: str, forbidden_terms: list[str]) -> list[str]:
     """Forbidden terms present in the reply under the reply filter's own matching rules (whole identifiers, ``test_`` as a
-    prefix, multi-word test vocabulary case-insensitively). Empty when nothing the filter recognises is present."""
-    return find_forbidden(reply_text or "", [t for t in forbidden_terms or [] if isinstance(t, str) and t])
+    prefix, multi-word test vocabulary case-insensitively), except Python builtin names: a generic exception or type name
+    is not a test-derived disclosure whoever says it. Empty when nothing the filter recognises is present."""
+    terms = [t for t in forbidden_terms or [] if isinstance(t, str) and t and t not in BUILTIN_NAMES]
+    return find_forbidden(reply_text or "", terms)
+
+
+def code_like_hits(hits: list[str]) -> list[str]:
+    """The hits that are unambiguously code or test vocabulary: identifiers with ``_``, ``.``, ``/`` or ``()``, camelCase or
+    CapWords names, and the filter's fixed test vocabulary. Plain lowercase words that merely occur in a test file
+    (``bounded``, ``reading``) are left for the reading pass to judge."""
+    return [h for h in hits if h in FIXED_FORBIDDEN or _CODE_LIKE.search(h)]
 
 
 # ---------------------------------------------------------------- patience
