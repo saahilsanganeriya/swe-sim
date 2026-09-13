@@ -14,7 +14,9 @@ Contract (interfaces §3)
   "absent". launch.json written by a different launcher (a VM-era systemd record read by a Cloud Run worker) reads as
   runtime "unknown": reconcile by hand, never relaunch.
 - launch.json carries `launcher`, `handle`, `image_digest` and `origin`: a record names the runtime and the code that
-  produced it.
+  produced it; and the workflow lineage the request names (`workflow_id` / `run_id` of the TrialWorkflow, `run_workflow_id`
+  of its parent; P2-11). Lineage keys (`PROVENANCE_KEYS`) are recorded, never part of the request's identity: the same
+  request under another run id is the same trial and is reconciled from its evidence, never relaunched.
 """
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ LauncherName = Literal["systemd", "cloudrun", "subprocess"]
 Decision = Literal["ingest", "runner-error", "reconcile", "unresolved", "launch-failed", "launch"]
 # A runtime that exists, existed, or cannot be seen: inspect it, never start another.
 LIVE_STATES: frozenset[str] = frozenset({"running", "succeeded", "failed", "unknown"})
+PROVENANCE_KEYS: tuple[str, ...] = ("run_workflow_id", "trial_workflow_id", "run_id")  # workflow lineage on a request: recorded, not identity
 
 
 class TrialBindingConflict(ValueError):
@@ -153,11 +156,16 @@ def _boot_id() -> str | None:
         return None
 
 
+def _bound(request: dict) -> dict:
+    """The part of a request that identifies the trial: everything but the workflow lineage (`PROVENANCE_KEYS`)."""
+    return {k: v for k, v in request.items() if k not in PROVENANCE_KEYS}
+
+
 def launch_once(layout: TrialLayout, launcher: Launcher, p: dict, *, image_digest: str | None = None, origin: str | None = None) -> dict:
     """Launch the trial's runtime exactly once; otherwise report the reconciliation decision without side effects."""
     tid = p["trial_id"]; unit = unit_name(tid); d = layout.trial_dir(tid); d.mkdir(parents=True, exist_ok=True)
     request = d / "request.json"
-    if request.exists() and json.loads(request.read_text()) != p:
+    if request.exists() and _bound(json.loads(request.read_text())) != _bound(p):
         raise TrialBindingConflict(f"trial {tid} already bound to a different request")
     ev = read_evidence(layout, launcher, tid); decision = decide_launch(ev)
     recorded = read_json(d / "launch.json")
@@ -167,7 +175,8 @@ def launch_once(layout: TrialLayout, launcher: Launcher, p: dict, *, image_diges
         return out
     atomic_json(request, p)
     intent = {"trial_id": tid, "unit": unit, "phase": "intent", "launcher": launcher.name, "started_at": time.time(), "boot_id": _boot_id(),
-              "image_digest": image_digest, "origin": origin}
+              "image_digest": image_digest, "origin": origin,
+              "workflow_id": p.get("trial_workflow_id"), "run_id": p.get("run_id"), "run_workflow_id": p.get("run_workflow_id")}
     atomic_json(d / "launch.json", intent)  # before the launcher runs: a lost acknowledgement is reconciled, never relaunched
     try:
         ack = launcher.start(tid, request, intent)

@@ -515,3 +515,23 @@ def test_workflow_report_folds_into_the_file_status_without_regressing_a_termina
     with pytest.raises(P.ProjectionError):
         P.project_trial(layout, marker, origin="laptop")
     assert P.project_trial(layout, marker, origin="laptop", request={**request, "trial_id": marker, "attempt_index": 5}, status="launch-failed")[0].status == "launch-failed"
+
+
+
+def test_record_provenance_wins_over_launch_json(tmp_path: Path):
+    """P2-11: record.json's worker_image_digest / origin / workflow_id / run_id are the row's; the request's `trial_workflow_id`
+    and launch.json only fill what a record written before the fields existed lacks."""
+    spec, ws, layout = _live_ws(tmp_path)
+    tid = write_trial(ws, spec)
+    d = ws.root / "trials" / tid
+    _w(d / "launch.json", {"trial_id": tid, "phase": "acknowledged", "launcher": "cloudrun", "returncode": 0, "handle": "h", "workflow_id": "launch-wf",
+                           "run_id": "launch-run", "image_digest": "sha256:" + "1" * 64, "origin": "vm-systemd"})
+    row = P.project_trial(layout, tid, origin="laptop")[0]
+    assert (row.workflow_id, row.run_id, row.worker_image_digest, row.origin) == ("launch-wf", "launch-run", "sha256:" + "1" * 64, "vm-systemd")
+    _w(d / "request.json", {"trial_id": tid, "scenario_id": spec.id, "trial_workflow_id": "request-wf", "run_id": "request-run", "run_workflow_id": "run-1"})
+    row = P.project_trial(layout, tid, origin="laptop")[0]
+    assert (row.workflow_id, row.run_id) == ("request-wf", "request-run")                     # the launcher's request names the trial's workflow
+    record = json.loads((d / "record.json").read_text())
+    _w(d / "record.json", {**record, "worker_image_digest": "sha256:" + "2" * 64, "origin": "cloudrun", "workflow_id": tid, "run_id": "record-run"})
+    row = P.project_trial(layout, tid, origin="laptop")[0]
+    assert (row.workflow_id, row.run_id, row.worker_image_digest, row.origin, row.status) == (tid, "record-run", "sha256:" + "2" * 64, "cloudrun", "completed")

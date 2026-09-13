@@ -810,8 +810,10 @@ def project_trial(layout: Layout, trial_id: str, *, origin: str | None = None, n
     transcript = _dict(rec.get("transcript")) or _dict(read_json(d / "transcript.json"))
     audit = _dict(read_json(d / "audit.json"))
     signals = report.get("integrity_signals")
-    workflow_id = _first(rec, request, launch, key="workflow_id")
-    run_id = _first(rec, request, launch, key="run_id")
+    # P2-11: the record's own provenance first; then the launcher's request (`trial_workflow_id` names this trial's workflow; a lone
+    # `run_workflow_id` is the parent's), then launch.json's intent stamps.
+    workflow_id = _first(rec, key="workflow_id") or _str(request.get("trial_workflow_id")) or _first(request, launch, key="workflow_id")
+    run_id = _first(rec, key="run_id") or (_str(request.get("run_id")) if request.get("trial_workflow_id") else None) or _first(request, launch, key="run_id")
     row_origin = _first(rec, launch, request, key="origin", allowed=ORIGINS) or origin
     stakeholder = _dict(rc.get("stakeholder"))
     from swesim.index.cohorts import semantic_config

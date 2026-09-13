@@ -1077,13 +1077,31 @@ def _record_verdict(d: Path, tid: str, status: str, reason: str) -> None:
                                     "worker_image_digest": SETTINGS.worker_image_digest})
 
 
+def _activity_info():
+    """`activity.info()` inside an activity, None outside it (direct callers, tests)."""
+    return activity.info() if activity.in_activity() else None
+
+
+def _with_trial_identity(p: dict) -> dict:
+    """The TrialWorkflow's own workflow id and run id on the request (P2-11: record.json's `workflow_id` / `run_id`, stamped into
+    launch.json too): from the workflow when it passed `trial_workflow_id` / `run_id`, else from this activity's context; unchanged
+    outside an activity."""
+    if p.get("trial_workflow_id") and p.get("run_id"):
+        return p
+    info = _activity_info()
+    if info is None:
+        return p
+    return {**p, "trial_workflow_id": p.get("trial_workflow_id") or info.workflow_id, "run_id": p.get("run_id") or info.workflow_run_id}
+
+
 @swesim_activity
 async def launch_trial_activity(p: dict) -> dict:
     if p.get("request_path"):
         request = json.loads(batching.checked_path(WS, p["request_path"]).read_text())
         if request["trial_id"] != p["trial_id"]:
             raise ValueError("trial request path belongs to a different trial")
-        p = {**request, "run_workflow_id": p.get("run_workflow_id")}
+        p = {**request, "run_workflow_id": p.get("run_workflow_id"), **{k: p[k] for k in ("trial_workflow_id", "run_id") if p.get(k)}}
+    p = _with_trial_identity(p)
     async with LAUNCH_SLOTS:
         out = await blocking(lambda: launch_once(p))
     # One line per launch decision; the Cloud Logging metric `swesim/trial_reconcile` counts `decision=reconcile`.

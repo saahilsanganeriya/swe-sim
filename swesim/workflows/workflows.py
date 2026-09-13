@@ -354,6 +354,9 @@ class TrialWorkflow:
 
     @workflow.run
     async def run(self, p: dict) -> dict:
+        ident = _workflow_identity()
+        if ident and ident.get("workflow_id"):
+            p = {**p, "trial_workflow_id": ident["workflow_id"], "run_id": ident["run_id"]}  # P2-11: record.json names the workflow that launched it
         launch = None; live = None; tid = p.get("trial_id"); self.params = p
         self.state = {"stage": "launching", "trial_id": tid}
         await index_workflow("running", params_summary(p))

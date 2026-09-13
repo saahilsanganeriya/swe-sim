@@ -2412,3 +2412,40 @@ def test_probe_candidate_activity_reprobes_a_row_without_the_grading_identity(ws
     judged2.write_text(json.dumps({**base, "instance_id": "u__2", "probe": {"statuses": {"base": {}}, "probe_dir": "/elsewhere/jobs/probe/u--2--0123/t"}}) + "\n")
     r2 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged2), "instance_id": "u__2"}))
     assert r2["reproducible"] is True and len(calls) == 3 and json.loads(judged2.read_text())["probe_workflow"]["reprobed"]["retired"] == []
+
+
+
+# ---------------------------------------------------------------- record provenance (P2-11)
+
+def test_launch_activity_carries_the_trial_workflow_identity_into_the_request(ws, systemd, monkeypatch):
+    """P2-11: the request the launcher binds (and the Job reads for record.json) names the TrialWorkflow: from the workflow's payload
+    when it passed `trial_workflow_id` / `run_id`, else from the activity's own context; a plan request read by path keeps them;
+    outside an activity nothing is invented."""
+    from types import SimpleNamespace
+    spec = frozen_scenario(ws); p = trial_request(ws, spec)
+    monkeypatch.setattr(A, "_activity_info", lambda: SimpleNamespace(workflow_id=p["trial_id"], workflow_run_id="run-ctx"))
+    asyncio.run(A.launch_trial_activity({**p, "run_workflow_id": "run-1"}))
+    d = ws.root / "trials" / p["trial_id"]; request = json.loads((d / "request.json").read_text()); launch = json.loads((d / "launch.json").read_text())
+    assert (request["trial_workflow_id"], request["run_id"], request["run_workflow_id"]) == (p["trial_id"], "run-ctx", "run-1")
+    assert (launch["workflow_id"], launch["run_id"], launch["run_workflow_id"]) == (p["trial_id"], "run-ctx", "run-1")
+    q = trial_request(ws, spec, attempt=1); plan = ws.root / "evidence" / "workflows" / "x" / f"{q['trial_id']}.json"; atomic_json(plan, q)
+    asyncio.run(A.launch_trial_activity({"trial_id": q["trial_id"], "request_path": str(plan), "run_workflow_id": "run-1", "trial_workflow_id": "explicit", "run_id": "r-9"}))
+    request = json.loads((ws.root / "trials" / q["trial_id"] / "request.json").read_text())
+    assert (request["trial_workflow_id"], request["run_id"], request["model"]) == ("explicit", "r-9", q["model"])
+    monkeypatch.setattr(A, "_activity_info", lambda: None)
+    r = trial_request(ws, spec, attempt=2); asyncio.run(A.launch_trial_activity({**r}))
+    assert "trial_workflow_id" not in json.loads((ws.root / "trials" / r["trial_id"] / "request.json").read_text())
+
+
+def test_trial_workflow_passes_its_identity_to_the_launcher(monkeypatch):
+    from types import SimpleNamespace
+    async def scenario():
+        calls = []
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, p)); return {"trial_id": p["trial_id"], "launched": False, "status": "completed"}
+        monkeypatch.setattr(W, "act", act)
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=SimpleNamespace(workflow_id="run-1"), workflow_id="t1", run_id="r-1", workflow_type="TrialWorkflow"))
+        await W.TrialWorkflow().run({"trial_id": "t1", "run_workflow_id": "run-1"})
+        launch = next(p for n, p in calls if n == "launch_trial_activity")
+        assert (launch["trial_workflow_id"], launch["run_id"], launch["run_workflow_id"]) == ("t1", "r-1", "run-1")
+    asyncio.run(scenario())

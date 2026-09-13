@@ -212,7 +212,8 @@ def test_run_trial_records_timestamps(scene, monkeypatch):
         assert start.tzinfo == timezone.utc and end.tzinfo == timezone.utc and start <= end
     assert status["started_at"] == running["started_at"] == record["started_at"] == rec.started_at and record["finished_at"] == rec.finished_at
     # appended after the frozen TrialRecord fields, in order: timestamps, then the solver cost (interfaces section 6)
-    assert list(record)[-6:] == ["started_at", "finished_at", "cost_usd", "input_tokens", "output_tokens", "price_source"]
+    assert list(record)[-10:] == ["started_at", "finished_at", "cost_usd", "input_tokens", "output_tokens", "price_source",
+                                  "worker_image_digest", "origin", "workflow_id", "run_id"]                     # then the provenance (P2-11)
     assert TrialRecord(**record) == rec and run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 0, URL, "secret") == rec
 
 
@@ -404,3 +405,40 @@ def test_missing_provider_key_stops_the_trial_before_any_session_or_launch(scene
     assert calls["post"] == [] and calls["run"] == [] and not (ws.root / "trials").exists()   # nothing created: reconcile has nothing to see
     rec = run_trial(ws, spec, RunConfig(condition="hidden", model="anthropic/claude-haiku-4-5-20251001"), 0, URL, "secret")
     assert rec.status == "completed"                                                        # other providers unaffected
+
+
+
+def test_run_trial_records_its_provenance(scene, monkeypatch):
+    """P2-11: record.json names the Job's image and origin (this process's Settings) and the TrialWorkflow that launched it (the
+    launcher's request.json `trial_workflow_id` / `run_id`, else launch.json's `workflow_id` / `run_id`); a lone `run_workflow_id`
+    is the parent RunTasksWorkflow, never this trial's workflow; records written before the fields existed still load as None."""
+    import hashlib as _h
+    from swesim.settings import reset_settings
+    from swesim.stages.run import trial_provenance
+    ws, spec, calls, state = scene
+    rc = RunConfig(condition="interactive", model="openai/gpt-5.5")
+    scaffold_id = "mini-swe-agent.interactive:" + _h.sha256((ws.task_dir(spec.id, "interactive") / "agent_config.yaml").read_bytes()).hexdigest()[:16]
+    effective = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": "c" * 8, "brief_profile": "natural", "agent_config": scaffold_id})
+    tid = trial_id(spec.spec_hash, "interactive", effective.run_config_hash, 0); tdir = ws.root / "trials" / tid; tdir.mkdir(parents=True)
+    (tdir / "request.json").write_text(json.dumps({"trial_id": tid, "run_workflow_id": "run-1", "trial_workflow_id": tid, "run_id": "r-7"}))
+    (tdir / "launch.json").write_text(json.dumps({"trial_id": tid, "phase": "acknowledged", "launcher": "cloudrun", "workflow_id": "stale-wf", "run_id": "stale-run"}))
+    monkeypatch.setenv("SWESIM_ORIGIN", "cloudrun"); monkeypatch.setenv("SWESIM_WORKER_IMAGE_DIGEST", "sha256:" + "b" * 64); reset_settings()
+    try:
+        rec = run_trial(ws, spec, rc, 0, URL, "secret")
+    finally:
+        reset_settings()
+    assert rec.trial_id == tid and (rec.worker_image_digest, rec.origin, rec.workflow_id, rec.run_id) == ("sha256:" + "b" * 64, "cloudrun", tid, "r-7")
+    record = json.loads((tdir / "record.json").read_text())
+    assert [record[k] for k in ("worker_image_digest", "origin", "workflow_id", "run_id")] == ["sha256:" + "b" * 64, "cloudrun", tid, "r-7"]
+    assert list(record)[-4:] == ["worker_image_digest", "origin", "workflow_id", "run_id"] and TrialRecord(**record) == rec
+    # launch.json is the fallback for a launcher that predates the request's ids; the parent's id alone names no trial workflow
+    monkeypatch.delenv("SWESIM_ORIGIN"); monkeypatch.delenv("SWESIM_WORKER_IMAGE_DIGEST"); reset_settings()   # a laptop process from here on
+    (tdir / "request.json").write_text(json.dumps({"trial_id": tid, "run_workflow_id": "run-1"}))
+    prov = trial_provenance(tdir)
+    assert (prov["workflow_id"], prov["run_id"], prov["origin"], prov["worker_image_digest"]) == ("stale-wf", "stale-run", "laptop", None)
+    (tdir / "launch.json").unlink()
+    assert trial_provenance(tdir) == {"worker_image_digest": None, "origin": "laptop", "workflow_id": None, "run_id": None}
+    for k in ("worker_image_digest", "origin", "workflow_id", "run_id"):
+        record.pop(k)
+    old = TrialRecord(**record)                                         # a record written before the fields existed
+    assert (old.worker_image_digest, old.origin, old.workflow_id, old.run_id) == (None, None, None, None)

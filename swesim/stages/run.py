@@ -14,6 +14,10 @@ name, so `run_trial` refuses to start (`ProviderKeyMissing`, before any session 
 Cost: after Harbor returns, the solver's usage is read from the trial directory (`costs.usage_from_trial_dir`) and
 recorded to ``trials/<trial_id>/costs.json``; ``record.json`` carries ``cost_usd/input_tokens/output_tokens/price_source``
 (all None when the trial left no usage evidence: unknown is never written as zero).
+
+Provenance (P2-11): ``record.json`` also carries ``worker_image_digest`` / ``origin`` (this process's `Settings`: the Job's own
+image and origin) and ``workflow_id`` / ``run_id`` (the TrialWorkflow that launched it, from the launcher's ``request.json``
+``trial_workflow_id`` / ``run_id``, else ``launch.json``), see `trial_provenance`; the index prefers these over ``launch.json``.
 """
 from __future__ import annotations
 
@@ -31,7 +35,7 @@ from swesim.models import RunConfig, ScenarioSpec
 from swesim.models import trial_id as make_trial_id
 from swesim.paths import Workspace
 from swesim.roles import PROVIDERS, parse_model_id
-from swesim.settings import Settings
+from swesim.settings import Settings, get_settings
 from swesim.settings import has_secret as _has_secret
 from swesim.stakeholder.view import forbidden_terms, visible_view
 from swesim.stages.compile import verify_compiled_artifacts
@@ -54,10 +58,33 @@ class TrialRecord:
     started_at: str = ""; finished_at: str | None = None      # ISO-8601 UTC; appended last so positional construction is unchanged
     # Solver cost (interfaces section 6), appended after the timestamps; None = no usage evidence or no verified price.
     cost_usd: float | None = None; input_tokens: int | None = None; output_tokens: int | None = None; price_source: str | None = None
+    # Provenance (P2-11), appended after the cost fields: the Job's image and origin (its Settings) and the TrialWorkflow that
+    # launched it (`trial_provenance`). None on records written before the fields existed.
+    worker_image_digest: str | None = None; origin: str | None = None; workflow_id: str | None = None; run_id: str | None = None
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def trial_provenance(tdir: Path, settings: Settings | None = None) -> dict:
+    """The record's provenance (P2-11): `worker_image_digest` and `origin` from this process's Settings (the Job's own image and
+    origin), `workflow_id` / `run_id` from the launcher's request.json (`trial_workflow_id` / `run_id`, which TrialWorkflow passes
+    through launch_once) or, for a launcher that predates them, from launch.json's `workflow_id` / `run_id`. A lone
+    `run_workflow_id` names the parent RunTasksWorkflow, not this trial's workflow, and is left out."""
+    s = settings or get_settings()
+    request, launch = _read_json(tdir / "request.json"), _read_json(tdir / "launch.json")
+    return {"worker_image_digest": s.worker_image_digest, "origin": s.origin,
+            "workflow_id": request.get("trial_workflow_id") or launch.get("workflow_id") or None,
+            "run_id": (request.get("run_id") if request.get("trial_workflow_id") else None) or launch.get("run_id") or None}
 
 
 def has_secret(name: str, settings: Settings | None = None) -> bool:
@@ -254,7 +281,7 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
                       started_at, finished_at,
                       cost_usd=None if cost is None or cost.usd is None else float(cost.usd),
                       input_tokens=None if cost is None else cost.input_tokens, output_tokens=None if cost is None else cost.output_tokens,
-                      price_source=None if cost is None else cost.price_source)
+                      price_source=None if cost is None else cost.price_source, **trial_provenance(tdir))
     for name, obj in (("run_config.json", rc.model_dump(mode="json")), ("spec.json", spec.model_dump(mode="json")), ("reward.json", reward),
                       ("report.json", report), ("transcript.json", transcript), ("record.json", asdict(rec))):
         (tdir / name).write_text(json.dumps(obj, indent=2))
