@@ -98,7 +98,7 @@ def probe_candidates(ws: Workspace, judged_path: Path | str, instance_ids: list[
                 continue
             existing = row.get("probe") or {}
             exact = (existing.get("runner") or {}).get("exact")
-            if existing.get("statuses") and existing.get("binding") == gr.probe_binding(row):
+            if existing.get("statuses") and existing.get("binding") == gr.probe_binding(row) and existing.get("test_user") == gr.GRADING_USER:
                 if exact == "exact":
                     summary["already-probed"] += 1  # a grading-faithful measurement bound to this row: no second Modal run
                     f.write(json.dumps(row) + "\n")

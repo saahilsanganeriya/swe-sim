@@ -25,7 +25,7 @@ from swesim.costs import Usage
 from swesim.llm import chat_json, take_last_usage
 from swesim.paths import atomic_json
 from swesim.sources import threads
-from swesim.sources.github_repo import _TEST_PATH, is_code_path, probe_binding, runner_prefix
+from swesim.sources.github_repo import GRADING_USER, _TEST_PATH, is_code_path, probe_binding, runner_prefix
 from swesim.sources.swebench_annotated import TEST_PYTHON, test_files_from_patch
 import keyword
 
@@ -243,13 +243,18 @@ def _kept_text(natural: str, ranges: list[tuple[int, int]]) -> tuple[str, list[t
 
 
 def reconstruct_withheld(natural: str, excerpts: list[str]) -> str:
-    """The withheld brief that exactly `excerpts` (the recorded removals, each a whole sentence/line of `natural`) produce:
-    every occurrence of each excerpt, matched after `_norm` and widened to sentence/line segments like `withhold` does, is
-    deleted line-aware and everything else is kept byte for byte. `withhold` checks its own brief against this, and the
-    approval gate (and, by patch, `ScenarioSpec._integrity`) recompute it from the spec alone, so a sentence can never
-    disappear from the brief without a ledger entry (B-P1-2)."""
+    """Delete one sentence/line occurrence per recorded excerpt, keeping duplicate removals accountable individually.
+
+    Matching and boundary trimming follow `withhold`; a missing or repeated removal without another occurrence is invalid.
+    """
     segs = _segments(natural)
-    ranges = [_extend(span, segs) for e in excerpts for span in _find_spans(natural, e)]
+    ranges = []
+    for excerpt in excerpts:
+        candidates = [_extend(span, segs) for span in _find_spans(natural, excerpt)]
+        span = next((candidate for candidate in candidates if candidate not in ranges), None)
+        if span is None:
+            raise ValueError("recorded withholding excerpt has no remaining occurrence in the natural brief")
+        ranges.append(span)
     return _kept_text(natural, ranges)[0]
 
 
@@ -1067,7 +1072,7 @@ def _code_mask(text: str, state: dict) -> list[bool]:
         else:
             mask[i] = True
             i += 1
-    state["quote"] = quote if quote and len(quote) == 3 else None  # a single-quoted string cannot span lines
+    state["quote"] = quote  # single-quoted strings may also continue with a backslash-newline
     return mask
 
 
@@ -1351,6 +1356,8 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
         if probe.get("binding") != probe_binding(row):
             raise ValueError("probe metadata binding mismatch: the probe measured a different base_commit/test_patch than this row carries "
                              "(stale or foreign measurement). Re-run `swesim probe`, or pass require_probe=False to draft unmeasured.")
+        if probe.get("test_user") != GRADING_USER:
+            raise ValueError(f"probe did not record the grading identity {GRADING_USER!r}; re-probe before drafting")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     assets = out_dir / "assets"

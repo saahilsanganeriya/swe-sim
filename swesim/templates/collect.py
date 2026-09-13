@@ -8,6 +8,7 @@ No repository code and no git command runs here: the archive is the only trust a
 import hashlib, json, os, pathlib, pwd, subprocess, tarfile, time, urllib.request
 
 OUT = pathlib.Path('/var/swesim-collect')
+BASE_MANIFEST = pathlib.Path('/opt/swesim/base-manifest.txt')
 LIMIT_BYTES = 500 * 1024 * 1024
 LIMIT_MEMBERS = 100000
 EXCLUDED = {'.git', '.venv', 'node_modules', '__pycache__', '.pytest_cache'}
@@ -102,10 +103,10 @@ def freeze(stakeholder_url, token, opener=urllib.request.urlopen, attempts=FREEZ
 
 
 def collect(repo, out, stakeholder_url, token, kill=kill_agent_processes, opener=urllib.request.urlopen,
-            limit_bytes=LIMIT_BYTES, limit_members=LIMIT_MEMBERS):
+            limit_bytes=LIMIT_BYTES, limit_members=LIMIT_MEMBERS, base_manifest=None):
     out = pathlib.Path(out)
     receipt = {'status': 'collection-failure', 'rc': 1, 'user': 'root', 'sha256': None, 'bytes': None, 'files': None,
-               'freeze_status': 'n/a', 'transcript_hash': None}
+               'freeze_status': 'n/a', 'transcript_hash': None, 'base_manifest_sha256': None}
     try:
         out.mkdir(mode=0o700, exist_ok=True); out.chmod(0o700)
         for p in out.iterdir():
@@ -114,6 +115,10 @@ def collect(repo, out, stakeholder_url, token, kill=kill_agent_processes, opener
         status, members, total = scan_tree(repo, limit_bytes, limit_members)
         receipt['status'] = status
         if status == 'ok':
+            manifest = pathlib.Path(base_manifest) if base_manifest is not None else BASE_MANIFEST
+            if manifest.is_symlink() or not manifest.is_file():
+                raise ValueError('base manifest missing or not a regular file')
+            receipt['base_manifest_sha256'] = hashlib.sha256(manifest.read_bytes()).hexdigest()
             receipt.update(sha256=write_archive(repo, members, out / 'app.tar'), bytes=total, files=len(members), rc=0)
     except Exception as e:
         receipt['status'] = 'collection-failure'; receipt['rc'] = 1; receipt['error'] = type(e).__name__ + ': ' + str(e)

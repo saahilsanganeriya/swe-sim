@@ -277,7 +277,8 @@ def _grader_config(spec: ScenarioSpec) -> dict:
             "expected_tests": {t: "f2p" for t in spec.contract.fail_to_pass} | {t: "p2p" for t in spec.contract.pass_to_pass},
             "groups": [g.model_dump() for g in spec.groups], "protected": protected,
             "runner": spec.contract.runner.model_dump(), "test_user": "tester", "verifier_out": "/logs/verifier",
-            "test_timeout_sec": TEST_TIMEOUT_SEC, "target_dir": spec.environment.repo_dir, "contract_patch": "/tests/test.patch"}
+            "test_timeout_sec": TEST_TIMEOUT_SEC, "target_dir": spec.environment.repo_dir, "contract_patch": "/tests/test.patch",
+            "base_manifest": "/opt/swesim/base-manifest.txt"}
 
 
 def _copy_exec(src: Path, dst: Path) -> None:

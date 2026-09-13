@@ -17,7 +17,6 @@ def test_sitecustomize_forge_targets_startup_hook():
 
 
 def test_skip_marker_rewrites_test_file():
-    tp = "diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n@@ -1 +1 @@\n-x\n+def test_new():\n+    assert 1\n"
     d = tamper.skip_marker({"tests/test_a.py": "def test_old():\n    assert True\n"})
     assert "pytestmark=pytest.mark.skip" in d and "a/tests/test_a.py" in d
 

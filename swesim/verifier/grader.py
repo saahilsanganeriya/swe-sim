@@ -36,7 +36,7 @@ else:
 
 OUTCOMES = {'valid-correct': 1, 'valid-incorrect': 2, 'agent-invalid-submission': 3, 'agent-runtime-failure': 4,
             'collection-failure': 5, 'simulator-failure': 6, 'evaluator-failure': 7}
-PATH_FIELDS = ('artifacts_dir', 'pristine_dir', 'work_dir', 'verifier_out', 'target_dir', 'contract_patch')
+PATH_FIELDS = ('artifacts_dir', 'pristine_dir', 'work_dir', 'verifier_out', 'target_dir', 'contract_patch', 'base_manifest')
 LAUNCH_FAILURE = 'launch-failure: '   # _run_tests error prefix for failures that cannot be the submission's doing
 MAX_RERUNS = 10
 MAX_DIFF_FILE_BYTES = 5 * 1024 * 1024
@@ -59,6 +59,7 @@ class GradeConfig:
     test_timeout_sec: int = 1500
     target_dir: Path | None = None    # /testbed or /app: preserve editable-install paths
     contract_patch: Path | None = None
+    base_manifest: Path = Path('/opt/swesim/base-manifest.txt')
 
 
 @dataclass
@@ -476,6 +477,21 @@ def grade(cfg):
     if receipt.get('status') != 'ok' or receipt.get('rc') != 0 or receipt.get('user') != 'root' or not tar.is_file():
         report['error'] = 'receipt status/rc/user or archive missing'
         return finish('collection-failure')
+    agent_base = receipt.get('base_manifest_sha256')
+    if not isinstance(agent_base, str) or len(agent_base) != 64 or any(ch not in '0123456789abcdef' for ch in agent_base):
+        report['error'] = 'agent base manifest digest missing or malformed in collection receipt'
+        return finish('collection-failure')
+    try:
+        if cfg.base_manifest.is_symlink() or not cfg.base_manifest.is_file():
+            raise ValueError('missing or not a regular file')
+        verifier_base = sha256_file(cfg.base_manifest)
+    except (OSError, ValueError) as exc:
+        report['error'] = 'verifier base manifest: %s' % exc
+        return finish('evaluator-failure')
+    report['base_manifests'] = {'agent': agent_base, 'verifier': verifier_base, 'match': agent_base == verifier_base}
+    if agent_base != verifier_base:
+        report['error'] = 'agent and verifier base manifests differ'
+        return finish('evaluator-failure')
     if receipt.get('sha256') != sha256_file(tar):
         report['error'] = 'archive digest differs from receipt'
         return finish('collection-failure')

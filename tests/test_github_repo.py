@@ -420,7 +420,7 @@ def test_probe_is_grading_faithful_exact_ids_in_definition_order(monkeypatch, tm
             "exact_command": "CMD", "test_exact": {"statuses": exact_test, "exit_code": 1, "error": None, "tail": ""},
             "gold": {"statuses": full_gold, "exit_code": 0, "error": None, "tail": ""},
             "gold_exact": {"statuses": {**full_gold, order[3]: "failed"}, "exit_code": 1, "error": None, "tail": ""}}
-    seen = _setup_probe(monkeypatch, tmp_path, data)
+    _setup_probe(monkeypatch, tmp_path, data)
     row = {**_swebench_probe_row(), "test_patch": "diff --git a/sklearn/utils/tests/test_pprint.py b/sklearn/utils/tests/test_pprint.py\n--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n x\n+def test_changed_only(): pass\n",
            "fail_to_pass": [order[1], order[2]], "pass_to_pass": [order[0], order[3]]}
     out = gr.probe_tests(row, Workspace(tmp_path / "ws"))
@@ -546,6 +546,26 @@ def test_reconstruct_probe_from_job_dir_and_probe_candidates_reuses_measurements
     assert json.loads(out.with_suffix(".summary.json").read_text()) == {"rows": 4, "probed": 0, "already-probed": 1, "reconstructed-whole-file-only": 1, "reproducible": 1, "build-budget-exhausted": 2}
 
 
+@pytest.mark.parametrize("test_user", [None, "root"])
+def test_probe_candidates_never_reuses_matching_bindings_measured_as_root(monkeypatch, tmp_path, test_user):
+    from swesim.paths import Workspace
+    from swesim.stages.mine import probe_candidates
+    row = {**_swebench_probe_row(), "judge": {"keep": True}}
+    row["probe"] = {"binding": gr.probe_binding(row), "test_user": test_user, "statuses": {"test": {"t": "failed"}}, "runner": {"exact": "exact"}}
+    judged = tmp_path / "judged.jsonl"; judged.write_text(json.dumps(row) + "\n")
+    calls = []
+
+    def fake_probe(candidate, ws):
+        calls.append(candidate["instance_id"])
+        return {"fail_to_pass": ["t"], "pass_to_pass": [], "test_python": gr.SWEBENCH_PYTHON, "probe_dir": "/job/trial",
+                "dockerfile": None, "probe": {**candidate["probe"], "test_user": "tester"}}
+
+    monkeypatch.setattr(gr, "probe_tests", fake_probe)
+    result = probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=1)
+    assert calls == [row["instance_id"]]
+    assert json.loads(result.read_text())["probe"]["test_user"] == "tester"
+
+
 def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_rows(monkeypatch, tmp_path):
     from swesim.paths import Workspace
     from swesim.stages.mine import probe_candidates
@@ -560,7 +580,7 @@ def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_row
 
     def fake_probe(row, ws):
         probed.append(row["instance_id"])
-        bound = {"kind": "image", "statuses": {"test": {"x": "failed"}, "gold": {"x": "passed"}}, "binding": gr.probe_binding(row), "runner": {"exact": "exact"}}
+        bound = {"kind": "image", "test_user": "tester", "statuses": {"test": {"x": "failed"}, "gold": {"x": "passed"}}, "binding": gr.probe_binding(row), "runner": {"exact": "exact"}}
         if row["instance_id"] == "pydata__xarray-2":
             return {"fail_to_pass": [], "pass_to_pass": [f + "test_old"], "dropped": {"network_or_env": [f + "test_new"], "gold_regressions": [], "other": [], "order_dependent": []}, "statuses": {},
                     "dockerfile": "FROM x", "probe_dir": "/j/2", "test_python": gr.SWEBENCH_PYTHON, "probe": {**bound, "probe_dir": "/j/2"}}

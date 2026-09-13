@@ -132,6 +132,20 @@ def test_withheld_brief_must_be_the_natural_text_minus_exactly_the_recorded_exce
     assert "withheld-reconstructs" in json.loads((sdir / "approval.json").read_text())["gates"]
 
 
+def test_reconstruction_gate_reports_a_duplicate_removal_instead_of_crashing():
+    from swesim.stages.approve import withheld_reconstruction_failures
+    d = minimal_spec_dict()
+    d["briefs"][0]["text"] = "Title\nRemove this sentence.\nKeep this sentence."
+    d["briefs"].append({"profile": "withheld", "text": "Title\nKeep this sentence.", "provenance": "withheld"})
+    d["ledger"].append({"id": "withheld-001", "text": "Remove this sentence.", "kind": "reproduction", "provenance": "original-issue",
+                        "source_excerpt": "Remove this sentence.", "source_url": "https://example.com/issue", "discovery": "on-request"})
+    d["operations"] = [{"type": "withholding", "target": "withheld-001", "rationale": "error_message"}]
+    spec = ScenarioSpec.model_validate(d)
+    assert withheld_reconstruction_failures(spec) == []
+    invalid = spec.model_copy(update={"operations": spec.operations * 2})
+    assert "no remaining occurrence" in withheld_reconstruction_failures(invalid)[0]
+
+
 def test_requirements_must_be_grounded_in_a_visible_fact_or_the_thread(tmp_path):
     """A-P1-2 / B-P1-2: a requirement with no fact_id is accepted only when its text is a verbatim thread or issue excerpt."""
     d = minimal_spec_dict()
