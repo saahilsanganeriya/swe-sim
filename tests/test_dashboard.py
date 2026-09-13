@@ -201,9 +201,11 @@ def test_reader_candidates_funnel_and_reject_histogram(site):
     pg = r.candidates(R.CandidateFilter(limit=100))
     by_id = {c.instance_id: c for c in pg.items}
     assert pg.total == 2 and by_id["acme__widget-12"].status == "rejected" and by_id["acme__widget-12"].gate == "judge" and by_id["acme__widget-12"].reasons
-    assert by_id["acme__widget-13"].status == "kept" and by_id["acme__widget-13"].stage == "judged" and by_id["acme__widget-13"].pr_number == 13
+    kept13 = by_id["acme__widget-13"]  # kept by the judge, never probed: pending at judged, and the reason says why
+    assert (kept13.status, kept13.stage, kept13.pr_number, kept13.reasons) == ("pending", "judged", 13, ["not-selected"])
     steps = {s.stage: s for s in r.funnel()}
-    assert steps["mined"].kept == 2 and steps["judged"].rejected == 1 and steps["judged"].kept == 1 and steps["registered"].kept == 0
+    assert steps["mined"].kept == 2 and steps["judged"].rejected == 1 and steps["judged"].pending == 1 and steps["judged"].kept == 0
+    assert steps["probed"].entered == 0 and steps["registered"].kept == 0 and steps["registered"].ids == []
     assert reject_histogram(r, pg.items, None) == {"discovery:no-linked-issue": 5, "discovery:diff-too-small": 2, "candidate:judge": 1}
     assert reject_histogram(r, pg.items, "other-key") == {}
     assert r.candidates(R.CandidateFilter(status=["rejected"])).total == 1
@@ -273,7 +275,8 @@ def test_every_page_and_json_twin_renders(site):
     assert "aria-current='page'" in home and "data-source='/api/home'" in home and "Leaderboard" in home and "Artifacts" in home
     assert "href='/static/tokens.css'" in home and "data-theme-toggle" in home and "role='search'" in home and "<dialog" in home
     counts = c.get("/api/counts").json()
-    assert counts == {"scenarios_valid": 1, "trials_running": 1, "candidates_pending": 0, "workflows_running": 0, "review_pending": 0}
+    # acme__widget-13 was kept by the judge and never probed: it is pending (not-selected), and the nav count says so
+    assert counts == {"scenarios_valid": 1, "trials_running": 1, "candidates_pending": 1, "workflows_running": 0, "review_pending": 0}
     h = c.get("/api/home").json()
     assert h["tiles"]["trials_completed"] == 3 and h["tiles"]["trials_unresolved"] == 2 and len(h["running"]) == 1 and h["funnel"][0]["stage"] == "mined"
     assert c.get("/scenario/nope-nope").status_code == 404 and c.get("/trial/" + "0" * 24).status_code == 404 and c.get("/db/nope").status_code == 404

@@ -18,6 +18,11 @@ Contract
 - Scenario validation status from files: scenario.json + validation.json valid -> valid; validation.json not valid
   -> invalid; a reject decision -> rejected; compile.json -> validating; approval.json -> compiling; else drafting;
   `archive/v<n>/` -> archived (one row per version).
+- Candidate rows (`project_candidates`): one per instance of a source key, at the last stage its current version reached,
+  with a terminal status there: `kept` only at the last stage, `rejected`/`error` at a gate, `pending` when kept but never
+  advanced (reason in `reasons[0]`); archived versions ride along in `earlier_versions` as `superseded` (or their own
+  rejection). The legacy per-instance probe files (`candidates/probe_<instance>.*.jsonl`) belong to the instance's
+  source, not to a source key of their own. A receipt of the same version (`candidate_events`) takes precedence.
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ import re
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any, NamedTuple, get_args
 
 from pydantic import ValidationError
 
@@ -375,15 +380,23 @@ def project_discoveries(layout: Layout, source_key: str | None = None, *, origin
         rows.extend(snapshots)
     return rows
 
+PROBE_FILE_PREFIX = "probe_"  # candidates/probe_<instance>.jsonl: the legacy chain's per-instance probe files, joined to the instance's source
+PENDING_REASONS: tuple[str, ...] = ("not-selected", "cap-cut", "workflow-stopped", "in-progress", "unknown")
+NEGATIVE: frozenset[str] = frozenset({"rejected", "error"})
+SPEC_STAGE_FILES: frozenset[str] = frozenset({"scenario.draft.json", "draft.meta.json", "approval.json", "compile.json", "validation.json", "scenario.json"})
+LAST_STAGE = M.FUNNEL_ORDER[-1]
+
+
 def source_keys(layout: Layout) -> list[str]:
-    """Source keys with a mined file (`<key>.jsonl`); derived files (`.judged`, `.probed`) are not keys."""
+    """Source keys with a mined file (`<key>.jsonl`). Derived files (`.judged`, `.probed`) and the legacy per-instance probe files
+    (`probe_<instance>.jsonl`, joined to the instance's own source by `project_candidates`) are not keys."""
     cdir = layout.candidates_dir()
     if not cdir.is_dir():
         return []
     keys = set()
     for p in cdir.glob("*.jsonl"):
         name = p.name[: -len(".jsonl")]
-        if ".judged" in name or name.endswith(".probed") or not SEGMENT_RE.fullmatch(name):
+        if ".judged" in name or name.endswith(".probed") or name.startswith(PROBE_FILE_PREFIX) or not SEGMENT_RE.fullmatch(name):
             continue
         keys.add(name)
     return sorted(keys)
@@ -421,14 +434,79 @@ def candidate_events_by_identity(layout: Layout, settings=None) -> CandidateEven
     return out
 
 
+class CandidatePlans(NamedTuple):
+    """What the frozen candidate plans under `evidence/workflows/<wf>/` say (`swesim.workflows.batching`): `offered` maps
+    (source_key, instance_id) -> {"selected": bool, "workflow_dir": str} for every row of a source snapshot
+    (`<n>.candidates.jsonl`), selected when the plan's `items` list it, cut by the source limit otherwise; `workflows`
+    maps a workflow id and `dirs` its plan directory name (`sha256(workflow_id)[:32]`) to the workflow's status."""
+
+    offered: dict[tuple[str, str], dict]
+    workflows: dict[str, str]
+    dirs: dict[str, str]
+
+
+def candidate_plans(layout: Layout, settings=None) -> CandidatePlans:
+    """Read once per listing/rebuild and passed to `project_candidates`; an unreadable file contributes nothing."""
+    offered: dict[tuple[str, str], dict] = {}
+    root = layout.root / "evidence" / "workflows"
+    if root.is_dir():
+        for d in sorted(p for p in root.iterdir() if p.is_dir()):
+            for plan_file in sorted(d.glob("*.plan.json")):
+                items = _dict(read_json(plan_file)).get("items")
+                if not isinstance(items, list) or not all(isinstance(i, dict) and _str(i.get("instance_id")) for i in items):
+                    continue  # a trial plan, or not a plan
+                chosen = {(str(i.get("source_key")), i["instance_id"]) for i in items}
+                key_of_snapshot = {Path(str(i.get("candidates_path"))).name: str(i.get("source_key")) for i in items if i.get("candidates_path")}
+                for snapshot in sorted(d.glob("*.candidates.jsonl")):
+                    key = key_of_snapshot.get(snapshot.name)
+                    if key is None:
+                        continue  # no plan item names this snapshot: its source key is unknown
+                    for iid in _jsonl_rows(snapshot):
+                        prior = offered.get((key, iid))
+                        selected = (key, iid) in chosen
+                        if prior is None or (selected and not prior["selected"]):
+                            offered[(key, iid)] = {"selected": selected, "workflow_dir": d.name}
+    workflows: dict[str, str] = {}
+    try:
+        from swesim.index.history import workflow_rows
+        for w in sorted(workflow_rows(layout, settings), key=lambda w: (w.started_at, w.run_id)):
+            if workflows.get(w.workflow_id) != "running":  # any run still open keeps the workflow running
+                workflows[w.workflow_id] = w.status
+    except (OSError, ValueError):
+        workflows = {}
+    dirs = {hashlib.sha256(wid.encode()).hexdigest()[:32]: status for wid, status in workflows.items()}
+    return CandidatePlans(offered, workflows, dirs)
+
+
+def _instance_probe_rows(layout: Layout, iid: str) -> tuple[dict, datetime | None]:
+    """The legacy chain's per-instance probe files, `candidates/probe_<instance>.jsonl` (the judged row it probed) and
+    `probe_<instance>.probed.jsonl` (the outcome); the outcome wins. (merged row, newest file time)."""
+    if not SEGMENT_RE.fullmatch(iid):
+        return {}, None
+    merged: dict = {}
+    at: datetime | None = None
+    for name in (f"{PROBE_FILE_PREFIX}{iid}.jsonl", f"{PROBE_FILE_PREFIX}{iid}.probed.jsonl"):
+        path = layout.candidates_dir() / name
+        per = _jsonl_rows(path).get(iid)
+        if per:
+            merged.update(per)
+            at = mtime(path) or at
+    return merged, at
+
+
 def project_candidates(layout: Layout, source_key: str, *, registry: dict[str, dict] | None = None, origin: str | None = None,
-                       now: datetime | None = None, events: CandidateEvents | None = None) -> list[M.CandidateRow]:
-    """Every instance of one source key with the furthest stage it reached and the outcome at that stage. `events` are the
-    candidates' decision receipts (`candidate_events_by_identity`); read here when not given."""
+                       now: datetime | None = None, events: CandidateEvents | None = None, plans: CandidatePlans | None = None
+                       ) -> list[M.CandidateRow]:
+    """Exactly one row per instance of one source key: the furthest stage its current version reached and the terminal
+    decision there (`CandidateRow`). Joins the source's mined/judged/probed files, the per-candidate files under
+    `candidates/judged/` and the legacy per-instance probe files (`probe_<instance>.*.jsonl`); `events` are the candidates'
+    decision receipts (`candidate_events_by_identity`) and `plans` the frozen candidate plans (`candidate_plans`), both read
+    here when not given. A receipt of the current version takes precedence over what the files suggest."""
     registry = project_registry(layout) if registry is None else registry
     origin = _default_origin(origin)
     now = now or M.utcnow()
     events = candidate_events_by_identity(layout) if events is None else events
+    plans = candidate_plans(layout) if plans is None else plans
     mined_path = layout.candidates_file(source_key, "mined")
     judged_path = layout.candidates_file(source_key, "judged")
     probed_path = layout.candidates_file(source_key, "probed")
@@ -439,13 +517,18 @@ def project_candidates(layout: Layout, source_key: str, *, registry: dict[str, d
         sid = scenario_id_for(iid)
         row = {**mined.get(iid, {}), **judged.get(iid, {}), **probed.get(iid, {})}
         judged_at = mtime(judged_path) if iid in judged else None
+        per, at = _instance_probe_rows(layout, iid)
+        if per:
+            row.update(per)
+            judged_at = at or judged_at
         if sid is not None and judged_dir.is_dir():
             for suffix in (".judged.jsonl", ".judged.probed.jsonl"):
                 per = _jsonl_rows(judged_dir / f"{sid}{suffix}").get(iid)
                 if per:
                     row.update(per)
                     judged_at = mtime(judged_dir / f"{sid}{suffix}") or judged_at
-        rows.append(_candidate_row(layout, source_key, iid, sid, row, judged_at, registry, origin, now, events.get((source_key, iid), [])))
+        rows.append(_candidate_row(layout, source_key, iid, sid, row, judged_at, registry, origin, now, events.get((source_key, iid), []),
+                                   plans=plans, has_judged=bool(judged)))
     return rows
 
 
@@ -454,11 +537,10 @@ def _further(a: str, b: str) -> bool:
     return a in M.FUNNEL_ORDER and b in M.FUNNEL_ORDER and M.FUNNEL_ORDER.index(a) > M.FUNNEL_ORDER.index(b)
 
 
-def _candidate_row(layout: Layout, source_key: str, iid: str, sid: str | None, row: dict, judged_at: datetime | None,
-                   registry: dict[str, dict], origin: str, now: datetime, events: list[M.CandidateEventRow] = ()) -> M.CandidateRow:
+def _file_decision(row: dict, error_file: dict) -> tuple[str, str, str | None, list[str]]:
+    """(stage, status, gate, reasons) the candidate files prove up to probing."""
     judge = row.get("judge") if isinstance(row.get("judge"), dict) else None
     probe = row.get("probe") if isinstance(row.get("probe"), dict) else None
-    error_file = _dict(read_json(layout.candidates_dir() / f"{iid}.error.json")) if SEGMENT_RE.fullmatch(iid) else {}
     stage, status, gate, reasons = "mined", "pending", None, []
     if judge is not None:
         keep = judge.get("keep")
@@ -466,6 +548,8 @@ def _candidate_row(layout: Layout, source_key: str, iid: str, sid: str | None, r
         status = "kept" if keep is True else "rejected" if keep is False else "pending"
         if keep is False:
             gate, reasons = "judge", [str(row.get("reject_reason") or judge.get("reject_reason") or "judge did not keep the candidate")]
+        elif keep is not True:
+            reasons = ["judge gave no decision"]
     if error_file:
         stage, status, gate, reasons = "probed", "error", "probe", [str(error_file.get("error") or "probe error")]
     elif row.get("reject_reason") in PROBE_REJECTS:
@@ -475,48 +559,135 @@ def _candidate_row(layout: Layout, source_key: str, iid: str, sid: str | None, r
         stage, status, gate, reasons = "probed", "error", "probe", [str(probe["error"])]
     elif probe is not None and status == "kept" and (probe.get("statuses") or probe.get("stages") or row.get("probe_workflow")):
         stage = "probed"
+    return stage, status, gate, reasons
+
+
+def _scenario_decision(present: set[str], files: dict[str, dict], *, registered: bool) -> tuple[str, str, str | None, list[str]] | None:
+    """(stage, status, gate, reasons) the scenario files of one version prove from drafting on; None without a spec-stage file.
+    `registered` says a valid validation counts as registered (the current version: a registry entry exists; an archived
+    version: registration follows a valid validation without a further gate, `workflows.py` validate -> register)."""
+    if not (present & SPEC_STAGE_FILES):
+        return None
+    review, approval, validation = files["review.json"], files["approval.json"], files["validation.json"]
+    if review.get("decision") == "reject":
+        return "approved", "rejected", "approval", [str(review.get("note") or "rejected in review")]
+    if approval.get("approved") is False:
+        return "approved", "rejected", "approval", [str(approval.get("note") or "not approved")]
+    stage = "drafted"
+    if "approval.json" in present:
+        stage = "approved"
+    if "compile.json" in present:
+        stage = "compiled"
+    if "validation.json" in present:
+        stage = "validated"
+        if validation.get("status") != "valid":
+            return stage, "rejected", "validation", [str(f) for f in (validation.get("failures") or [])][:10] or ["validation not valid"]
+        if registered:
+            stage = LAST_STAGE
+    return stage, "kept", None, []
+
+
+def _latest_receipt(events, version: int | None) -> M.CandidateEventRow | None:
+    """The newest receipt of one version (a receipt without a version, or any receipt when the version is unknown)."""
+    mine = [e for e in events if version is None or e.version is None or e.version == version]
+    return max(mine, key=lambda e: (e.occurred_at, e.event_id), default=None)
+
+
+def _apply_receipt(latest: M.CandidateEventRow | None, decision: tuple[str, str, str | None, list[str]]) -> tuple[str, str, str | None, list[str]]:
+    """The workflow's own receipt of its last decision: a terminal rejection/error is the truth about this version even when its
+    scenario directory holds files from a later stage (an auto-approval reject leaves approval-stage files; a human reject or
+    approval timeout leaves a draft). A kept receipt never lowers what the files show, only raises the stage."""
+    stage, status, gate, reasons = decision
+    if latest is None:
+        return decision
+    if latest.terminal and latest.status in NEGATIVE:
+        return latest.stage, latest.status, latest.gate, list(latest.reasons)
+    if status == "kept" and _further(latest.stage, stage):
+        stage = latest.stage
+    return stage, status, gate, reasons
+
+
+def _pending_reason(stage: str, has_judged: bool, plans: CandidatePlans | None, source_key: str, iid: str, workflow_id: str | None) -> str:
+    """Why a candidate kept at `stage` never advanced: `cap-cut` when a frozen plan offered it and the source limit left it out;
+    `workflow-stopped` / `in-progress` from the owning workflow's status (its receipt's id, else its plan directory);
+    `cap-cut` for a mined row of a source the legacy whole-file judge capped; `not-selected` for a judged row the legacy
+    pipeline never reached; else `unknown`."""
+    plan = plans.offered.get((source_key, iid)) if plans is not None else None
+    if plan is not None and not plan["selected"]:
+        return "cap-cut"
+    status = plans.workflows.get(workflow_id) if plans is not None and workflow_id else None
+    if status is None and plan is not None:
+        status = plans.dirs.get(plan["workflow_dir"])
+    if status is not None:
+        return "in-progress" if status == "running" else "workflow-stopped"
+    if plan is not None:
+        return "unknown"
+    if stage == "mined":
+        return "cap-cut" if has_judged else "unknown"
+    if stage == "judged":
+        return "not-selected"
+    return "unknown"
+
+
+def _earlier_versions(layout: Layout, sid: str, current: int, events) -> list[dict] | None:
+    """The archived versions below `current` (`archive/v<n>/`), each at the last stage its files (or its receipts) prove, with
+    status `superseded` unless that version was itself rejected or errored."""
+    archive = layout.scenario_dir(sid) / "archive"
+    if not archive.is_dir():
+        return None
+    out: list[dict] = []
+    for adir in sorted(archive.iterdir(), key=lambda p: p.name):
+        if not adir.is_dir() or not re.fullmatch(r"v[1-9][0-9]*", adir.name):
+            continue
+        v = int(adir.name[1:])
+        if v >= current:
+            continue
+        present, files = _scenario_files(adir)
+        decision = _scenario_decision(present, files, registered=True) or (("judged", "kept", None, []) if "judge.json" in present else None)
+        if decision is None:
+            continue  # nothing archived says what this version reached
+        stage, status, gate, reasons = _apply_receipt(_latest_receipt(events, v), decision)
+        if status not in NEGATIVE:
+            status = "superseded"
+        out.append({"version": v, "stage": stage, "status": status, "gate": gate, "reasons": reasons})
+    return out or None
+
+
+def _candidate_row(layout: Layout, source_key: str, iid: str, sid: str | None, row: dict, judged_at: datetime | None,
+                   registry: dict[str, dict], origin: str, now: datetime, events: list[M.CandidateEventRow] = (), *,
+                   plans: CandidatePlans | None = None, has_judged: bool = False) -> M.CandidateRow:
+    error_file = _dict(read_json(layout.candidates_dir() / f"{iid}.error.json")) if SEGMENT_RE.fullmatch(iid) else {}
+    stage, status, gate, reasons = _file_decision(row, error_file)
     present: set[str] = set()
     files: dict[str, dict] = {}
     entry = registry.get(sid) if sid else None
     if sid is not None:
         present, files = _scenario_files(layout.scenario_dir(sid))
-    if present and status not in ("rejected", "error"):
-        if "scenario.draft.json" in present or "draft.meta.json" in present:
-            stage, status = "drafted", "kept"
-        if files["review.json"].get("decision") == "reject":
-            stage, status, gate = "approved", "rejected", "approval"
-            reasons = [str(files["review.json"].get("note") or "rejected in review")]
-        elif "approval.json" in present:
-            stage, status = "approved", "kept"
-        if "compile.json" in present and status == "kept":
-            stage = "compiled"
-        if "validation.json" in present and status == "kept":
-            stage = "validated"
-            if files["validation.json"].get("status") != "valid":
-                status, gate = "rejected", "validation"
-                reasons = [str(f) for f in (files["validation.json"].get("failures") or [])][:10] or ["validation not valid"]
-        if entry is not None and status == "kept":
-            stage = "registered"
+    current = (scenario_version_of(files) if files else None) or (_int(entry.get("version")) if entry else None)
+    if present and status not in NEGATIVE:
+        decided = _scenario_decision(present, files, registered=entry is not None)
+        if decided is not None:
+            stage, status, gate, reasons = decided
     scenario_id = sid if (present or entry is not None) else None
-    version = scenario_version_of(files) if files else (_int((entry or {}).get("version")) if entry else None)
+    version = current
+    latest = _latest_receipt(events, current)
     workflow_id = run_id = candidates_path = None
-    latest = max(events, key=lambda e: (e.occurred_at, e.event_id), default=None)
     if latest is not None:
-        # The workflow's own receipt of its last decision: a terminal rejection/error is the truth about this candidate even
-        # when its scenario directory holds files from a later stage (an auto-approval reject leaves approval-stage files;
-        # a human reject or approval timeout leaves a draft). A kept receipt never lowers what the files show.
         workflow_id, run_id, candidates_path = latest.workflow_id, latest.run_id, latest.candidates_path
         scenario_id, version = latest.scenario_id or scenario_id, latest.version or version
-        if latest.terminal and latest.status in ("rejected", "error"):
-            stage, status, gate, reasons = latest.stage, latest.status, latest.gate, list(latest.reasons)
-        elif status == "kept" and _further(latest.stage, stage):
-            stage = latest.stage
+        stage, status, gate, reasons = _apply_receipt(latest, (stage, status, gate, reasons))
+    # Terminal status: `kept` means it advanced, so a candidate kept at any stage but the last never advanced -> pending, with why.
+    if status == "kept" and stage != LAST_STAGE:
+        status, gate, reasons = "pending", None, [_pending_reason(stage, has_judged, plans, source_key, iid, workflow_id)]
+    elif status == "pending" and not reasons:
+        reasons = [_pending_reason(stage, has_judged, plans, source_key, iid, workflow_id)]
+    earlier = _earlier_versions(layout, sid, current, events) if sid is not None and current is not None and current > 1 else None
     source = _str(row.get("source")) or ("swebench-annotated" if "swebench" in source_key else source_key.split("--", 1)[0])
     discovery = _dict(row.get("discovery"))
     return M.CandidateRow(
         instance_id=iid, source_key=source_key, source=source, repo=_str(row.get("repo")), pr_number=pr_number_of(iid),
         pr_kind=_str(discovery.get("kind")), stage=stage, status=status, gate=gate, reasons=reasons, judged_at=judged_at,
-        scenario_id=scenario_id, version=version, candidates_path=candidates_path,
+        scenario_id=scenario_id, version=version, candidates_path=candidates_path, earlier_versions=earlier,
         created_at=now, updated_at=now, workflow_id=workflow_id, run_id=run_id, origin=origin)
 
 
@@ -817,5 +988,5 @@ def project_workflows_from_jobs(layout: Layout, *, origin: str | None = None, no
 __all__ = ["ProjectionError", "NoScenarioFiles", "aware", "dec", "mtime", "provider_of", "scenario_id_for", "pr_number_of", "read_json",
            "project_registry", "scenario_ids", "scenario_version_of", "validation_status_of", "project_scenario", "project_scenario_versions",
            "source_keys", "discovery_source_keys", "project_discovery", "project_discoveries", "read_discovery_snapshot",
-           "project_candidates", "candidate_events_by_identity", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_workflow_costs",
+           "project_candidates", "candidate_events_by_identity", "candidate_plans", "CandidatePlans", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_workflow_costs",
            "project_scores", "project_workflows_from_jobs"]

@@ -293,12 +293,22 @@ def test_candidates_reach_their_furthest_stage(record: Record, registry: dict):
     assert fourth.source == "github-repo" and fourth.pr_kind == "bugfix" and fourth.pr_number == 3
     fifth = P.project_candidates(record.layout, "github-repo--fifth__lib", registry=registry, origin="laptop")[0]
     assert (fifth.stage, fifth.status, fifth.gate) == ("probed", "error", "probe") and "unreliable" in fifth.reasons[0]
+    assert rows["third__lib-7"].reasons == ["cap-cut"]  # the whole-file judge capped this source: mined, never judged
+    assert reg.earlier_versions == [{"version": 1, "stage": "registered", "status": "superseded", "gate": None, "reasons": []}]
+    assert rej.earlier_versions is None and fourth.earlier_versions is None
     steps = {s.stage: s for s in R.funnel_steps([*rows.values(), fourth, fifth])}
     assert [s for s in steps] == list(M.FUNNEL_ORDER)
-    assert (steps["mined"].kept, steps["mined"].pending) == (4, 1)
-    assert (steps["judged"].kept, steps["judged"].rejected) == (3, 1)
-    assert (steps["probed"].kept, steps["probed"].rejected, steps["probed"].error) == (1, 1, 1)
-    assert steps["registered"].kept == 1 and steps["drafted"].kept == 1
+    # six candidate versions: SID v1 (superseded) and v2 (registered), other (judge reject), third (mined, cap-cut), fourth, fifth
+    assert (steps["mined"].entered, steps["mined"].kept, steps["mined"].pending) == (6, 5, 1)
+    assert (steps["judged"].entered, steps["judged"].kept, steps["judged"].rejected) == (5, 4, 1)
+    assert (steps["probed"].entered, steps["probed"].kept, steps["probed"].rejected, steps["probed"].error) == (4, 2, 1, 1)
+    assert (steps["drafted"].entered, steps["drafted"].kept) == (2, 2)
+    assert (steps["registered"].entered, steps["registered"].kept, steps["registered"].superseded) == (2, 1, 1)
+    assert steps["registered"].ids == [f"{SID}@v2"] and steps["validated"].ids == [f"{SID}@v1", f"{SID}@v2"]
+    for earlier, later in zip(M.FUNNEL_ORDER, M.FUNNEL_ORDER[1:]):
+        assert steps[later].entered == steps[earlier].kept, (earlier, later)
+    for s in steps.values():
+        assert s.entered == s.kept + s.rejected + s.error + s.pending + s.superseded, s
 
 
 # ----------------------------------------------------------------------------- trials

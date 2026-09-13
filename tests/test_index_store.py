@@ -72,7 +72,7 @@ def test_ensure_migrated_is_the_workers_startup_step(tmp_path, caplog):
         assert ensure_migrated(enabled) is True
         assert ensure_migrated(enabled) is True  # idempotent: nothing to do the second time
     lines = [r.getMessage() for r in caplog.records if r.name == "swesim.index.store"]
-    assert len(lines) == 2 and all("0004_history" in line for line in lines) and "migrated from empty" in lines[0] and "migrated" not in lines[1]
+    assert len(lines) == 2 and all("0005_funnel_versions" in line for line in lines) and "migrated from empty" in lines[0] and "migrated" not in lines[1]
     assert not any(url in line or "index.db" in line for line in lines)
     assert IndexStore(url).trials(M.TrialFilter()).total == 0  # the tables exist
 
@@ -156,7 +156,9 @@ def test_sql_reader_scenarios_candidates_scores_and_exchanges(rebuilt, record: R
     assert store.candidates(M.CandidateFilter(status=["rejected"])).total == 2
     assert store.candidates(M.CandidateFilter(source_key=["swebench-annotated"], stage=["registered"])).items[0].instance_id == SID
     funnel = {s.stage: s for s in store.funnel()}
-    assert (funnel["mined"].kept, funnel["judged"].rejected, funnel["probed"].error, funnel["registered"].kept) == (4, 1, 1, 1)
+    # five candidate versions advance past mining: SID v1 (superseded at registered) and v2, other, fourth, fifth; third is cap-cut
+    assert (funnel["mined"].kept, funnel["judged"].rejected, funnel["probed"].error, funnel["registered"].kept) == (5, 1, 1, 1)
+    assert (funnel["registered"].entered, funnel["registered"].superseded, funnel["registered"].ids) == (2, 1, [f"{SID}@v2"])
     assert store.funnel("github-repo--fifth__lib")[2].error == 1
     scores = store.scores(M.ScoreFilter(scenario_id=[SID]))
     assert len(scores) == 2 and scores[0].mean_reward is not None and isinstance(scores[0].mean_reward, Decimal)
