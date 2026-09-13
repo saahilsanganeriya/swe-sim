@@ -1,363 +1,170 @@
-# swesim grading
+# Grading and measurement
 
-The reward contract as implemented in `swesim/verifier/` (grader, path policy, evidence parsers), the control sweep in `swesim/stages/validate.py`, and the gates that decide whether a scenario exists. Everything here is code-owned; no model output touches a reward.
+This document describes the implemented grading contract and the preserved experimental record shown by the website. **New task discovery and experiments are deferred by the current user priority.** The current work is a verified hosted website over preserved records; no new task yield, treatment effect or hosted model comparison is claimed.
 
-## The reward contract
+## Reward and outcomes
 
-The separate, offline verifier writes `reward.json` with finite numbers only (Harbor rejects anything else); everything descriptive goes to `report.json`.
+`reward.json` contains finite numbers only. `success` means the whole contract passed. `reward` is partial credit over fixed positive-weight requirement groups. A group earns its weight only if every linked FAIL_TO_PASS test passes; any PASS_TO_PASS regression forces reward to zero. Asking the stakeholder changes available information, never tests or reward weights.
 
-| Key | Type | Meaning |
+| Code | Outcome | Interpretation |
 |---|---|---|
-| `reward` | float in [0, 1] | partial credit by requirement group; 0 on any regression |
-| `success` | 0 or 1 | whole-contract correctness: every FAIL_TO_PASS and PASS_TO_PASS id observed `passed` |
-| `f2p_passed`, `f2p_expected` | int | FAIL_TO_PASS ids passed and expected |
-| `p2p_passed`, `p2p_expected` | int | PASS_TO_PASS ids passed and expected |
-| `groups_passed`, `groups_total` | int | requirement groups fully passed and total |
-| `integrity_signal_count` | int | entries in `report.integrity_signals` |
-| `outcome_code` | int 1 to 7 | outcome class (below) |
-| `patch_applied` | 0 or 1 | whether any allowed change reached the graded tree |
+| 1 | valid-correct | Full contract passed |
+| 2 | valid-incorrect | Valid submission did not satisfy the full contract |
+| 3 | agent-invalid-submission | Invalid or empty allowed change; base tests still run where applicable |
+| 4 | agent-runtime-failure | Submission-time failure or inconsistent test evidence |
+| 5 | collection-failure | Missing/invalid trusted collection evidence |
+| 6 | simulator-failure | Stakeholder/simulator failure by adjudication |
+| 7 | evaluator-failure | Harness, configuration, image or verifier failure |
 
-`success` drives outcomes and pass rates; `reward` is exported for training and for explaining near misses and never decides an outcome. If the grader never writes, the verifier entrypoint's exit trap writes `{"reward": 0, "success": 0, "outcome_code": 7}`.
+Outcome, success and reward are distinct. For example, a source change plus a protected-test edit is graded on the allowed source change and also records the rejected edit. An infrastructure error is not evidence that an exploit was defeated. If the verifier cannot complete, its fallback outcome is evaluator-failure with zero reward/success.
 
-## Requirement groups and the regression rule
+## Build, collector and verifier
 
-A fraction of tests passed is a poor reward (a no-op passes every PASS_TO_PASS test; one requirement may own a hundred parameterized tests, another two), so credit is awarded per requirement group. `groups.json` maps every FAIL_TO_PASS id to exactly one group with a positive weight; the schema requires exact coverage and weights summing to 1. A group passes only if every test in it passes.
+The compiler verifies declared asset bytes and SHA256, pins its inputs, and hashes canonical compile configuration plus the complete rendered-file manifest. That includes endpoint, hosts, timeouts, review configuration and rendered grader files. A run checks the manifest before creating a session or using the task. Legacy builds without it must be compiled and validated again.
 
+Both images record a base file manifest. The root collector runs with a cleared environment and absolute executables, kills agent processes, bounds the submitted tree, archives it and freezes the stakeholder in `finally`. Its receipt includes `base_manifest_sha256` alongside archive hash, size/member counts, status, user and transcript hash. The verifier requires its own base manifest to match before processing the submission. Missing collector evidence is outcome 5; unequal bases or a missing verifier manifest are outcome 7.
+
+The verifier is a separate offline container. It diffs against the untouched base, applies allowed source changes to the task's `/testbed` or `/app`, then overlays the hidden assertions. Keeping those runtime paths preserves editable imports. It never treats an agent-writable log directory as the collector's trust anchor.
+
+Protected paths include contract tests, pytest configuration, conftest/startup hooks, package metadata, lockfiles and CI/git metadata. Symlinks, hard links, device files and escaping archive members are refused. Gold-touched source paths cannot be protected merely because a model suggested them.
+
+## Test evidence and diagnostic budget
+
+The main contract run uses the task's interpreter with `-I` and a trusted launcher that imports pytest before adding submitted roots. It runs as `tester`, with a compiled default budget of 600 seconds. Four signals must agree:
+
+1. Collected node ids exactly equal the contract.
+2. JUnit contains those ids once each.
+3. Terminal status/category summaries agree with JUnit.
+4. Exit status agrees with whether any test failed or errored.
+
+Disagreement yields unknown observations, outcome 4 and zero reward. Reruns are diagnostic only and never restore credit. They have a **separate budget of another `test_timeout_sec`**, normally 600 seconds total across at most ten FAIL_TO_PASS ids. This is not merely the unused remainder of the first 600 seconds. The compiled verifier timeout is 1,800 seconds. Output-cap failures skip diagnostics rather than repeatedly running a flood.
+
+These signals detect disagreement; they do not independently authenticate the behavior of arbitrary submitted code. The submission shares pytest's process and can attempt coordinated forgery of collection, JUnit, summaries and exit status, including late handlers. A forged summary is caught when it disagrees with the other evidence, not guaranteed caught in every attack.
+
+## Controls and authoring gates
+
+Before registration, validation executes:
+
+| Control | Required evidence |
+|---|---|
+| No-op | Zero reward; measured base FAIL_TO_PASS fails and PASS_TO_PASS holds |
+| Oracle | Success 1 and reward 1 |
+| Plausible-wrong | Applies, fails correctness and stays below its declared reward ceiling |
+| Alternative-correct | Passes when required for structural tests |
+| Incorrect-exploit tamper | Applies and earns exactly zero without an infrastructure failure |
+| Reachability | Gold objects and distinctive post-fix material are unavailable to the agent |
+
+The reachability probe pairs distinctive added lines with their hunk's removed lines so a stale base copy is not automatically classified as a post-fix leak. This heuristic is not a complete proof that no useful oracle information exists.
+
+Probe jobs record the binding of the measured inputs and the grading identity. Cached rows and drafting require a matching binding and `test_user=tester`. An old row-level binding alone cannot validate root-run or unbound evidence.
+
+A fallback plausible-wrong patch must come from fetched Python source, apply, parse, and differ from gold in executable AST after docstrings are excluded. Lexical state carries through diff-hunk gaps and continued strings. This prevents a docstring edit from masquerading as an incorrect control; executed validation still decides whether the behavior is wrong.
+
+The eight automatic approval gates cover strict schema, verified assets, judge acceptance, a load-bearing on-request fact, grounded requirements, withholding leaks, exact reconstruction and controls. Every identical removed occurrence needs its own ledger entry. Every requirement links to a visible fact or a verbatim human statement. Author-only facts remain unavailable to the stakeholder.
+
+## Metrics and grouping
+
+With `n` agent-attributable attempts (outcomes 1–4) and `c` successes in one frozen configuration:
+
+```text
+pass@k = 1 - C(n-c, k) / C(n, k)
+pass^k = C(c, k) / C(n, k)
 ```
-reward  = 0                                 if any PASS_TO_PASS id is not passed
-        = min(1, sum(weight_g * passed_g))  otherwise
-success = 1  iff every FAIL_TO_PASS and PASS_TO_PASS id is passed
+
+Both use draws without replacement and remain null when there are fewer than `k` attempts. `k` is not silently reduced. Infrastructure failures and unresolved attempts are reported separately; mean reward uses the same eligible denominator.
+
+Groups preserve spec hash, condition, profile, model, purpose, compiled build and effective scaffold identity. Legacy runs whose configuration lacks `agent_config` derive that identity from `report.agent_config_sha256`. Calibration, screen, comparison and demonstration records never pool. Old documentation that pooled scaffold and default-agent runs does not establish a valid pass@k estimate for the new grouping.
+
+Difficulty is measured by hidden/full screening with a specified solver and attempt budget. Diff size is a discovery filter. The leaderboard additionally requires current validation, an informative screen and coherent/fair task-sense labels. A saturated toy task or unfair hidden test is not evidence of model separation.
+
+## Preserved inventory — 2026-09-13
+
+The read-only source is `registry.json`, `workspace/scenarios/*/scenario.json` and `workspace/trials/*/{record,run_config}.json`. There are **50 trial records**; **19 match the current registered version-2 spec hashes**. The other 31 belong to earlier specs. These are laptop/VM-era results, not new Cloud Run experiments.
+
+| Current registered spec | F2P / P2P | Current-spec records | Correct / incorrect |
+|---|---:|---:|---:|
+| `mwaskom--seaborn-3190` v2, `812be6e0…` | 1 / 84 | 6 | 6 / 0 |
+| `scikit-learn--scikit-learn-13584` v2, `4e3ecb62…` | 6 / 3 | 7 | 7 / 0 |
+| `py-pdf--pypdf-3826` v2, `89338bfe…` | 2 / 95 | 6 | 0 / 6 |
+
+The 19 records contain 13 Haiku 4.5 trials and 6 Sonnet 5 trials. The exact historical cells are:
+
+| Scenario | Model | Condition/profile | n | Successes | Recorded config hash |
+|---|---|---|---:|---:|---|
+| seaborn | Haiku | full/natural | 1 | 1 | `50783ca4…` |
+| seaborn | Haiku | hidden/natural | 1 | 1 | `47a3098c…` |
+| seaborn | Haiku | interactive/natural | 2 | 2 | `ed408a96…` |
+| seaborn | Sonnet | interactive/natural | 2 | 2 | `d45e87b6…` |
+| sklearn | Haiku | full/natural | 1 | 1 | `7d316eb1…` |
+| sklearn | Haiku | hidden/natural | 1 | 1 | `e6048dec…` |
+| sklearn | Haiku | hidden/withheld | 1 | 1 | `914ff147…` |
+| sklearn | Haiku | interactive/withheld | 2 | 2 | `36ca35b4…` |
+| sklearn | Sonnet | interactive/withheld | 2 | 2 | `eef1a538…` |
+| pypdf | Haiku | full/natural | 1 | 0 | `5a5256b6…` |
+| pypdf | Haiku | hidden/withheld | 1 | 0 | `a8e6771b…` |
+| pypdf | Haiku | interactive/withheld | 2 | 0 | `c1e834f8…` |
+| pypdf | Sonnet | interactive/withheld | 2 | 0 | `c4b3355c…` |
+
+These counts describe stored outcomes, not a treatment-effect claim. None of these cells supplies three attempts for pass@3. The pypdf failures also do not establish informative difficulty: the saved task-sense audit flagged an unfair hidden-test dependency.
+
+Scenario version and stakeholder prompt version are different fields. These older run configs still contain `prompt_version=v1`, while transcript annotations identify v2 reporter/filter behavior for ten interactive audited trials. Two no-exchange trials were reported as unknown by the historical audit. Preserve that provenance discrepancy; do not silently rewrite the source records or pool them with current v3 configurations.
+
+A minimal inventory check after pulling the same record is:
+
+```python
+import json
+from swesim.models import ScenarioSpec
+from swesim.settings import get_settings
+s = get_settings()
+catalog = json.loads(s.registry_path.read_text())["scenarios"]
+hashes = {
+    sid: ScenarioSpec.model_validate_json(
+        (s.workspace / "scenarios" / sid / "scenario.json").read_text()
+    ).spec_hash
+    for sid in catalog
+}
+records = [
+    json.loads(path.read_text())
+    for path in (s.workspace / "trials").glob("*/record.json")
+]
+current = [r for r in records if hashes.get(r.get("scenario_id")) == r.get("spec_hash")]
+print({"records": len(records), "current_spec_records": len(current)})
 ```
 
-Skipped, xfailed, xpassed, errored and missing all count as not passed. Integrity signals never change either number; the control sweep decides whether a task whose exploit control earns credit is accepted at all.
+## Historical task-sense and disclosure audit
 
-## Outcome codes
+Artifact `workspace/evidence/audit/2026-09-13-task-sense.json`, generated at 09:07:36 UTC with rubric `2026-09-13.1`, covers the preserved record. Its model-reading labels are historical observations; the stronger current drafter/filter has not been validated by a new hosted experiment.
 
-Outcomes 1 to 4 are agent-attributable and enter pass-rate denominators; 5 to 7 are infrastructure, excluded from denominators and reported.
-
-| Code | Outcome | Assigned when |
-|---|---|---|
-| 1 | `valid-correct` | evidence reconciled, `success == 1` |
-| 2 | `valid-incorrect` | evidence reconciled, patch applied, `success == 0` |
-| 3 | `agent-invalid-submission` | receipt `oversized` or `invalid-tree`; corrupt, oversized or self-colliding archive; nothing left after the path policy (tests still run for base evidence); solver timeout |
-| 4 | `agent-runtime-failure` | evidence cannot be reconciled; invocation timeout; output past the 64 MiB cap (run killed); other agent-side Harbor exceptions |
-| 5 | `collection-failure` | receipt missing or unparsable, `status != ok`, `rc != 0`, `user != root`, archive missing or digest mismatch |
-| 6 | `simulator-failure` | reserved for a stakeholder 5xx or interrupted request on a within-budget call; the run stage records service evidence and marks the episode ineligible; assigned by adjudication, never automatically |
-| 7 | `evaluator-failure` | malformed grader config, `/pristine` or target missing, disk errors, hidden test patch fails to apply, test user missing, unexpected exception, Harbor launch failure |
-
-## pass@k and pass^k
-
-Attempts are grouped by `condition|brief_profile|run_config_hash`; the hash binds model, purpose, compiled build and brief profile, so calibration and comparison never share a group, and a group with more than one model or purpose raises rather than pools. With `n` attempts of outcome 1 to 4 and `c` of them with `success == 1`:
-
-```
-pass@k = 1 - C(n - c, k) / C(n, k)     null when n == 0 or k > n
-pass^k = C(c, k) / C(n, k)             null when n < k
-```
-
-`n_infra_failures` and `n_agent_failures` (outcomes 3 and 4) are reported beside the counts; attempts without a record are listed as unresolved and never enter `n`. `k` is never silently reduced. `mean_reward` is the mean of `reward` over the same `n`.
-
-## Evidence reconciliation
-
-The grader runs the contract once with the task's own interpreter through a trusted launcher (`run_pytest.py`) started with `-I`, so the repository root is not a site directory and no `PYTHON*` variable is inherited; pytest is imported before the submitted roots are added, and the launcher records the exact collected node ids. The process runs as `tester` with a 600 s budget. Four signals must agree: the collected ids equal the contract ids exactly; the JUnit XML holds exactly those ids, each once; the `-rA` summary lines, read only from the last `short test summary info` section so captured output cannot collide, agree per id and the counts line agrees per category; and the exit code is 1 if and only if any test failed or errored.
-
-Any disagreement is an `EvidenceError`: outcome 4, every test `observed: unknown`, reward 0. The grader then re-runs each FAIL_TO_PASS id in a fresh process (at most 10, within the remaining budget) and records the results under `report.reruns` as diagnostics; reruns never grant credit. xfail and xpass are never credited.
-
-## Protected paths
-
-The change set is computed by content hash against `/pristine` and applied onto the runtime tree (the task's `/testbed` or `/app` in place, so editable installs import the submitted code) with protected paths dropped and recorded as `protected-path-edit` signals. Globs match NFC-normalized, case-folded paths at any depth. Extraction refuses symlinks, hard links, devices and escaping paths; writes through a symlinked parent in the base tree are refused.
-
-| Family | Paths | Why |
-|---|---|---|
-| contract tests | the contract's test files and every path the hidden test patch touches | the contract itself; also stops pre-editing a fixture so the overlay fails and is coded 7 |
-| conftest | `**/conftest.py` | loaded at any depth; a hook can replace every test body with a no-op |
-| startup hooks | `**/sitecustomize.py`, `**/usercustomize.py`, `**/*.pth` | executed before pytest; `-I` plus protection keeps them out |
-| pytest configuration | `pytest.ini`, `.pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`, `pytest.toml`, `.pytest.toml`, root and any depth | pytest reads the first config found walking up; `addopts`, `python_files` and plugin lines change what runs |
-| CI and git metadata | `.github/**`, `.gitattributes`, `.gitignore` | never part of a fix's behavior in the verifier; an edit is a signal |
-| lockfiles | `**/uv.lock`, `**/poetry.lock`, `**/Pipfile.lock`, `**/requirements*.txt`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | the verifier installs nothing; a pin change cannot be honored and must not be silently ignored |
-| package metadata | `**/*.egg-info/**`, `**/*.dist-info/**` | an in-tree `entry_points.txt` can register a `pytest11` plugin loaded before any conftest |
-
-## Collector receipt and transcript binding
-
-The `[[verifier.collect]]` hook runs as root with a cleared environment and absolute executables: it kills every process of the `agent` user (verified via `/proc`), bounds the tree (symlinked root is `invalid-tree`; over 500 MiB or 100,000 members is `oversized`), archives without following symlinks, hashes the archive, and in a `finally` block calls `POST /freeze` before writing the receipt: `status, rc, user, sha256, bytes, files, freeze_status, transcript_hash`. Both files live in root-only `/var/swesim-collect` as file artifacts; `/logs/artifacts` is never read. The run stage sets `transcript_binding_valid` only when the fetched transcript's hash matches the receipt and the session is frozen; an unbound transcript never changes correctness scores but makes the episode ineligible for training.
-
-## The control sweep
-
-`validate` launches one Harbor job per control on Modal plus a reachability probe. A scenario is `valid` only if every row holds.
-
-| Control | Applied by | Declared expectation |
-|---|---|---|
-| `nop` | Harbor's no-op agent | `reward == 0`; every FAIL_TO_PASS id `failed` or `error`, every PASS_TO_PASS id `passed`, no other ids (`expected_base`) |
-| `oracle` | Harbor's oracle agent, gold diff | `success == 1`, `reward == 1`, every id `passed` (`expected_gold`) |
-| plausible-wrong (at least one) | patch agent | `success == expected_success` (0); `reward <= expected_reward_max` (0.5 by default) |
-| alternative-correct (required when the judge flags structural tests) | patch agent | `success == 1` and `reward == 1` |
-| tamper, `incorrect-exploit` (at least one): root conftest no-op, skip marker on base test files, sitecustomize startup probe | patch agent | `reward == 0` exactly |
-| tamper, `benign-edit` (optional) | patch agent | `success == 1`; `expected_signals` recorded, not yet asserted |
-| reachability probe | patch agent | gold commit object unreachable; no gold-line hits in the image |
-
-Any declared `expected_reward` is checked exactly. Every control must finish with outcome 1 to 4: an infrastructure outcome or a Harbor agent exception is "not a passing control", never a defeated attack. Any incorrect-exploit control that earns `reward > 0` invalidates the scenario.
-
-## Worked examples
-
-| Submission | Outcome | reward, success |
-|---|---|---|
-| fixes every FAIL_TO_PASS, no regression | 1 | 1.0, 1 |
-| fixes only group `g01` (weight 0.4), no regression | 2 | 0.4, 0 |
-| real source fix plus an edited `conftest.py`: the conftest change is dropped with a `protected-path-edit` signal | 1 or 2 | graded on the source fix |
-| only `conftest.py` edited (the root-conftest exploit): nothing applied, tests still run | 3 | 0.0, 0 |
-| fixes FAIL_TO_PASS but breaks one PASS_TO_PASS test | 2 | 0.0, 0 |
-| floods output past 64 MiB (killed, `output-cap-exceeded`) or forges summary lines (evidence disagreement) | 4 | 0.0, 0 |
-| receipt missing or archive digest differs; retried as a new attempt | 5 | 0.0, 0 |
-| stakeholder 5xx on a within-budget request; not training-eligible | 6 by adjudication | correctness scores kept |
-| malformed grader config, or hidden test patch fails to apply | 7 | 0.0, 0 |
-
-## What the judge and the approval gates check
-
-- Judge: code extracts the issue-to-contract delta (exception names and literals asserted by the tests, public names introduced by the fix, all absent from the issue); a model classifies each gap; the code-owned rule requires at least one gap explicitly non-derivable from the repository, consequential and resolved by a stakeholder statement in the thread, plus a self-contained task. The judge model must differ from the draft model.
-- Draft: every non-authored fact quotes a verbatim span (at least 12 characters and 3 words after normalization) of the text its provenance names, with a URL under the repository; at least one on-request fact links a FAIL_TO_PASS test; every withheld span is verbatim in the natural issue and absent from the withheld brief, title retained. One correction round, then failure.
-- `swesim approve --auto`: schema (the strict `ScenarioSpec` validator), assets (declared bytes and sha256, inside the scenario directory), judge acceptance, on-request fact linked to FAIL_TO_PASS, withholding leak, controls present. It freezes `scenario.json` and records `approved_by: auto-validators, review_needed: true`. Compile refuses an unpinned image digest, unknown provider, non-HTTPS stakeholder URL or unpinned agent version.
-
-## Known residuals
-
-- In-process forging. Submitted code runs inside the pytest process as `tester` and could forge the collected-id manifest, JUnit, terminal summary and exit code together, including from an `atexit` handler after the real summary. The defenses above are tested, not a proof; the sitecustomize control is a startup-execution probe and does not claim to close this. This is the acknowledged CLAUDE.md residual.
-- Base copies versus the reachability probe. The probe on `main` greps for the first three added lines longer than 20 characters; an added line that already exists at base (an import, a stale `build/lib` copy) counts as a hit and invalidates a legitimate scenario. A heuristic pairing added lines with their hunk's removed lines exists on a stream branch, not yet merged.
-- A test that passes and then errors in teardown yields duplicate terminal evidence and outcome 4. A base tree containing a hard link could be written through in in-place mode; the precondition is implausible and the hardening is not applied.
-
-## Measured results
-
-Everything below is read from artifacts on disk on 2026-09-13 (UTC): `registry.json`, `workspace/scenarios/*/validation.json` and `scores.json`, `workspace/trials/*/{run_config,reward,report,transcript,record}.json`, `workspace/judge_calibration.json`, `workspace/candidates/*.rejects.json` and `.probed.jsonl`, `workspace/evidence/*.log` and `workspace/evidence/vm/`. Every validation ran on Modal (`environment_provider: modal`) under the validation run configuration `0b03142e…`. Nothing here is projected.
-
-### Valid scenarios: executed controls
-
-Three scenarios are `valid` and registered. In every table `nop` earns outcome 3 because Harbor's no-op agent leaves nothing for the path policy to apply (tests still run for base evidence), the oracle earns outcome 1, the plausible-wrong patch applies and fails (outcome 2), and each incorrect-exploit tamper is dropped by the path policy with one `protected-path-edit` signal (outcome 3). The reachability probe found the gold commit object unreachable in all three images.
-
-**mwaskom--seaborn-3190** (SWE-bench pool A; contract 1 FAIL_TO_PASS `tests/_core/test_scales.py::TestContinuous::test_interval_with_bools`, 84 PASS_TO_PASS; one group, weight 1.0). This `validation.json` is the re-validation of the build compiled after the interactive-instruction change (`compiled_hash 750e014c…`); the first build (`befc959d…`) was also valid and is the one `registry.json` still records, because `register` was not re-run after the recompile.
-
-| Control | reward | success | F2P | P2P | signals | outcome | Expectation |
-|---|---|---|---|---|---|---|---|
-| `nop` | 0.0 | 0 | 0/1 | 84/84 | 0 | 3 `agent-invalid-submission` | reward 0; base fails every F2P, passes every P2P |
-| `oracle` | 1.0 | 1 | 1/1 | 84/84 | 0 | 1 `valid-correct` | success 1, reward 1 |
-| `plausible-wrong:xor-based-boolean-handling` | 0.0 | 0 | 0/1 | 69/84 | 0 | 2 `valid-incorrect` | success 0, reward at most 0.5 |
-| `tamper:tamper-root-conftest` | 0.0 | 0 | 0/1 | 84/84 | 1 | 3 | reward exactly 0 |
-| `tamper:tamper-skip-marker` | 0.0 | 0 | 0/1 | 84/84 | 1 | 3 | reward exactly 0 |
-| `tamper:tamper-sitecustomize` | 0.0 | 0 | 0/1 | 84/84 | 1 | 3 | reward exactly 0 |
-| reachability probe | gold object unreachable; raw hits 0, filtered hits 0 | | | | | | no gold lines in the image |
-
-**scikit-learn--scikit-learn-13584** (SWE-bench pool A; 6 FAIL_TO_PASS in `sklearn/utils/tests/test_pprint.py`, 3 PASS_TO_PASS; one group). This is the second spec for the instance; the first is in the rejections below.
-
-| Control | reward | success | F2P | P2P | signals | outcome | Expectation |
-|---|---|---|---|---|---|---|---|
-| `nop` | 0.0 | 0 | 0/6 | 3/3 | 0 | 3 | reward 0; base evidence as declared |
-| `oracle` | 1.0 | 1 | 6/6 | 3/3 | 0 | 1 | success 1, reward 1 |
-| `plausible-wrong:wrap-array-equality-with-any` | 0.0 | 0 | 0/6 | 1/3 | 0 | 2 | success 0, reward at most 0.5 |
-| `tamper:tamper-root-conftest` | 0.0 | 0 | 0/6 | 3/3 | 1 | 3 | reward exactly 0 |
-| `tamper:tamper-skip-marker` | 0.0 | 0 | 0/6 | 3/3 | 1 | 3 | reward exactly 0 |
-| `tamper:tamper-sitecustomize` | 0.0 | 0 | 0/6 | 3/3 | 1 | 3 | reward exactly 0 |
-| reachability probe | gold object unreachable; raw hits 0, filtered hits 0 | | | | | | no gold lines |
-
-**py-pdf--pypdf-3826** (repository URL, discovered without a PR override; 2 FAIL_TO_PASS `tests/test_reader.py::test_startxref_corrupt_trailing_pointer` and `::test_find_previous_startxref_pos_recovery_variants`, 95 PASS_TO_PASS; two groups, weights 0.6 and 0.4). The plausible-wrong control is the code-built fallback: the model's own wrong patch did not apply to the base commit (`corrupt patch at line 34`, recorded in `draft.meta.json` under `controls_dropped`), so the drafter substituted `fallback-comment-only`, a comment-only change that is guaranteed to apply and to fail the F2P tests.
-
-| Control | reward | success | F2P | P2P | signals | outcome | Expectation |
-|---|---|---|---|---|---|---|---|
-| `nop` | 0.0 | 0 | 0/2 | 95/95 | 0 | 3 | reward 0; base evidence as declared |
-| `oracle` | 1.0 | 1 | 2/2 | 95/95 | 0 | 1 | success 1, reward 1 |
-| `plausible-wrong:fallback-comment-only` | 0.0 | 0 | 0/2 | 95/95 | 0 | 2 | success 0, reward at most 0.5 |
-| `tamper:tamper-root-conftest` | 0.0 | 0 | 0/2 | 95/95 | 1 | 3 | reward exactly 0 |
-| `tamper:tamper-skip-marker` | 0.0 | 0 | 0/2 | 95/95 | 1 | 3 | reward exactly 0 |
-| `tamper:tamper-sitecustomize` | 0.0 | 0 | 0/2 | 95/95 | 1 | 3 | reward exactly 0 |
-| reachability probe | gold object unreachable; 1 raw hit in `pypdf/_reader.py` filtered as a base copy, filtered hits 0 | | | | | | no gold lines |
-
-The pypdf probe row is the first time the added-line-paired-with-removed-line filter (merged as `3d59493` and `1db2076`) changed a verdict: under the earlier probe this raw hit would have invalidated a legitimate scenario, as it did for requests-1944.
-
-### Trials
-
-25 trial directories exist and all 25 have completed: 15 `valid-correct`, 6 `valid-incorrect`, 4 `evaluator-failure`. Every trial used mini-swe-agent 2.4.6 on Modal with a 2,400 s solver budget and purpose `demonstration`; interactive trials used the stakeholder on `openai/gpt-5.5` with the default patience profile (start 6, question 1, review 2, terse below 3, refuse at 0). Groups are `condition|brief_profile|run_config_hash`, so the two seaborn builds and the three solver models never pool. `pass@k` and `pass^k` (k = 3) are only defined for the two groups with n ≥ 3; both are 1.0. `k` is never reduced.
-
-| Scenario | Condition | Profile | Solver | Build / instruction | n | success | mean reward | questions asked |
-|---|---|---|---|---|---|---|---|---|
-| seaborn-3190 | full | natural | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
-| seaborn-3190 | hidden | natural | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
-| seaborn-3190 | hidden | withheld | Haiku 4.5 | v1 | 1 | 0 | 0.0 | 0 |
-| seaborn-3190 | interactive | withheld | Haiku 4.5 | v1 | 3 | 3 | 1.0 (pass@3 1.0, pass^3 1.0) | 0, 0, 0 |
-| seaborn-3190 | interactive | withheld | Sonnet 5 | v1 | 1 | 1 | 1.0 | 0 |
-| seaborn-3190 | interactive | withheld | Haiku 4.5 | v2; attempts 50 and 51 also carried the scaffold config | 4 | 4 | 1.0 (pass@3 1.0, pass^3 1.0) | 0, 0, 2, 0 |
-| seaborn-3190 | interactive | withheld | Sonnet 5 | v2 | 1 | 1 | 1.0 | 1 |
-| seaborn-3190 | interactive | withheld | Opus 5 | v2 | 1 | 1 | 1.0 | 2 |
-| sklearn-13584 | full | natural | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
-| sklearn-13584 | hidden | natural | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
-| sklearn-13584 | hidden | withheld | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
-| sklearn-13584 | interactive | withheld | Haiku 4.5 | v1 | 1 | 0 | 0.0 | 0 |
-| pypdf-3826 | full | natural | Haiku 4.5 | attempt 0 | 0 (1 evaluator-failure) | 0 | null | none |
-| pypdf-3826 | hidden | natural | Haiku 4.5 | attempt 0 | 0 (1 evaluator-failure) | 0 | null | none |
-| pypdf-3826 | hidden | withheld | Haiku 4.5 | attempt 0 | 0 (1 evaluator-failure) | 0 | null | none |
-| pypdf-3826 | interactive | withheld | Haiku 4.5 | attempt 0 | 0 (1 evaluator-failure) | 0 | null | none |
-| pypdf-3826 | full | natural | Haiku 4.5 | attempt 1, build-essential image | 1 | 0 | 0.0 | 0 |
-| pypdf-3826 | hidden | natural | Haiku 4.5 | attempt 1 | 1 | 0 | 0.0 | 0 |
-| pypdf-3826 | hidden | withheld | Haiku 4.5 | attempt 1 | 1 | 0 | 0.0 | 0 |
-| pypdf-3826 | interactive | withheld | Haiku 4.5 | attempt 1 | 1 | 0 | 0.0 | 0 |
-
-Sources and caveats for the table: seaborn and sklearn rows come from `scores.json`; all rows come from `scores.json` as regenerated after the last trial landed (the Opus trial `e54052254969566b15d6cb1b` appears as its own group, n=1). The four pypdf evaluator-failures are Harbor launch failures before the agent started: mini-swe-agent's setup needed `gcc`/`make` and tried to `apt-get` inside the allowlisted sandbox; `build-essential` is now pre-installed in the environment image (`5723414`) and attempt 1 ran the agent. Near misses are visible in `report.json`: the seaborn `hidden|withheld` Haiku submission passed the F2P test and failed five `TestTemporal` PASS_TO_PASS tests (reward 0 by the regression rule, outcome 2); the sklearn interactive Haiku submission passed 0 of 6 F2P with 3/3 P2P; each pypdf attempt-1 submission passed 0 of 2 F2P with 95/95 P2P. Solver models: `anthropic/claude-haiku-4-5-20251001`, `anthropic/claude-sonnet-5`, `anthropic/claude-opus-5`.
-
-Three further trials ran on the VM under Temporal and are mirrored under `workspace/evidence/vm/workspace/trials/` (they are not in the laptop's `scores.json`): seaborn-3190 `interactive|withheld` Haiku attempts 10 and 40 (reward 1.0, no questions, transcripts frozen and bound) and `hidden|withheld` Haiku attempt 40 (reward 1.0), all on the v1 build. With the laptop's `hidden|withheld` attempt 0 (0.0) that arm has n = 2 on seaborn.
-
-Every interactive transcript on disk is frozen and hash-bound: `report.transcript_hash` equals the collector receipt's `transcript_hash` and `transcript_binding_valid` is true for every completed interactive trial. Exports mark all episodes `simulator_validity: unadjudicated` and `training_eligible: false`, as designed.
-
-### The interaction finding
-
-15 interactive trial records exist (13 on the laptop, 2 on the VM); 14 reached the agent (the pypdf attempt-0 trial failed at launch). Questions were asked in 3 of those 14:
-
-| Solver | Instruction | Scaffold config | Interactive trials | Trials with at least one question | Questions, reviews, patience |
-|---|---|---|---|---|---|
-| Haiku 4.5 | v1 | no | 7 (seaborn 0, 1, 2 and VM attempts 10, 40; sklearn 0; pypdf 1) | 0 | 6 → 6 in every trial |
-| Haiku 4.5 | v2 | no | 2 (seaborn 20, 21) | 0 | 6 → 6 |
-| Haiku 4.5 | v2 | yes | 2 (seaborn 50, 51) | 1 (attempt 50) | attempt 50: 2 questions, 1 review, 6 → 2; attempt 51: none |
-| Sonnet 5 | v1 | no | 1 (seaborn 0) | 0 | 6 → 6 |
-| Sonnet 5 | v2 | no | 1 (seaborn 30) | 1 | 1 question, 2 reviews, 6 → 1 |
-| Opus 5 | v2 | no | 1 (seaborn 30) | 1 | 2 questions, 1 review, 6 → 2 |
-
-So Haiku 4.5 asked nothing in 9 of 9 trials under either instruction alone, and asked in 1 of 2 trials once the agent scaffold itself listed asking as a step; Sonnet 5 asked under v2 and not under v1 (one trial each); Opus 5 asked under v2 (one trial). Every one of the 12 seaborn interactive trials (10 on the laptop, 2 on the VM) earned reward 1.0 whether or not it asked, while the seaborn `hidden|withheld` arm holds one trial at 0.0 and one at 1.0; nothing about a treatment effect can be concluded from that. All 3 asking trials were on seaborn-3190; the sklearn and pypdf interactive trials (Haiku, v1) asked nothing and failed.
-
-What each change was:
-
-- **v1 instruction** (`instruction.md.j2` as first compiled, build `befc959d…`): "A stakeholder who filed this request is available. They can answer a limited number of questions before they have to leave; investigate what you can from the repository first." plus the two shim commands.
-- **v2 instruction** (`af9fab9`, build `750e014c…`, re-validated valid): "The brief above is intentionally incomplete: the person who filed this request left out decisions that the acceptance tests depend on (expected behavior on edge cases, exact error types or messages, scope, naming). Guessing them is how solutions fail. The stakeholder is available now and will answer a limited number of questions before they have to leave, so ask about any decision the brief does not settle before you implement it, and ask early. Repository facts (where code lives, how it works) you should find yourself."
-- **Scaffold config** (`be55d7f`, `swesim/templates/mini_swe_agent.interactive.yaml`, layered by Harbor as `-c mini -c <file>` for interactive trials only): the packaged mini-swe-agent `instance_template` with one added step in its Recommended Workflow ("List every decision the task description leaves open … Ask the stakeholder about each such decision with `ask-user` BEFORE you implement it") and an optional `request-review` in the edge-case step. It is recorded per trial as `report.agent_config_sha256` (`02791a33…` on attempts 50 and 51, null elsewhere) so the two Haiku v2 groups can be told apart even though they share a `run_config_hash`. It exists because the packaged agent workflow never lists asking as a step, so the instruction alone competes with the harness's own procedure.
-
-**The Sonnet 5 episode** (`workspace/trials/e49349d80b190bf73f14a66f`, seaborn-3190, interactive, withheld brief, attempt 30, v2 instruction, no scaffold). Session created 03:45:24Z; question at 03:46:16Z (patience 6 → 5, tier `full`); review at 03:48:33Z (5 → 3, `full`); review at 03:49:19Z (3 → 1, `terse`, since 1 is below `terse_below 3`); frozen 03:50:15Z; graded `reward 1.0, success 1`, F2P 1/1, P2P 84/84. The agent's edit to `tests/_core/test_scales.py` was dropped with a `protected-path-edit` signal and `seaborn/_core/scales.py` was applied.
-
-The question (excerpt of the transcript event, 03:46:16Z):
-
-> I found the bug: when Color.default_scale infers a scale for boolean data (no explicit scale spec given), it calls variable_type(data, boolean_type='numeric') which returns 'numeric' for booleans, so it picks a Continuous scale, and Continuous._setup crashes because numpy booleans don't support subtraction. […] Should the fix be: (a) narrowly make Color.default_scale treat booleans as categorical/Nominal (matching Color.infer_scale's existing behavior), or (b) more broadly fix the base Property.default_scale to treat booleans as categorical for all properties, or (c) fix it at a lower level in ContinuousBase._setup so that boolean data is cast to float/numeric before computing vmin/vmax normalization […]? Do you have a preference […]
-
-The stakeholder's reply (verbatim):
-
-> Prefer (c). Boolean values that reach the Continuous scale path should be treated numerically, i.e. upcast so False/True map as 0/1 and subtraction does not fail.
->
-> Do not make booleans default to Nominal here, either just for Color or broadly through Property.default_scale. That would be a larger semantic change; a distinct Boolean scale may make sense later, but this fix should stay narrow and preserve the existing numeric-default path.
-
-That answer is the on-request ledger fact `f03` ("boolean data passed through a continuous scale should be upcast to 0/1 floats", provenance `pr-thread`, linked to the F2P test). The first review round told the agent, without executing anything, that its regression test should exercise `Continuous()._setup(..., IntervalProperty())` directly; the agent's second diff added a test named `test_interval_with_bools`, the same name as the hidden F2P test, which the path policy then dropped so grading used only the hidden test. Transcript hash `417981a4…` appears identically in `report.transcript_hash` and the receipt; `transcript_binding_valid` is true.
-
-**The other two asking trials.** Haiku 4.5 with the scaffold (`c39a73b6cfdffdc66581af1a`, attempt 50): "When boolean data is used with a continuous color property, what should be the expected behavior? Should we: (A) convert boolean to numeric (True->1, False->0) for normalization, (B) treat it as categorical, or (C) raise an informative error?" (answered (A), 6 → 5), then a question about the custom-norm branch (→ 4), then a review the stakeholder called "not acceptable as-is" because scratch files were in the diff (→ 2); the final submission applied only `seaborn/_core/scales.py` and earned 1.0. Opus 5 (`e54052254969566b15d6cb1b`, attempt 30): two multi-part questions on scope and on object-dtype and nullable booleans (6 → 4), one review (→ 2), reward 1.0 with `seaborn/_core/scales.py` and a new test in `tests/_core/test_plot.py` applied (only the contract file is protected). In that review the stakeholder warned that `vmin, vmax = map(float, axis.convert_units((vmin, vmax)))` "is broader than the bug requires"; that line is the gold patch's own change (it is the judge's `g3` evidence). The diff-only reviewer is a model with the requirement texts, not the oracle, and its opinion never reaches the reward.
-
-### Stakeholder versions
-
-Every interactive trial recorded before commit `99b4584` (2026-09-13) ran **stakeholder v1**: a maintainer-voiced prompt, diff review available through `request-review`, no reply filter. On the seaborn scenario v1 answered a review request by describing the regression test's inputs and expected output (request `cf8b5b39…`), which is exactly the information the hidden tests withhold; the question/reply episodes counted in the interaction finding above therefore include replies a reporter could not have given. **Stakeholder v2** (`99b4584`) speaks as the reporter, never names tests, verification steps, or identifiers outside the brief, does not pick among the agent's options, regenerates and redacts replies that contain hidden-test identifiers (`forbidden_terms`, recorded worker-only as `redacted_terms`), and replaces diff review with `confirm-behavior`: the agent describes the resulting behavior in plain language and the stakeholder confirms it or names the requirement that still sounds unmet. Diff review remains available only under `review_mode: diff-only`. Scores and exports carry `confirmations` next to `questions_asked` and `reviews`. The v1 trials stay in the record labelled as such and are not pooled with v2 runs (the compiled build and the stakeholder configuration are part of `RunConfig`, so the trial groups differ).
-
-**Measured under stakeholder v2 (2026-09-13 06:10–06:40 UTC, all through `RunTasksWorkflow` on the VM).** The registered scenarios were rebuilt as version 2 with `swesim create --rebuild` (new draft, compile and validation on the v2 templates: `confirm-behavior` shim, reporter-stance stakeholder, test-vocabulary fact filter). seaborn-3190 v2 (spec `812be6e0…`, compiled `e208a80f…`) lost its withheld brief because the withholding model selected no spans on this draft (the nudge in `383a8fc` did not exist yet); its on-request facts f02 and f04 are the maintainer's 0/1-upcast decision stated as behavior, and the v1 fact that described the regression test is now author-only. sklearn-13584 v2 (spec `4e3ecb62…`, compiled `060e1c1b…`) kept its withheld brief.
-
-| scenario (v2) | condition · brief | model | trials | reward 1.0 | asked | confirmed behavior |
-|---|---|---|---|---|---|---|
-| seaborn-3190 | full · natural | Haiku 4.5 | 1 | 1 | – | – |
-| seaborn-3190 | hidden · natural | Haiku 4.5 | 1 | 1 | – | – |
-| seaborn-3190 | interactive · natural | Haiku 4.5 | 2 | 2 | 2 of 2 (1 and 2 questions) | 1 of 2 (the other confirmed through a second `ask-user`) |
-| seaborn-3190 | interactive · natural | Sonnet 5 | 2 | 2 | 2 of 2 | 2 of 2 |
-| sklearn-13584 | full · natural | Haiku 4.5 | 1 | 1 | – | – |
-| sklearn-13584 | hidden · withheld | Haiku 4.5 | 1 | 1 | – | – |
-| sklearn-13584 | interactive · withheld | Haiku 4.5 | 2 | 2 | 0 of 2 | 0 of 2 |
-| sklearn-13584 | interactive · withheld | Sonnet 5 | 2 | 2 | 2 of 2 | 2 of 2 |
-
-Every one of the twelve v2 trials earned 1.0, so these two scenarios do not separate `hidden` from `interactive` for Haiku 4.5 or Sonnet 5; the interaction mechanism is what they show. Sonnet 5 asked with intent in all four of its trials ("I plan to … Is that what you want?") and then described the resulting behavior with `confirm-behavior`; the stakeholder answered in behavior ("False → 0.0 and True → 1.0", "I don't care where in the code that happens") and confirmed. Haiku 4.5 asked in both seaborn trials and in neither sklearn trial. Disclosure audit: all twelve stakeholder replies in the eight interactive trials carry `regenerated: false` and an empty `redacted_terms`; read in full, none names a test, a verification step, a function, class or file, and none picks among the agent's options in code terms (the sklearn replies restate the thread's decision, comparison by textual representation, which is a stakeholder-visible fact from the PR thread). Trial ids: seaborn `eb136435`, `f9435904`, `dc88e732`, `793e78e0`, `c1846a15`, `7bf266da`; sklearn `f3e43d74`, `eb325582`, `350216f8`, `444c038d`, `3ff99666`, `689a9433`. The registry also lists four `unresolved` attempts per scenario from the first interactive submissions: the Temporal planner hashed `agent_config: ""` while `run_trial` added the scaffold digest, so the planned trial ids never matched the records the units wrote (fixed in `ec16791`; the resubmitted workflows resolved against the existing records without launching anything). pypdf-3826 v2 is recorded below when its rebuild completes.
-
-### Judge calibration
-
-`workspace/judge_calibration.json`: prompt `judge-v3`, model `openai/gpt-5.5`, 150 annotated instances requested, 145 judged, 5 errored (all `pydata__xarray` and `astropy__astropy` rows whose F2P ids, issue head and test-patch head alone exceed the 120,000-character authoring budget). Against the human `underspecified >= 2` label: agreement 0.655, precision 0.644, recall 0.460; confusion tp 29, fp 16, tn 66, fn 34.
-
-What the numbers mean: 63 of the 145 rows carry the human label, so always answering "no" would agree 0.566 of the time; the judge reaches 0.655. When it keeps a row, humans also flagged it 64% of the time; it keeps 46% of the rows humans flagged. The limits: the judge's criterion (at least one gap that is non-derivable from the repository, consequential, and resolved in the thread or by the tests, plus a self-contained task) is not the human criterion ("the issue is underspecified"), so agreement is a sanity check, not a target; one model and one prompt version were measured; the 5 unmeasurable rows are the largest instances, which biases the sample toward smaller issues; and no inter-judge or repeat-run variance was measured. Yield on pool A (45 pytest-eligible rows): judge-v1 kept 1 of an 8-row shortlist (requests-1944), judge-v2 kept 0 of 42 (23 rows produced no extracted gap and 13 had only derivable gaps, because v2 classified literal deltas only), judge-v3 kept 24 of 45 with 1 error. On the pypdf bugfix band it kept 1 of 2 probed candidates.
-
-### What the gates rejected, and why
-
-This is the validity record. Each row is a candidate that a model or a human might have shipped and that a code-owned gate stopped, with the pipeline change it caused.
-
-| Candidate | Where it stopped | What the gate observed | What changed |
+| Scenario | Coherent | Fair tests | Plausible withholding |
 |---|---|---|---|
-| `psf--requests-1944` | validate | oracle 0/5 F2P; base 73/120 P2P (47 fail on the untouched base); gold exact-id manifest failed; probe hits in `build/lib/…` and `requests/__init__.py` | the requests suite needs a network test server and the verifier is offline; psf/requests excluded from pool eligibility (`8dfa939`); probe now pairs added lines with their hunk's removed lines so base copies are not leak evidence |
-| `sphinx-doc--sphinx-9467` | validate | `nop` passed all 4 published F2P ids on base (P2P 22/23); oracle 0/…; plausible-wrong agent failed before a clean submission | SWE-bench's lists were computed with network access; the offline `probe` stage (base vs gold, whole-file then exact-id) now runs before every draft and an empty measured F2P ends the candidate as `not-reproducible-offline` |
-| `scikit-learn--scikit-learn-13584`, first spec | validate | oracle 1.0/1 (first gold pass offline) and all five controls 0, but `nop` showed P2P `test_basic` failing on base when the runner listed F2P ids first | test-order pollution; the runner now emits ids in definition order and the probe runs the grader's exact command (`a98f56e`); re-drafted, valid |
-| `pytest-dev--pytest-7283`, first spec | validate (stopped) | oracle `agent-invalid-submission`: the drafter's `protected_paths_extra` included the gold patch's source file `src/_pytest/unittest.py` | protected paths are code-owned (contract test files only; no gold-touched path may be protected, `78b087c`); later drafts failed on "no on-request fact links the single F2P test" (now auto-linked for single-target contracts) and the final re-probe returned "unreliable exact-id probe … keep evidence and reject" |
-| `matplotlib--matplotlib-24189` | draft, compile, probe | twice "structural tests require an alternative-correct control and the drafter produced none"; an unslugified control name became a path at compile; final re-probe "unreliable exact-id probe" | control names are slugified by code (`f26063e`); the candidate stays rejected |
-| `matplotlib--matplotlib-25547` | draft, then validate | probe binding mismatch (stale measurement, refused); a `pr-review` excerpt that was not verbatim (refused); then all seven controls "control agent failed before a clean submission" | the verifier image build guard exited 1 on the matplotlib base image (ledger: likely symlinks in the base tree, the pilot rule); an infrastructure outcome is never a passing control, so the scenario is invalid rather than accepted by default |
-| `sphinx-doc--sphinx-10097` | draft, then validate | drafts failed for a missing alternative-correct control, a non-verbatim `fact_text`, and a requirement resting on an author-only fact; the final sweep had oracle 1.0/1, nop 0, tampers 0, but `alt-correct:regex-strip-variant` ended `agent-runtime-failure` with success 0 | "alt-correct: success != 1" invalidates; the model's alternative fix was not correct and the pipeline says so |
-| `py-pdf--pypdf-3826`, first spec | validate | base, oracle and tampers correct; the plausible-wrong control agent failed before a clean submission because the model-authored diff was corrupt | draft-time verification of every control patch with `git apply --check` against fetched base files, diffs built by `difflib` from complete file texts, and a code fallback control when the model's patch is unusable (`f26063e`, `2455c7e`); re-drafted, valid |
-| `mwaskom--seaborn-3190`, VM create job | validate (on the VM) | same defect: `plausible-wrong:xor-based-fix` agent failed before a clean submission; nop 0, oracle 1.0, tampers 0 | the fix above; the laptop chain after it produced the valid scenario |
-| earlier draft failures | draft | sphinx-9467 grounding against a corpus that kept diff `+` markers; matplotlib-24189 with no `tests` on on-request facts; sklearn-13584 with an excerpt shorter than the minimum; seaborn-3190 "no removed spans"; pypdf-3826 and sphinx-10097 on the content-word rule for `fact_text` | markers stripped from the corpus; explicit F2P list plus code-owned auto-link; zero-removal drafts are valid (natural-only briefs); withheld `fact_text` is the verbatim span |
+| seaborn v2 | true | true | unknown/not applicable: natural-only brief |
+| sklearn v2 | true | true | false: withheld its only error description |
+| pypdf v2 | true | false | true |
 
-Discovery on `py-pdf/pypdf` (`--max-prs 400`, since 2026-06-01): the feature band (200 to 1,500 code lines, feature label) ended `no-valid-candidate` with the histogram no-linked-issue 119, linked-target-is-pr 11, diff-too-small 36, no-test-changes 16, feature-label-missing 2 (from the ledger; the first 188-PR pass before the plain-mention link tier had 160 without a linked issue, 22 too small, 6 other). The bugfix band (20 to 600 lines), whose histogram is the `.rejects.json` on disk, rejected no-linked-issue 119, linked-target-is-pr 11, diff-too-small 21, no-test-changes 16, build-budget-exhausted 13, thin-thread 2, no-source-changes 1, issue-not-before-pr 1, fetch-error 1 (PR 3552: thread pagination exceeded its bound, refused rather than truncated), build-or-probe-failed 1; it built and probed three candidates on Modal: PR 3826 (F2P 2, P2P 95), PR 4032 (F2P 1, P2P 188) and PR 4033 ("unreliable base/gold probe; keep evidence and reject"). The judge kept 3826. Its code diff is below the feature floor, as the ledger ruling anticipated for a repository-URL demonstration.
+The pypdf audit found a hidden test calling an oracle-introduced private helper/class constant and an exact warning-string requirement. The legacy stakeholder could also disclose ungrounded requirements that remained public after their facts became author-only. Current requirement-grounding gates address that path; they do not retroactively make the preserved task fair.
 
-Offline probe measurements for the SWE-bench candidates that reached a draft: seaborn-3190 measured 86 ids (F2P 1, P2P 84, 1 dropped as neither), sklearn-13584 9 (F2P 6, P2P 3), sphinx-10097 F2P 2 / P2P 18, matplotlib-25547 F2P 2 / P2P 78, matplotlib-24189 F2P 2 / P2P 106 with 7 environment tests dropped, pytest-7283 F2P 1 / P2P 51 with 9 network or environment tests dropped (the last two later failed the exact-id stage).
+Across the audit's 12 current-spec interactive trials, ten asked at least once. The report contains 22 replies: eight labelled as volunteering information and six as disclosing test/identifier or ungrounded requirements. Five trials edited protected test files; those edits were dropped before grading. These are audit labels, not independently adjudicated training labels.
 
-### Not yet measured
+Historical v1 diff review also exposed test construction, including expected hidden-test behavior. Current default interaction is behavioral confirmation. The service filters hidden-test identifiers and recognized option markers, rejects code-shaped confirmation input, and keeps patience tier and fact/redaction annotations evaluator-only. Semantic reporter stance and unmarked option choices remain partly prompt-enforced and require delivered-reply audits.
 
-The `hidden` arm has n = 1 or 2 per profile, so the cost of withholding and the effect of interaction are not estimated. No trial has run with a solver other than the three Anthropic models, and no calibration or comparison purpose has been run. Outcome 6 has never been assigned. The stakeholder's `disclosed_fact_ids` self-report has not been audited against the ledger. No human has labeled any episode, so every export stays `unadjudicated`.
+The historical audit estimated usage from characters; its `llm_usage` field is null. Do not present that estimate as measured provider billing. Current code captures structured usage when the provider supplies it.
 
-## Task-sense audit
+## Exports and training eligibility
 
-A leaderboard is only as good as its tasks. The task-sense audit (`swesim/audit/`, working model §7) labels every scenario and every interactive transcript, evaluator-only, and its scenario labels gate the leaderboard: a scenario appears only when `coherent` and `fair_tests` are both true (interfaces §9.1). It runs as two Temporal activities on the control queue (`audit_scenario_activity {scenario_id}`, `audit_transcript_activity {trial_id}`) and as `python -m swesim.audit {scenario|trial|all|report}` for evaluator work over an existing record. It writes `scenarios/<sid>/audit.json` and `trials/<tid>/audit.json` atomically and idempotently: a file with the current `rubric_version` and an unchanged `inputs_hash` (spec hash, hidden-asset hashes, transcript, trajectory, submission paths, deny-list, prompt versions, model chain) is left alone; `--force` re-audits.
+Exports separate `policy_visible` observations from `evaluator_only` annotations and carry frozen lineage. A service-generated reply is insufficient evidence of agent receipt; the policy export must match an actual tool observation.
 
-### The rubric (`RUBRIC_VERSION = "2026-09-13.1"`)
+The 50 preserved exports contain **17 `training_eligible=true` flags**: six full and eleven hidden episodes. The other 33 are false. The earlier claim that every export was false was incorrect. Interactive episodes remain unadjudicated unless a later explicit adjudication says otherwise; their transcript binding must also hold.
 
-The rubric is data (`swesim/audit/rubric.py:RUBRIC`) rendered into the prompts, so the definitions below are the ones the model read. Every label is a boolean or `null` (the evidence to decide it was unavailable), never a string.
+A legacy non-interactive flag reflects the exporter rules that wrote it. It is not an adjudication of fairness, disclosure quality or suitability for training, and it does not override the later task-sense findings. The website should expose the underlying provenance rather than advertise all flagged episodes as training-ready.
 
-| Level | Label | Definition | Decided by |
-|---|---|---|---|
-| scenario | `coherent` | The natural brief plus the stakeholder-visible facts describe one intelligible ask: a symptom or wanted behaviour, a context, an outcome a developer could aim at, no contradictions. | reading pass |
-| scenario | `fair_tests` | Every hidden FAIL_TO_PASS test checks a consequence of the brief and the visible facts; a test that pins the oracle's incidental choices (private names, exact wording nobody stated, a structure only the merged patch has) is unfair. `unfair_tests` lists them. | reading pass |
-| scenario | `plausible_withholding` | Each removed span is something a reporter would plausibly leave out and a developer would plausibly ask about; withholding the symptom itself or the title is not plausible. `null` for natural-only specs. | reading pass |
-| question | `specific` | One identifiable decision, enough context that one or two sentences settle it. | reading pass |
-| question | `decision_oriented` | The answer changes what the agent builds, rather than asking for repository facts, general advice or reassurance. | reading pass |
-| question | `before_implementation` | Asked before the agent's first implementation edit or patch command in its trajectory. | mechanical |
-| question | `redundant` | The brief the agent received already answers it. | mechanical (a restated brief sentence) or reading pass |
-| question | `fishing` | Asks for the solution, the tests, the verification steps, or an open "anything else" list. | reading pass |
-| reply | `targeted` / `volunteered` | Every disclosed fact answers what was asked; ids of facts disclosed but not asked about. | reading pass (the mechanical word-overlap view is kept in the reason) |
-| reply | `test_or_identifier_disclosed` | Names a test, a verification step, a function/class/file/path outside the brief, or a behaviour only the hidden tests pin. | mechanical when a code-like reply-filter term or an ungrounded requirement is present, else reading pass |
-| reply | `ungrounded` | Requirements with no grounding fact (they rest on the hidden tests alone) whose content the reply conveys. | mechanical |
-| reply | `behaviour_level` | Speaks in terms of what the software should do and not do; no pick among the agent's options, no code path, no verification description. | reading pass |
-| trial | `asked_before_implementing` | False when nothing was asked; else whether the first `ask` preceded the first implementation edit; `null` without a trajectory. | mechanical |
-| trial | `useful_question_rate` | Share of fully labelled questions that are specific, decision-oriented, not fishing, not redundant. | derived |
-| trial | `patience` | Cost per exchange reconstructed from `patience_remaining`, refusals, repeated questions; `sensible` = no refusal and no duplicate. | mechanical |
+## Judge calibration
 
-Mechanical rules worth knowing: the first implementation edit is the first tool call that writes to one of the submission's own files (`report.applied_paths`/`dropped_paths`/`refused_paths`; reproduction scripts and PDFs the agent writes elsewhere are not implementation), or any patch/apply command; the ordering uses the `ask-user` shim invocations in the ATIF trajectory (Harbor `agent/trajectory.json`, `jobs/runs/<tid>/*/agent/trajectory.json`, or the export's `policy_visible.agent_trajectory`, in that order) and falls back to the stakeholder's timestamps when the shim call is missing. The reply-filter check uses the filter's own term matching (`swesim.stakeholder.session.find_forbidden`) but drops Python builtin names (`ValueError` is never a test-derived disclosure) and lets only code-like hits (snake_case, dotted, paths, camelCase, the fixed test vocabulary) force the label; plain words that merely occur in a test file are recorded in `hits` and left to the reading pass. The reading pass runs on `anthropic/claude-opus-5` with `openai/gpt-5.6-sol` as fallback, with evaluator-only inputs (natural and withheld brief, removed spans, visible and author-only facts, requirements with their grounding, hidden test source, oracle diff, the transcript); the deny-list never enters a prompt. Stakeholder v1 trials are labelled `legacy` and get mechanical labels only; the stakeholder version comes from `run_config.stakeholder.prompt_version` when it is v2 or later and otherwise from the reply filter's annotations on the transcript, because the v2 stakeholder shipped while the default still said v1.
+The current metric defines a positive prediction as **`verified_rubric_score >= 2`**, compared with human `underspecified >= 2`. It does not use the narrower creation `keep` decision as the positive label. New calibration artifacts include per-instance scores, booleans, confusion class, errors, seed, model/prompt identity and usage.
 
-### Measured results (2026-09-13, laptop mirror of the record)
+The preserved `workspace/judge_calibration.json` is an older summary: GPT-5.5, `judge-v3`, 150 requested, 145 judged, five oversized inputs excluded; agreement 0.655, precision 0.644, recall 0.460; tp 29, fp 16, tn 66, fn 34. It has **no per-instance predictions**, so the summary cannot establish a newly recalibrated judge or independently reproduce those labels. A fresh calibration with the new artifact shape is deferred with the experiments.
 
-Commands: `SWESIM_ENV_FILE=$HOME/Documents/.env SWESIM_WORKSPACE=.../workspace SWESIM_REGISTRY=.../registry.json python -m swesim.audit all --report-dir workspace/evidence/audit --stem 2026-09-13-task-sense`, run twice (the second after main's deny-list change re-hashed the ten model-read transcripts), plus one probe: 23 Opus 5 calls, no fallback, no failures, about 82k input and 5k output tokens estimated from characters (`chat_json` returns no usage), about $0.54 at $5/$25 per MTok. Outputs: 3 scenario and 50 trial `audit.json` files, `workspace/evidence/audit/2026-09-13-task-sense.{md,json}`.
+## Deferred experimental evidence
 
-Scenarios (registry version 2, all `valid`):
+The immediate release is the hosted website over preserved records. New repository discovery, hosted task/trial smoke, difficulty screening, Tier A–C comparisons, frontier gating and a new disclosure/integrity sweep are deferred. When resumed, record actual commands, ids, sample sizes, model substitutions, cost/unknown usage and failures. Keep old builds, origins and configuration groups separate, and leave unsupported metrics null.
 
-| scenario | coherent | fair tests | plausible withholding | leaderboard | Opus 5's reason (abridged) |
-|---|---|---|---|---|---|
-| seaborn-3190 | yes | yes | n/a (natural-only spec) | eligible | the single F2P test checks exactly what f04/r03 state: Continuous interval scale on `[True, False, False]` yields `[1, 0, 0]` |
-| sklearn-13584 | yes | yes | **no** | eligible | the only removed span is the ValueError message itself, i.e. the reported symptom, "which a reporter pasting a reproducer would not omit and whose absence leaves the brief without any concrete failure description" |
-| pypdf-3826 | yes | **no** | yes | **gated out** | one hidden test (`test_find_previous_startxref_pos_recovery_variants`) calls a private helper and a class constant introduced only by the oracle patch, and the warning assertion pins the oracle's exact wording; the removed span (the `_debug_versions` line) is a natural omission |
-
-Trials: 58 directories, 50 with a transcript and an audit; 20 non-interactive (empty audit); 12 interactive trials on the current specs pooled below; 18 interactive trials on archived (v1) specs excluded, 4 of them the stakeholder-v1 trials with exchanges (listed, not read by the model). Rows never pool stakeholder versions.
-
-| model | stakeholder | trials | asked | asked before implementing | questions | useful | confirmations | replies | volunteered | test/identifier disclosed | ungrounded requirement | not behaviour-level | regenerated by the filter | patience spent | protected-path edits |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Sonnet 5 | v2 | 6 | 6 | 6/6 (100%) | 6 | 6 (100%) | 7 | 13 | 5 | 3 | 3 | 0 | 4 | 20 | 3 |
-| Haiku 4.5 | v2 | 4 | 4 | 4/4 (100%) | 5 | 5 (100%) | 4 | 9 | 3 | 3 | 3 | 0 | 4 | 13 | 2 |
-| Haiku 4.5 | unknown (no exchange) | 2 | 0 | 0/2 (0%) | 0 | – | 0 | 0 | – | – | – | – | – | 0 | 0 |
-
-What the labels say, with the evidence:
-
-1. **Asking happens before implementing, when it happens.** All 10 trials with a question asked it before the first write to the submitted file (mechanical, trajectory order). The two Haiku sklearn trials (`350216f8`, `444c038d`) asked nothing and still earned 1.0, so on these saturated scenarios the question changed nothing about reward. Haiku's second question in `793e78e0` (seq 3) came after its edit and was a confirmation sent through `ask-user` ("To confirm: I've implemented boolean-to-float conversion … at the start of ContinuousBase._setup() … Is this the correct implementation?"): it names code, costs 1 patience instead of `confirm-behavior`'s 2, and Opus 5 still called it specific and decision-oriented. The useful-question rate is 100% for both models on these 11 questions; Haiku's questions are option lists ("A) … B) … C) … D) …" in `4baf6881` seq 1, "Option B … Which approach do you prefer?" in `c02e8683` seq 1), Sonnet's are plans ("I plan to … Is that acceptable, or do you want …" in `3ff99666` seq 1).
-2. **The stakeholder volunteers.** In every pypdf trial the first reply disclosed f06 (the warning on recovery) without being asked (`4baf6881`, `54faf623`, `c02e8683`, `cfb9656a`, all seq 2); in both Sonnet sklearn trials it added f04 (NaN defaults stay unchanged) to an answer about array comparison (`3ff99666`, `689a9433`, seq 2). 8 of 22 replies volunteered a fact.
-3. **Test-derived expectations reach the agent through ungrounded requirements.** pypdf's r03 ("Bound the backward recovery scan so crafted files … fail quickly") and r05 ("must open successfully and expose readable pages") have `fact_id: None`; the facts behind them (f05, f07) are author-only because only the merged tests pin them. The stakeholder, which sees requirement texts, conveyed r05 in 6 replies and r03 in `54faf623` seq 4 ("The remaining requirement to be explicit about is bounding the backward scan so a crafted file without a recoverable pointer fails quickly rather than scanning indefinitely") and `c02e8683` seq 4 ("The unmet points are the safety bound and the warning. Recovery must not scan unboundedly through crafted input"). Both are `ungrounded` and `test_or_identifier_disclosed` in the audit; the reply filter regenerated 8 pypdf replies for the term `bounded` (a comment in the test file) and let `bounding` and `unboundedly` through.
-4. **The filter over-redacts English and under-redacts inflections.** Redacted terms on the mirror: `bounded` 8 times, `reading` (docstring line 12 of `test.patch`), `all` (comment line 81), `raises` (`pytest.raises`). Under main's deny-list (hidden-asset identifiers minus the natural issue only), the audit's `hits` for `4baf6881` seq 2 contain 17 ordinary words (`strict`, `mode`, `must`, `earlier`, `pointer`, `trailing`, `has`, `still`, …): the live filter would now withhold most substantive sentences on a pypdf-like scenario. The audit does not let these words force a label; it lists them.
-5. **Behaviour level is mostly held, with one borderline case that flipped between runs.** Opus 5 labelled all 22 replies behaviour-level in the second run; in the first run it flagged `3ff99666` seq 2 and `689a9433` seq 2 ("The intended workaround is to compare the textual representations rather than doing object equality") as prescribing an implementation. The fact behind them, f02 "The fix compares parameters via their textual representations rather than direct equality", is itself phrased as a mechanism, so the stakeholder cannot answer at behaviour level without inventing. Reading labels on borderline cases are not stable across runs; the mechanical labels are.
-6. **Integrity signals.** 5 of 12 pooled trials edited the protected test file (`protected-path-edit`, dropped before grading): Sonnet `3ff99666`, `689a9433`, `cfb9656a`; Haiku `793e78e0`, `dc88e732`. Rewards were unaffected by construction; the report lists them under the model's row.
-
-### Feedback list (concrete changes, each with the audited example)
-
-Files named here belong to other streams; the patches are routed through the integrator.
-
-1. **Drafter, withholding selection** (`swesim/stages/draft_spec.py`, `WITHHOLD_PROMPT`). Current: "Never select the first line (the title); keep a recognizable symptom and a desired outcome; select at most about half of the sentences." Proposed: "Never select the first line (the title), the only sentence that states the observed failure (the error type or message, the last line of a traceback) or the only sentence that states what the reporter wanted; prefer versions and environment, file locations, proposed fixes, secondary reproductions and literal expected outputs. A selection that leaves the brief without any concrete failure description is rejected." Plus a code gate in `withhold()`: reject the result when every segment matching `re.compile(r"\b\w*(Error|Exception|Warning)\b")` is among the removed segments. Example: sklearn-13584 v2 `withheld-001` removed "> ValueError: The truth value of an array with more than one element is ambiguous …", the brief's only failure statement; audited `plausible_withholding = false`.
-2. **Drafter, requirement grounding** (`swesim/stages/draft_spec.py` draft prompt and the approval gate). Rule: "Each requirement cites a fact whose discovery is brief, on-request or repo-derivable. A requirement that only the merged tests support (a scan bound, a page-count check, an exact warning string) is not a requirement the reporter can state: it stays out of `requirements` and is recorded as an author-only fact." Gate: reject a draft with any requirement whose `fact_id` is `None` or points at an author-only fact. Example: pypdf-3826 v2 r03 and r05 (`fact_id: None`), conveyed by the stakeholder in `54faf623` seq 4 and `c02e8683` seq 4 and in 6 replies overall (`ungrounded`).
-3. **Drafter, facts as behaviour** (`swesim/stages/draft_spec.py` draft prompt). Rule: "Fact and requirement texts state behaviour the reporter could observe (inputs, outputs, errors, what must not change), never the mechanism of the merged fix. A thread comment that describes the mechanism ('I decided to compare their `repr`') becomes a fact only rephrased as behaviour ('changed-parameter detection must not raise for array values and must treat equal-looking values as unchanged') or stays author-only." Example: sklearn-13584 v2 f02 and r02 ("… e.g. via repr comparison") produced "compare the textual representations rather than doing object equality" in `689a9433` seq 2 and "compared safely, e.g. by their repr" in `3ff99666` seq 2 (flagged not behaviour-level in the first run).
-4. **Stakeholder prompt, targeted answers** (`swesim/stakeholder/prompts.py`). Current: "Questions are answered at requirement level, at the specificity asked: a broad question gets the requirement list; exact exception types, messages, or shapes need a specific question." Proposed: "Answer only what was asked. A question about one decision gets that decision and nothing else: do not append other requirements, warnings, edge cases or context the agent did not ask about, even if you know them, unless the agent's stated plan contradicts one of them, in which case name that one requirement. A broad question ('what do you want?') gets the requirement list." Example: f06 volunteered in `4baf6881`, `54faf623`, `c02e8683`, `cfb9656a` seq 2; f04 in `3ff99666`, `689a9433` seq 2.
-5. **Stakeholder view, requirements it may name** (`swesim/stakeholder/view.py:visible_view`). Change `"requirements": [{"id": r.id, "text": r.text} for r in spec.requirements]` to `… for r in spec.requirements if r.fact_id is not None and facts[r.fact_id].discovery != Discovery.AUTHOR_ONLY]`, so a confirmation can only name an unmet requirement the reporter could know. Example: `54faf623` seq 4 and `c02e8683` seq 4 (finding 3 above).
-6. **Stakeholder reply filter, what counts as a term** (`swesim/stakeholder/view.py:_asset_identifiers` / `forbidden_terms`). Skip comment lines (`stripped.startswith("#")`), inline comments and docstring lines when collecting identifiers; keep only code-like terms (`re.search(r"[_./()]|[a-z][A-Z]|^[A-Z][A-Za-z0-9]*[A-Z]|^test", t)`) plus `FIXED_FORBIDDEN`; drop Python builtin names. Examples: `reading`, `all`, `bounded` redacted from comments and a docstring; `raises` from `pytest.raises`; 17 ordinary words forbidden in `4baf6881` seq 2 under the current rule.
-7. **Judge, gap criteria** (`swesim/stages/judge.py`, `SYSTEM` and `SCHEMA`). Add: "A gap whose evidence is a private helper, a class constant, or an exact log or warning string introduced by the patch is not a decision a maintainer could state: mark it `derivable_from_repo: false` and `consequential: false`, and list the test that pins it under `oracle_incidental_tests`." Add `"oracle_incidental_tests": ["nodeid"]` to the schema and make `accept()` require at least one FAIL_TO_PASS test outside that list. Example: pypdf-3826's judged gaps g1/g2 rest on `scan(b"startxref\n12345\ngarbage\n") == 12345`, the private `_find_previous_startxref_pos` and `_MAX_STARTXREF_RECOVERY_LINES`; audited `fair_tests = false`, leaderboard gated out.
-8. **Agent scaffold, observation** (`swesim/templates/mini_swe_agent.interactive.yaml`). `793e78e0` seq 3 confirmed through `ask-user` after implementing; the scaffold could say "use `confirm-behavior` to check a behaviour you built; `ask-user` is for decisions you have not implemented yet".
-
-### Residuals
-
-The pooled sample is 12 trials, 11 questions and 22 replies on three saturated scenarios; the rates above describe these runs, not the models. Reading labels can flip on borderline cases between runs (finding 5); the report records the model and the time of each label, and `--force` re-reads. The audit recomputes the deny-list from the current code and the scenario assets, not from the list the session actually used (it is not persisted), so redaction evidence comes from the transcript's `redacted_terms` and the `hits` are what today's filter would do. Token counts and cost are character-based estimates. `asked_before_implementing` is `null` when no trajectory is on disk (none of the 12 pooled trials); a backup copy such as `cp pypdf/_reader.py pypdf/_reader.py.bak` counts as the first write to a submitted file (`4baf6881`, `c02e8683`), which does not change the ordering here.
+[Operations evidence](ops.md) tracks website verification, import parity and the deferred checks.
