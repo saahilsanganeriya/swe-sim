@@ -59,9 +59,10 @@ def issue_contract_delta(row: dict) -> list[dict]:
 
 
 def accept(judged: dict) -> bool:
-    """Code-owned acceptance rule: at least one gap that is non-derivable, consequential and resolved by a stakeholder statement."""
-    return any(not g.get("derivable_from_repo") and g.get("consequential") and g.get("resolved_by") == "thread"
-               for g in judged.get("gaps") or []) and bool(judged.get("self_contained"))
+    """Code-owned acceptance rule: at least one gap that is explicitly non-derivable (`derivable_from_repo is False`, a
+    missing field never counts), consequential and resolved by a stakeholder statement; and the task is self-contained."""
+    return any(g.get("derivable_from_repo") is False and g.get("consequential") is True and g.get("resolved_by") == "thread"
+               for g in judged.get("gaps") or []) and judged.get("self_contained") is True
 
 
 def judge_candidate(row: dict, model_id: str) -> dict:

@@ -100,8 +100,12 @@ def _strip(c: dict) -> dict:
             "url": c.get("html_url"), "path": c.get("path")}
 
 
-def fetch_issue_thread(repo: str, number: int) -> dict:
-    issue = _gh(f"repos/{repo}/issues/{number}")
+def fetch_issue_thread(repo: str, number: int, issue: dict | None = None) -> dict:
+    """Issue title/body/comments. `issue` may be a prefetched `repos/{repo}/issues/{n}` payload. PRs are refused:
+    the issues endpoint returns them too, but a PR body is not a stakeholder's problem statement."""
+    issue = issue if issue is not None else _gh(f"repos/{repo}/issues/{number}")
+    if issue.get("pull_request"):
+        raise ValueError(f"#{number} is a pull request, not an issue")
     comments = pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
     return {"issue_url": issue["html_url"], "number": issue.get("number", number), "title": issue["title"], "body": issue.get("body") or "",
             "user": _login(issue), "created_at": issue["created_at"], "comments": [_strip(c) for c in comments if not _is_bot(c)]}
@@ -112,33 +116,55 @@ def closing_text(pr: dict) -> str:
     return f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
 
 
-def linked_numbers(repo: str, pr: int, body: str) -> list[int]:
-    """Issue numbers a PR closes: closing keywords in the body, else cross-referenced issues of this repo in the timeline."""
-    found = {int(n) for n in _LINK.findall(body or "")}
-    if not found:
+def linked_targets(repo: str, pr: int, body: str) -> dict:
+    """Classify the numbers a PR claims to close. Closing-keyword numbers are fetched and kept only when the payload is
+    a real issue (no `pull_request`); PR-typed targets go to `prs`, unfetchable ones to `missing`. When no real issue
+    is named, fall back to issues of this repo that cross-reference the PR in its timeline.
+    Returns {"issues": [n], "prs": [n], "missing": [n], "payloads": {n: issue_json}}."""
+    out = {"issues": [], "prs": [], "missing": [], "payloads": {}}
+    for n in sorted({int(x) for x in _LINK.findall(body or "")}):
+        try:
+            payload = _gh(f"repos/{repo}/issues/{n}")
+        except subprocess.CalledProcessError:
+            out["missing"].append(n)
+            continue
+        if payload.get("pull_request"):
+            out["prs"].append(n)
+        else:
+            out["issues"].append(n)
+            out["payloads"][n] = payload
+    if not out["issues"]:
         for event in pages(f"repos/{repo}/issues/{pr}/timeline", max_pages=3):
             issue = (event.get("source") or {}).get("issue") or {}
             if event.get("event") == "cross-referenced" and issue and not issue.get("pull_request"):
-                if (issue.get("html_url") or "").startswith(f"https://github.com/{repo}/issues/"):
-                    found.add(int(issue["number"]))
-    return sorted(found)
+                if (issue.get("html_url") or "").startswith(f"https://github.com/{repo}/issues/") and int(issue["number"]) not in out["issues"]:
+                    out["issues"].append(int(issue["number"]))
+        out["issues"].sort()
+    return out
+
+
+def linked_numbers(repo: str, pr: int, body: str) -> list[int]:
+    """Issue numbers a PR closes (real issues only; see `linked_targets`)."""
+    return linked_targets(repo, pr, body)["issues"]
 
 
 def fetch_pr_thread(repo: str, pr: int) -> dict:
     p = _gh(f"repos/{repo}/pulls/{pr}")
     body = p.get("body") or ""
-    linked = linked_numbers(repo, pr, closing_text(p))
+    targets = linked_targets(repo, pr, closing_text(p))
     out = {"pr_url": p["html_url"], "number": p.get("number", pr), "pr_title": p["title"], "pr_body": body, "author": _login(p),
            "merged_at": p.get("merged_at"), "gold_commit": p.get("merge_commit_sha"), "pr_created_at": p["created_at"],
            "reviews": [_strip(c) for c in pages(f"repos/{repo}/pulls/{pr}/reviews")],
            "pr_comments": [_strip(c) for c in pages(f"repos/{repo}/issues/{pr}/comments?per_page=100") if not _is_bot(c)],
            "review_comments": [_strip(c) for c in pages(f"repos/{repo}/pulls/{pr}/comments?per_page=100")],
-           "linked_issues": []}
-    for n in linked[:3]:
+           "linked_issues": [], "linked_prs": targets["prs"]}
+    for n in targets["issues"][:3]:
         try:
-            out["linked_issues"].append(fetch_issue_thread(repo, n))
-        except subprocess.CalledProcessError as e:
+            out["linked_issues"].append(fetch_issue_thread(repo, n, issue=targets["payloads"].get(n)))
+        except (subprocess.CalledProcessError, ValueError) as e:
             out.setdefault("fetch_errors", []).append({"issue": n, "error": str(e)})
+    for n in targets["missing"]:
+        out.setdefault("fetch_errors", []).append({"issue": n, "error": "closing keyword names a number this repo's issues endpoint cannot serve"})
     # Interfaces-block keys: the primary linked issue mirrored at the top level.
     first = out["linked_issues"][0] if out["linked_issues"] else None
     out["issue_url"] = first["issue_url"] if first else None

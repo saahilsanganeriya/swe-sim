@@ -1,5 +1,6 @@
 import hashlib
 import json
+import shlex
 import subprocess
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
@@ -194,14 +195,27 @@ def test_base_text_decodes_content_and_returns_none_on_404(monkeypatch):
     assert threads.base_text("o/r", "a" * 40, "conftest.py") is None
 
 
+def _issue(n, pr=False):
+    d = {"number": n, "html_url": f"https://github.com/o/r/{'pull' if pr else 'issues'}/{n}", "title": f"#{n}", "body": "", "user": {"login": "u"}, "created_at": "2021-05-01T00:00:00Z"}
+    if pr:
+        d["pull_request"] = {"url": "x"}
+    return d
+
+
 def test_linked_numbers_from_body_and_timeline_fallback(monkeypatch):
-    assert threads.linked_numbers("o/r", 5, "Fixes #12, closes: #34 and resolves #12; see #99") == [12, 34]
     timeline = [{"event": "cross-referenced", "source": {"issue": {"number": 7, "html_url": "https://github.com/o/r/issues/7"}}},
                 {"event": "cross-referenced", "source": {"issue": {"number": 8, "html_url": "https://github.com/o/r/pull/8", "pull_request": {}}}},
                 {"event": "cross-referenced", "source": {"issue": {"number": 9, "html_url": "https://github.com/other/repo/issues/9"}}},
                 {"event": "labeled"}]
-    monkeypatch.setattr(subprocess, "run", FakeGH({"repos/o/r/issues/5/timeline": timeline}))
-    assert threads.linked_numbers("o/r", 5, "no reference here") == [7]
+    gh = FakeGH({"repos/o/r/issues/12": _issue(12), "repos/o/r/issues/34": _issue(34), "repos/o/r/issues/40": _issue(40, pr=True), "repos/o/r/issues/5/timeline": timeline})
+    monkeypatch.setattr(subprocess, "run", gh)
+    assert threads.linked_numbers("o/r", 5, "Fixes #12, closes: #34 and resolves #12; see #99") == [12, 34]
+    assert not any("timeline" in c[2] for c in gh.calls)                       # real issues found: no timeline fallback
+    assert threads.linked_numbers("o/r", 5, "no reference here") == [7]         # timeline fallback skips PRs and other repos
+    t = threads.linked_targets("o/r", 5, "Closes #40 and fixes #77")              # 40 is a PR, 77 does not exist -> fallback to timeline
+    assert t["prs"] == [40] and t["missing"] == [77] and t["issues"] == [7] and 40 not in t["payloads"]
+    t = threads.linked_targets("o/r", 5, "Fixes #12")
+    assert t == {"issues": [12], "prs": [], "missing": [], "payloads": {12: _issue(12)}}
 
 
 def _pr_routes():
@@ -226,7 +240,18 @@ def test_fetch_pr_thread_composes_pr_reviews_comments_and_linked_issue(monkeypat
     assert len(li) == 1 and li[0]["issue_url"].endswith("/issues/3") and li[0]["body"] == "" and [c["user"] for c in li[0]["comments"]] == ["maint"]
     # Interfaces-block keys: issue_url / issue_comments at top level mirror the first linked issue
     assert t["issue_url"] == li[0]["issue_url"] and t["issue_comments"] == li[0]["comments"]
-    assert "fetch_errors" not in t
+    assert "fetch_errors" not in t and t["linked_prs"] == []
+
+
+def test_fetch_pr_thread_drops_pull_request_typed_links(monkeypatch):
+    routes = _pr_routes()
+    routes["repos/o/r/issues/3"] = {**routes["repos/o/r/issues/3"], "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/3"}}
+    routes["repos/o/r/issues/5/timeline"] = []
+    monkeypatch.setattr(subprocess, "run", FakeGH(routes))
+    t = threads.fetch_pr_thread("o/r", 5)
+    assert t["linked_issues"] == [] and t["linked_prs"] == [3] and t["issue_url"] is None and "fetch_errors" not in t
+    with pytest.raises(ValueError, match="pull request, not an issue"):
+        threads.fetch_issue_thread("o/r", 3)
 
 
 def test_fetch_pr_thread_links_issues_named_in_the_title(monkeypatch):
@@ -238,9 +263,10 @@ def test_fetch_pr_thread_links_issues_named_in_the_title(monkeypatch):
 
 def test_fetch_pr_thread_records_linked_issue_fetch_errors(monkeypatch):
     routes = _pr_routes(); del routes["repos/o/r/issues/3"]
+    routes["repos/o/r/issues/5/timeline"] = []   # the unfetchable closing target triggers the timeline fallback, which finds nothing
     monkeypatch.setattr(subprocess, "run", FakeGH(routes))
     t = threads.fetch_pr_thread("o/r", 5)
-    assert t["linked_issues"] == [] and t["fetch_errors"][0]["issue"] == 3 and t["issue_url"] is None
+    assert t["linked_issues"] == [] and t["fetch_errors"][0]["issue"] == 3 and t["issue_url"] is None and t["linked_prs"] == []
 
 
 # ---------------------------------------------------------------- judge
@@ -325,9 +351,19 @@ def _row(**over):
            "test_patch": "diff --git a/xarray/tests/test_weighted.py b/xarray/tests/test_weighted.py\n--- a/xarray/tests/test_weighted.py\n+++ b/xarray/tests/test_weighted.py\n@@ -1 +1,2 @@\n x\n+def test_new(): pass\n",
            "image": sb.image_for("pydata__xarray-5362"), "repo_dir": "/testbed",
            "annotation": {"underspecified": "2.0", "underspecified_notes": "n", "false_negative": "0.0", "false_negative_notes": "", "difficulty": "15 min - 1 hour"},
-           "thread": {"pr_url": "https://github.com/pydata/xarray/pull/5362", "gold_commit": "b" * 40, "pr_created_at": "2021-05-20T00:00:00Z",
-                      "linked_issues": [{"issue_url": "https://github.com/pydata/xarray/issues/5360", "title": "t", "body": "b", "comments": []}]}}
+           "thread": _thread("pydata/xarray", 5362)}
     row.update(over); return row
+
+
+def _thread(repo, pr):
+    """A PR thread whose review text and body contain the spans the fake drafter cites (grounding)."""
+    url = f"https://github.com/{repo}/pull/{pr}"
+    return {"pr_url": url, "number": pr, "pr_title": "Raise on missing weights dim", "pr_body": "Adds a _check_dim helper before reducing.",
+            "author": "dev", "merged_at": "2021-06-01T00:00:00Z", "gold_commit": "b" * 40, "pr_created_at": "2021-05-20T00:00:00Z",
+            "reviews": [{"user": "rev", "created_at": "2021-05-21T00:00:00Z", "body": "Please raise a  ValueError\nwhen the dim is missing.", "url": url + "#pullrequestreview-1", "path": None}],
+            "pr_comments": [], "review_comments": [], "linked_prs": [],
+            "linked_issues": [{"issue_url": f"https://github.com/{repo}/issues/5360", "number": 5360, "title": "t", "body": "b", "created_at": "2021-05-01T00:00:00Z", "comments": []}],
+            "issue_url": f"https://github.com/{repo}/issues/5360", "issue_comments": []}
 
 
 def _judged(**over):
@@ -337,17 +373,22 @@ def _judged(**over):
     j.update(over); return j
 
 
-def _draft_llm(alt=None):
+def _draft_llm(alt=None, repo="pydata/xarray", pr=5362):
+    url = f"https://github.com/{repo}/pull/{pr}"
     return {"briefs": [{"profile": "natural", "text": "ignored", "provenance": "original-issue"}],
             "ledger": [{"id": "f01", "text": "Raise ValueError when the weights dim is missing", "kind": "behavior", "provenance": "pr-review",
-                        "source_excerpt": "raise a ValueError", "source_url": "https://github.com/pydata/xarray/pull/5362#discussion_r1",
+                        "source_excerpt": "raise a ValueError when the dim is missing", "source_url": url + "#pullrequestreview-1",  # whitespace differs from the review text
                         "authored_rationale": None, "discovery": "on-request", "tests": [F2P]},
-                       {"id": "f02", "text": "_check_dim helper name", "kind": "interface", "provenance": "pr-thread", "source_excerpt": "_check_dim",
-                        "source_url": "https://github.com/pydata/xarray/pull/5362", "authored_rationale": None, "discovery": "author-only", "tests": []}],
+                       {"id": "f02", "text": "_check_dim helper name", "kind": "interface", "provenance": "pr-thread", "source_excerpt": "_check_dim helper",
+                        "source_url": url, "authored_rationale": None, "discovery": "author-only", "tests": []},
+                       {"id": "f03", "text": "Reporter expects a ValueError", "kind": "behavior", "provenance": "original-issue", "source_excerpt": "Expected: raise ValueError.",
+                        "source_url": f"https://github.com/{repo}/issues/5360", "authored_rationale": None, "discovery": "brief", "tests": []},
+                       {"id": "f04", "text": "Reviewer tone is terse", "kind": "context", "provenance": "authored", "source_excerpt": None, "source_url": None,
+                        "authored_rationale": "persona detail inferred from the thread", "discovery": "repo-derivable", "tests": []}],
             "operations": [{"type": "clarification", "target": "f01", "rationale": "issue never names the exception"}],
             "persona": {"summary": "xarray maintainer", "tone": "terse", "disclosure_style": "answers what is asked",
-                        "derived_from_urls": ["https://github.com/pydata/xarray/pull/5362"], "role": "maintainer"},
-            "requirements": [{"id": "r01", "text": "raise ValueError", "fact_id": "f01", "tests": [F2P], "source_url": "https://github.com/pydata/xarray/pull/5362#discussion_r1"}],
+                        "derived_from_urls": [url], "role": "maintainer"},
+            "requirements": [{"id": "r01", "text": "raise ValueError", "fact_id": "f01", "tests": [F2P], "source_url": url + "#pullrequestreview-1"}],
             "checks": [{"id": "c01", "description": "user-level reproducer", "command": "python -c 'import xarray'", "expected_observation": "ValueError"}],
             "groups": [{"id": "g01", "weight": 0.5, "tests": [F2P]}],  # weights are renormalized to sum to 1
             "plausible_wrong": {"name": "keyerror", "rationale": "wrong exception type", "diff": "diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n@@ -1 +1,2 @@\n x\n+raise KeyError\n"},
@@ -396,11 +437,12 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     assert [c.cls for c in spec.controls.plausible_wrong] == ["plausible-wrong"] and spec.controls.plausible_wrong[0].expected_success == 0
     assert len(spec.controls.tamper) == 3 and all(c.cls == "incorrect-exploit" and c.expected_reward == 0.0 for c in spec.controls.tamper)
     assert {c.asset for c in spec.controls.tamper} == {"tamper-root-conftest.diff", "tamper-sitecustomize.diff", "tamper-skip-marker.diff"}
-    # runner: exact node ids, {junit_path} placeholder survives str.format, braces in ids are escaped
+    # runner: exact node ids; the verifier substitutes {junit_path} with str.replace, so braces in ids pass through literally
     r = spec.contract.runner
     assert r.kind == "pytest-ra" and r.command.startswith("/opt/miniconda3/envs/testbed/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} ")
-    formatted = r.command.format(junit_path="/tmp/j.xml")
-    assert "--junitxml=/tmp/j.xml" in formatted and "[{a}-b]" in formatted and P2P in formatted
+    substituted = r.command.replace("{junit_path}", "/tmp/j.xml")
+    assert "--junitxml=/tmp/j.xml" in substituted and shlex.quote(F2P) in substituted and P2P in substituted
+    assert "{{" not in r.command and "}}" not in r.command and r.command.count("{") == 2  # {junit_path} + the literal brace in F2P
     assert r.single_command.endswith("{nodeid}") and r.test_files == ["xarray/tests/test_weighted.py"]
     assert spec.environment.test_command == r.command
     assert spec.contract.test_assets == ["test.patch"] and spec.contract.protected_paths == ["xarray/tests/data/w.nc", "xarray/tests/test_weighted.py"]
@@ -458,11 +500,12 @@ def test_draft_rejects_leaky_withholding_and_empty_controls(monkeypatch, tmp_pat
 def test_draft_github_repo_uses_dockerfile_environment(monkeypatch, tmp_path):
     from swesim.models import ScenarioSpec
     from swesim.stages import draft_spec
-    _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    _patch_llm(monkeypatch, _draft_llm(repo="py-pdf/pypdf", pr=3400), _withhold_llm())
+    thread = {**_thread("py-pdf/pypdf", 3400), "gold_commit": None, "linked_issues": [], "issue_url": None}
     row = _row(source="github-repo", instance_id="py-pdf__pypdf-3400", repo="py-pdf/pypdf", image=None, repo_dir="/app",
                dockerfile="FROM python@sha256:abc\nRUN echo hi\n", test_python="/usr/local/bin/python",
                annotation={"underspecified": "", "underspecified_notes": "", "false_negative": "", "false_negative_notes": "", "difficulty": ""},
-               thread={"pr_url": "https://github.com/py-pdf/pypdf/pull/3400", "gold_commit": None, "pr_created_at": "2026-07-01T00:00:00Z", "linked_issues": []})
+               thread=thread)
     p = draft_spec.draft(row, _judged(), "fake/model", tmp_path / "pypdf")
     spec = ScenarioSpec.model_validate_json(p.read_text())
     assert spec.id == "py-pdf--pypdf-3400" and spec.source == "github-repo"
@@ -498,5 +541,67 @@ def test_llm_view_trims_pass_to_pass_but_spec_keeps_it(monkeypatch, tmp_path):
 def test_draft_fails_without_a_source_url_for_withheld_facts(monkeypatch, tmp_path):
     from swesim.stages import draft_spec
     _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    thread = {**_thread("pydata/xarray", 5362), "pr_url": None, "linked_issues": []}
     with pytest.raises(ValueError, match="source URL"):
-        draft_spec.draft(_row(thread={}), _judged(), "fake/model", tmp_path / "s")
+        draft_spec.draft(_row(thread=thread), _judged(), "fake/model", tmp_path / "s")
+
+
+# ---------------------------------------------------------------- fix round 1: grounding, model separation, discovery restriction
+
+def test_ledger_violations_ground_every_non_authored_fact():
+    from swesim.stages.draft_spec import ledger_violations
+    assert ledger_violations(_draft_llm(), _row()) == []
+    d = _draft_llm(); d["ledger"][0]["source_excerpt"] = "raise a TypeError when the dim is missing"   # paraphrase, not in any review
+    assert any("f01" in v and "verbatim" in v for v in ledger_violations(d, _row()))
+    d = _draft_llm(); d["ledger"][0]["source_url"] = "https://github.com/other/repo/pull/1#r1"          # URL outside the repo
+    assert any("f01" in v and "source_url" in v for v in ledger_violations(d, _row()))
+    d = _draft_llm(); d["ledger"][1]["provenance"] = "issue-thread"                                     # "_check_dim helper" is PR-body text, not issue text
+    assert any("f02" in v for v in ledger_violations(d, _row()))
+    d = _draft_llm(); d["ledger"][2]["source_excerpt"] = "Expected: raise KeyError."                    # not in the original issue
+    assert any("f03" in v for v in ledger_violations(d, _row()))
+    d = _draft_llm(); d["ledger"][0]["discovery"] = "repo-derivable"                                    # nothing on-request links a F2P test any more
+    assert any("on-request" in v for v in ledger_violations(d, _row()))
+    d = _draft_llm(); d["ledger"].append({"id": "f05", "text": "n", "kind": "context", "provenance": "annotator-note", "source_excerpt": "note says n", "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": []})
+    assert ledger_violations(d, _row(annotation={**_row()["annotation"], "underspecified_notes": "The note says n"})) == []  # annotator notes are a valid corpus
+    assert any("f05" in v for v in ledger_violations(d, _row()))                                        # blank annotation notes cannot ground a fact
+    # hints_text counts as issue-thread text (SWE-bench issue comments)
+    d = _draft_llm(); d["ledger"][1].update(provenance="issue-thread", source_excerpt="fixed in the next release")
+    assert ledger_violations(d, _row(hints_text="This will be fixed  in the\nnext release")) == []
+
+
+def test_draft_rejects_ungrounded_facts_after_one_correction_round(monkeypatch, tmp_path):
+    from swesim.stages import draft_spec
+    d = _draft_llm(); d["ledger"][0]["source_excerpt"] = "raise a TypeError when the dim is missing"
+    calls = _patch_llm(monkeypatch, d, _withhold_llm())
+    with pytest.raises(ValueError, match="grounding validation after two attempts.*f01"):
+        draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    draft_calls = [c for c in calls if "Remove selected spans" not in c["system"]]
+    assert len(draft_calls) == 2 and "Correct these violations" in draft_calls[1]["messages"][-1]["content"] and "f01" in draft_calls[1]["messages"][-1]["content"]
+    assert not (tmp_path / "s" / "scenario.draft.json").exists()
+
+
+def test_draft_requires_distinct_judge_and_draft_models(monkeypatch, tmp_path):
+    from swesim.stages import draft_spec
+    calls = _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    with pytest.raises(ValueError, match="judge and draft models must differ"):
+        draft_spec.draft(_row(), _judged(model_id="fake/model"), "fake/model", tmp_path / "s")
+    assert calls == []  # rejected before any LLM call
+
+
+def test_withhold_restricts_discovery_to_on_request_or_repo_derivable(monkeypatch):
+    from swesim.stages import draft_spec
+    out = {"withheld_brief": "Import fails", "removed": [{"category": "error_message", "excerpt": "ERROR42", "kind": "reproduction", "discovery": "author-only"}]}
+    attempts = []
+    monkeypatch.setattr(draft_spec, "chat_json", lambda model_id, system, messages, schema, **kw: attempts.append(messages) or out)
+    with pytest.raises(ValueError, match="withholding failed"):
+        draft_spec.withhold("Import fails\nTraceback: ERROR42", "fake/model")
+    assert len(attempts) == 2 and "invalid discovery" in attempts[1][-1]["content"]
+
+
+def test_accept_requires_explicit_non_derivable_gap():
+    from swesim.stages.judge import accept
+    gap = {"consequential": True, "resolved_by": "thread"}
+    assert not accept({"gaps": [gap], "self_contained": True})                                   # derivable_from_repo missing
+    assert not accept({"gaps": [{**gap, "derivable_from_repo": None}], "self_contained": True})
+    assert accept({"gaps": [{**gap, "derivable_from_repo": False}], "self_contained": True})
+    assert not accept({"gaps": [{**gap, "derivable_from_repo": False}], "self_contained": "yes"})

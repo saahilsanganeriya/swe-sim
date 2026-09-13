@@ -18,6 +18,12 @@ log = logging.getLogger(__name__)
 LINK = re.compile(r"(?:[Ff]ix(?:es|ed)?|[Cc]los(?:es|ed)?|[Rr]esolves?)\s*:?\s*#(\d+)")
 _TEST_PATH = re.compile(r"(^|/)tests?/|test_.*\.py$|_test\.py$|conftest\.py$")
 _DIFF_HEADER = re.compile(r"^diff --git a/(\S+)", re.M)
+# "Source" for band filtering means code: docs, changelogs, markup, config and lockfiles never count toward
+# additions/deletions or the source-file band (they still travel in the oracle patch).
+CODE_EXTENSIONS = {".py", ".pyx", ".pxd", ".pyi", ".c", ".h", ".cc", ".cpp", ".hpp", ".rs", ".go", ".js", ".mjs", ".ts", ".tsx", ".jsx",
+                   ".java", ".kt", ".rb", ".sh"}
+_NON_CODE_DIRS = re.compile(r"(^|/)(docs?|doc|documentation|examples?|resources|fixtures|benchmarks?)/")
+_NON_CODE_NAMES = re.compile(r"(^|/)(CHANGELOG|CHANGES|HISTORY|NEWS|README|AUTHORS|CONTRIBUTORS|LICENSE)[^/]*$", re.I)
 FEATURE_BAND = {"min_comments": 8, "diff_min": 200, "diff_max": 1500, "source_files": (3, 30)}
 FEATURE_LABEL_WORDS = ("enhancement", "feature", "rfc", "proposal")
 KNOWN_RECIPES = {"py-pdf/pypdf": {"install_command": "pip install -e '.[full]' -r requirements/ci.txt", "test_marker": '-m "not samples and not enable_socket"'}}
@@ -39,20 +45,50 @@ def linked_issues(body: str) -> list[int]:
     return sorted({int(n) for n in LINK.findall(body or "")})
 
 
-def split_patch(patch: str) -> tuple[str, str]:
-    src, tst = [], []
+def _chunks(patch: str) -> list[tuple[str, str]]:
+    out = []
     for chunk in re.split(r"(?=^diff --git )", patch, flags=re.M):
-        if not chunk.strip():
-            continue
         m = re.match(r"diff --git a/(\S+)", chunk)
-        if not m:
-            continue
-        (tst if _TEST_PATH.search(m.group(1)) else src).append(chunk)
+        if chunk.strip() and m:
+            out.append((m.group(1), chunk))
+    return out
+
+
+def is_code_path(path: str) -> bool:
+    """Code file by extension, outside docs/examples/fixtures directories and not a changelog/readme-style file."""
+    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else ""
+    return ext in CODE_EXTENSIONS and not _NON_CODE_DIRS.search(path) and not _NON_CODE_NAMES.search(path)
+
+
+def split_patch(patch: str) -> tuple[str, str]:
+    """(non-test diff, test diff). The non-test part is the whole oracle patch (docs, config and all); use
+    `code_stats` for the band filters."""
+    src, tst = [], []
+    for path, chunk in _chunks(patch):
+        (tst if _TEST_PATH.search(path) else src).append(chunk)
     return "".join(src), "".join(tst)
+
+
+def code_stats(src: str) -> dict:
+    """Code-only view of a non-test diff: {"files": [paths], "additions": n, "deletions": n, "non_code_files": [paths]}."""
+    files, non_code, add, dele = [], [], 0, 0
+    for path, chunk in _chunks(src):
+        if not is_code_path(path):
+            non_code.append(path)
+            continue
+        files.append(path)
+        lines = chunk.splitlines()
+        add += sum(l.startswith("+") and not l.startswith("+++") for l in lines)
+        dele += sum(l.startswith("-") and not l.startswith("---") for l in lines)
+    return {"files": files, "additions": add, "deletions": dele, "non_code_files": non_code}
 
 
 def reject_reason(c: dict, min_comments: int, diff_min: int, diff_max: int) -> str | None:
     if not c.get("issue"):
+        if c.get("linked_prs"):
+            return "linked-target-is-pr"
+        if c.get("linked_missing"):
+            return "linked-target-missing"
         return "no-linked-issue"
     if c.get("thread") and not c["thread"].get("linked_issues"):
         return "missing-linked-issue"
@@ -83,12 +119,11 @@ def _pr_diff(repo: str, number: int) -> str:
 
 def _candidate(repo: str, p: dict, patch: str) -> dict:
     src, tst = split_patch(patch)
-    lines = src.splitlines()
+    code = code_stats(src)
     return {"repo": repo, "pr": p["number"], "title": p["title"], "base_commit": p["base"]["sha"], "merge_commit": p.get("merge_commit_sha"),
-            "additions": sum(l.startswith("+") and not l.startswith("+++") for l in lines),
-            "deletions": sum(l.startswith("-") and not l.startswith("---") for l in lines),
-            "patch": src, "test_patch": tst, "source_files": _DIFF_HEADER.findall(src), "test_files": _DIFF_HEADER.findall(tst),
-            "issue": None, "issue_body": None, "thread": None}
+            "additions": code["additions"], "deletions": code["deletions"],
+            "patch": src, "test_patch": tst, "source_files": code["files"], "non_code_files": code["non_code_files"],
+            "test_files": _DIFF_HEADER.findall(tst), "issue": None, "issue_body": None, "thread": None, "linked_prs": [], "linked_missing": []}
 
 
 def _merged_details(repo: str, since: str, max_prs: int, pr: int | None) -> list[dict]:
@@ -123,8 +158,10 @@ def discover(repo: str, since: str, max_prs: int = 400, min_comments: int = 4, d
     cands, rejects = [], Counter()
     for p in prs:
         try:
-            issues = threads.linked_numbers(repo, p["number"], threads.closing_text(p))
+            targets = threads.linked_targets(repo, p["number"], threads.closing_text(p))
+            issues = targets["issues"]
             c = _candidate(repo, p, _pr_diff(repo, p["number"]))
+            c["linked_prs"], c["linked_missing"] = targets["prs"], targets["missing"]
             if issues:
                 c["issue"] = issues[0]
                 c["thread"] = threads.fetch_pr_thread(repo, p["number"])
@@ -160,7 +197,7 @@ def build_recipe(repo: str, base_commit: str, profile: str = "python-pytest") ->
 
 
 def candidate_to_row(c: dict) -> dict:
-    iss = (c["thread"] or {}).get("linked_issues", [{}])[0] if c.get("thread") else {}
+    iss = ((c.get("thread") or {}).get("linked_issues") or [{}])[0]
     before_pr = [x for x in iss.get("comments", []) if x["created_at"] < c["thread"]["pr_created_at"]]
     return {"source": "github-repo", "instance_id": f"{c['repo'].replace('/', '__')}-{c['pr']}", "repo": c["repo"], "base_commit": c["base_commit"], "version": "",
             "problem_statement": (iss.get("title", c["title"]) + "\n\n" + (iss.get("body") or "")).strip(), "hints_text": "\n\n".join(x["body"] for x in before_pr),

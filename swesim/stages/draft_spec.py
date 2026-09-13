@@ -34,9 +34,12 @@ Groups partition FAIL_TO_PASS test ids into requirement groups with weights summ
 as a unified diff against the repository at the base commit: a tempting incomplete or wrong fix (e.g. wrong exception type).
 Constraints the record must satisfy: at least one on-request fact links a FAIL_TO_PASS test id (the decision the agent has to
 ask about); fact, requirement, check and group ids match ^[a-z0-9][a-z0-9._-]{2,63}$ and never start with "withheld-"; test
-links use only the FAIL_TO_PASS and PASS_TO_PASS ids given; check ids differ from test ids. If the judge marked
-structural_tests, also write one alternative-correct patch (a different implementation the tests should still accept);
-otherwise set alternative_correct to null."""
+links use only the FAIL_TO_PASS and PASS_TO_PASS ids given; check ids differ from test ids. Every non-authored fact's
+source_excerpt is copied verbatim (no paraphrase) from the text its provenance names: issue-thread = linked issue
+title/body/comments or hints_text, pr-thread = PR title/body/comments, pr-review = review bodies and review comments,
+annotator-note = the annotation notes; its source_url is a URL under the repository. If the judge marked structural_tests,
+also write one alternative-correct patch (a different implementation the tests should still accept); otherwise set
+alternative_correct to null."""
 SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "original-issue"}],
 "ledger": [{"id": "f01", "text": "...", "kind": "behavior|interface|constraint|reproduction|context",
   "provenance": "issue-thread|pr-thread|pr-review|annotator-note|authored", "source_excerpt": "...", "source_url": "...",
@@ -51,7 +54,9 @@ SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "ori
 "protected_paths_extra": ["paths the fix's tests depend on"]}"""
 
 WITHHOLD_CATEGORIES = {"reproduction", "error_message", "expected_output", "location", "version", "proposed_fix"}
+WITHHOLD_DISCOVERY = {"on-request", "repo-derivable"}  # a removed reporter statement is never author-only
 REPO_DERIVABLE_CATEGORIES = {"location", "proposed_fix"}
+GROUNDED_PROVENANCE = ("original-issue", "issue-thread", "pr-thread", "pr-review", "annotator-note")
 WITHHOLD_SCHEMA = ('{"withheld_brief":"text","removed":[{"category":"reproduction|error_message|expected_output|location|version|proposed_fix",'
                    '"excerpt":"verbatim contiguous span","kind":"reproduction|context|behavior|interface|constraint","discovery":"on-request|repo-derivable"}]}')
 WITHHOLD_PROMPT = ("Remove selected spans by category; preserve the first line exactly and a recognizable symptom and desired outcome. "
@@ -81,6 +86,8 @@ def withhold(natural_issue: str, model_id: str) -> dict:
                 bad.append("invalid removed span")
             elif span.casefold() in text.casefold():
                 bad.append(span)
+            if item.get("discovery") not in WITHHOLD_DISCOVERY:
+                bad.append(f"invalid discovery {item.get('discovery')!r}; use on-request or repo-derivable")
         if not bad:
             return out
         messages.append({"role": "assistant", "content": json.dumps(out)})
@@ -92,9 +99,69 @@ def _sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def _format_safe(s: str) -> str:
-    """The grader substitutes {junit_path} with str.format; literal braces in node ids must be doubled."""
-    return s.replace("{", "{{").replace("}", "}}")
+def _norm(text: str | None) -> str:
+    return " ".join((text or "").split())
+
+
+def _corpora(row: dict) -> dict[str, str]:
+    """Whitespace-normalized source text per provenance; a fact's excerpt must be a verbatim span of its corpus."""
+    t = row.get("thread") or {}
+    ann = row.get("annotation") or {}
+
+    def bodies(items):
+        return [x.get("body") or "" for x in items or []]
+
+    issue_parts = [row.get("hints_text") or ""]
+    for i in t.get("linked_issues") or []:
+        issue_parts += [i.get("title") or "", i.get("body") or "", *bodies(i.get("comments"))]
+    return {"original-issue": _norm(row.get("problem_statement")),
+            "issue-thread": _norm("\n".join(issue_parts)),
+            "pr-thread": _norm("\n".join([t.get("pr_title") or "", t.get("pr_body") or "", *bodies(t.get("pr_comments"))])),
+            "pr-review": _norm("\n".join(bodies(t.get("reviews")) + bodies(t.get("review_comments")))),
+            "annotator-note": _norm("\n".join([ann.get("underspecified_notes") or "", ann.get("false_negative_notes") or ""]))}
+
+
+def ledger_violations(d: dict, row: dict) -> list[str]:
+    """Code-owned grounding of LLM-authored facts. Every non-authored fact must quote a verbatim span (after whitespace
+    normalization) of the text its provenance names and cite a URL under the repository; and at least one on-request
+    fact must link a FAIL_TO_PASS test, otherwise interaction is not load-bearing and approval would fail anyway."""
+    corpora = _corpora(row)
+    url_prefix = f"https://github.com/{row['repo']}/".casefold()
+    bad = []
+    ledger = d.get("ledger") or []
+    for f in ledger:
+        fid, prov = f.get("id", "?"), f.get("provenance")
+        if prov == "authored":
+            continue
+        if prov not in corpora:
+            bad.append(f"{fid}: unknown provenance {prov!r}")
+            continue
+        excerpt = _norm(f.get("source_excerpt"))
+        if not excerpt or excerpt not in corpora[prov]:
+            bad.append(f"{fid}: source_excerpt is not a verbatim span of the {prov} text: {excerpt[:80]!r}")
+        if not (f.get("source_url") or "").casefold().startswith(url_prefix):
+            bad.append(f"{fid}: source_url must be under https://github.com/{row['repo']}/")
+    f2p = set(row.get("fail_to_pass") or [])
+    if not any(f.get("discovery") == "on-request" and set(f.get("tests") or []) & f2p for f in ledger):
+        bad.append("no on-request fact links a FAIL_TO_PASS test id (interaction would not be load-bearing)")
+    return bad
+
+
+def _author(row: dict, judged: dict, model_id: str) -> dict:
+    """One LLM authoring call, validated by `ledger_violations`, one correction round, then fail."""
+    user = json.dumps({"candidate": llm_view(row), "judge": judged}, ensure_ascii=False)
+    if len(user) > CONTEXT_BUDGET_CHARS:
+        raise ValueError("candidate exceeds authoring context budget")
+    messages = [{"role": "user", "content": user}]
+    bad: list[str] = []
+    for _attempt in range(2):
+        d = chat_json(model_id, SYSTEM, messages, SCHEMA, max_tokens=8000)
+        bad = ledger_violations(d, row)
+        if not bad:
+            return d
+        messages.append({"role": "assistant", "content": json.dumps(d)})
+        messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(bad)})
+    raise ValueError("draft failed grounding validation after two attempts: " + "; ".join(bad))
 
 
 def _normalize_groups(groups: list[dict]) -> list[dict]:
@@ -106,14 +173,13 @@ def _normalize_groups(groups: list[dict]) -> list[dict]:
 
 
 def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_version: str = "0.1.0") -> Path:
+    if judged.get("model_id") and judged["model_id"] == model_id:
+        raise ValueError(f"judge and draft models must differ so their errors are not correlated (both {model_id})")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     assets = out_dir / "assets"
     assets.mkdir(exist_ok=True)
-    user = json.dumps({"candidate": llm_view(row), "judge": judged}, ensure_ascii=False)
-    if len(user) > CONTEXT_BUDGET_CHARS:
-        raise ValueError("candidate exceeds authoring context budget")
-    d = chat_json(model_id, SYSTEM, [{"role": "user", "content": user}], SCHEMA, max_tokens=8000)
+    d = _author(row, judged, model_id)
 
     pw = d.get("plausible_wrong") or {}
     if not (pw.get("diff") or "").strip():
@@ -146,7 +212,8 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     selected = [nodeid_map.get(t, t) for t in row["fail_to_pass"] + row["pass_to_pass"]]
     interpreter = row.get("test_python") or TEST_PYTHON
     prefix = shlex.quote(interpreter) + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} "
-    runner_cmd = prefix + " ".join(_format_safe(shlex.quote(t)) for t in selected)
+    # The verifier substitutes {junit_path}/{nodeid} with str.replace (integrator ruling), so node ids keep literal braces.
+    runner_cmd = prefix + " ".join(shlex.quote(t) for t in selected)
     if len(runner_cmd) > RUNNER_COMMAND_MAX_CHARS:
         raise ValueError(f"runner command with {len(selected)} node ids is {len(runner_cmd)} chars, over the single-argument limit; "
                          "candidate needs a nodeid-file runner")

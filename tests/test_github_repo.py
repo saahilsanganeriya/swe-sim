@@ -24,6 +24,19 @@ def test_split_patch_by_tests():
 def test_filters_reject_reasons():
     c = {"comments_total": 1, "additions": 5, "deletions": 0, "test_files": [], "source_files": ["a.py"], "issue": None}
     assert gr.reject_reason(c, min_comments=4, diff_min=20, diff_max=600) == "no-linked-issue"
+    assert gr.reject_reason({**c, "linked_prs": [8]}, 4, 20, 600) == "linked-target-is-pr"
+    assert gr.reject_reason({**c, "linked_missing": [77]}, 4, 20, 600) == "linked-target-missing"
+
+
+def test_source_stats_count_code_only_but_oracle_patch_keeps_everything():
+    patch = (_file("pkg/a.py", 30) + _file("docs/index.md", 400) + _file("CHANGELOG.md", 50) + _file("README.rst", 20) + _file("pyproject.toml", 5)
+             + _file("docs/conf.py", 10) + _file("pkg/data.json", 300) + _file("tests/test_a.py", 4))
+    src, tst = gr.split_patch(patch)
+    assert "docs/index.md" in src and "pyproject.toml" in src and "tests/test_a.py" not in src and "tests/test_a.py" in tst   # oracle patch stays complete
+    stats = gr.code_stats(src)
+    assert stats["files"] == ["pkg/a.py"] and stats["additions"] == 30 and stats["deletions"] == 0
+    assert stats["non_code_files"] == ["docs/index.md", "CHANGELOG.md", "README.rst", "pyproject.toml", "docs/conf.py", "pkg/data.json"]
+    assert gr.is_code_path("pypdf/_page.py") and gr.is_code_path("src/lib.rs") and not gr.is_code_path("docs/conf.py") and not gr.is_code_path("CHANGES.txt")
 
 
 def test_build_recipe_pypdf():
@@ -67,6 +80,8 @@ def test_candidate_to_row_shapes_like_swebench():
     assert row["fail_to_pass"] == [] and row["pass_to_pass"] == [] and row["image"] is None and row["repo_dir"] == "/app"
     assert set(row["annotation"]) == {"underspecified", "underspecified_notes", "false_negative", "false_negative_notes", "difficulty"}
     assert row["thread"] is thread and row["discovery"]["repo_only"] is True and row["test_files"] == ["tests/test_s.py"]
+    bare = gr.candidate_to_row({**c, "thread": {**thread, "linked_issues": []}})   # no linked issue: PR title, no hints, no crash
+    assert bare["problem_statement"] == "pr title" and bare["hints_text"] == ""
 
 
 # ---------------------------------------------------------------- discovery against a fake gh api
@@ -112,6 +127,7 @@ def _routes():
             rows = [{"number": n, "merged_at": None} for n in range(1, 101)]           # closed-unmerged: skipped without a detail fetch
             rows[6] = {"number": 7, "merged_at": "2026-07-03T00:00:00Z"}              # merged, tiny diff -> diff-too-small
             rows[8] = {"number": 9, "merged_at": "2026-07-04T00:00:00Z"}              # merged, no linked issue
+            rows[10] = {"number": 11, "merged_at": "2026-07-05T00:00:00Z"}            # merged, "Fixes #8" but #8 is a pull request
             rows[41] = {"number": 42}                                                 # list row lacks merged_at/labels/stats: admitted only after the detail fetch
             return rows
         return [{"number": n, "merged_at": "2026-01-01T00:00:00Z"} for n in range(101, 106)]  # short page; merged before `since`
@@ -130,6 +146,10 @@ def _routes():
         "repos/o/r/pulls/9": _detail(9, "2026-07-04T00:00:00Z", "no link here", ["bug"]),
         "repos/o/r/issues/9/timeline": [],
         ("repos/o/r/pulls/9", "diff"): _file("pkg/a.py", 30) + _file("tests/test_a.py", 2),
+        "repos/o/r/pulls/11": _detail(11, "2026-07-05T00:00:00Z", "Fixes #8", ["bug"]),
+        "repos/o/r/issues/8": {"html_url": "https://github.com/o/r/pull/8", "number": 8, "title": "a PR", "body": "", "user": {"login": "dev"}, "created_at": "2026-06-01T00:00:00Z", "pull_request": {"url": "x"}},
+        "repos/o/r/issues/11/timeline": [],
+        ("repos/o/r/pulls/11", "diff"): _file("pkg/a.py", 300) + _file("tests/test_a.py", 2),
     }
 
 
@@ -138,14 +158,15 @@ def test_discover_pages_filters_and_admits_feature_after_detail_fetch(monkeypatc
     monkeypatch.setattr(subprocess, "run", gh)
     cands, rejects = gr.discover("https://github.com/o/r", since="2026-06-01", max_prs=150, kind="feature")
     assert gh.list_pages() == ["1", "2"]                                   # more than one page, stops on the short page
-    assert rejects == {"diff-too-small": 1, "no-linked-issue": 1}
+    assert rejects == {"diff-too-small": 1, "no-linked-issue": 1, "linked-target-is-pr": 1}
     assert [c["pr"] for c in cands] == [42]
     c = cands[0]
     assert c["repo"] == "o/r" and c["issue"] == 40 and c["base_commit"] == "b" * 40 and c["merge_commit"] == "d" * 40
     assert c["source_files"] == ["pkg/a.py", "pkg/b.py", "pkg/c.py"] and c["test_files"] == ["tests/test_stream.py"]
     assert c["additions"] == 250 and c["deletions"] == 0                    # sizes come from the diff, not list-response statistics
     assert "tests/test_stream.py" not in c["patch"] and "tests/test_stream.py" in c["test_patch"]
-    assert c["comments_total"] == 8 and c["labels"] == ["enhancement", "needs-docs"]
+    assert c["comments_total"] == 8 and c["labels"] == ["enhancement", "needs-docs"] and c["linked_prs"] == [] and c["non_code_files"] == []
+    assert c["issue_body"] == "Please add streaming." and c["thread"]["linked_issues"][0]["number"] == 40
     assert c["discovery"] == {"kind": "feature", "repo_only": True, "since": "2026-06-01", "max_prs": 150}
     detail_fetches = [x for x in gh.calls if urlsplit(x[2]).path.startswith("repos/o/r/pulls/") and "-H" not in x]
     assert {urlsplit(x[2]).path for x in detail_fetches} >= {"repos/o/r/pulls/42", "repos/o/r/pulls/7", "repos/o/r/pulls/9"}
@@ -156,8 +177,8 @@ def test_discover_bugfix_kind_and_no_survivors(monkeypatch):
     gh = FakeGH(_routes())
     monkeypatch.setattr(subprocess, "run", gh)
     cands, rejects = gr.discover("o/r", since="2026-06-01", max_prs=150, kind="bugfix")
-    # bugfix band (min_comments 4, 20..600 lines): 42 is thin? no: 8 comments, 250 lines -> accepted; 7 too small; 9 no issue
-    assert [c["pr"] for c in cands] == [42] and rejects == {"diff-too-small": 1, "no-linked-issue": 1}
+    # bugfix band (min_comments 4, 20..600 lines): 42 has 8 comments, 250 lines -> accepted; 7 too small; 9 no issue; 11 links a PR
+    assert [c["pr"] for c in cands] == [42] and rejects == {"diff-too-small": 1, "no-linked-issue": 1, "linked-target-is-pr": 1}
     cands, rejects = gr.discover("o/r", since="2026-08-01", max_prs=150, kind="feature")
     assert cands == [] and rejects == {}
     with pytest.raises(ValueError, match="kind"):
