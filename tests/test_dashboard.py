@@ -217,9 +217,11 @@ def test_reader_scores_and_leaderboard_gate(site):
     assert scores and all(s.spec_hash == site["spec"].spec_hash for s in scores)
     cal = next(s for s in scores if s.condition == "interactive")
     assert cal.n == 2 and cal.success_count == 1 and cal.questions_asked == 1 and cal.confirmations == 0
-    gate = leaderboard_gate(r, False)
-    assert gate[0]["checks"] == {"valid": True, "difficulty": False, "task_sense": False} and gate[0]["eligible"] is False
-    assert r.leaderboard(R.LeaderboardFilter(purpose="calibration")) == []  # nothing without a difficulty label and audit
+    gate = leaderboard_gate(r)
+    # the console admits every difficulty label (unlabelled included); the audit is what this version still lacks
+    assert gate[0]["checks"] == {"valid": True, "difficulty": True, "task_sense": False} and gate[0]["eligible"] is False and gate[0]["difficulty_label"] == "unlabelled"
+    assert leaderboard_gate(r, ["informative"])[0]["checks"]["difficulty"] is False  # an applied filter is the only way the label excludes
+    assert r.leaderboard(R.LeaderboardFilter(purpose="calibration")) == []  # the readers' own default gate is unchanged: nothing without a label and audit
     sdir = site["ws"].scenario_dir(site["spec"].id)
     (sdir / "difficulty.json").write_text(json.dumps({"tier": "informative", "model": "openrouter/deepseek/deepseek-v3.2", "hidden": {"n": 2, "successes": 1},
                                                       "full": {"n": 1, "successes": 1}, "labelled_at": "2026-09-13T08:00:00+00:00", "trial_ids": []}))
@@ -259,7 +261,7 @@ def test_reader_costs_spend_table_and_operator_actions(site, tmp_path, monkeypat
 # ---------------------------------------------------------------- pages and JSON twins
 
 PUBLIC_ROUTES = ("/", "/scenarios", "/trials", "/trials?status=unresolved&condition=interactive", "/candidates", "/workflows", "/review", "/leaderboard",
-                 "/leaderboard?include_saturated=1&tier=C", "/db", "/db/trials", "/db/exchanges", "/db/scenarios", "/artifacts", "/artifacts?path=trials", "/create", "/run",
+                 "/leaderboard?include_saturated=1&tier=C", "/leaderboard?difficulty_tier=broken&difficulty_tier=unlabelled", "/trends", "/api/trends", "/db", "/db/trials", "/db/exchanges", "/db/scenarios", "/artifacts", "/artifacts?path=trials", "/create", "/run",
                  "/spend", "/search?q=example", "/api/counts", "/api/home", "/api/scenarios", "/api/trials", "/api/candidates", "/api/workflows", "/api/leaderboard",
                  "/api/spend", "/api/review", "/api/db/trials", "/api/db/exchanges", "/api/db/exchanges.csv", "/api/db/trials.csv", "/api/artifacts?path=scenarios")
 
@@ -340,23 +342,46 @@ def test_workflows_page_merges_live_listing_and_deep_links_to_temporal(site, mon
     assert "Live listing unavailable" in c.get("/workflows").text and c.get("/workflows/run-1").status_code == 404
 
 
-def test_leaderboard_page_gate_toggle_and_confidence(site):
+def test_leaderboard_default_shows_every_difficulty_label_and_the_label_is_a_filter(site):
     c = site["client"]
     html = c.get("/leaderboard").text
-    assert "0 / 1" in html and "excluded" in html and "not audited" in html and "No cells" in html and "include saturated" in html
+    assert "0 / 1" in html and "excluded" in html and "not audited" in html and "No cells" in html and "every label is on the board" in html
+    assert "include saturated" not in html and "Saturated scenarios (shown separately)" not in html
     sdir = site["ws"].scenario_dir(site["spec"].id)
-    (sdir / "difficulty.json").write_text(json.dumps({"tier": "saturated", "model": "openrouter/deepseek/deepseek-v3.2", "hidden": {"n": 2, "successes": 2},
-                                                      "full": {"n": 1, "successes": 1}, "labelled_at": "2026-09-13T08:00:00+00:00", "trial_ids": []}))
+    (sdir / "difficulty.json").write_text(json.dumps({"tier": "broken", "model": "openrouter/deepseek/deepseek-v3.2", "hidden": {"n": 2, "successes": 0},
+                                                      "full": {"n": 1, "successes": 0}, "labelled_at": "2026-09-13T08:00:00+00:00", "trial_ids": []}))
     (sdir / "audit.json").write_text(json.dumps({"coherent": True, "fair_tests": True, "plausible_withholding": True, "reasons": {}, "model": "anthropic/claude-opus-5",
                                                  "audited_at": "2026-09-13T08:00:00+00:00", "rubric_version": "v1"}))
     access.reset()
+    # a valid, audited scenario labelled "broken" is on the board by default; the label is a chip on its row
     html = c.get("/leaderboard?purpose=calibration").text
-    assert "Saturated scenarios (shown separately)" in html and "0 / 1" in html  # saturated excluded by default, shown separately
-    api = c.get("/api/leaderboard?purpose=calibration&include_saturated=1").json()
-    assert len(api["items"]) == 1 and api["items"][0]["n"] == 2 and "Wilson 95% CI" in api["items"][0]["confidence_note"] and api["items"][0]["asked_first_rate"] == "1.000"
-    assert api["items"][0]["pass_at_k"] is None  # k=3 requested, 2 valid attempts: not computed, and the note says so
-    html = c.get("/leaderboard?purpose=calibration&include_saturated=1").text
-    assert "chart-matrix" in html and "chart-lb" in html and HAIKU in html and "1 / 1" in html
+    assert "1 / 1" in html and "chart-matrix" in html and "chart-lb" in html and HAIKU in html
+    gate = html.split("<h2>Gate</h2>", 1)[1]
+    assert ">broken</span>" in gate and "on board" in gate
+    matrix = html.split("Per-scenario matrix", 1)[1].split("Pass rate by condition", 1)[0]
+    assert ">broken</span>" in matrix  # the informational chip on the matrix row
+    api = c.get("/api/leaderboard?purpose=calibration").json()
+    assert len(api["items"]) == 1 and api["items"][0]["n"] == 2 and api["items"][0]["tier"] == "C" and "Wilson 95% CI" in api["items"][0]["confidence_note"]
+    assert api["items"][0]["asked_first_rate"] == "1.000" and api["items"][0]["pass_at_k"] is None  # k=3 requested, 2 valid attempts: not computed
+    assert api["difficulty_labels"] == ["informative", "saturated", "broken", "unlabelled"] and api["gate"][0]["eligible"] is True
+    # the readers' own gate (interfaces §9.1 default) still excludes it: the console's default is a console decision
+    assert reader_of(site).leaderboard(R.LeaderboardFilter(purpose="calibration", include_saturated=True)) == []
+    # the label as a filter the operator applies
+    filtered = c.get("/api/leaderboard?purpose=calibration&difficulty_tier=informative").json()
+    assert filtered["items"] == [] and filtered["gate"][0]["eligible"] is False and filtered["gate"][0]["checks"]["difficulty"] is False
+    assert "Difficulty filter applied: informative" in c.get("/leaderboard?purpose=calibration&difficulty_tier=informative").text
+    both = c.get("/api/leaderboard?purpose=calibration&difficulty_tier=broken&difficulty_tier=unlabelled").json()
+    assert len(both["items"]) == 1 and both["difficulty_labels"] == ["broken", "unlabelled"]
+    assert c.get("/leaderboard?difficulty_tier=hard").status_code == 400
+    # the pre-2026-09-13 toggle is accepted for old links and changes nothing
+    legacy = c.get("/api/leaderboard?purpose=calibration&include_saturated=1").json()
+    assert legacy["items"] == api["items"]
+    # a saturated label is on the board too, with its chip
+    (sdir / "difficulty.json").write_text(json.dumps({"tier": "saturated", "model": "openrouter/deepseek/deepseek-v3.2", "hidden": {"n": 2, "successes": 2},
+                                                      "full": {"n": 1, "successes": 1}, "labelled_at": "2026-09-13T08:00:00+00:00", "trial_ids": []}))
+    access.reset()
+    html = c.get("/leaderboard?purpose=calibration").text
+    assert "1 / 1" in html and ">saturated</span>" in html.split("<h2>Gate</h2>", 1)[1] and "Saturated scenarios (shown separately)" not in html
 
 
 def test_database_browser_lists_tables_filters_and_exports_csv(site):

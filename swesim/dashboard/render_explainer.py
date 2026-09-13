@@ -177,7 +177,7 @@ SECTION_1 = Section("measures", "What swesim measures", (
          "Interactive gives the same withheld brief plus a simulated reporter the agent can question. Hidden and interactive share the selected brief "
          "profile, so the only difference between them is the stakeholder; asking changes what the agent knows, never the tests or the reward weights.",
          (S(ARCH, "Conditions and stakeholder boundary"), S(CLAUDE_MD, "Contracts: brief profiles"), S(GRADING, "Reward and outcomes")),
-         Console("/leaderboard", "the 'Pass rate by condition' chart and the per-scenario matrix; /trends splits every curve by condition"),
+         Console("/leaderboard", "the 'Pass rate by condition' chart and the per-scenario matrix; /trends splits accuracy, deltas and cost by condition and tier"),
          ARMS,
          (Decision("Hidden and interactive share the selected brief profile; full uses natural plus stakeholder-visible facts.",
                    "Only one thing may differ between the arms being compared, or the gap measures the brief rather than the asking.",
@@ -763,9 +763,9 @@ SECTION_8 = Section("difficulty", "Difficulty screen and task-sense audit", (
     Card("The difficulty screen",
          "After validation the screen runs the withheld brief twice without a stakeholder and the full brief once, on one frozen model and build, as purpose "
          "screen so the attempts never pool with comparisons. Full failing wins over hidden saturation. Labels live in difficulty.json and on the scenario row; "
-         "the leaderboard admits only informative scenarios, shows saturated ones separately behind a toggle, and never shows broken ones.",
+         "the leaderboard shows every valid, audited scenario whatever its label (the label is a chip and a filter, not an exclusion), and the Trends page reads difficulty as a capability gradient across solver tiers instead.",
          (S(DIFFICULTY, "label(), SCREEN_MODEL, SCREEN_COUNTS"), S(BRIEF, "§5 Difficulty"), S(INTERFACES, "§9.1 difficulty.json and the leaderboard gate")),
-         Console("/trends", "'Current valid-scenario difficulty' with one link per label; /scenario/<id> 'Difficulty' shows the three screen trials"),
+         Console("/trends", "the capability gradient (accuracy by tier A→E, per-scenario gradient chips) and 'Screen labels' with one link per label; /scenario/<id> 'Difficulty' shows the three screen trials"),
          SCREEN,
          (Decision("Difficulty comes from selection and measurement; a scenario is never edited after a gate to make it harder.",
                    "Hand-tuned tests would measure the tuner, not the model, and would break the provenance of every fact and requirement.",

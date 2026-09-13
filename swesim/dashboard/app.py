@@ -41,6 +41,7 @@ from swesim.dashboard.data import merge_timeline  # noqa: F401 - contract re-exp
 from swesim.dashboard.identity import Identity, identity_from_headers
 from swesim.dashboard.public import PRIVATE_KEYS, project
 from swesim.dashboard.access import all_rows
+from swesim.index import reports
 from swesim.index.cohorts import cohort_of
 from swesim.settings import Settings, get_settings
 from swesim.sources import observations
@@ -466,16 +467,22 @@ def runs_redirect() -> RedirectResponse:
 
 # ----------------------------------------------------------------------------- leaderboard
 
+DIFFICULTY_LABELS = reports.DIFFICULTY_LABELS
+
+
+def _admitted_labels(labels) -> tuple[str, ...]:
+    """The difficulty labels the board admits: the operator's selection, else every label (the console default: the
+    difficulty screen is a chip and a filter on the leaderboard, never an exclusion)."""
+    return tuple(labels) if labels else DIFFICULTY_LABELS
+
+
 def _lb_filter(request: Request, reader) -> tuple[R.LeaderboardFilter, dict]:
-    lists = _lists(request, "brief_profile", "source", "condition", "tier")
+    lists = _lists(request, "brief_profile", "source", "condition", "tier", "difficulty_tier")
     facet = _pool(request, lists)
     tiers = lists.pop("tier")
-    include_sat = request.query_params.get("include_saturated") == "1"
-    difficulty = request.query_params.get("difficulty_tier") or None
-    if difficulty and difficulty not in ("informative", "saturated"):
-        raise HTTPException(400, "difficulty_tier must be informative or saturated")
-    if difficulty == "saturated":
-        include_sat = True
+    labels = lists.pop("difficulty_tier") or []
+    if any(label not in DIFFICULTY_LABELS for label in labels):
+        raise HTTPException(400, "difficulty_tier must be one of " + ", ".join(DIFFICULTY_LABELS))
     purpose = request.query_params.get("purpose") or "comparison"
     if purpose not in ("calibration", "comparison", "demonstration", "screen"):
         purpose = "comparison"
@@ -484,32 +491,31 @@ def _lb_filter(request: Request, reader) -> tuple[R.LeaderboardFilter, dict]:
     if requested_models:
         models = [m for m in requested_models if not tiers or m in (models or [])] or ["__no_model__"]
     metric_k = request.query_params.get("metric_k") or None
-    f = R.LeaderboardFilter(**lists, model=models, purpose=purpose, include_saturated=include_sat,
+    # `include_saturated=1` was the pre-2026-09-13 toggle; every label is on the board by default now, so the parameter is
+    # accepted for old links and changes nothing. The filter's own gate is bypassed by `difficulty_labels` everywhere below.
+    f = R.LeaderboardFilter(**lists, model=models, purpose=purpose, include_saturated=True,
                            evaluation_cohort=request.query_params.get("evaluation_cohort") or None,
                            metric_k=int(metric_k) if metric_k else None)
-    if difficulty:
-        ids = [s.scenario_id for s in all_rows(reader.scenarios, R.ScenarioFilter(difficulty_tier=[difficulty]))]
-        f = f.model_copy(update={"scenario_id": ids or ["__no_scenarios__"]})
     current = {k: v or [] for k, v in lists.items()}
     options = dict(cohort_of(t) for t in all_rows(reader.trials, R.TrialFilter(purpose=[purpose], status=["completed"])))
-    current.update(tier=tiers or [], include_saturated=include_sat, purpose=purpose, difficulty_tier=[difficulty] if difficulty else [],
+    current.update(tier=tiers or [], purpose=purpose, difficulty_tier=list(labels), difficulty_labels=_admitted_labels(labels),
                    evaluation_cohort=f.evaluation_cohort, cohort_options=sorted(options.items()), metric_k=f.metric_k, pool=facet)
     return f, current
 
 
-def leaderboard_gate(reader, include_saturated: bool) -> list[dict]:
+def leaderboard_gate(reader, difficulty_labels=None) -> list[dict]:
     """Interfaces §9.1 per current scenario version, with the per-check breakdown the page explains; ``eligible`` is the
-    reader's own ``reports.gate_passes`` so the board and its explanation can never disagree."""
-    from swesim.index.reports import gate_passes
+    reader's own ``reports.gate_passes`` so the board and its explanation can never disagree. ``difficulty`` is the
+    operator's label filter (every label when none is selected), not a screen gate."""
+    admitted = _admitted_labels(difficulty_labels)
     out = []
     for s in all_rows(reader.scenarios, R.ScenarioFilter(latest_only=True)):
         ts = s.task_sense if isinstance(s.task_sense, dict) else {}
-        checks = {"valid": s.validation_status == "valid",
-                  "difficulty": s.difficulty_tier == "informative" or (include_saturated and s.difficulty_tier == "saturated"),
-                  "task_sense": bool(ts.get("coherent")) and bool(ts.get("fair_tests"))}
-        out.append({"scenario_id": s.scenario_id, "version": s.version, "validation_status": s.validation_status, "difficulty_tier": s.difficulty_tier, "source": s.source,
+        checks = {"valid": s.validation_status == "valid", "difficulty": reports.difficulty_label(s) in admitted, "task_sense": reports.task_sense_passes(s)}
+        out.append({"scenario_id": s.scenario_id, "version": s.version, "validation_status": s.validation_status, "difficulty_tier": s.difficulty_tier,
+                    "difficulty_label": reports.difficulty_label(s), "source": s.source,
                     "task_sense": {k: ts.get(k) for k in ("coherent", "fair_tests", "plausible_withholding")} if ts else None, "checks": checks,
-                    "eligible": gate_passes(s, include_saturated)})
+                    "eligible": reports.gate_passes(s, difficulty_labels=admitted)})
     return out
 
 
@@ -524,27 +530,39 @@ def _wilson(successes: int, n: int, z: float = 1.96) -> tuple[float, float] | No
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
-def board_trials(reader, f: R.LeaderboardFilter) -> list:
-    """Completed, attributable trials admitted by the shared version-aware leaderboard gate."""
-    from swesim.index.reports import gate_passes, scenario_for_trial
-    versions = {}
+def _board(reader, f: R.LeaderboardFilter, difficulty_labels=None) -> tuple[list, dict[str, list]]:
+    """(admitted trials, scenario versions by id): completed, attributable trials of the board's purpose whose scenario
+    version passes the shared gate with the admitted difficulty labels."""
+    admitted = _admitted_labels(difficulty_labels)
+    versions: dict[str, list] = {}
     for s in all_rows(reader.scenarios, R.ScenarioFilter(scenario_id=f.scenario_id)):
         versions.setdefault(s.scenario_id, []).append(s)
     selected = []
     for t in all_rows(reader.trials, R.TrialFilter(scenario_id=f.scenario_id, purpose=[f.purpose], status=["completed"],
                                                  condition=f.condition, brief_profile=f.brief_profile, model=f.model, outcome_code=[1, 2, 3, 4])):
-        s = scenario_for_trial(t, versions.get(t.scenario_id, []))
+        s = reports.scenario_for_trial(t, versions.get(t.scenario_id, []))
         if f.evaluation_cohort and cohort_of(t)[0] != f.evaluation_cohort:
             continue
-        if s is not None and gate_passes(s, f.include_saturated) and (not f.source or s.source in f.source):
+        if s is not None and reports.gate_passes(s, difficulty_labels=admitted) and (not f.source or s.source in f.source):
             selected.append(t)
-    return selected
+    return selected, versions
 
 
-def board_views(reader, rows: list, eligible: set[str], f: R.LeaderboardFilter) -> list[dict]:
+def board_trials(reader, f: R.LeaderboardFilter, difficulty_labels=None) -> list:
+    """Completed, attributable trials admitted by the shared version-aware leaderboard gate (every difficulty label by default)."""
+    return _board(reader, f, difficulty_labels)[0]
+
+
+def board_rows(reader, f: R.LeaderboardFilter, difficulty_labels=None, board: tuple[list, dict] | None = None) -> list[R.LeaderboardRow]:
+    """The board's cells over the admitted trials: the readers' ``compute_leaderboard`` with the console's admitted labels."""
+    trials, versions = board if board is not None else _board(reader, f, difficulty_labels)
+    return reports.compute_leaderboard(trials, [s for vs in versions.values() for s in vs], f, difficulty_labels=_admitted_labels(difficulty_labels))
+
+
+def board_views(reader, rows: list, eligible: set[str], f: R.LeaderboardFilter, difficulty_labels=None, trials: list | None = None) -> list[dict]:
     """Recompute requested estimators within each admitted spec/config/cohort group."""
     from swesim.stages.score import pass_at_k, pass_pow_k
-    trials = [t for t in board_trials(reader, f) if t.scenario_id in eligible]
+    trials = [t for t in (board_trials(reader, f, difficulty_labels) if trials is None else trials) if t.scenario_id in eligible]
     views = []
     for r in rows:
         d = r.model_dump(mode="json")
@@ -575,19 +593,22 @@ def board_views(reader, rows: list, eligible: set[str], f: R.LeaderboardFilter) 
         d["confidence_note"] = (f"n={r.n} valid attempts over {r.scenarios} scenarios; {r.cohort_label}. "
                                 f"Mean per-spec/config estimator k={common_k or 'unknown/mixed'}; {len(pk)}/{len(groups)} groups have sufficient n. "
                                 + (f"Wilson 95% CI {ci[0]:.2f}–{ci[1]:.2f}; attempt independence approximation." if ci else ""))
+        d["tier"] = render.tier_of(r.model)
         d["key"] = f"{r.model}|{r.condition}|{r.brief_profile}|{r.evaluation_cohort}"
         views.append(d)
     return views
 
 
-def leaderboard_charts(trials: list, rows: list, cohort: str | None = None, sources: dict[str, str] | None = None) -> tuple[str, str]:
-    """``sources`` (scenario_id -> ScenarioRow.source) labels every matrix row with its task-origin badge."""
-    sources = sources or {}
+def leaderboard_charts(trials: list, rows: list, cohort: str | None = None, sources: dict[str, str] | None = None,
+                       labels: dict[str, str | None] | None = None) -> tuple[str, str]:
+    """``sources`` (scenario_id -> ScenarioRow.source) labels every matrix row with its task-origin badge; ``labels``
+    (scenario_id -> difficulty_tier) adds the informational difficulty chip to the row."""
+    sources, labels = sources or {}, labels or {}
     if cohort is None:
         parts = []
         for key, label in sorted({cohort_of(t) for t in trials}):
             matrix, chart = leaderboard_charts([t for t in trials if cohort_of(t)[0] == key],
-                                                [r for r in rows if r.evaluation_cohort == key], key, sources)
+                                                [r for r in rows if r.evaluation_cohort == key], key, sources, labels)
             heading = f"<h3>{render.h(label)}</h3>"
             parts.append((heading + matrix, heading + chart))
         return ("".join(p[0] for p in parts), "".join(p[1] for p in parts)) if parts else ("<p class='empty'>No eligible trials.</p>", "")
@@ -603,52 +624,60 @@ def leaderboard_charts(trials: list, rows: list, cohort: str | None = None, sour
             return None, 0, f"{sid} · {model}: no valid attempts"
         return sum(1 for t in ts if t.success) / len(ts), len(ts), f"{sid} · {model}: {sum(1 for t in ts if t.success)}/{len(ts)} valid attempts succeeded"
 
+    def row_label(sid: str) -> str:
+        parts = [sid]
+        if sources.get(sid):
+            parts.append(origin.badge_label(sources.get(sid)) or "")
+        if sid in labels:
+            parts.append(labels[sid] or "unlabelled")
+        return " · ".join(p for p in parts if p)
+
+    def row_html(sid: str) -> str:
+        return (f"<a href='/scenario/{render.h(sid)}'>{render.h(sid)}</a> {origin.badge(sources.get(sid))} "
+                + (render.difficulty_chip(labels[sid]) if sid in labels else ""))
+
     matrices = []
     for condition, profile in sorted({(t.condition, t.brief_profile) for t in trials}):
         matrices.append(f"<h3>{render.h(condition)} · {render.h(profile)}</h3>" + pages.charts.matrix(
             sorted(eligible), models, lambda sid, model, c=condition, p=profile: cell(sid, model, c, p),
             chart_id=f"chart-matrix-{condition}-{profile}-{cohort}", title=f"{condition} / {profile}: pass rate per scenario × model",
-            col_label=lambda m: m.split("/")[-1][:18],
-            row_label=lambda sid: f"{sid} · {origin.badge_label(sources.get(sid))}" if sources.get(sid) else sid,
-            row_html=lambda sid: f"<a href='/scenario/{render.h(sid)}'>{render.h(sid)}</a> {origin.badge(sources.get(sid))}"))
+            col_label=lambda m: m.split("/")[-1][:18], row_label=row_label, row_html=row_html))
     matrix_html = "".join(matrices) or "<p class='empty'>No eligible scenario has completed trials for this purpose.</p>"
     chart_rows = [{"model": r.model, "condition": r.condition, "pass_rate": float(r.pass_rate) if r.pass_rate is not None else None, "n": r.n} for r in rows]
     chart_html = pages.charts.grouped_bars(chart_rows, metric="pass_rate", chart_id="chart-lb-" + cohort, title="pass rate per model per condition")
     return matrix_html, chart_html
 
 
+def _leaderboard_payload(reader, f: R.LeaderboardFilter, current: dict) -> dict:
+    """Everything the leaderboard page and its JSON twin share: the gate table, the admitted trials, the cells and the charts."""
+    labels = current["difficulty_labels"]
+    gate = leaderboard_gate(reader, labels)
+    sources = {g["scenario_id"]: g["source"] for g in gate}
+    difficulty = {g["scenario_id"]: g["difficulty_tier"] for g in gate}
+    if f.source:  # the task-origin facet (or an explicit source filter): the gate table and its hero count show the same subset as the board
+        gate = [g for g in gate if g["source"] in f.source]
+    board = _board(reader, f, labels)
+    trials = board[0]
+    eligible = {t.scenario_id for t in trials}
+    rows = board_rows(reader, f, labels, board)
+    views = board_views(reader, rows, eligible, f, labels, trials=trials)
+    matrix, chart = leaderboard_charts(trials, rows, sources=sources, labels=difficulty)
+    return {"gate": gate, "trials": trials, "rows": rows, "views": views, "matrix": matrix, "chart": chart}
+
+
 @app.get("/leaderboard", response_class=HTMLResponse)
 def leaderboard(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
     f, current = _lb_filter(request, reader)
-    rows = reader.leaderboard(f)
-    gate = leaderboard_gate(reader, f.include_saturated)
-    sources = {g["scenario_id"]: g["source"] for g in gate}
-    if f.source:  # the task-origin facet (or an explicit source filter): the gate table and its hero count show the same subset as the board
-        gate = [g for g in gate if g["source"] in f.source]
-    trials = board_trials(reader, f)
-    eligible = {t.scenario_id for t in trials}
-    saturated_views: list[dict] = []
-    if not f.include_saturated:
-        sat_ids = {g["scenario_id"] for g in leaderboard_gate(reader, True) if g["eligible"] and g["difficulty_tier"] == "saturated"}
-        if sat_ids:
-            sat_rows = reader.leaderboard(R.LeaderboardFilter(purpose=f.purpose, condition=f.condition, brief_profile=f.brief_profile, model=f.model, source=f.source,
-                                                              scenario_id=sorted(sat_ids), include_saturated=True, evaluation_cohort=f.evaluation_cohort, metric_k=f.metric_k))
-            saturated_views = board_views(reader, sat_rows, sat_ids, f.model_copy(update={"include_saturated": True, "scenario_id": sorted(sat_ids)}))
-    views = board_views(reader, rows, eligible, f)
-    for key in ("condition", "brief_profile", "model"):
-        want = getattr(f, key)
-        if want:
-            trials = [t for t in trials if getattr(t, key) in want]
-    matrix_html, chart_html = leaderboard_charts(trials, rows, sources=sources)
+    d = _leaderboard_payload(reader, f, current)
     p = render.Page("Leaderboard", "leaderboard", "leaderboard", crumbs=(("Leaderboard", None),),
                     attrs={"source": "/api/leaderboard?" + str(request.query_params), "chart-target": "leaderboard-charts", "poll-ms": "10000"}, live="updated 0s ago")
-    return page(p, pages.leaderboard_body(views, gate, current, matrix_html, chart_html, saturated_views, request.query_params.multi_items()), reader, identity, settings)
+    return page(p, pages.leaderboard_body(d["views"], d["gate"], current, d["matrix"], d["chart"], request.query_params.multi_items()), reader, identity, settings)
 
 
 @app.get("/leaderboard/evidence", response_class=HTMLResponse)
 def leaderboard_evidence(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
     f, current = _lb_filter(request, reader)
-    selected = board_trials(reader, f)
+    selected = board_trials(reader, f, current["difficulty_labels"])
     offset, limit = _paging(request)
     body = (f"<h1>Leaderboard evidence</h1><p class='lead' data-count-line>{len(selected)} admitted attempts in the selected evaluation cohort · showing {render.h(origin.subset_text(current.get('pool')))}.</p>"
             + render.table("leaderboard-evidence", pages.TRIAL_COLUMNS, trial_views(reader, selected[offset:offset + limit]),
@@ -659,31 +688,23 @@ def leaderboard_evidence(request: Request, reader=Depends(reader_dep), identity:
 
 @app.get("/api/leaderboard")
 def api_leaderboard(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
-    f, _ = _lb_filter(request, reader)
-    gate = leaderboard_gate(reader, f.include_saturated)
-    sources = {g["scenario_id"]: g["source"] for g in gate}
-    if f.source:
-        gate = [g for g in gate if g["source"] in f.source]
-    trials = board_trials(reader, f)
-    eligible = {t.scenario_id for t in trials}
-    rows = reader.leaderboard(f)
-    views = board_views(reader, rows, eligible, f)
-    matrix, chart = leaderboard_charts(trials, rows, sources=sources)
-    return _json(200, {"items": views, "gate": gate, "charts": {"matrix": "<h2>Per-scenario matrix</h2>" + matrix,
-                                                              "pass": "<h2>Pass rate by condition</h2>" + chart},
-                       "fragments": {"leaderboard-comparison": {"table": pages.leaderboard_comparison(views)}}})
+    f, current = _lb_filter(request, reader)
+    d = _leaderboard_payload(reader, f, current)
+    return _json(200, {"items": d["views"], "gate": d["gate"], "difficulty_labels": list(current["difficulty_labels"]),
+                       "charts": {"matrix": "<h2>Per-scenario matrix</h2>" + d["matrix"], "pass": "<h2>Pass rate by condition</h2>" + d["chart"]},
+                       "fragments": {"leaderboard-comparison": {"table": pages.leaderboard_comparison(d["views"])}}})
 
 
 # ----------------------------------------------------------------------------- episode
 
 def _trends_data(request: Request, reader) -> tuple[dict, dict]:
     f, current = _lb_filter(request, reader)
-    query = {k: request.query_params.getlist(k) for k in ("source", "tier", "difficulty_tier", "include_saturated") if request.query_params.get(k)}
+    query = {k: request.query_params.getlist(k) for k in ("source", "tier", "difficulty_tier", origin.PARAM) if request.query_params.get(k)}
     query["purpose"] = f.purpose
     if f.evaluation_cohort:
         query["evaluation_cohort"] = f.evaluation_cohort
     scenarios = list(all_rows(reader.scenarios, R.ScenarioFilter(source=f.source, latest_only=True)))
-    payload = trends.summarize(board_trials(reader, f), scenarios, query)
+    payload = trends.summarize(board_trials(reader, f, current["difficulty_labels"]), scenarios, query)
     payload["charts"] = render_trends.chart_fragments(payload)
     payload["coverage"] = render_trends.coverage(payload)
     payload["generated_at"] = datetime.now(UTC).isoformat()
@@ -707,12 +728,12 @@ def api_trends(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
 
 @app.get("/trends/evidence", response_class=HTMLResponse)
 def trend_evidence(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
-    f, _ = _lb_filter(request, reader)
+    f, current = _lb_filter(request, reader)
     through = date.fromisoformat(request.query_params.get("through", ""))
     cohort = request.query_params.get("cohort")
     if cohort not in (None, "asked", "did-not-ask"):
         raise HTTPException(400, "cohort must be asked or did-not-ask")
-    selected = [t for t in board_trials(reader, f) if t.finished_at is not None and t.finished_at.astimezone(UTC).date() <= through]
+    selected = [t for t in board_trials(reader, f, current["difficulty_labels"]) if t.finished_at is not None and t.finished_at.astimezone(UTC).date() <= through]
     if cohort:
         selected = [t for t in selected if t.questions_asked is not None and (t.questions_asked > 0) == (cohort == "asked")]
     offset, limit = _paging(request)

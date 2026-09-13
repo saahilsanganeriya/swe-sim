@@ -23,6 +23,8 @@ from html import escape
 from typing import Iterable, Sequence
 from urllib.parse import urlencode
 
+from swesim.roles import TIERS as ROLE_TIERS
+
 # ----------------------------------------------------------------------------- primitives
 
 def h(x) -> str:
@@ -167,16 +169,11 @@ FAMILIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("gpt-oss", "gpt-oss", ("openrouter/openai/gpt-oss",)),
 )
 FAMILY_SLOT = {key: i + 1 for i, (key, _label, _p) in enumerate(FAMILIES)}
-TIERS: dict[str, tuple[str, ...]] = {  # brief §3.2, verbatim ids
-    "A": ("openrouter/deepseek/deepseek-chat-v3-0324", "openrouter/z-ai/glm-4.5", "openrouter/qwen/qwen3-coder",
-          "openrouter/moonshotai/kimi-k2", "openrouter/minimax/minimax-m2", "openrouter/openai/gpt-oss-120b"),
-    "B": ("openrouter/deepseek/deepseek-v3.2", "openrouter/deepseek/deepseek-v4-flash", "openrouter/deepseek/deepseek-v4-pro-0813",
-          "openrouter/z-ai/glm-5.2", "openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "openrouter/qwen/qwen3.6-plus",
-          "openrouter/moonshotai/kimi-k2.7-code", "openrouter/minimax/minimax-m3"),
-    "C": ("openai/gpt-5-mini", "openai/gpt-5.6-luna", "anthropic/claude-haiku-4-5-20251001"),
-    "D": ("anthropic/claude-sonnet-5", "openai/gpt-5.6-sol"),
-    "E": ("openai/gpt-6-astra", "anthropic/claude-fable-5-1", "anthropic/claude-opus-5", "openai/gpt-5.5"),
-}
+# Solver tiers: brief §3.2 verbatim, owned by `swesim.roles.TIERS` (A older open, B newer open, C small closed, D mid frontier,
+# E frontier). The console reads them from there so the generation axis of the Trends page can never drift from the sweep.
+TIERS: dict[str, tuple[str, ...]] = {tier: tuple(models) for tier, models in ROLE_TIERS.items()}
+TIER_ORDER: tuple[str, ...] = tuple(TIERS)
+TIER_LABELS: dict[str, str] = {"A": "older open", "B": "newer open", "C": "small closed", "D": "mid frontier", "E": "frontier"}
 TIER_OF = {m: t for t, ms in TIERS.items() for m in ms}
 
 
@@ -207,12 +204,14 @@ def model_chip(model_id: str | None, tier: bool = True) -> str:
 
 
 def difficulty_chip(tier: str | None) -> str:
+    """The difficulty-screen label as an informational chip. It never hides a scenario: the leaderboard shows every valid,
+    audited scenario and offers the label as a filter; the capability gradient on /trends is the difficulty evidence."""
     if not tier:
-        return chip("unlabelled", "neutral", "no difficulty screen has run for this version")
+        return chip("unlabelled", "neutral", "no difficulty screen has run for this version; the scenario is still on the board")
     return chip(tier, {"informative": "good", "saturated": "neutral", "broken": "critical"}.get(tier, ""),
-                {"informative": "hidden arm ≤ 1/2 on the screen model: the task discriminates",
-                 "saturated": "screen model passes hidden 2/2 and full 1/1: excluded from the leaderboard by default",
-                 "broken": "full arm 0/1 on the screen model: suspect the task"}.get(tier))
+                {"informative": "screen model: hidden ≤ 1/2, so the screen model does not saturate it (informational)",
+                 "saturated": "screen model passed hidden 2/2 and full 1/1 (informational; on the board, filterable)",
+                 "broken": "screen model failed the full arm 0/1: look at the report (informational; on the board, filterable)"}.get(tier))
 
 
 # ----------------------------------------------------------------------------- tables

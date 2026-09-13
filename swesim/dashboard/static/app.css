@@ -118,6 +118,8 @@ details > summary { cursor: pointer; color: var(--ink-2); }
 .toolbar { display: flex; flex-wrap: wrap; gap: var(--s-3); align-items: end; margin: var(--s-3) 0; }
 .toolbar label { display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-0); color: var(--ink-2); }
 .toolbar label.inline { flex-direction: row; align-items: center; gap: var(--s-1); color: var(--ink); font-size: var(--fs-1); }
+.toolbar .check-group { display: flex; flex-wrap: wrap; gap: var(--s-2) var(--s-3); align-items: center; padding: var(--s-1) var(--s-2); border: 1px solid var(--line); border-radius: var(--r-1); }
+.toolbar .check-group > span { flex-basis: 100%; }
 
 /* controls */
 select, textarea, input, button { font: inherit; color: var(--ink); background: var(--overlay); border: 1px solid var(--line-2); border-radius: var(--r-1); padding: var(--s-1) var(--s-2); }

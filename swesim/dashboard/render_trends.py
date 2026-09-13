@@ -42,9 +42,8 @@ def body(data: dict, current: dict) -> str:
                + select("brief_profile", ["natural", "withheld"], current.get("brief_profile"), "brief profile")
                + select("source", ["github-repo", "swebench-annotated", "authored"], current.get("source"), "source")
                + select("tier", ["A", "B", "C", "D", "E"], current.get("tier"), "model tier")
-               + select("difficulty_tier", ["informative", "saturated"], current.get("difficulty_tier"), "difficulty")
-               + f"<label class='inline'><input type='checkbox' name='include_saturated' value='1'{' checked' if current['include_saturated'] else ''}> include saturated</label>"
-               "<button class='button' type='submit'>Apply</button><a class='button' href='/trends'>Reset</a></form>")
+               + pages.difficulty_checkboxes(list(current.get("difficulty_tier") or []))
+               + "<button class='button' type='submit'>Apply</button><a class='button' href='/trends'>Reset</a></form>")
     return ("<h1>Trends</h1><p class='lead'>How results change as scenarios accrue. The leaderboard's validation, difficulty and task-sense gates apply. "
             "Each purpose, condition and brief profile remains separate.</p>" + filters
             + f"<p class='note' id='trend-coverage'>{coverage(data)}</p>"

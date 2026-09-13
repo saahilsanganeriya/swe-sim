@@ -13,12 +13,15 @@ Contract
   `validation_status == "valid"`, `difficulty_tier == "informative"` (or `saturated` when asked; `broken` never) and
   `task_sense.coherent and task_sense.fair_tests`; the trial is `completed` with an agent-attributable outcome
   (1-4, the pass@k denominator of `swesim.stages.score`) and the board's single `purpose`. Cells are
-  model x condition x brief_profile.
+  model x condition x brief_profile. The keyword `difficulty_labels` (also on `gate_passes`) replaces the difficulty
+  clause with an explicit set of admitted labels (`DIFFICULTY_LABELS`; `"unlabelled"` stands for a version with no
+  screen): the console passes all four so the difficulty label is a chip and a filter, never a default exclusion.
+  Without the keyword (every other caller: the readers' `leaderboard`, the frontier gate) nothing changes.
 - `blank_exchange`: the public view of an exchange (evaluator-only columns emptied).
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from collections import Counter
 from decimal import ROUND_HALF_EVEN, Decimal
 
@@ -122,13 +125,32 @@ def funnel(rows: Iterable[M.CandidateRow]) -> list[M.FunnelStep]:
 funnel_steps = funnel
 
 
-def gate_passes(s: M.ScenarioRow, include_saturated: bool = False) -> bool:
-    if s.validation_status != "valid":
-        return False
-    if s.difficulty_tier != "informative" and not (include_saturated and s.difficulty_tier == "saturated"):
-        return False
+DIFFICULTY_LABELS: tuple[str, ...] = ("informative", "saturated", "broken", "unlabelled")
+
+
+def difficulty_label(s: M.ScenarioRow) -> str:
+    """The version's screen label, `"unlabelled"` when no difficulty screen has run (one of `DIFFICULTY_LABELS`)."""
+    return s.difficulty_tier or "unlabelled"
+
+
+def task_sense_passes(s: M.ScenarioRow) -> bool:
+    """The task-sense audit's two board checks: coherent and fair tests."""
     task_sense = s.task_sense or {}
     return bool(task_sense.get("coherent")) and bool(task_sense.get("fair_tests"))
+
+
+def gate_passes(s: M.ScenarioRow, include_saturated: bool = False, *, difficulty_labels: Collection[str] | None = None) -> bool:
+    """Interfaces §9.1. `difficulty_labels=None` keeps the screen gate (`informative`, plus `saturated` when asked, `broken`
+    never); an explicit collection admits exactly the versions whose `difficulty_label` is in it (the console's default is
+    every label, so difficulty never hides a valid, audited scenario there)."""
+    if s.validation_status != "valid":
+        return False
+    if difficulty_labels is None:
+        if s.difficulty_tier != "informative" and not (include_saturated and s.difficulty_tier == "saturated"):
+            return False
+    elif difficulty_label(s) not in difficulty_labels:
+        return False
+    return task_sense_passes(s)
 
 
 def scenario_for_trial(t: M.TrialRow, versions: list[M.ScenarioRow]) -> M.ScenarioRow | None:
@@ -147,7 +169,9 @@ def scenario_for_trial(t: M.TrialRow, versions: list[M.ScenarioRow]) -> M.Scenar
     return max(versions, key=lambda s: s.version)
 
 
-def compute_leaderboard(trials: Iterable[M.TrialRow], scenarios: Iterable[M.ScenarioRow], f: M.LeaderboardFilter) -> list[M.LeaderboardRow]:
+def compute_leaderboard(trials: Iterable[M.TrialRow], scenarios: Iterable[M.ScenarioRow], f: M.LeaderboardFilter, *,
+                        difficulty_labels: Collection[str] | None = None) -> list[M.LeaderboardRow]:
+    """`difficulty_labels` is passed to `gate_passes`; None (the default) is the filter's own `include_saturated` gate."""
     by_sid: dict[str, list[M.ScenarioRow]] = {}
     for s in scenarios:
         by_sid.setdefault(s.scenario_id, []).append(s)
@@ -160,7 +184,7 @@ def compute_leaderboard(trials: Iterable[M.TrialRow], scenarios: Iterable[M.Scen
         if (f.model and t.model not in f.model) or (f.provider and t.provider not in f.provider) or (f.scenario_id and t.scenario_id not in f.scenario_id):
             continue
         s = scenario_for_trial(t, by_sid.get(t.scenario_id, []))
-        if s is None or not gate_passes(s, f.include_saturated) or (f.source and s.source not in f.source):
+        if s is None or not gate_passes(s, f.include_saturated, difficulty_labels=difficulty_labels) or (f.source and s.source not in f.source):
             continue
         cohort, label = cohort_of(t)
         if f.evaluation_cohort and cohort != f.evaluation_cohort:
