@@ -34,6 +34,7 @@ TrialStatus = Literal["planned", "launched", "running", "completed", "runner-err
 ExchangeRole = Literal["agent", "stakeholder", "system"]
 ExchangeKind = Literal["ask", "confirm", "review", "system"]
 WorkflowStatus = Literal["running", "completed", "failed", "cancelled", "terminated", "timed_out", "continued_as_new"]
+WorkflowLifecycleSource = Literal["workflow", "temporal", "harbor"]
 CostRole = Literal["solver", "judge", "drafter", "stakeholder", "withholder", "audit", "probe", "validation"]
 ActionResult = Literal["accepted", "rejected", "failed"]
 DiscoveryBand = Literal["bugfix", "feature"]
@@ -92,6 +93,29 @@ class CandidateRow(Provenance):
     judged_at: AwareDatetime | None
     scenario_id: str | None
     version: int | None
+    candidates_path: str | None = None
+
+
+class CandidateEventRow(Provenance):
+    """Durable stage/terminal receipt, table candidate_events, pk event_id."""
+
+    event_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_key: str
+    instance_id: str
+    candidates_path: str | None = None
+    scenario_id: str | None = None
+    version: int | None = None
+    spec_hash: str | None = None
+    phase: str
+    result_status: str | None = None
+    stage: FunnelStage
+    status: CandidateStatus
+    gate: str | None = None
+    reasons: list[str] = Field(default_factory=list)
+    terminal: bool
+    occurred_at: AwareDatetime
+    workflow_id: str
+    run_id: str
 
 
 def discovery_identity(source_key: str, artifact_sha256: str, workflow_id: str | None, run_id: str | None) -> str:
@@ -213,6 +237,7 @@ class WorkflowRow(Provenance):
     task_queue: str | None
     cost_usd: Decimal | None
     search_attributes: dict
+    lifecycle_source: WorkflowLifecycleSource | None = None
 
 
 class CostRow(Provenance):

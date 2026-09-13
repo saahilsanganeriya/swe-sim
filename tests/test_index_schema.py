@@ -26,7 +26,7 @@ EXPECTED_PK = {
     "scenarios": ("scenario_id", "version"), "candidates": ("instance_id", "source_key"), "trials": ("trial_id",),
     "exchanges": ("trial_id", "seq"), "scores": ("scenario_id", "spec_hash", "condition", "brief_profile", "model", "run_config_hash"),
     "workflows": ("workflow_id", "run_id"), "costs": ("cost_id",), "operator_actions": ("action_id",), "index_rebuilds": ("rebuild_id",),
-    "discoveries": ("source_key", "discovery_id"),
+    "discoveries": ("source_key", "discovery_id"), "candidate_events": ("event_id",),
 }
 NOW = datetime(2026, 9, 13, 8, 0, tzinfo=UTC)
 
@@ -135,11 +135,11 @@ def test_migration_creates_the_metadata_exactly_and_is_idempotent(tmp_path: Path
     insp = sa.inspect(store.engine)
     assert set(S.TABLES) <= set(insp.get_table_names()) and "alembic_version" in insp.get_table_names()
     with store.engine.connect() as conn:
-        assert conn.execute(sa.text("select version_num from alembic_version")).scalar_one() == "0003_measurement_cohorts"
+        assert conn.execute(sa.text("select version_num from alembic_version")).scalar_one() == "0004_history"
         diff = compare_metadata(MigrationContext.configure(conn), S.metadata)
     assert diff == [], diff
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == ["0003_measurement_cohorts"]
+    assert script.get_heads() == ["0004_history"]
 
 
 def test_discovery_migration_preserves_existing_v1_rows(tmp_path: Path):

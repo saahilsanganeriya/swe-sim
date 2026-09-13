@@ -82,6 +82,22 @@ def test_candidate_probe_evidence_and_job_paths(layout: Layout):
         layout.workflow_costs_path("../x")
 
 
+def test_history_snapshot_paths(layout: Layout):
+    """Immutable row snapshots (P1-5/P1-7): `evidence/history/<kind>/<identity sha256>/<revision sha256>.json`."""
+    root = layout.root
+    identity, revision = "a" * 64, "b" * 64
+    for kind in ("workflows", "operator_actions", "index_rebuilds", "candidate_events"):
+        assert layout.history_dir(kind) == root / "evidence" / "history" / kind
+        assert layout.history_snapshot(kind, identity, revision) == root / "evidence" / "history" / kind / identity / f"{revision}.json"
+    with pytest.raises(LayoutError):
+        layout.history_dir("trials-of-doom")
+    with pytest.raises(LayoutError):
+        layout.history_snapshot("workflows", "../escape", revision)
+    with pytest.raises(LayoutError):
+        layout.history_snapshot("workflows", identity, "short")
+    assert layout.reconciliation_checkpoint() == root / "evidence" / "history" / "temporal-reconcile.json"
+
+
 def test_ids_are_validated(layout: Layout):
     for bad in ("", "A", "Upper-Case", "../x", "a/b", "x" * 65):
         with pytest.raises(LayoutError):

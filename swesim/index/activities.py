@@ -207,6 +207,7 @@ def index_workflow(p: dict, settings: Settings | None = None) -> dict:
             workflow_id=str(workflow_id), run_id=str(run_id), type=str(type_), parent_workflow_id=P._str(p.get("parent_workflow_id")), status=status,
             params_summary=params if isinstance(params, dict) else {}, failure=P._str(p.get("failure")), started_at=started_at, closed_at=closed_at,
             task_queue=P._str(p.get("task_queue")), cost_usd=P.dec(p.get("cost_usd")), search_attributes=attrs if isinstance(attrs, dict) else {},
+            lifecycle_source=p.get("lifecycle_source") or "workflow",
             created_at=existing.created_at if existing else now, updated_at=now, worker_image_digest=s.worker_image_digest, origin=s.origin)
     except ValueError as e:
         raise _projection_error(f"workflow {workflow_id}: {e}") from e

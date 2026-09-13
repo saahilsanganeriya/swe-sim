@@ -26,9 +26,11 @@ def record(tmp_path_factory) -> Record:
 
 
 @pytest.fixture
-def settings(tmp_path) -> Settings:
+def settings(tmp_path, record: Record) -> Settings:
+    """The store publishes history snapshots into `Settings.workspace`: the same record the rebuild reads."""
     return Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env"), "SWESIM_SPEND_CAP_USD": "100", "SWESIM_ORIGIN": "laptop",
-                              "SWESIM_WORKER_IMAGE_DIGEST": "sha256:" + "1" * 64})
+                              "SWESIM_WORKER_IMAGE_DIGEST": "sha256:" + "1" * 64, "SWESIM_WORKSPACE": str(record.layout.root),
+                              "SWESIM_REGISTRY": str(record.registry_path)})
 
 
 @pytest.fixture
@@ -70,7 +72,7 @@ def test_ensure_migrated_is_the_workers_startup_step(tmp_path, caplog):
         assert ensure_migrated(enabled) is True
         assert ensure_migrated(enabled) is True  # idempotent: nothing to do the second time
     lines = [r.getMessage() for r in caplog.records if r.name == "swesim.index.store"]
-    assert len(lines) == 2 and all("0003_measurement_cohorts" in line for line in lines) and "migrated from empty" in lines[0] and "migrated" not in lines[1]
+    assert len(lines) == 2 and all("0004_history" in line for line in lines) and "migrated from empty" in lines[0] and "migrated" not in lines[1]
     assert not any(url in line or "index.db" in line for line in lines)
     assert IndexStore(url).trials(M.TrialFilter()).total == 0  # the tables exist
 
@@ -102,7 +104,8 @@ def test_rebuild_reprojects_every_file_and_reports_counts_and_skips(rebuilt, rec
     assert row.counts["skipped"]["scenarios"] == [] and row.counts["projected"]["trials"] == row.counts["trials"]
     assert row.diff["trials"] == {"before": 0, "after": row.counts["trials"], "delta": row.counts["trials"]}
     assert row.origin == "laptop" and row.worker_image_digest == "sha256:" + "1" * 64 and row.finished_at >= row.started_at
-    assert [r.rebuild_id for r in store.rebuilds()] == [row.rebuild_id]
+    assert store.rebuilds()[0].rebuild_id == row.rebuild_id and "index_rebuilds" not in row.diff  # the log's own growth is not drift
+    assert row.counts["operator_actions"] == 1 and row.counts["projected"]["operator_actions"] == 1  # the console's file-mode log is history too
 
 
 def test_rebuild_removes_rows_the_files_no_longer_have_and_keeps_activity_fed_tables(rebuilt, record: Record):
@@ -121,7 +124,7 @@ def test_rebuild_removes_rows_the_files_no_longer_have_and_keeps_activity_fed_ta
     ids = {c.cost_id for c in store.costs(M.CostFilter())}
     assert "01J8Z0000000000000000JUDGE" not in ids and "01J8Z0000000000000000JUDG1" in ids and len(ids) == 5 and second.diff["costs"]["delta"] == -1
     assert store.trial(record.tids["done"]).origin == "vm-systemd"  # the rebuild's origin labels rows whose files carry none
-    assert [r.rebuild_id for r in store.rebuilds()] == [second.rebuild_id, first.rebuild_id]
+    assert [r.rebuild_id for r in store.rebuilds()][:2] == [second.rebuild_id, first.rebuild_id]  # earlier rebuilds come back from their snapshots
 
 
 def test_sql_reader_filters_pages_and_orders(rebuilt, record: Record):
@@ -192,7 +195,7 @@ def test_sql_reader_leaderboard_spend_costs_and_tables(rebuilt, record: Record):
                                  confirmed=True, origin_header=None, result="accepted", workflow_id=None, at=datetime(2026, 9, 13, 12, tzinfo=UTC), origin="cloudrun")
     store.add_operator_action(action)
     store.add_operator_action(action)
-    assert store.operator_actions(M.PageFilter()).total == 1 and store.table("operator_actions", M.TableFilter()).items[0]["actor"] == "a@example.com"
+    assert store.operator_actions(M.PageFilter(q="rebuild-index")).total == 1 and store.table("operator_actions", M.TableFilter()).items[0]["actor"] == "a@example.com"
 
 
 def test_advisory_lock_on_sqlite_is_exclusive_per_key_within_the_process(store: IndexStore):

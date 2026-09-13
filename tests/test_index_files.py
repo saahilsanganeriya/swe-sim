@@ -74,14 +74,16 @@ def test_file_reader_matches_the_sql_reader(readers, record: Record):
         files.trials(M.TrialFilter(order_by="bogus"))
 
 
-def test_file_reader_reads_jobs_actions_and_has_no_rebuilds(readers, record: Record):
-    files, _sql = readers
+def test_file_reader_reads_jobs_actions_and_rebuild_history(readers, record: Record):
+    files, sql = readers
     page = files.workflows(M.WorkflowFilter())
     assert page.total == 1 and page.items[0].workflow_id == record.tids["done"] and files.workflow(record.tids["done"]).status == "completed"
     assert files.workflows(M.WorkflowFilter(status=["failed"])).total == 0 and files.workflow("nope") is None
     actions = files.operator_actions(M.PageFilter())
     assert actions.total == 1 and actions.items[0].action == "run-tasks" and actions.items[0].at == datetime(2026, 9, 13, 12, tzinfo=UTC)
-    assert files.rebuilds() == [] and files.table("index_rebuilds", M.TableFilter()).total == 0
+    # the SQL rebuild published its own snapshot into the record: the file reader sees the same rebuild history
+    assert [r.rebuild_id for r in files.rebuilds()] == [r.rebuild_id for r in sql.rebuilds()] and files.rebuilds()
+    assert files.table("index_rebuilds", M.TableFilter()).total == len(sql.rebuilds())
     assert files.table("workflows", M.TableFilter()).items[0]["workflow_id"] == record.tids["done"]
 
 

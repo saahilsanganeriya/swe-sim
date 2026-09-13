@@ -10,11 +10,14 @@ Contract
   SQLite): running it twice leaves one row; `updated_at` bumps, `created_at` keeps the first value.
 - `advisory_lock(key)` is `pg_advisory_xact_lock(hashtext(key))` held for a transaction on Postgres and a
   process-local lock on SQLite. It replaces `registry.json.lock`, which GCS FUSE cannot honour across instances.
-- `rebuild_from_layout()` projects every file into rows first (reads outside the transaction), then truncates the
-  file-backed tables (scenarios, candidates, discoveries, trials, exchanges, scores, costs) and inserts the projection in one
-  transaction, so readers never see a half-built index. Tables the files cannot rebuild (workflows: Temporal state;
-  operator_actions: the console's audit; index_rebuilds) are kept. The returned `IndexRebuildRow` carries the row
-  counts after the rebuild, the per-table diff against before, and every skipped id with its reason.
+- `rebuild_from_layout()` projects every file into rows first (reads outside the transaction), then truncates every
+  table and inserts the projection in one transaction, so readers never see a half-built index. The tables the
+  pipeline's files do not describe (workflows: the workflows' own reports and the Temporal reconciler; operator_actions:
+  the console's audit; candidate_events: stage/decision receipts; index_rebuilds) are rebuilt from the immutable row
+  snapshots under `Layout.history_dir` (`swesim.storage.history`), which every writer publishes *before* its SQL upsert:
+  a fresh database rebuilt from the bucket equals the live one. The returned `IndexRebuildRow` carries the row counts
+  after the rebuild, the per-table diff against before, and every skipped id with its reason; it is itself snapshotted
+  before it is inserted.
 - Reads return the row models; invalid input (unknown table, unknown order_by/where column) raises `ValueError`.
 """
 from __future__ import annotations
@@ -36,16 +39,22 @@ from pydantic import BaseModel, SecretStr
 from sqlalchemy.pool import StaticPool
 from ulid import ULID
 
+from swesim.index import history as H
 from swesim.index import models as M
 from swesim.index import project as P
 from swesim.index import reports as R
 from swesim.index import schema as S
 from swesim.settings import Settings, get_settings
+from swesim.storage.history import persist_row
 from swesim.storage.layout import Layout
 
 log = logging.getLogger(__name__)
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
-REBUILT_TABLES: tuple[str, ...] = ("exchanges", "costs", "scores", "trials", "candidates", "discoveries", "scenarios")  # delete order (children first)
+# delete order (children first); the last four are rebuilt from the immutable history snapshots, the rest from the pipeline's files
+REBUILT_TABLES: tuple[str, ...] = ("exchanges", "costs", "scores", "trials", "candidates", "discoveries", "scenarios",
+                                   "candidate_events", "operator_actions", "workflows", "index_rebuilds")
+HISTORY_TABLES: tuple[str, ...] = ("workflows", "operator_actions", "index_rebuilds", "candidate_events")
+HISTORY_LOCK = "swesim.index.history-and-rebuild"
 BATCH = 500
 RANGES: dict[str, tuple[str, str]] = {"started_from": ("started_at", ">="), "started_to": ("started_at", "<="),
                                       "judged_from": ("judged_at", ">="), "judged_to": ("judged_at", "<="),
@@ -53,7 +62,7 @@ RANGES: dict[str, tuple[str, str]] = {"started_from": ("started_at", ">="), "sta
 CONTROL_FIELDS: frozenset[str] = frozenset({"offset", "limit", "order_by", "desc", "q", "latest_only", "min_n", "where"})
 DEFAULT_ORDER: dict[str, str] = {"scenarios": "scenario_id", "candidates": "instance_id", "trials": "started_at", "scores": "scenario_id",
                                  "workflows": "started_at", "costs": "at", "operator_actions": "at", "index_rebuilds": "started_at",
-                                 "exchanges": "seq", "discoveries": "discovered_at"}
+                                 "exchanges": "seq", "discoveries": "discovered_at", "candidate_events": "occurred_at"}
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -198,7 +207,7 @@ class IndexStore:
 
     def upsert_discovery(self, row: M.DiscoveryRow) -> None:
         """Preserve the first immutable observation; replaying its activity cannot rewrite history."""
-        with self.engine.begin() as conn:
+        with self.locked_transaction(HISTORY_LOCK) as conn:
             stmt = self._insert(S.discoveries).values(**row.model_dump(mode="python"))
             conn.execute(stmt.on_conflict_do_nothing(index_elements=S.PRIMARY_KEYS["discoveries"]))
 
@@ -214,8 +223,26 @@ class IndexStore:
     def upsert_scores(self, rows: Iterable[M.ScoreRow]) -> int:
         return self._upsert(S.scores, rows)
 
+    # ------------------------------------------------------------------ history-backed writes (snapshot first, SQL second)
+    def history_layout(self) -> Layout:
+        """Where the immutable row snapshots live: the record root (`Settings.workspace`, the bucket mount when hosted)."""
+        return Layout(root=self.settings.workspace)
+
+    def _publish(self, row: BaseModel) -> None:
+        """The durable half of a history-backed write. Raises before any SQL is touched when the record cannot be written,
+        so a row is never visible in the disposable index without its snapshot in the record."""
+        persist_row(self.history_layout(), row, self._settings)
+
     def upsert_workflow(self, row: M.WorkflowRow) -> None:
-        self._upsert(S.workflows, [row])
+        """Snapshot the report as made, then let a server-observed terminal state win over a late `running` hook (the same
+        precedence `swesim.index.history.choose_workflow` applies when the snapshots are reprojected)."""
+        from swesim.index.history import choose_workflow
+        self._publish(row)
+        with self.locked_transaction(HISTORY_LOCK) as conn:
+            data = conn.execute(sa.select(S.workflows).where(S.workflows.c.workflow_id == row.workflow_id,
+                                                           S.workflows.c.run_id == row.run_id)).mappings().first()
+            chosen = choose_workflow(M.WorkflowRow.model_validate(dict(data)) if data else None, row)
+            self._upsert(S.workflows, [chosen], conn)
 
     def add_cost(self, row: M.CostRow) -> None:
         self._upsert(S.costs, [row])
@@ -224,7 +251,25 @@ class IndexStore:
         return self._upsert(S.costs, rows)
 
     def add_operator_action(self, row: M.OperatorActionRow) -> None:
+        self._publish(row)
         self._upsert(S.operator_actions, [row])
+
+    def upsert_candidate_event(self, row: M.CandidateEventRow) -> None:
+        self._publish(row)
+        self._upsert(S.candidate_events, [row])
+
+    @contextmanager
+    def locked_transaction(self, key: str) -> Iterator[sa.Connection]:
+        """One transaction holding the advisory lock on the same connection it writes with (Postgres); the process-local
+        lock around a transaction on SQLite."""
+        if self.engine.dialect.name == "postgresql":
+            with self.engine.begin() as conn:
+                conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
+                yield conn
+        else:
+            with self.advisory_lock(key):
+                with self.engine.begin() as conn:
+                    yield conn
 
     # ------------------------------------------------------------------ locking
     @contextmanager
@@ -289,7 +334,19 @@ class IndexStore:
             trial_rows.append(t)
             exchange_rows.extend(ex)
             cost_rows.extend(cs)
-        with self.engine.begin() as conn:
+        # The history-backed tables: every snapshot the writers published, reprojected (a corrupt snapshot is a skip, not a guess).
+        history_rows: dict[str, list[BaseModel]] = {}
+        for name, project in (("workflows", H.workflow_rows), ("operator_actions", H.action_rows),
+                              ("index_rebuilds", H.rebuild_rows), ("candidate_events", H.candidate_events)):
+            try:
+                history_rows[name] = list(project(layout, settings))
+            except ValueError as e:
+                history_rows[name] = []
+                skipped[name] = [{"id": layout.relative(layout.history_dir(name)), "reason": str(e)[:300]}]
+        projected = {"scenarios": len(scenario_rows), "candidates": len(candidate_rows), "trials": len(trial_rows), "exchanges": len(exchange_rows),
+                     "scores": len(score_rows), "costs": len(cost_rows), "discoveries": len(discovery_rows),
+                     **{name: len(rows) for name, rows in history_rows.items()}}
+        with self.locked_transaction(HISTORY_LOCK) as conn:
             before = self._counts(conn)
             for name in REBUILT_TABLES:
                 conn.execute(sa.delete(S.TABLES[name]))
@@ -300,14 +357,18 @@ class IndexStore:
             self._upsert(S.exchanges, exchange_rows, conn)
             self._upsert(S.scores, score_rows, conn)
             self._upsert(S.costs, cost_rows, conn)
+            for name in HISTORY_TABLES:
+                self._upsert(S.TABLES[name], history_rows[name], conn)
             after = self._counts(conn)
+            after["index_rebuilds"] += 1  # this row
+            # The diff answers "did the index drift from the record?": the rebuild log's own growth (+1 per rebuild) is not drift.
             row = M.IndexRebuildRow(
-                rebuild_id=str(ULID()), started_at=started, finished_at=M.utcnow(),
-                counts={**after, "skipped": skipped, "projected": {"scenarios": len(scenario_rows), "candidates": len(candidate_rows),
-                                                                   "trials": len(trial_rows), "exchanges": len(exchange_rows),
-                                                                   "scores": len(score_rows), "costs": len(cost_rows), "discoveries": len(discovery_rows)}},
-                diff={name: {"before": before[name], "after": after[name], "delta": after[name] - before[name]} for name in after},
+                rebuild_id=str(ULID()), started_at=started, finished_at=M.utcnow(), counts={**after, "skipped": skipped, "projected": projected},
+                diff={name: {"before": before[name], "after": after[name], "delta": after[name] - before[name]} for name in after if name != "index_rebuilds"},
                 origin=origin, worker_image_digest=settings.worker_image_digest)
+            # This rebuild's own row is history too: its snapshot is published (into the layout being rebuilt) before it is
+            # inserted, and a failed publication rolls the whole rebuild back, so the next fresh database rebuilds it as well.
+            persist_row(layout, row, self._settings)
             self._upsert(S.index_rebuilds, [row], conn)
         return row
 
