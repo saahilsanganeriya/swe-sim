@@ -6,7 +6,9 @@ Contract
 - A missing or malformed file is an empty state, never an exception, *except* when the identity of a row cannot be
   established (a trial without scenario id / spec hash / run config hash, a scenario without a source, a scores
   group without a spec hash): that raises `ProjectionError(ValueError)` so the caller can record the skip instead
-  of inventing a row. Nullable columns stay None when the files do not say.
+  of inventing a row. Nullable columns stay None when the files do not say. A scenario that nothing identifies *yet*
+  (no spec file and no registry entry: the candidate is still being judged, probed or drafted) raises the subclass
+  `NoScenarioFiles`, which a hook reports as "nothing to index yet" rather than as a failure.
 - Money is `Decimal` (through `dec`), never float. Times are tz-aware UTC (through `aware`): epoch numbers and ISO
   strings are accepted; a naive ISO string is taken as UTC.
 - `origin` is the file's own label when it carries one, else the caller's (`Settings.origin`).
@@ -54,6 +56,16 @@ _PR_RE = re.compile(r"-(\d+)$")
 
 class ProjectionError(ValueError):
     """The files do not identify a row; the caller records the skip rather than guessing."""
+
+
+class NoScenarioFiles(ProjectionError):
+    """Nothing identifies the scenario yet: no spec file (`scenario.json` / `scenario.draft.json`) and no registry entry.
+    An expected state while the candidate workflow is judging, probing or drafting; `reason` is the short operator-facing text."""
+
+    def __init__(self, scenario_id: str, reason: str) -> None:
+        super().__init__(f"{scenario_id}: {reason}")
+        self.scenario_id = scenario_id
+        self.reason = reason
 
 
 # ----------------------------------------------------------------------------- primitives
@@ -222,7 +234,9 @@ def scenario_ids(layout: Layout, registry: dict[str, dict] | None = None) -> lis
 
 def project_scenario(layout: Layout, scenario_id: str, version: int | None = None, *, registry: dict[str, dict] | None = None,
                      origin: str | None = None, now: datetime | None = None) -> M.ScenarioRow:
-    """One scenario version. `version=None` is the current one; an archived version reads `archive/v<version>/`."""
+    """One scenario version. `version=None` is the current one; an archived version reads `archive/v<version>/`. A version
+    requested while the files record none yet (the candidate workflow indexes `version: 1` after every stage, from judging on)
+    is the version in progress, not an unknown archive."""
     registry = project_registry(layout) if registry is None else registry
     origin = _default_origin(origin)
     now = now or M.utcnow()
@@ -232,24 +246,27 @@ def project_scenario(layout: Layout, scenario_id: str, version: int | None = Non
     current = scenario_version_of(files) or (_int(entry.get("version")) if entry else None)
     archived_at: datetime | None = None
     entry_json: dict | None = entry
-    if version is not None and version != current:
-        adir = layout.scenario_archive_dir(scenario_id, version)
-        if not adir.is_dir():
-            raise ProjectionError(f"{scenario_id}: no version {version} (current {current})")
+    adir = layout.scenario_archive_dir(scenario_id, version) if version is not None and version != current else None
+    archived = adir is not None and adir.is_dir()
+    if archived:
         present, files = _scenario_files(adir)
         status = "archived"
         archived_at = aware(files["archived.json"].get("at")) or mtime(adir / "archived.json") or mtime(adir)
         row_version = version
         entry_json = None
+    elif adir is not None and current is not None:
+        raise ProjectionError(f"{scenario_id}: no version {version} (current {current})")
     else:
         if not present and entry is None:
-            raise ProjectionError(f"{scenario_id}: no scenario files and no registry entry")
+            raise NoScenarioFiles(scenario_id, "no scenario files yet")
         status = validation_status_of(present, files) if present else _registry_status(entry or {})
-        row_version = current or 1  # ScenarioSpec.version defaults to 1
+        row_version = current or version or 1  # ScenarioSpec.version defaults to 1
     spec = files["scenario.json"] or files["scenario.draft.json"]
     source = _str(spec.get("source")) or _str((entry or {}).get("source"))
     source_ref = _str(spec.get("source_ref")) or _str((entry or {}).get("source_ref"))
     if not source or not source_ref:
+        if not spec and entry is None and not archived:  # only judge.json / draft.meta.json so far: the draft is not written yet
+            raise NoScenarioFiles(scenario_id, "no scenario spec yet")
         raise ProjectionError(f"{scenario_id}: source and source_ref are unknown")
     approval, compiled, validation, meta = files["approval.json"], files["compile.json"], files["validation.json"], files["draft.meta.json"]
     spec_hash = _first(approval, compiled, validation, meta, key="spec_hash") or (_str((entry or {}).get("spec_hash")) if entry_json is not None else None)
@@ -797,7 +814,7 @@ def project_workflows_from_jobs(layout: Layout, *, origin: str | None = None, no
     return rows
 
 
-__all__ = ["ProjectionError", "aware", "dec", "mtime", "provider_of", "scenario_id_for", "pr_number_of", "read_json",
+__all__ = ["ProjectionError", "NoScenarioFiles", "aware", "dec", "mtime", "provider_of", "scenario_id_for", "pr_number_of", "read_json",
            "project_registry", "scenario_ids", "scenario_version_of", "validation_status_of", "project_scenario", "project_scenario_versions",
            "source_keys", "discovery_source_keys", "project_discovery", "project_discoveries", "read_discovery_snapshot",
            "project_candidates", "candidate_events_by_identity", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_workflow_costs",

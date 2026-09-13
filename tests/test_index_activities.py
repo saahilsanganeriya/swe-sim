@@ -16,10 +16,12 @@ from swesim.index import models as M
 from swesim.settings import QUEUES, Settings, get_settings, reset_settings
 from swesim.workflows import queues as Q
 
+from swesim.storage.layout import Layout
+
 try:
-    from test_index_project import SID, Record, build_record
+    from test_index_project import SID, Record, _w, build_record
 except ImportError:  # pragma: no cover
-    from tests.test_index_project import SID, Record, build_record
+    from tests.test_index_project import SID, Record, _w, build_record
 
 NAMES = ["index_scenario_activity", "index_candidate_activity", "index_trial_activity", "index_score_activity", "index_workflow_activity",
          "index_rebuild_activity", "index_discovery_activity", "index_candidate_event_activity"]
@@ -106,8 +108,7 @@ def test_scenario_candidate_and_score_activities(enabled: Settings, record: Reco
     assert store.scenarios(M.ScenarioFilter()).total == 2
     with pytest.raises(ApplicationError):
         run(IA.index_scenario_activity, {"scenario_id": SID, "version": 9})
-    with pytest.raises(ApplicationError):
-        run(IA.index_scenario_activity, {"scenario_id": "no-such-scenario"})
+    assert run(IA.index_scenario_activity, {"scenario_id": "no-such-scenario"}) == {"indexed": False, "reason": "no scenario files yet"}
     assert run(IA.index_candidate_activity, {"source_key": "swebench-annotated", "instance_id": "other__lib-12"}) == {"indexed": True, "rows": 1}
     assert store.candidates(M.CandidateFilter()).items[0].status == "rejected"
     with pytest.raises(ApplicationError):
@@ -115,6 +116,38 @@ def test_scenario_candidate_and_score_activities(enabled: Settings, record: Reco
     assert run(IA.index_score_activity, {"scenario_id": SID}) == {"indexed": True, "rows": 2}
     assert run(IA.index_score_activity, {"scenario_id": "second-scenario"}) == {"indexed": True, "rows": 0}
     assert len(store.scores(M.ScoreFilter())) == 2
+
+
+def test_scenario_activity_reports_nothing_to_index_while_the_candidate_is_in_progress(tmp_path):
+    """The candidate workflow's hook fires with `version: 1` after judging and probing, before the drafter has written a file:
+    an expected state the hook must report, never fail on (hosted: `ProjectionError: pytest-dev--pytest-7283: no version 1
+    (current None)` on every candidate). Each later file set projects the row it can."""
+    settings = Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env"), "SWESIM_DATABASE_URL": f"sqlite:///{tmp_path / 'index.db'}",
+                                  "SWESIM_WORKSPACE": str(tmp_path / "record"), "SWESIM_REGISTRY": str(tmp_path / "record" / "registry.json"),
+                                  "SWESIM_ORIGIN": "cloudrun"})
+    store = IA.store_for(settings); store.migrate()
+    try:
+        sid = "pytest-dev--pytest-7283"; p = {"scenario_id": sid, "version": 1}
+        nothing = {"indexed": False, "reason": "no scenario files yet"}
+        assert IA.index_scenario(p, settings) == nothing and IA.index_scenario({"scenario_id": sid}, settings) == nothing
+        sdir = Layout(root=settings.workspace).scenario_dir(sid)
+        _w(sdir / "judge.json", {"keep": True, "verified_rubric_score": 2, "complexity": 3})
+        assert IA.index_scenario(p, settings) == {"indexed": False, "reason": "no scenario spec yet"}
+        assert store.scenarios(M.ScenarioFilter()).total == 0
+        _w(sdir / "scenario.draft.json", {"id": sid, "version": 1, "source": "swebench-annotated", "source_ref": "pytest-dev__pytest-7283"})
+        _w(sdir / "draft.meta.json", {"version": 1, "spec_hash": "h" * 64})
+        assert IA.index_scenario(p, settings) == {"indexed": True, "rows": 1}
+        drafted = store.scenario(sid, 1)
+        assert drafted.validation_status == "drafting" and drafted.spec_hash == "h" * 64 and drafted.source_ref == "pytest-dev__pytest-7283"
+        _w(sdir / "scenario.json", {"id": sid, "version": 1, "source": "swebench-annotated", "source_ref": "pytest-dev__pytest-7283"})
+        _w(sdir / "validation.json", {"status": "valid", "failures": [], "spec_hash": "h" * 64, "compiled_hash": "c" * 64})
+        assert IA.index_scenario(p, settings) == {"indexed": True, "rows": 1}
+        assert store.scenario(sid, 1).validation_status == "valid" and store.scenarios(M.ScenarioFilter()).total == 1
+        with pytest.raises(ApplicationError) as e:  # a version the record does not have is still a projection error
+            IA.index_scenario({"scenario_id": sid, "version": 3}, settings)
+        assert e.value.type == "projection" and e.value.non_retryable
+    finally:
+        IA.reset_store()
 
 
 def test_workflow_activity_keeps_started_at_and_closes_terminal_rows(enabled: Settings):

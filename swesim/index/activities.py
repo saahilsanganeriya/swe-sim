@@ -14,7 +14,9 @@ Contract
   `{"indexed": False, "reason": "index disabled"}`. Discovery still freezes its immutable file snapshot and requires
   a valid source payload; it also returns the snapshot's discovery_id.
 - A payload or record that cannot identify a row raises `ApplicationError(type="projection", non_retryable=True)`;
-  transient database errors propagate unchanged so Temporal retries them (`retries.HOOK`).
+  transient database errors propagate unchanged so Temporal retries them (`retries.HOOK`). One expected state is not a
+  failure: `index_scenario_activity` for a candidate whose scenario directory holds no spec yet (still judging, probing or
+  drafting) returns `{"indexed": False, "reason": "no scenario files yet"}` (`P.NoScenarioFiles`).
 - Payloads carry ids and artifact references. Discovery additionally carries provenance (workflow/run, band and time).
   `index_workflow_activity` also carries state: the workflow itself is the source of
   Temporal state, so its payload carries the row's fields (`workflow_id, run_id, type, status, params_summary,
@@ -80,7 +82,8 @@ def _layout(s: Settings) -> Layout:
 # ----------------------------------------------------------------------------- synchronous bodies (tested directly)
 
 def index_scenario(p: dict, settings: Settings | None = None) -> dict:
-    """`{"scenario_id", "version"}`: one version when given, else the current one plus every archived version."""
+    """`{"scenario_id", "version"}`: one version when given, else the current one plus every archived version. Nothing to
+    index yet (no spec file, no registry entry: the candidate is still being judged, probed or drafted) is reported, not raised."""
     s = settings or get_settings()
     store = store_for(s)
     if store is None:
@@ -94,6 +97,8 @@ def index_scenario(p: dict, settings: Settings | None = None) -> dict:
             rows = P.project_scenario_versions(layout, sid, registry=registry, origin=s.origin)
         else:
             rows = [P.project_scenario(layout, sid, int(version), registry=registry, origin=s.origin)]
+    except P.NoScenarioFiles as e:
+        return {"indexed": False, "reason": e.reason}
     except (ValueError, TypeError) as e:  # ProjectionError, LayoutError, ValidationError, a non-integer version
         raise _projection_error(f"scenario {sid}: {e}") from e
     return {"indexed": True, "rows": store.upsert_scenarios(rows)}
