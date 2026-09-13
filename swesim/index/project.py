@@ -562,6 +562,37 @@ def project_costs(trial_id: str, path: Path, *, origin: str, now: datetime | Non
     return rows, tokens_in, tokens_out, usd_total
 
 
+def project_workflow_costs(layout: Layout, *, origin: str | None = None, now: datetime | None = None) -> list[M.CostRow]:
+    """Priced cost records of workflows without a trial (`root/costs/<workflow_id>.json`, written by
+    `swesim.costs.record_cost`). A file that is not a list of records raises `ProjectionError`."""
+    origin = _default_origin(origin)
+    now = now or M.utcnow()
+    cdir = layout.costs_dir()
+    if not cdir.is_dir():
+        return []
+    rows: list[M.CostRow] = []
+    for path in sorted(cdir.glob("*.json")):
+        workflow_id = path.name[: -len(".json")]
+        data = read_json(path)
+        if not isinstance(data, list):
+            raise ProjectionError(f"{path}: costs file must be a list of cost records")
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise ProjectionError(f"{path}[{i}]: not a cost record")
+            if item.get("usd") is None:
+                continue
+            fields = {k: v for k, v in item.items() if k in M.CostRow.model_fields}
+            fields["origin"] = _origin(fields.get("origin")) or origin
+            fields.setdefault("workflow_id", workflow_id)
+            fields.setdefault("created_at", now)
+            fields["updated_at"] = now
+            try:
+                rows.append(M.CostRow(**fields))
+            except ValidationError as e:
+                raise ProjectionError(f"{path}[{i}]: {e.error_count()} invalid field(s): {[err['loc'] for err in e.errors()]}") from e
+    return rows
+
+
 # ----------------------------------------------------------------------------- scores
 
 def _spec_hash_of_trials(layout: Layout, trial_ids_: list) -> str | None:
@@ -658,5 +689,5 @@ def project_workflows_from_jobs(layout: Layout, *, origin: str | None = None, no
 
 __all__ = ["ProjectionError", "aware", "dec", "mtime", "provider_of", "scenario_id_for", "pr_number_of", "read_json",
            "project_registry", "scenario_ids", "scenario_version_of", "validation_status_of", "project_scenario", "project_scenario_versions",
-           "source_keys", "project_candidates", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_scores",
-           "project_workflows_from_jobs"]
+           "source_keys", "project_candidates", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_workflow_costs",
+           "project_scores", "project_workflows_from_jobs"]

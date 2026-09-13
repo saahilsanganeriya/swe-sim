@@ -157,6 +157,14 @@ class FileIndexReader:
                 log.warning("scores of %s not projected: %s", sid, e)
         return rows
 
+    def _cost_rows(self) -> list[M.CostRow]:
+        rows = [c for _t, _ex, cs in self._trials() for c in cs]
+        try:
+            rows.extend(P.project_workflow_costs(self.layout, origin=self.settings.origin))
+        except ValueError as e:
+            log.warning("workflow costs not projected: %s", e)
+        return rows
+
     def _action_rows(self) -> list[M.OperatorActionRow]:
         path = self.layout.evidence_dir("console") / "actions.jsonl"
         rows: list[M.OperatorActionRow] = []
@@ -237,13 +245,12 @@ class FileIndexReader:
         return max(rows, key=lambda r: r.started_at) if rows else None
 
     def costs(self, f: M.CostFilter) -> list[M.CostRow]:
-        rows = [c for _t, _ex, cs in self._trials() for c in cs if matches(c, f, TEXT_FIELDS["costs"])]
+        rows = [c for c in self._cost_rows() if matches(c, f, TEXT_FIELDS["costs"])]
         rows.sort(key=lambda r: (r.at, r.cost_id), reverse=True)
         return rows[: f.limit]
 
     def spend(self) -> list[M.SpendRow]:
-        costs = [c for _t, _ex, cs in self._trials() for c in cs]
-        return R.spend_rows(R.cost_totals(costs), self.settings.spend_cap_usd)
+        return R.spend_rows(R.cost_totals(self._cost_rows()), self.settings.spend_cap_usd)
 
     def operator_actions(self, f: M.PageFilter) -> M.Page[M.OperatorActionRow]:
         return page([r for r in self._action_rows() if matches(r, f, TEXT_FIELDS["operator_actions"])], f, DEFAULT_ORDER["operator_actions"])
@@ -273,7 +280,7 @@ class FileIndexReader:
         if name == "exchanges":
             return [e for _t, ex, _c in self._trials() for e in ex]
         if name == "costs":
-            return [c for _t, _ex, cs in self._trials() for c in cs]
+            return list(self._cost_rows())
         if name == "scores":
             return list(self._score_rows())
         if name == "workflows":
