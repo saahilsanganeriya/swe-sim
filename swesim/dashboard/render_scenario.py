@@ -7,6 +7,8 @@ judge/draft metadata, task-sense reasons) are rendered only when ``identity.eval
 """
 from __future__ import annotations
 
+from swesim.dashboard.public import project
+
 from swesim.dashboard.render import (
     Column, chip, dash, difficulty_chip, evaluator_switch, h, ident, kv, outcome_chip, short, table,
 )
@@ -31,7 +33,7 @@ def scenario_row_view(r) -> dict:
     ts = d.get("task_sense") or {}
     d["task_sense_label"] = None if not ts else ("coherent" if ts.get("coherent") and ts.get("fair_tests") else "review_needed")
     d["difficulty_tier"] = d.get("difficulty_tier") or None
-    return d
+    return project(d)
 
 
 def scenarios_table(rows, total: int, offset: int, limit: int) -> str:

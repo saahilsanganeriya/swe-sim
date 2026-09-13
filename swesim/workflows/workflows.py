@@ -18,9 +18,17 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
-from temporalio.exceptions import ActivityError, ApplicationError, TemporalError, WorkflowAlreadyStartedError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    TemporalError,
+    WorkflowAlreadyStartedError,
+    is_cancelled_exception,
+)
 
 from swesim.workflows import queues, retries
+from swesim.workflows import search_attributes as SA
+from swesim.workflows.payloads import check_payload
 
 ONE = RetryPolicy(maximum_attempts=1)          # pre-patch command shape, kept for replay of executions started before PATCH_QUEUES
 LEGACY_READ = RetryPolicy(maximum_attempts=3)  # idem, for await_trial_activity
@@ -29,6 +37,11 @@ LEGACY_READ = RetryPolicy(maximum_attempts=3)  # idem, for await_trial_activity
 PATCH_QUEUES = "20260913-queues"               # act(): task queue per activity + retry classes (items 1-2)
 PATCH_HOOKS = "20260913-bookkeeping"           # index / cost / spend hooks and trial cleanup after every stage and trial (item 3)
 PATCH_SPLIT = "20260913-split-activities"      # discover (GitHub only) + per-control validation; TrialWorkflow stops its runtime on cancel (item 4)
+PATCH_BATCH = "20260913-bounded-batches"
+PATCH_SEARCH = "20260913-search-attributes"
+PATCH_DIFFICULTY = "20260913-difficulty-screen"
+PATCH_AUDIT = "20260913-automatic-audits"
+CHILDREN_PER_RUN = 100
 HOOK_MINUTES = 2
 CONTROL_MINUTES = 60                           # one Harbor control run on Modal (validate_scenario's whole set had 180)
 APPROVAL_TIMEOUT = timedelta(hours=24)   # PipelineWorkflow signal mode
@@ -70,7 +83,11 @@ async def act(name: str, p: dict, minutes: int = 10, *, retry: RetryPolicy = ret
     """One activity on its queue (`queues.queue_for`) with its retry class. Call sites pick the class: LLM for judge /
     draft / approve / stakeholder-bound work, BUILD for probe / compile / validate, READ for polls and local reads,
     ONCE for launch. The pre-patch shape (inherited queue, one attempt) is kept for replay."""
-    timeouts = dict(start_to_close_timeout=timedelta(minutes=minutes), heartbeat_timeout=timedelta(minutes=2))
+    try:
+        check_payload(p, f"{name} input")
+    except ValueError as e:
+        raise ApplicationError(str(e), non_retryable=True) from e
+    timeouts = {"start_to_close_timeout": timedelta(minutes=minutes), "heartbeat_timeout": timedelta(minutes=2)}
     if _patched(PATCH_QUEUES):
         if name == "launch_trial_activity" and _patched(PATCH_SPLIT):
             timeouts["cancellation_type"] = workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
@@ -100,6 +117,7 @@ async def hook(name: str, p: dict) -> dict:
     try:
         r = await act(name, p, HOOK_MINUTES, retry=retries.HOOK)
     except Exception as e:  # noqa: BLE001 - bookkeeping never decides a workflow's outcome; the record on disk is the truth
+        _raise_if_cancelled(e)
         return {"indexed": False, "reason": _err(e)}
     return r if isinstance(r, dict) else {"indexed": True, "result": r}
 
@@ -117,6 +135,8 @@ def _workflow_identity() -> dict | None:
 
 async def index_workflow(status: str, summary: dict, failure: str | None = None) -> dict:
     """`index_workflow_activity` at a workflow's start and at every status change (interfaces §2), parent id included."""
+    if _patched(PATCH_SEARCH):
+        SA.upsert_status(status)
     ident = _workflow_identity()
     if ident is None:
         return {"indexed": False, "reason": "not running inside a workflow"}
@@ -182,7 +202,7 @@ async def build_scenario(set_stage, p: dict, sid: str, spec_hash: str, *, split:
     await set_stage("validating", **accepted)
     controls = list((compiled or {}).get("controls") or [])
     if split and controls:
-        validation = await validate_per_control(step, controls, set_control)
+        validation = await validate_per_control({**step, "compiled_hash": compiled.get("compiled_hash")}, controls, set_control)
     else:
         validation = await act("validate_activity", step, 180, retry=retries.BUILD)
     if validation["status"] != "valid":
@@ -190,7 +210,8 @@ async def build_scenario(set_stage, p: dict, sid: str, spec_hash: str, *, split:
                 "validation": validation, "step": step}
     await set_stage("registering", **accepted)
     await act("register_activity", step, retry=retries.READ)
-    return {"scenario_id": sid, "spec_hash": accepted["spec_hash"], "status": "valid", "reasons": [], "validation": validation, "step": step}
+    audit = await audit_stage("audit_scenario_activity", {"scenario_id": sid, "audit_model": p.get("audit_model")})
+    return {"scenario_id": sid, "spec_hash": accepted["spec_hash"], "status": "valid", "reasons": [], "validation": validation, "step": step, "audit": audit}
 
 
 def _run_workflow_id() -> str | None:
@@ -205,10 +226,11 @@ async def run_trials(set_trial_status, trials: list[dict], sem: asyncio.Semaphor
             await set_trial_status(trial, "running")
             try:
                 child = {**trial, "run_workflow_id": _run_workflow_id()}
-                r = await workflow.execute_child_workflow(TrialWorkflow.run, child, id=trial["trial_id"], id_reuse_policy=REJECT_DUP)
+                r = await workflow.execute_child_workflow(TrialWorkflow.run, child, id=trial["trial_id"], id_reuse_policy=REJECT_DUP, **_child_options(child))
             except WorkflowAlreadyStartedError:
                 r = {"trial_id": trial["trial_id"], "status": "duplicate-rejected"}
             except Exception as e:  # noqa: BLE001 - one failed child never stops its siblings
+                _raise_if_cancelled(e)
                 r = {"trial_id": trial["trial_id"], "status": "error", "error": _err(e)}
             await set_trial_status(trial, r.get("status", "unknown"))
             return r
@@ -232,16 +254,20 @@ class TrialWorkflow:
         the activity refuses until terminal evidence exists). None of these decides the trial's outcome."""
         tid = p.get("trial_id"); ident = _workflow_identity() or {}
         cost = await hook("record_cost_activity", {"trial_id": tid, "workflow_id": ident.get("workflow_id"), "model": p.get("model")})
+        audit = None
+        if result.get("status") == "completed" and p.get("condition") == "interactive":
+            audit = await audit_stage("audit_transcript_activity", {"trial_id": tid, "audit_model": p.get("audit_model")})
         index = await hook("index_trial_activity", {"trial_id": tid})
         cleanup: dict
         if _patched(PATCH_HOOKS):
             try:
                 cleanup = await act("cleanup_trial_activity", {"trial_id": tid}, HOOK_MINUTES, retry=retries.HOOK)
             except Exception as e:  # noqa: BLE001 - a Job left behind is quota, not evidence; the operator sees the reason
+                _raise_if_cancelled(e)
                 cleanup = {"cleaned": False, "reason": _err(e)}
         else:
             cleanup = {"cleaned": False, "reason": "execution predates the bookkeeping hooks"}
-        return {"indexed": _indexed(index), "cost": cost, "index": index, "cleanup": cleanup}
+        return {"indexed": _indexed(index), "cost": cost, "index": index, "cleanup": cleanup, "audit": audit}
 
     async def _on_cancel(self, tid: str | None, launch: dict | None) -> None:
         """Workflow cancellation while the trial runs: ask the launcher to stop the runtime (Cloud Run cancels the execution, systemd
@@ -252,7 +278,9 @@ class TrialWorkflow:
         try:
             self.state["cancel"] = await asyncio.shield(act("cancel_trial_activity", {"trial_id": tid}, HOOK_MINUTES, retry=retries.HOOK))
         except Exception as e:  # noqa: BLE001 - the runtime may already be gone; the operator reads the reason
+            _raise_if_cancelled(e)
             self.state["cancel"] = {"cancelled": False, "reason": _err(e)}
+        self.state["index"] = await asyncio.shield(hook("index_trial_activity", {"trial_id": tid}))
         await asyncio.shield(index_workflow("cancelled", params_summary(self.params)))
         self.state["stage"] = "cancelled"
 
@@ -265,37 +293,46 @@ class TrialWorkflow:
             try:
                 launch = await act("launch_trial_activity", p, 5, retry=retries.ONCE)
             except Exception as e:  # noqa: BLE001 - a lost launch acknowledgement is ambiguous by design
+                _raise_if_cancelled(e)
                 # Poll the same unit/id; never relaunch it. The await activity reads the recorded evidence.
                 launch = {"trial_id": tid, "launched": False, "error": str(e)[:500]}
             self.state = {"stage": "awaiting", "trial_id": tid, "launch": launch}
             try:
                 result = await act("await_trial_activity", p, 180, retry=retries.READ)
             except Exception as e:  # noqa: BLE001 - deadline or repeated read failures: unresolved, not relaunched
+                _raise_if_cancelled(e)
                 result = {"trial_id": tid, "status": "unresolved", "error": str(e)[:500]}
         except asyncio.CancelledError:
             await self._on_cancel(tid, launch)
             raise
-        out = {**result, "launch": launch}
-        out["bookkeeping"] = await self._bookkeeping(p, out)
-        self.state = {"stage": "done", "trial_id": tid, "status": out.get("status"), "launch": launch, "indexed": out["bookkeeping"]["indexed"]}
-        await index_workflow("completed", {**params_summary(p), "status": out.get("status")})
-        return out
+        try:
+            out = {**result, "launch": launch}
+            out["bookkeeping"] = await self._bookkeeping(p, out)
+            self.state = {"stage": "done", "trial_id": tid, "status": out.get("status"), "launch": launch, "indexed": out["bookkeeping"]["indexed"]}
+            self.state["audit"] = out["bookkeeping"]["audit"]
+            await index_workflow("completed", {**params_summary(p), "status": out.get("status")})
+            return out
+        except asyncio.CancelledError:
+            await self._on_cancel(tid, launch)
+            raise
 
 
 @workflow.defn
 class RunMatrixWorkflow:
     @workflow.run
     async def run(self, p: dict) -> dict:
+        _search_status("running")
         results = []
         # Serial pilot runs are deliberate: global launch concurrency = 1, cheap recovery reasoning.
         for trial in p["trials"]:
             try:
-                r = await workflow.execute_child_workflow(TrialWorkflow.run, trial, id=trial["trial_id"], id_reuse_policy=REJECT_DUP)
+                r = await workflow.execute_child_workflow(TrialWorkflow.run, trial, id=trial["trial_id"], id_reuse_policy=REJECT_DUP, **_child_options(trial))
             except WorkflowAlreadyStartedError:
                 r = {"trial_id": trial["trial_id"], "status": "duplicate-rejected"}
             results.append(r)
         await act("score_activity", {"scenario_id": p["scenario_id"]}, retry=retries.READ)
         await act("export_activity", {"scenario_id": p["scenario_id"]}, retry=retries.READ)
+        _search_status("completed")
         return {"scenario_id": p["scenario_id"], "trials": results}
 
 
@@ -311,7 +348,8 @@ class RunTasksWorkflow:
     @workflow.query
     def progress(self) -> dict:
         return {"stage": self.state["stage"], "scenarios": self.scenarios, "trials": self.trials, "spend": self.state.get("spend", {}),
-                "stopped_reason": self.state.get("stopped_reason")}
+                "stopped_reason": self.state.get("stopped_reason"), "summary": self.state.get("summary", {}),
+                "checkpoint_path": self.state.get("checkpoint_path")}
 
     async def _spend_exceeded(self, p: dict) -> bool:
         """`spend_check_activity` against the cap (params `spend_cap_usd`, else Settings); an unreadable ledger never stops the run
@@ -328,6 +366,8 @@ class RunTasksWorkflow:
     @workflow.run
     async def run(self, p: dict) -> dict:
         p = dict(p or {})
+        if _patched(PATCH_BATCH):
+            return await _run_batched(self, p)
         sem = asyncio.Semaphore(max(1, int(p.get("max_parallel_trials", 1))))
         plan_keys = ("models", "conditions", "k", "purpose", "brief_profile", "stakeholder_model", "attempt_offset", "stakeholder_url")
         plan_p = {k: p[k] for k in plan_keys if p.get(k) is not None}
@@ -345,6 +385,7 @@ class RunTasksWorkflow:
             try:
                 planned = await act("plan_trials_activity", {**plan_p, "scenario_id": sid}, 5, retry=retries.READ)
             except Exception as e:  # noqa: BLE001 - an unplannable scenario (not validated) never stops the others
+                _raise_if_cancelled(e)
                 self.scenarios[sid] = {"status": "error", "error": _err(e), "trials": 0}
                 results[sid] = {"status": "error", "error": _err(e), "trials": []}
                 return
@@ -360,6 +401,7 @@ class RunTasksWorkflow:
                 await act("export_activity", {"scenario_id": sid}, retry=retries.READ)
                 self.scenarios[sid]["status"] = "complete"
             except Exception as e:  # noqa: BLE001
+                _raise_if_cancelled(e)
                 self.scenarios[sid].update(status="score-export-error", error=_err(e))
             self.scenarios[sid]["indexed"] = _indexed(await hook("index_score_activity", {"scenario_id": sid}))
             results[sid] = {"status": self.scenarios[sid]["status"], "trials": trial_results}
@@ -400,6 +442,8 @@ class CandidateWorkflow:
     async def _stage(self, stage: str, **extra) -> None:
         keep = {k: v for k, v in extra.items() if k in ("scenario_id", "spec_hash", "reasons", "instance_id", "refusal")}
         self.state = {**self.state, "stage": stage, **keep}
+        if _patched(PATCH_SEARCH):
+            SA.upsert_status(stage)
         info = workflow.info()
         if info.parent is not None:
             payload = {"instance_id": self.state.get("instance_id"), "scenario_id": self.state.get("scenario_id"),
@@ -417,7 +461,10 @@ class CandidateWorkflow:
 
     def _done(self, sid, status: str, reasons: list, spec_hash) -> dict:
         self.state = {**self.state, "stage": "done", "status": status, "scenario_id": sid, "spec_hash": spec_hash, "reasons": reasons}
-        return {"scenario_id": sid, "instance_id": self.state.get("instance_id"), "status": status, "reasons": reasons, "spec_hash": spec_hash}
+        result = {"scenario_id": sid, "instance_id": self.state.get("instance_id"), "status": status, "reasons": reasons, "spec_hash": spec_hash}
+        if "audit" in self.state:
+            result["audit"] = self.state["audit"]
+        return result
 
     async def _finish(self, result: dict, failure: str | None = None) -> dict:
         """Terminal bookkeeping: the candidate's and scenario's rows, then the workflow row; the result is returned unchanged."""
@@ -467,6 +514,7 @@ class CandidateWorkflow:
                                          retry=retries.READ)
                     return sid, approved, {}
                 except Exception as e:
+                    _raise_if_cancelled(e)
                     if not _refusable(e):  # cancellation or infrastructure failure: propagate, never re-enter the wait
                         raise
                     refusal = f"approve refused: {_err(e)}"
@@ -507,8 +555,11 @@ class CandidateWorkflow:
                 if not approved["approved"]:
                     return await self._finish(self._done(sid, "rejected", list(approved.get("reasons", [])), None))
             built = await build_scenario(self._stage, p, sid, approved["spec_hash"], split=_patched(PATCH_SPLIT), set_control=self._control)
+            if built.get("audit") is not None:
+                self.state["audit"] = built["audit"]
             return await self._finish(self._done(sid, built["status"], built["reasons"], built["spec_hash"]))
         except Exception as e:
+            _raise_if_cancelled(e)
             # Infrastructure failure (LLM, Harbor, a lost parent): FAIL the child so `create:<sid>` can be started again
             # (ALLOW_DUPLICATE_FAILED_ONLY); the parent records `error` from the cause and siblings are unaffected.
             stage = self.state.get("stage")
@@ -530,11 +581,9 @@ def _normalize_repo(repo: str) -> str:
     """`https://github.com/X/A/`, `x/a.git`, `git@github.com:x/a` -> `x/a` (the same spellings mine merges into one output file)."""
     r = str(repo).strip().casefold()
     for prefix in ("https://github.com/", "http://github.com/", "git@github.com:", "github.com/"):
-        if r.startswith(prefix):
-            r = r[len(prefix):]
+        r = r.removeprefix(prefix)
     r = r.rstrip("/")
-    if r.endswith(".git"):
-        r = r[:-4]
+    r = r.removesuffix(".git")
     return r.rstrip("/")
 
 
@@ -543,9 +592,11 @@ def candidate_child_id(sid: str, version=None) -> str:
     return f"create:{sid}" if not version or int(version) <= 1 else f"create:{sid}@v{int(version)}"
 
 
-def _source_key(src: dict) -> str:
+def _source_key(src: dict, *, include_band: bool = False) -> str:
     kind = src.get("kind", "swebench-annotated")
     if kind == "github-repo":
+        if include_band:
+            return f"github-repo--{_normalize_repo(src.get('repo') or '').replace('/', '__')}--{src.get('pr_kind') or 'feature'}"
         return f"{kind}:{_normalize_repo(src.get('repo') or '')}"
     return f"{kind}:{str(src.get('pool', 'A')).strip().casefold()}"
 
@@ -577,7 +628,7 @@ class CreateTasksWorkflow:
     @workflow.query
     def progress(self) -> dict:
         return {"stage": self.state["stage"], "counts": self.counts, "sources": self.state.get("sources", {}), "rebuild": self.state.get("rebuild", False),
-                "probe": self.state.get("probe", {}), "candidates": self.candidates,
+                "probe": self.state.get("probe", {}), "candidates": self.candidates, "checkpoint_path": self.state.get("checkpoint_path"),
                 "awaiting_approval": [{"scenario_id": sid, "spec_hash": c.get("spec_hash"), "candidate_workflow_id": c.get("candidate_workflow_id")}
                                       for sid, c in self.candidates.items() if c.get("status") == "awaiting-approval"]}
 
@@ -589,12 +640,14 @@ class CreateTasksWorkflow:
             raise ApplicationError(f"approval_mode must be one of {sorted(CREATE_APPROVAL_MODES)}", non_retryable=True)
         # Mine outputs are one file per pool/repo, so two sources with the same key in one batch would race on that
         # file while mining concurrently. Guard: duplicate keys are rejected before any activity runs.
-        keys = [_source_key(src) for src in p.get("sources", [])]
+        keys = [_source_key(src, include_band=_patched(PATCH_BATCH)) for src in p.get("sources", [])]
         dups = sorted({k for k in keys if keys.count(k) > 1})
         if dups:
             raise ApplicationError(f"duplicate sources in one batch: {dups}; merge them into one source or run separate batches", non_retryable=True)
         if not keys:
             raise ApplicationError("sources is empty", non_retryable=True)
+        if _patched(PATCH_BATCH):
+            return await _create_batched(self, p)
         sem = asyncio.Semaphore(max(1, int(p.get("max_parallel", 8))))
         rebuild = bool(p.get("rebuild"))
         self.state = {"stage": "probing-models", "sources": {}, "probe": {}, "rebuild": rebuild}
@@ -619,6 +672,7 @@ class CreateTasksWorkflow:
                     try:
                         ver = await act("scenario_version_activity", {"scenario_id": sid}, 5, retry=retries.READ)
                     except Exception as e:  # noqa: BLE001 - one unreadable scenario never stops its siblings
+                        _raise_if_cancelled(e)
                         r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "error", "reasons": [_err(e)], "spec_hash": None}
                         self.candidates[sid].update(status="error", stage="done", reasons=r["reasons"]); self.counts["error"] = self.counts.get("error", 0) + 1
                         results[sid] = r
@@ -628,11 +682,12 @@ class CreateTasksWorkflow:
                         child_id = candidate_child_id(sid, ver["next"])
                         self.candidates[sid].update(version=ver["next"], previous_version=ver["version"], candidate_workflow_id=child_id)
                 try:
-                    r = await workflow.execute_child_workflow(CandidateWorkflow.run, child, id=child_id, id_reuse_policy=DUP_FAILED_ONLY)
+                    r = await workflow.execute_child_workflow(CandidateWorkflow.run, child, id=child_id, id_reuse_policy=DUP_FAILED_ONLY, **_child_options({**child, "scenario_id": sid}))
                 except WorkflowAlreadyStartedError:
                     r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "duplicate-rejected", "spec_hash": None,
                          "reasons": ["a CandidateWorkflow with this id already completed; read its result instead"]}
                 except Exception as e:  # noqa: BLE001 - one failed child never stops its siblings; a failed id may be started again
+                    _raise_if_cancelled(e)
                     r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "error", "reasons": [_err(e)], "spec_hash": None}
                 self.candidates[sid].update(status=r["status"], stage="done", spec_hash=r.get("spec_hash"), reasons=r.get("reasons", []))
                 self.counts[r["status"]] = self.counts.get(r["status"], 0) + 1
@@ -651,6 +706,7 @@ class CreateTasksWorkflow:
                 listed = await act("list_candidates_activity", {"candidates_path": mined["candidates_path"],
                                                                 "max_candidates": src.get("max_candidates") or src.get("limit")}, 5, retry=retries.READ)
             except Exception as e:  # noqa: BLE001 - a failed source never stops the others
+                _raise_if_cancelled(e)
                 self.state["sources"][key] = {"status": "error", "error": _err(e)}
                 return
             self.state["sources"][key] = {**self.state["sources"][key], "status": "mined", "candidates": len(listed["candidates"]), "candidates_path": mined["candidates_path"]}
@@ -691,10 +747,13 @@ class PipelineWorkflow:
         return self.state
 
     async def _set_stage(self, stage: str, **extra) -> None:
+        if _patched(PATCH_SEARCH):
+            SA.upsert_status(stage)
         self.state = {"stage": stage, **extra}
 
     @workflow.run
     async def run(self, p: dict) -> dict:
+        _search_status("running")
         p = dict(p or {})
         if p.get("approval_mode", "auto") not in APPROVAL_MODES:
             raise ApplicationError(f"approval_mode must be one of {sorted(APPROVAL_MODES)}", non_retryable=True)
@@ -711,6 +770,7 @@ class PipelineWorkflow:
         counts = {"tried": 0, "completed": 0, "rejected": 0, "invalid": 0}
         if not judged["instance_ids"]:
             self.state = {"stage": "no-valid-candidate", **counts}
+            _search_status("completed")
             return {"status": "no-valid-candidate", "scenarios": [], **counts}
         max_scenarios = p.get("max_scenarios", 1); max_tried = p.get("max_candidates_tried", 3)
         solver_unavailable = list(probe.get("solver_unavailable") or [])
@@ -732,6 +792,7 @@ class PipelineWorkflow:
                     # No Boolean is read from wait_condition: the signal payload and approval.json carry the truth.
                     await workflow.wait_condition(lambda sid=sid: sid in self.approvals, timeout=APPROVAL_TIMEOUT)
                 except TimeoutError:
+                    _search_status("completed")
                     return {"status": "awaiting-approval-timeout", "scenarios": out, "pending": draft, **counts}
             built = await build_scenario(self._set_stage, p, sid, self.approvals[sid])
             if built["status"] != "valid":
@@ -749,7 +810,7 @@ class PipelineWorkflow:
             for trial in trials["trials"]:
                 self.state = {"stage": "trial", **accepted, "trial_id": trial["trial_id"]}
                 try:
-                    r = await workflow.execute_child_workflow(TrialWorkflow.run, trial, id=trial["trial_id"], id_reuse_policy=REJECT_DUP)
+                    r = await workflow.execute_child_workflow(TrialWorkflow.run, trial, id=trial["trial_id"], id_reuse_policy=REJECT_DUP, **_child_options(trial))
                 except WorkflowAlreadyStartedError:
                     r = {"trial_id": trial["trial_id"], "status": "duplicate-rejected"}
                 results.append(r)
@@ -760,4 +821,219 @@ class PipelineWorkflow:
             counts["completed"] += 1
         status = "complete" if counts["completed"] else "complete-with-failures"
         self.state = {"stage": status, **counts}
+        _search_status("completed")
         return {"status": status, "scenarios": out, **counts}
+
+
+async def _create_candidate(self, p, mode, rebuild, sem, results, sid: str, cand: dict) -> None:
+    async with sem:
+        self.candidates[sid].update(status="running", stage="starting")
+        child = {"candidates_path": cand["candidates_path"], "instance_id": cand["instance_id"], "judge_model": p.get("judge_model"),
+                 "draft_model": p.get("draft_model"), "audit_model": p.get("audit_model"), "stakeholder_model": p.get("stakeholder_model"), "stakeholder_url": p.get("stakeholder_url"),
+                 "approval_mode": mode, "redraft_on_leak": p.get("redraft_on_leak", True), "version": 1, "source_key": self.candidates[sid].get("source")}
+        child_id = candidate_child_id(sid)
+        if rebuild:
+            # Rebuild: an existing scenario (scenario.json or registry entry) is re-created as version n+1 under a new
+            # child id; nothing existing behaves like a first build (version 1, plain id).
+            try:
+                ver = await act("scenario_version_activity", {"scenario_id": sid}, 5, retry=retries.READ)
+            except Exception as e:  # noqa: BLE001 - one unreadable scenario never stops its siblings
+                _raise_if_cancelled(e)
+                r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "error", "reasons": [_err(e)], "spec_hash": None}
+                self.candidates[sid].update(status="error", stage="done", reasons=r["reasons"]); self.counts["error"] = self.counts.get("error", 0) + 1
+                results[sid] = r
+                return
+            if ver.get("exists"):
+                child.update(rebuild=True, version=ver["next"], previous_version=ver["version"])
+                child_id = candidate_child_id(sid, ver["next"])
+                self.candidates[sid].update(version=ver["next"], previous_version=ver["version"], candidate_workflow_id=child_id)
+        try:
+            r = await workflow.execute_child_workflow(CandidateWorkflow.run, child, id=child_id, id_reuse_policy=DUP_FAILED_ONLY, **_child_options({**child, "scenario_id": sid}))
+        except WorkflowAlreadyStartedError:
+            r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "duplicate-rejected", "spec_hash": None,
+                 "reasons": ["a CandidateWorkflow with this id already completed; read its result instead"]}
+        except Exception as e:  # noqa: BLE001 - one failed child never stops its siblings; a failed id may be started again
+            _raise_if_cancelled(e)
+            r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "error", "reasons": [_err(e)], "spec_hash": None}
+        self.candidates[sid].update(status=r["status"], stage="done", spec_hash=r.get("spec_hash"), reasons=r.get("reasons", []))
+        if r.get("audit") is not None:
+            self.candidates[sid]["audit"] = r["audit"]
+        self.counts[r["status"]] = self.counts.get(r["status"], 0) + 1
+        results[sid] = r
+
+
+
+async def _checkpoint(p: dict, state: dict) -> str:
+    ident = _workflow_identity() or {'workflow_id': 'direct', 'run_id': 'direct'}
+    result = await act('checkpoint_workflow_activity', {**ident, 'state': state}, retry=retries.READ)
+    return result['checkpoint_path']
+
+
+async def _continue(p: dict, continuation: dict, state: dict) -> None:
+    # All children have been awaited. Candidate stage signals are synchronous, so no handlers remain in flight.
+    path = await _checkpoint(p, {**state, 'previous_checkpoint': continuation.get('previous_checkpoint')})
+    continuation = {**continuation, 'previous_checkpoint': path}
+    await index_workflow('continued_as_new', {**params_summary(p), 'checkpoint_path': path})
+    next_params = {**p, '_continuation': continuation}
+    check_payload(next_params, 'continue-as-new input')
+    workflow.continue_as_new(next_params)
+
+
+async def _create_batched(self: CreateTasksWorkflow, p: dict) -> dict:
+    resume = p.get('_continuation') or {}
+    mode = p.get('approval_mode', 'auto'); rebuild = bool(p.get('rebuild'))
+    sem = asyncio.Semaphore(max(1, int(p.get('max_parallel', 8))))
+    self.state = {'stage': 'starting', 'sources': resume.get('sources', {}), 'probe': resume.get('probe', {}), 'rebuild': rebuild,
+                  'checkpoint_path': resume.get('previous_checkpoint')}
+    await index_workflow('running', params_summary(p))
+    if resume:
+        self.counts = dict(resume['counts']); prepared = resume['plan']
+    else:
+        self.state['stage'] = 'probing-models'
+        probe = await act('probe_models_activity', p, 5)
+        p = {**p, **(probe.get('substitutions') or {}), **(probe.get('resolved') or {})}
+        self.state['probe'] = {k: probe.get(k) or ({} if k in ('resolved', 'substitutions') else [])
+                               for k in ('resolved', 'substitutions', 'notes', 'needs_human')}
+        sources = []
+        # Discovery is sequential per repository; children begin from a frozen, deduplicated candidate plan.
+        for src in p['sources']:
+            key = _source_key(src, include_band=True)
+            self.state['sources'][key] = {'status': 'mining'}
+            try:
+                name = 'discover_activity' if src.get('kind') == 'github-repo' else 'mine_activity'
+                mined = await act(name, {**p, **_mine_params(src)}, 30 if name == 'discover_activity' else 180)
+                source_key = mined.get('source_key') or mined['candidates_path'].rsplit('/', 1)[-1].removesuffix('.jsonl')
+                sources.append({'source_key': source_key, 'candidates_path': mined['candidates_path'], 'limit': src.get('max_candidates') or src.get('limit')})
+                self.state['sources'][key] = {'status': 'mined', 'candidates_path': mined['candidates_path'],
+                                              'candidates': mined.get('written'), 'discovered': mined.get('discovered'), 'rejects': mined.get('rejects', {})}
+                if name == 'discover_activity':
+                    self.state['sources'][key]['index'] = await hook('index_discovery_activity', {
+                        **(_workflow_identity() or {}), 'source_key': mined.get('source_key') or key,
+                        'artifact_sha256': mined.get('rejects_sha256'),
+                        'artifact_path': mined.get('rejects_path'),
+                        'repo': mined.get('repo') or _normalize_repo(src['repo']), 'band': mined.get('band') or src.get('pr_kind') or 'feature'})
+            except Exception as e:  # noqa: BLE001 - isolate a failed stage; cancellation propagates
+                _raise_if_cancelled(e)
+                self.state['sources'][key] = {'status': 'error', 'error': _err(e)}
+        prepared = await act('prepare_candidate_plan_activity', {'workflow_id': _run_workflow_id() or 'direct', 'sources': sources}, retry=retries.READ)
+        self.counts['candidates'] = prepared['total']; self.counts['duplicate-in-batch'] = prepared.get('duplicates', 0)
+    page = await act('read_plan_page_activity', {'plan_path': prepared['plan_path'], 'offset': resume.get('offset', 0), 'limit': CHILDREN_PER_RUN}, retry=retries.READ)
+    self.state['stage'] = 'creating'; results = {}
+    for cand in page['items']:
+        sid = cand['scenario_id']
+        self.candidates[sid] = {'instance_id': cand['instance_id'], 'source': cand['source_key'], 'status': 'queued', 'stage': 'queued',
+                                'stages': [], 'candidate_workflow_id': candidate_child_id(sid), 'spec_hash': None}
+    await asyncio.gather(*(_create_candidate(self, p, mode, rebuild, sem, results, c['scenario_id'], c) for c in page['items']))
+    checkpoint_state = {'counts': self.counts, 'candidates': self.candidates, 'results': results, 'plan_path': prepared['plan_path'], 'offset': page['next_offset']}
+    if page['next_offset'] < page['total']:
+        await _continue(p, {'plan': prepared, 'offset': page['next_offset'], 'counts': self.counts, 'sources': self.state['sources'],
+                            'probe': self.state['probe'], 'previous_checkpoint': resume.get('previous_checkpoint')}, checkpoint_state)
+    self.state['stage'] = 'complete'
+    status = 'complete' if self.counts.get('valid') else 'complete-with-failures'
+    path = await _checkpoint(p, {**checkpoint_state, 'previous_checkpoint': resume.get('previous_checkpoint')})
+    self.state['checkpoint_path'] = path
+    await index_workflow('completed', {**params_summary(p), 'status': status, 'counts': self.counts})
+    return {'status': status, 'counts': self.counts, 'candidates': results, 'sources': self.state['sources'], 'probe': self.state['probe'], 'checkpoint_path': path}
+
+
+async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
+    resume = p.get('_continuation') or {}
+    if not resume:
+        self.state = {'stage': 'probing-models'}
+        probe = await act('probe_models_activity', p, 5)
+        p = {**p, **(probe.get('substitutions') or {}), **(probe.get('resolved') or {})}
+        if probe.get('solver_unavailable'):
+            self.state = {'stage': 'complete', 'stopped_reason': 'model-unavailable', 'probe': probe}
+            await index_workflow('completed', {**params_summary(p), 'stopped_reason': 'model-unavailable'})
+            return {'status': 'complete-with-failures', 'scenarios': {}, 'trials': {}, 'stopped_reason': 'model-unavailable', 'probe': probe}
+    sem = asyncio.Semaphore(max(1, int(p.get('max_parallel_trials', 1))))
+    keys = ('models', 'conditions', 'k', 'purpose', 'brief_profile', 'stakeholder_model', 'audit_model', 'attempt_offset', 'stakeholder_url')
+    plan_p = {k: p[k] for k in keys if p.get(k) is not None}
+    results = {}; children = 0; summary = dict(resume.get('summary') or {'children': 0, 'scenarios': 0, 'failed_scenarios': 0})
+    self.state = {'stage': 'running', 'summary': summary, 'checkpoint_path': resume.get('previous_checkpoint')}
+    await index_workflow('running', params_summary(p))
+    await self._spend_exceeded(p)
+    async def set_status(trial, status):
+        self.trials[trial['trial_id']] = {**self.trials.get(trial['trial_id'], {}), 'status': status}
+    sids = p.get('scenario_ids', [])
+    start = int(resume.get('scenario_index', 0))
+    for index in range(start, len(sids)):
+        sid = sids[index]
+        if await self._spend_exceeded(p):
+            self.scenarios[sid] = {'status': 'skipped', 'reason': 'spend-cap', 'trials': 0}
+            results[sid] = {**self.scenarios[sid], 'trials': []}; summary['failed_scenarios'] += 1
+            continue
+        self.scenarios[sid] = {'status': 'planning', 'trials': 0}
+        try:
+            prepared = resume.get('plan') if index == start else None
+            prepared = prepared or await act('prepare_trial_plan_activity', {**plan_p, 'scenario_id': sid, 'workflow_id': _run_workflow_id() or 'direct'}, 5, retry=retries.READ)
+        except Exception as e:  # noqa: BLE001 - isolate a failed stage; cancellation propagates
+            _raise_if_cancelled(e)
+            self.scenarios[sid] = {'status': 'error', 'error': _err(e), 'trials': 0}
+            results[sid] = {**self.scenarios[sid], 'trials': []}; summary['failed_scenarios'] += 1
+            continue
+        offset = int(resume.get('offset', 0)) if index == start else 0
+        page = await act('read_plan_page_activity', {'plan_path': prepared['plan_path'], 'offset': offset, 'limit': CHILDREN_PER_RUN - children}, retry=retries.READ)
+        trials = page['items']
+        for t in trials:
+            self.trials[t['trial_id']] = {k: t[k] for k in ('scenario_id', 'model', 'condition', 'attempt_index')}
+            self.trials[t['trial_id']]['status'] = 'planned'
+        self.scenarios[sid] = {'status': 'running', 'trials': prepared['total']}
+        raw = await run_trials(set_status, trials, sem)
+        compact = [{k: r[k] for k in ('trial_id', 'status', 'reward', 'error') if k in r} for r in raw]
+        results[sid] = {'status': 'running', 'trials': compact}
+        children += len(trials); summary['children'] += len(trials)
+        more_trials = page['next_offset'] < page['total']
+        if not more_trials:
+            self.scenarios[sid]['status'] = 'scoring'
+            try:
+                await act('score_activity', {'scenario_id': sid}, retry=retries.READ)
+                await act('export_activity', {'scenario_id': sid}, retry=retries.READ)
+                if p.get('purpose') == 'screen' and _patched(PATCH_DIFFICULTY):
+                    self.scenarios[sid]['difficulty'] = await act('difficulty_label_activity', {'scenario_id': sid, 'plan_path': prepared['plan_path']}, retry=retries.READ)
+                    self.scenarios[sid]['scenario_index'] = await hook('index_scenario_activity', {'scenario_id': sid})
+                self.scenarios[sid]['status'] = 'complete'
+            except Exception as e:  # noqa: BLE001 - isolate a failed stage; cancellation propagates
+                _raise_if_cancelled(e)
+                self.scenarios[sid].update(status='score-export-error', error=_err(e)); summary['failed_scenarios'] += 1
+            self.scenarios[sid]['indexed'] = _indexed(await hook('index_score_activity', {'scenario_id': sid}))
+            summary['scenarios'] += 1
+            results[sid]['status'] = self.scenarios[sid]['status']
+        if children == CHILDREN_PER_RUN and (more_trials or index + 1 < len(sids)):
+            await _continue(p, {'scenario_index': index if more_trials else index + 1, 'offset': page['next_offset'] if more_trials else 0,
+                                'plan': prepared if more_trials else None, 'summary': summary, 'previous_checkpoint': resume.get('previous_checkpoint')},
+                            {'scenarios': self.scenarios, 'trials': self.trials, 'results': results, 'summary': summary})
+    self.state['stage'] = 'complete'
+    ok = bool(summary['scenarios']) and not summary['failed_scenarios']
+    out = {'status': 'complete' if ok else 'complete-with-failures', 'scenarios': results, 'trials': self.trials, 'summary': summary,
+           'stopped_reason': self.state.get('stopped_reason'), 'spend': self.state.get('spend', {})}
+    out['checkpoint_path'] = await _checkpoint(p, {**out, 'previous_checkpoint': resume.get('previous_checkpoint')})
+    self.state['checkpoint_path'] = out['checkpoint_path']
+    await index_workflow('completed', {**params_summary(p), 'status': out['status'], 'stopped_reason': out['stopped_reason']})
+    return out
+
+
+def _child_options(p: dict) -> dict:
+    return {'search_attributes': SA.for_params(p)} if _patched(PATCH_SEARCH) else {}
+
+
+def _raise_if_cancelled(error: BaseException) -> None:
+    if _patched(PATCH_SPLIT) and is_cancelled_exception(error):
+        raise asyncio.CancelledError() from error
+
+
+async def audit_stage(name: str, p: dict) -> dict | None:
+    """Audit after grading/registration; an outage leaves a visible pending audit and the measured reward unchanged."""
+    if not _patched(PATCH_AUDIT):
+        return None
+    try:
+        result = await act(name, p, 30, retry=retries.AUDIT)
+    except Exception as error:  # noqa: BLE001 - keep measurements and report missing audit evidence
+        _raise_if_cancelled(error)
+        return {'audited': False, 'status': 'pending', 'reason': _err(error)}
+    return {**result, 'audited': True, 'status': 'completed'}
+
+
+def _search_status(status: str) -> None:
+    if _patched(PATCH_SEARCH):
+        SA.upsert_status(status)

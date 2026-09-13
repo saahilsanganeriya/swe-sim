@@ -23,6 +23,7 @@ from swesim import harbor_cli
 from swesim.models import ControlPatch, ScenarioSpec
 from swesim.paths import Workspace, atomic_json
 from swesim.stages import validate as V
+from swesim.stages.compile import verify_compiled_artifacts
 
 PROBE = "probe"
 GROUPS = (("plausible-wrong", "plausible_wrong"), ("alt-correct", "alternative_correct"), ("tamper", "tamper"))
@@ -85,17 +86,24 @@ def job_name(scenario_id: str, control: str) -> str:
 def run_control(ws: Workspace, spec: ScenarioSpec, name: str, compiled_hash: str) -> dict:
     """One control run; the same job dir as validate_scenario, so a rerun reconciles instead of relaunching."""
     task = ws.task_dir(spec.id, "full")
+    compiled = json.loads((ws.scenario_dir(spec.id) / "compile.json").read_text())
+    if compiled.get("compiled_hash") != compiled_hash or compiled.get("spec_hash") != spec.spec_hash:
+        raise ValueError("control plan differs from the compiled scenario and build")
+    verify_compiled_artifacts(task, compiled, "full")
     control = next((c for c in control_plan(spec, task) if c.name == name), None)
     if control is None:
         raise ValueError(f"{name!r} is not a control of {spec.id}; controls: {control_names(spec)}")
     td = harbor_cli.run_task(task, control.agent, jobs_dir(ws, spec.id, compiled_hash), job_name(spec.id, name), agent_kwargs=control.agent_kwargs)
     reward = harbor_cli.read_reward(td) if name != PROBE else {}
-    return {"control": name, "trial_dir": str(td), "outcome_code": reward.get("outcome_code"), "reward": reward.get("reward"),
+    return {"control": name, "trial_dir": str(td), "compiled_hash": compiled_hash, "spec_hash": spec.spec_hash,
+            "outcome_code": reward.get("outcome_code"), "reward": reward.get("reward"),
             "success": reward.get("success"), "agent_failed": exception_info(td) is not None}
 
 
 def _probe_block(task: Path, probe_dir: str | None) -> tuple[dict, list[str]]:
-    from swesim.agents.patch_agent import parse_probe_output  # harbor import kept off the module path
+    from swesim.agents.patch_agent import (
+        parse_probe_output,  # harbor import kept off the module path
+    )
 
     probes = V.gold_probes((task / "solution" / "oracle.diff").read_text())
     probe = {"raw": "", "gold_hits": [], "raw_hits": [], "filtered_hits": [], "probes": probes, "all_refs": None, "reflog_entries": None,
@@ -119,6 +127,13 @@ def assemble_validation(ws: Workspace, spec: ScenarioSpec, trial_dirs: dict[str,
                         run_config_hash: str | None) -> dict:
     """validate_scenario's verdict over recorded control runs; writes scenarios/<sid>/validation.json and returns it."""
     task = ws.task_dir(spec.id, "full"); expected = expectations(spec)
+    compiled = json.loads((ws.scenario_dir(spec.id) / "compile.json").read_text())
+    if compiled.get("compiled_hash") != compiled_hash or compiled.get("spec_hash") != spec.spec_hash:
+        raise ValueError("control results differ from the compiled scenario and build")
+    verify_compiled_artifacts(task, compiled, "full")
+    for name, td in trial_dirs.items():
+        if name not in control_names(spec) or not Path(td).resolve().is_relative_to((jobs_dir(ws, spec.id, compiled_hash) / job_name(spec.id, name)).resolve()):
+            raise ValueError("control trial directory does not belong to this control and compiled build")
     results: dict[str, dict] = {}; failures: list[str] = []
     for name in control_names(spec):
         td = trial_dirs.get(name)
@@ -128,6 +143,8 @@ def assemble_validation(ws: Workspace, spec: ScenarioSpec, trial_dirs: dict[str,
         if exception_info(Path(td)) is not None:
             failures.append(f"{name}: control agent failed before a clean submission")
     probe, probe_failures = _probe_block(task, trial_dirs.get(PROBE))
+    if trial_dirs.get(PROBE) and exception_info(Path(trial_dirs[PROBE])) is not None:
+        failures.append("probe: control agent failed before a clean submission")
     _ok, control_failures = V.evaluate_controls(results, spec.controls.model_dump()); failures.extend(control_failures)
     base = {t["id"]: t["observed"] for t in results.get("nop", {}).get("report", {}).get("per_test", [])}
     gold = {t["id"]: t["observed"] for t in results.get("oracle", {}).get("report", {}).get("per_test", [])}

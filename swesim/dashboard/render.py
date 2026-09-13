@@ -370,9 +370,9 @@ NAV: tuple[tuple[str, tuple[NavItem, ...]], ...] = (
     ("", (NavItem("Home", "/", "home"),)),
     ("Record", (NavItem("Scenarios", "/scenarios", "scenarios", "scenarios_valid"), NavItem("Trials", "/trials", "trials", "trials_running"),
                 NavItem("Candidates", "/candidates", "candidates", "candidates_pending"), NavItem("Workflows", "/workflows", "workflows", "workflows_running"),
-                NavItem("Leaderboard", "/leaderboard", "leaderboard"))),
+                NavItem("Leaderboard", "/leaderboard", "leaderboard"), NavItem("Trends", "/trends", "trends"))),
     ("Operate", (NavItem("Review", "/review", "review", "review_pending"), NavItem("Create", "/create", "create"), NavItem("Run", "/run", "run"),
-                 NavItem("Spend", "/spend", "spend"))),
+                 NavItem("Spend", "/spend", "spend"), NavItem("Worker health", "/health", "health"))),
     ("Browse", (NavItem("Database", "/db", "db"), NavItem("Artifacts", "/artifacts", "artifacts"))),
 )
 COUNT_TITLES = {"scenarios_valid": "valid scenarios", "trials_running": "running trials", "candidates_pending": "candidates pending",
