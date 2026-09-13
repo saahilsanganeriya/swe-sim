@@ -60,42 +60,185 @@ REPO_DERIVABLE_CATEGORIES = {"location", "proposed_fix"}
 MIN_EXCERPT_CHARS = 12   # a one-word "excerpt" grounds nothing; both bounds apply after _norm
 MIN_EXCERPT_TOKENS = 3
 _BLOCKQUOTE = re.compile(r"(?m)^[ \t]*(?:>[ \t]?)+")
-WITHHOLD_SCHEMA = ('{"withheld_brief":"text","removed":[{"category":"reproduction|error_message|expected_output|location|version|proposed_fix",'
-                   '"excerpt":"verbatim contiguous span","kind":"reproduction|context|behavior|interface|constraint","discovery":"on-request|repo-derivable"}]}')
-WITHHOLD_PROMPT = ("Remove selected spans by category; preserve the first line exactly and a recognizable symptom and desired outcome. "
-                   "Do not add requirements. Record EVERY removal verbatim. No free summary. File locations and explicit fix proposals are repo-derivable.")
+WITHHOLD_PROMPT_VERSION = "withhold-v2"  # v2: the model selects spans, code deletes them; the brief is computed, never trusted
+WITHHOLD_KINDS = {"reproduction", "context", "behavior", "interface", "constraint"}
+MAX_REMOVED_FRACTION = 0.6  # of sentence/line segments
+WITHHOLD_SCHEMA = ('{"removed":[{"category":"reproduction|error_message|expected_output|location|version|proposed_fix",'
+                   '"excerpt":"verbatim contiguous span copied from the issue","fact_text":"one sentence stating the withheld fact",'
+                   '"kind":"reproduction|context|behavior|interface|constraint","discovery":"on-request|repo-derivable"}]}')
+WITHHOLD_PROMPT = ("Select spans of this issue to withhold from the agent, by category. Do not rewrite the issue and do not return a brief: "
+                   "code deletes the sentence or line containing each selected span and keeps everything else verbatim. Each excerpt must be a "
+                   "verbatim contiguous span copied from the issue. Never select the first line (the title); keep a recognizable symptom and a "
+                   "desired outcome; select at most about half of the sentences. File locations and explicit fix proposals are repo-derivable; "
+                   "expected behaviour, error text, versions and reproductions the maintainer can supply are on-request.")
+_SENTENCE_END = re.compile(r"[.!?]+[\"')\]]*(?=\s|$)")
+
+
+def _title_range(natural_issue: str) -> tuple[int, int]:
+    """Offsets of the first non-empty line, stripped: the title, which withholding never touches."""
+    pos = 0
+    for line in natural_issue.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if content.strip():
+            lead = len(content) - len(content.lstrip())
+            return pos + lead, pos + len(content.rstrip())
+        pos += len(line)
+    return 0, 0
 
 
 def _title(natural_issue: str) -> str:
-    lines = [l.strip() for l in natural_issue.strip().splitlines() if l.strip()]
-    return lines[0] if lines else ""
+    a, b = _title_range(natural_issue)
+    return natural_issue[a:b]
+
+
+def _segments(text: str) -> list[tuple[int, int]]:
+    """Sentence-or-line segments of the natural issue as [start, end) offsets trimmed of surrounding whitespace. A line
+    without sentence terminators (code, tracebacks, headings) is one segment."""
+    segs, pos = [], 0
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        starts = [0] + [m.end() for m in _SENTENCE_END.finditer(content)]
+        for a, b in zip(starts, starts[1:] + [len(content)]):
+            piece = content[a:b]
+            if piece.strip():
+                lead = len(piece) - len(piece.lstrip())
+                segs.append((pos + a + lead, pos + a + len(piece.rstrip())))
+        pos += len(line)
+    return segs
+
+
+def _norm_map(text: str) -> tuple[str, list[int]]:
+    """`_norm(text)` together with, for every normalized character, the offset of the original character it came from."""
+    skip: set[int] = set()
+    for m in _BLOCKQUOTE.finditer(text):
+        skip.update(range(m.start(), m.end()))
+    chars, idx, ws_start, started = [], [], None, False
+    for i, ch in enumerate(text):
+        if i in skip:
+            continue
+        if ch.isspace():
+            if started and ws_start is None:
+                ws_start = i
+            continue
+        if ws_start is not None:
+            chars.append(" ")
+            idx.append(ws_start)
+            ws_start = None
+        for c in ch.casefold():
+            chars.append(c)
+            idx.append(i)
+        started = True
+    return "".join(chars), idx
+
+
+def _find_spans(natural: str, excerpt: str) -> list[tuple[int, int]]:
+    """Every non-overlapping occurrence of `excerpt` in `natural`, matched after `_norm` on both sides, as original offsets."""
+    norm_text, idx = _norm_map(natural)
+    needle = _norm(excerpt)
+    spans, pos = [], 0
+    while needle:
+        hit = norm_text.find(needle, pos)
+        if hit < 0:
+            break
+        spans.append((idx[hit], idx[hit + len(needle) - 1] + 1))
+        pos = hit + len(needle)
+    return spans
+
+
+def _extend(span: tuple[int, int], segs: list[tuple[int, int]]) -> tuple[int, int]:
+    """Grow a matched span to the whole sentence/line segments it touches so the remaining text stays grammatical."""
+    a, b = span
+    hits = [s for s in segs if s[0] < b and s[1] > a]
+    return (min(s[0] for s in hits), max(s[1] for s in hits)) if hits else span
+
+
+def _merge(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for a, b in sorted(ranges):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _tidy(text: str, title: str) -> str:
+    """Join of the kept pieces with normalized whitespace: runs collapsed, blank lines dropped (a deleted line leaves no
+    hole), the title line verbatim."""
+    lines: list[str] = []
+    for raw in text.splitlines():
+        if raw.strip():
+            lines.append(title if title and raw.strip() == title else " ".join(raw.split()))
+    return "\n".join(lines)
 
 
 def withhold(natural_issue: str, model_id: str) -> dict:
-    """Category-targeted withholding with verbatim removal records; validated, one correction round, then fail."""
+    """Category-targeted withholding where the model only SELECTS spans and code performs the deletion.
+
+    Each selected excerpt must match the natural issue verbatim (after `_norm`); it is extended to whole sentence/line
+    boundaries and every occurrence is deleted. The withheld brief is exactly the natural issue minus the deleted spans,
+    joined with normalized whitespace, so no text can be added and nothing undeclared can disappear. The title line is
+    never deletable, at most `MAX_REMOVED_FRACTION` of the sentence segments may go, at least one removal is required,
+    and every removed span must be absent from the brief. Violations get one correction round, then ValueError.
+
+    Returns {"withheld_brief", "removed": [{category, kind, discovery, fact_text, selected, excerpt, start, end,
+    occurrences}], "kept": [(start, end)], "stats": {...}}; `natural[start:end] == excerpt` for every removal."""
     messages = [{"role": "user", "content": natural_issue}]
-    title = _title(natural_issue)
+    title_a, title_b = _title_range(natural_issue)
+    title = natural_issue[title_a:title_b]
+    segs = _segments(natural_issue)
+    bad: list[str] = []
     for _attempt in range(2):
         out = chat_json(model_id, WITHHOLD_PROMPT, messages, WITHHOLD_SCHEMA, max_tokens=5000)
-        bad = []
-        text = out.get("withheld_brief") or ""
-        if not text or title not in text:
-            bad.append("missing title")
-        if not out.get("removed"):
+        bad, removed, ranges = [], [], []
+        items = out.get("removed") or []
+        if not items:
             bad.append("no removed spans")
-        for item in out.get("removed") or []:
-            span = item.get("excerpt") or ""
-            if item.get("category") not in WITHHOLD_CATEGORIES or not span or span not in natural_issue:
-                bad.append("invalid removed span")
-            elif span.casefold() in text.casefold():
-                bad.append(span)
+        for item in items:
+            selected = item.get("excerpt") or ""
+            if item.get("category") not in WITHHOLD_CATEGORIES:
+                bad.append(f"invalid category {item.get('category')!r}")
+            if item.get("kind") not in WITHHOLD_KINDS:
+                bad.append(f"invalid kind {item.get('kind')!r}")
             if item.get("discovery") not in WITHHOLD_DISCOVERY:
                 bad.append(f"invalid discovery {item.get('discovery')!r}; use on-request or repo-derivable")
+            spans = _find_spans(natural_issue, selected)
+            if not spans:
+                bad.append(f"excerpt is not a verbatim span of the issue: {selected!r}")
+                continue
+            extended = [_extend(s, segs) for s in spans]
+            if any(a < title_b and b > title_a for a, b in extended):
+                bad.append(f"the title line cannot be withheld: {selected!r}")
+                continue
+            ranges.extend(extended)
+            a, b = extended[0]
+            removed.append({"category": item.get("category"), "kind": item.get("kind"), "discovery": item.get("discovery"),
+                            "fact_text": (item.get("fact_text") or "").strip() or natural_issue[a:b], "selected": selected,
+                            "excerpt": natural_issue[a:b], "start": a, "end": b, "occurrences": [{"start": x, "end": y} for x, y in extended]})
+        merged = _merge(ranges)
+        removed_segs = sum(1 for s in segs if any(a <= s[0] and s[1] <= b for a, b in merged))
+        if segs and removed_segs / len(segs) > MAX_REMOVED_FRACTION:
+            bad.append(f"removed {removed_segs} of {len(segs)} sentences; the cap is {int(MAX_REMOVED_FRACTION * 100)}%")
+        kept, pos = [], 0
+        for a, b in merged:
+            if a > pos:
+                kept.append((pos, a))
+            pos = b
+        if pos < len(natural_issue):
+            kept.append((pos, len(natural_issue)))
+        brief = _tidy("".join(natural_issue[a:b] for a, b in kept), title)
+        if title and title not in brief:
+            bad.append("missing title")
+        for r in removed:
+            if r["excerpt"].casefold() in brief.casefold():
+                bad.append(f"removed span still visible in the brief: {r['excerpt']!r}")
         if not bad:
-            return out
+            return {"withheld_brief": brief, "removed": removed, "kept": kept,
+                    "stats": {"sentences_total": len(segs), "sentences_removed": removed_segs,
+                              "fraction_removed": round(removed_segs / max(1, len(segs)), 3), "prompt_version": WITHHOLD_PROMPT_VERSION}}
         messages.append({"role": "assistant", "content": json.dumps(out)})
         messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(bad)})
-    raise ValueError("withholding failed validation after two attempts")
+    raise ValueError("withholding failed validation after two attempts: " + "; ".join(bad))
 
 
 def _sha(b: bytes) -> str:
@@ -260,9 +403,13 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
         if any(f.get("id") == fid for f in spec["ledger"]):
             raise ValueError("reserved withholding fact id")
         discovery = "repo-derivable" if item["category"] in REPO_DERIVABLE_CATEGORIES else item["discovery"]
-        spec["ledger"].append({"id": fid, "text": item["excerpt"], "kind": item["kind"], "provenance": "original-issue",
+        spec["ledger"].append({"id": fid, "text": item["fact_text"], "kind": item["kind"], "provenance": "original-issue",
                                "source_excerpt": item["excerpt"], "source_url": issue_url, "discovery": discovery, "tests": []})
-        spec["operations"].append({"type": "withholding", "target": fid, "rationale": "Removed category: " + item["category"]})
+        # Operation is frozen at {type, target, rationale}: the exact span and its offsets in the natural text ride in the rationale
+        # (machine-readable copy in draft.meta.json under "withholding").
+        offsets = ", ".join(f"natural[{o['start']}:{o['end']}]" for o in item["occurrences"])
+        spec["operations"].append({"type": "withholding", "target": fid,
+                                   "rationale": f"Removed category: {item['category']}; {offsets} = {item['excerpt']!r}"})
 
     from swesim.models import ScenarioSpec
     parsed = ScenarioSpec.model_validate(spec)
@@ -271,5 +418,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     atomic_json(out_dir / "judge.json", {"gaps": judged.get("gaps", []), "verified_rubric_score": judged.get("verified_rubric_score"),
                                          "keep": judged.get("keep"), **judged})
     atomic_json(out_dir / "draft.meta.json", {"model_id": model_id, "prompt_version": DRAFT_PROMPT_VERSION, "pipeline_version": pipeline_version,
-                                              "created_at": spec["created_at"], "spec_hash": parsed.spec_hash})
+                                              "created_at": spec["created_at"], "spec_hash": parsed.spec_hash,
+                                              "withholding": {"removed": [{**r, "fact_id": f"withheld-{i + 1:03d}"} for i, r in enumerate(withheld["removed"])],
+                                                              "kept": withheld["kept"], "stats": withheld["stats"]}})
     return p

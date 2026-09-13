@@ -17,7 +17,10 @@ P2P = "xarray/tests/test_weighted.py::test_weighted_sum"
 ISSUE = ("Weighted mean silently ignores missing dims\n"
          "Calling ds.weighted(w).mean('z') with a dim 'z' that does not exist returns a result.\n"
          "Traceback shows no error at all.\n"
-         "Expected: raise ValueError.")
+         "Expected: raise ValueError.\n"
+         "I am using xarray 0.18 on Linux.\n"
+         "A small reproducer is attached below.")
+WITHHOLD_PROMPT_MARK = "Select spans of this issue to withhold"
 
 
 # ---------------------------------------------------------------- pool A / pure helpers
@@ -330,26 +333,103 @@ def test_calibrate_reports_agreement_at_threshold(monkeypatch):
 
 def test_withheld_brief_has_no_excerpts(monkeypatch):
     from swesim.stages import draft_spec
-    issue = 'Import fails\nTraceback: ERROR42\nrun_import("bad.csv")'
+    issue = 'Import fails\nThe importer stops on the first row.\nTraceback: ERROR42\nrun_import("bad.csv")\nWe expected the whole file to load.'
     monkeypatch.setattr(draft_spec, 'chat_json', lambda *a, **k: {'withheld_brief': 'Import fails',
         'removed': [{'category': 'error_message', 'excerpt': 'ERROR42', 'kind': 'reproduction', 'discovery': 'on-request'},
                     {'category': 'reproduction', 'excerpt': 'run_import("bad.csv")', 'kind': 'reproduction', 'discovery': 'on-request'}]})
     result = draft_spec.withhold(issue, 'fake/model')
     assert all(x['excerpt'] not in result['withheld_brief'] for x in result['removed'])
+    assert result['withheld_brief'] == 'Import fails\nThe importer stops on the first row.\nWe expected the whole file to load.'
 
 
 def test_withhold_retries_once_with_violations_then_fails(monkeypatch):
+    """A selected span that does not match the issue verbatim gets one correction round, then ValueError."""
     from swesim.stages import draft_spec
-    issue = 'Import fails\nTraceback: ERROR42'
+    issue = 'Import fails\nThe importer stops on the first row.\nTraceback: ERROR42'
     attempts = []
 
-    def leaky(model_id, system, messages, schema, **kw):
+    def not_verbatim(model_id, system, messages, schema, **kw):
         attempts.append(messages)
-        return {'withheld_brief': 'Import fails ERROR42', 'removed': [{'category': 'error_message', 'excerpt': 'ERROR42', 'kind': 'reproduction', 'discovery': 'on-request'}]}
-    monkeypatch.setattr(draft_spec, 'chat_json', leaky)
-    with pytest.raises(ValueError, match="withholding failed"):
+        return {'removed': [{'category': 'error_message', 'excerpt': 'Traceback: ERROR99', 'kind': 'reproduction', 'discovery': 'on-request'}]}
+    monkeypatch.setattr(draft_spec, 'chat_json', not_verbatim)
+    with pytest.raises(ValueError, match="withholding failed.*not a verbatim span"):
         draft_spec.withhold(issue, 'fake/model')
-    assert len(attempts) == 2 and "Correct these violations" in attempts[1][-1]["content"] and "ERROR42" in attempts[1][-1]["content"]
+    assert len(attempts) == 2 and "Correct these violations" in attempts[1][-1]["content"] and "ERROR99" in attempts[1][-1]["content"]
+
+
+WITHHOLD_ISSUE = ("Importer crashes on empty header\n"
+                  "Running run_import(\"bad.csv\") stops at row 1. The importer must stay compatible with v1 files.\n"
+                  "Traceback: ERROR42\n"
+                  "> quoted from the mailing list: the expected result is an empty table\n"
+                  "Expected: an empty table and no error.\n"
+                  "Seen on version 2.3.1 with Python 3.12.")
+
+
+def _select(*items):
+    return {"removed": [{"category": c, "excerpt": e, "kind": "context", "discovery": "on-request", "fact_text": f"fact about {c}"} for c, e in items]}
+
+
+def test_withhold_brief_is_computed_not_trusted(monkeypatch):
+    """The model's own brief is ignored: it cannot add a requirement or silently delete an unlisted sentence."""
+    from swesim.stages import draft_spec
+    hostile = _select(("error_message", "Traceback: ERROR42"))
+    hostile["withheld_brief"] = ("Importer crashes on empty header\nThe importer must break v1 files.\n"
+                                 "Running run_import(\"bad.csv\") stops at row 1.")      # adds a contradictory requirement, drops the compatibility and expectation sentences
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: hostile)
+    res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert res["withheld_brief"] == ("Importer crashes on empty header\n"
+                                     "Running run_import(\"bad.csv\") stops at row 1. The importer must stay compatible with v1 files.\n"
+                                     "> quoted from the mailing list: the expected result is an empty table\n"
+                                     "Expected: an empty table and no error.\n"
+                                     "Seen on version 2.3.1 with Python 3.12.")
+    assert "break v1" not in res["withheld_brief"] and "ERROR42" not in res["withheld_brief"]
+    assert [r["excerpt"] for r in res["removed"]] == ["Traceback: ERROR42"] and res["removed"][0]["fact_text"] == "fact about error_message"
+    assert res["removed"][0]["selected"] == "Traceback: ERROR42" and res["stats"]["sentences_total"] == 7
+
+
+def test_withhold_extends_to_sentence_boundaries_and_reconstructs(monkeypatch):
+    from swesim.stages import draft_spec
+    sel = _select(("expected_output", "empty table and no error"), ("version", "2.3.1"), ("reproduction", "stops at row 1"))
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: sel)
+    res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert [r["excerpt"] for r in res["removed"]] == ["Expected: an empty table and no error.", "Seen on version 2.3.1 with Python 3.12.",
+                                                       "Running run_import(\"bad.csv\") stops at row 1."]
+    assert "The importer must stay compatible with v1 files." in res["withheld_brief"]           # the other sentence on that line survives
+    assert all(WITHHOLD_ISSUE[r["start"]:r["end"]] == r["excerpt"] for r in res["removed"])
+    removed_ranges = [(o["start"], o["end"]) for r in res["removed"] for o in r["occurrences"]]
+    ranges = sorted(removed_ranges + res["kept"])
+    assert "".join(WITHHOLD_ISSUE[a:b] for a, b in ranges) == WITHHOLD_ISSUE                       # kept pieces + removed spans partition the natural issue
+    kept_text = "".join(WITHHOLD_ISSUE[a:b] for a, b in res["kept"])
+    assert " ".join(res["withheld_brief"].split()) == " ".join(kept_text.split())                  # brief == natural minus the spans, modulo whitespace
+    assert res["stats"] == {"sentences_total": 7, "sentences_removed": 3, "fraction_removed": 0.429, "prompt_version": "withhold-v2"}
+
+
+def test_withhold_caps_removed_fraction_and_protects_title(monkeypatch):
+    from swesim.stages import draft_spec
+    too_much = _select(("reproduction", "stops at row 1"), ("error_message", "Traceback: ERROR42"), ("expected_output", "an empty table and no error"),
+                       ("version", "Python 3.12"), ("location", "quoted from the mailing list"))
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: too_much)
+    with pytest.raises(ValueError, match="removed 5 of 7 sentences; the cap is 60%"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("location", "crashes on empty header")))
+    with pytest.raises(ValueError, match="title line cannot be withheld"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: {"removed": []})
+    with pytest.raises(ValueError, match="no removed spans"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+
+
+def test_withhold_matches_after_normalization_and_removes_every_occurrence(monkeypatch):
+    from swesim.stages import draft_spec
+    issue = "Dup title\nThe error is  Boom.\nUnrelated line here.\n> the error is boom.\nAnother fine line."
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("error_message", "the ERROR is boom")))
+    res = draft_spec.withhold(issue, "fake/model")
+    assert res["withheld_brief"] == "Dup title\nUnrelated line here.\nAnother fine line."
+    assert len(res["removed"]) == 1 and len(res["removed"][0]["occurrences"]) == 2 and res["removed"][0]["excerpt"] == "The error is  Boom."
+    norm_text, idx = draft_spec._norm_map(issue)
+    assert norm_text == draft_spec._norm(issue) and len(idx) == len(norm_text)
+    norm_text, idx = draft_spec._norm_map(WITHHOLD_ISSUE)
+    assert norm_text == draft_spec._norm(WITHHOLD_ISSUE)
 
 
 def _row(**over):
@@ -417,7 +497,7 @@ def _patch_llm(monkeypatch, draft_out, withhold_out):
 
     def fake_chat(model_id, system, messages, schema, **kw):
         calls.append({"model": model_id, "system": system, "messages": messages, "kw": kw})
-        return withhold_out if "Remove selected spans" in system else draft_out
+        return withhold_out if WITHHOLD_PROMPT_MARK in system else draft_out
     monkeypatch.setattr(draft_spec, "chat_json", fake_chat)
     monkeypatch.setattr(threads, "base_text", lambda repo, commit, path: "def test_weighted_sum():\n    assert True\n" if path.endswith(".py") and "tests" in path else None)
     return calls
@@ -461,6 +541,15 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     wf = {f.id: f for f in spec.ledger if f.id.startswith("withheld-")}
     assert all(f.provenance == "original-issue" and f.source_excerpt in ISSUE and f.source_url.endswith("/issues/5360") for f in wf.values())
     assert wf["withheld-001"].discovery == "on-request" and wf["withheld-003"].discovery == "repo-derivable"  # location category is repo-derivable
+    # the brief is computed by code: title plus every sentence not selected; operations carry the exact spans and offsets
+    assert spec.briefs[1].text == "Weighted mean silently ignores missing dims\nI am using xarray 0.18 on Linux.\nA small reproducer is attached below."
+    assert wf["withheld-003"].source_excerpt == "Calling ds.weighted(w).mean('z') with a dim 'z' that does not exist returns a result."  # selection extended to its sentence
+    for o, f in zip(ops, wf.values()):
+        start, end = ISSUE.index(f.source_excerpt), ISSUE.index(f.source_excerpt) + len(f.source_excerpt)
+        assert f"natural[{start}:{end}]" in o.rationale and repr(f.source_excerpt) in o.rationale
+    meta = json.loads((out_dir / "draft.meta.json").read_text())
+    assert [r["fact_id"] for r in meta["withholding"]["removed"]] == ["withheld-001", "withheld-002", "withheld-003"]
+    assert meta["withholding"]["stats"]["sentences_removed"] == 3 and meta["withholding"]["kept"]
     # the on-request fact linked to a FAIL_TO_PASS test survives for the approval gate
     assert any(f.discovery == "on-request" and F2P in f.tests for f in spec.ledger)
     assert [g.weight for g in spec.groups] == [1.0]
@@ -491,7 +580,7 @@ def test_draft_structural_tests_require_alternative_correct(monkeypatch, tmp_pat
 
 def test_draft_rejects_leaky_withholding_and_empty_controls(monkeypatch, tmp_path):
     from swesim.stages import draft_spec
-    leaky = _withhold_llm(); leaky["withheld_brief"] = ISSUE
+    leaky = _withhold_llm(); leaky["removed"][0]["excerpt"] = "Expected: raise TypeError."   # not a verbatim span of the issue
     _patch_llm(monkeypatch, _draft_llm(), leaky)
     with pytest.raises(ValueError, match="withholding failed"):
         draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s1")
@@ -609,7 +698,7 @@ def test_draft_rejects_ungrounded_facts_after_one_correction_round(monkeypatch, 
     calls = _patch_llm(monkeypatch, d, _withhold_llm())
     with pytest.raises(ValueError, match="grounding validation after two attempts.*f01"):
         draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
-    draft_calls = [c for c in calls if "Remove selected spans" not in c["system"]]
+    draft_calls = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
     assert len(draft_calls) == 2 and "Correct these violations" in draft_calls[1]["messages"][-1]["content"] and "f01" in draft_calls[1]["messages"][-1]["content"]
     assert not (tmp_path / "s" / "scenario.draft.json").exists()
 
