@@ -221,30 +221,28 @@ LB_COLUMNS = (
     Column("condition", "condition", "text"),
     Column("brief_profile", "brief", "text"),
     Column("n", "n", "num"),
+    Column("scenarios", "scenarios", "num"),
     Column("success_count", "solved", "num"),
+    Column("pass_rate", "pass rate", "metric"),
     Column("pass_at_k", "pass@k", "metric"),
     Column("pass_pow_k", "pass^k", "metric"),
     Column("mean_reward", "mean reward", "metric"),
-    Column("cost_per_solved_usd", "cost / solved", "usd"),
+    Column("cost_per_success", "cost / solved", "usd"),
     Column("questions_asked", "questions", "num"),
-    Column("asked_before_implementing_rate", "asked-first rate", "metric"),
-    Column("scenarios", "scenarios", "num"),
+    Column("confirmations", "confirmations", "num"),
+    Column("asked_first_rate", "asked-first rate", "metric"),
     Column("confidence_note", "confidence", "text"),
 )
 
 
-def leaderboard_body(rows: list, gate: list[dict], current: dict, matrix_html: str, chart_html: str, saturated_rows: list) -> str:
-    views = []
-    for r in rows:
-        d = r.model_dump(mode="json")
-        d["scenarios"] = len(r.scenario_ids)
-        views.append(d)
+def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_html: str, chart_html: str, saturated_views: list[dict]) -> str:
     eligible = [g for g in gate if g["eligible"]]
     checks = "".join(f"<tr><td><a href='/scenario/{h(g['scenario_id'])}'>{h(g['scenario_id'])}</a> <span class='mono muted'>v{h(g['version'])}</span></td><td>{chip(g['validation_status'])}</td>"
                      f"<td>{difficulty_chip(g['difficulty_tier'])}</td>"
                      f"<td>{chip('coherent + fair', 'good') if g['checks']['task_sense'] else chip('not audited' if not g['task_sense'] else 'fails audit', 'neutral' if not g['task_sense'] else 'critical')}</td>"
                      f"<td>{chip('on board', 'good') if g['eligible'] else chip('excluded', 'neutral')}</td></tr>" for g in gate)
     form = ("<form class='toolbar' method='get' action='/leaderboard'>"
+            + _filter_select("purpose", ["comparison", "calibration", "demonstration", "screen"], [current.get("purpose") or "comparison"], "purpose (never pooled)")
             + _filter_select("brief_profile", ["natural", "withheld"], current.get("brief_profile"), "brief profile")
             + _filter_select("source", ["github-repo", "swebench-annotated", "authored"], current.get("source"), "scenario source")
             + _filter_select("tier", ["A", "B", "C", "D", "E"], current.get("tier"), "model tier")
@@ -252,18 +250,14 @@ def leaderboard_body(rows: list, gate: list[dict], current: dict, matrix_html: s
             + f"<label class='inline'><input type='checkbox' name='include_saturated' value='1'{' checked' if current.get('include_saturated') else ''}> include saturated scenarios</label>"
             "<button type='submit' class='button'>Apply</button> <a class='button' href='/leaderboard'>Reset</a></form>")
     body = ["<h1>Leaderboard</h1><p class='lead'>How do models compare on informative tasks? Only scenarios that are valid, labelled <em>informative</em> by the difficulty screen and "
-            "pass the task-sense audit (coherent, fair tests) enter the board; saturated scenarios are excluded by default; broken never appear. Nothing is shown without n.</p>",
-            hero(f"{len(eligible)} / {len(gate)}", "scenarios on the board (eligible / current)", "/scenarios"), form,
-            table("leaderboard", LB_COLUMNS, views, key="model", total=len(views), empty="<strong>No cells with n ≥ 1 on eligible scenarios.</strong> The gate table below says why each scenario is excluded; "
-                                                                                          "run the difficulty screen (<a href='/run'>Run</a>, purpose = screen) and the task-sense audit to admit scenarios.", export=True),
+            "pass the task-sense audit (coherent, fair tests) enter the board; saturated scenarios are excluded by default; broken never appear. Nothing is shown without n; "
+            "purposes are never pooled.</p>",
+            hero(f"{len(eligible)} / {len(gate)}", "scenarios on the board (eligible / current versions)", "/scenarios"), form,
+            table("leaderboard", LB_COLUMNS, views, key="key", total=len(views), empty="<strong>No cells with n ≥ 1 on eligible scenarios.</strong> The gate table below says why each scenario is excluded; "
+                                                                                       "run the difficulty screen (<a href='/run'>Run</a>, purpose = screen) and the task-sense audit to admit scenarios.", export=True),
             "<h2>Per-scenario matrix</h2>", matrix_html, "<h2>Pass rate by condition</h2>", chart_html]
-    if saturated_rows:
-        sviews = []
-        for r in saturated_rows:
-            d = r.model_dump(mode="json")
-            d["scenarios"] = len(r.scenario_ids)
-            sviews.append(d)
-        body.append("<h2>Saturated scenarios (shown separately)</h2>" + table("saturated", LB_COLUMNS, sviews, key="model", empty="none", export=False))
+    if saturated_views:
+        body.append("<h2>Saturated scenarios (shown separately)</h2>" + table("saturated", LB_COLUMNS, saturated_views, key="key", empty="none", export=False))
     body.append("<h2>Gate</h2><p class='muted small'>Interfaces §9.1: valid · difficulty informative (saturated only with the toggle; broken never) · task-sense coherent and fair_tests.</p>"
                 f"<div class='table-wrap'><table><thead><tr><th>scenario</th><th>validation</th><th>difficulty</th><th>task sense</th><th>board</th></tr></thead><tbody>{checks}</tbody></table></div>")
     return "".join(body)
@@ -441,7 +435,7 @@ def preview_file(root: Path, rel: Path, max_bytes: int = 400_000) -> dict | None
 
 # ----------------------------------------------------------------------------- spend
 
-SPEND_COLUMNS = (Column("provider", "provider", "text"), Column("model", "model", "model"), Column("role", "role", "text"), Column("usd", "USD", "usd"),
+SPEND_COLUMNS = (Column("provider", "provider", "text"), Column("model", "model", "model"), Column("usd", "USD", "usd"), Column("share_of_cap", "share of cap", "metric"),
                  Column("input_tokens", "input tokens", "num"), Column("output_tokens", "output tokens", "num"), Column("records", "records", "num"))
 COST_COLUMNS = (Column("at", "at", "time"), Column("trial_id", "trial", "id", href="/trial/{trial_id}"), Column("workflow_id", "workflow", "id", href="/workflows/{workflow_id}", n=20),
                 Column("role", "role", "text"), Column("model", "model", "model"), Column("input_tokens", "in", "num"), Column("output_tokens", "out", "num"),
@@ -452,7 +446,7 @@ def spend_body(spend_rows: list, costs: list, cap: Decimal | None, by_run: list[
     total = sum((r.usd for r in spend_rows), Decimal(0))
     pct = f"{(float(total) / float(cap) * 100):.1f}% of cap ${cap:,.2f}" if cap else "no cap configured"
     views = [r.model_dump(mode="json") for r in spend_rows]
-    body = ["<h1>Spend</h1><p class='lead'>Recorded provider spend per provider, model and role (the live ledger from <code>costs</code>); per run below. "
+    body = ["<h1>Spend</h1><p class='lead'>Recorded provider spend per provider and model (the live ledger from <code>costs</code>); per run below. "
             "Unknown prices are recorded with <code>price_source = unknown</code> and never guessed.</p>",
             hero(f"${total:,.2f}", f"recorded spend · {pct}", "/db/costs"),
             table("spend", SPEND_COLUMNS, views, key="model", empty="<strong>No costs recorded yet.</strong> Costs land in <code>trials/&lt;tid&gt;/costs.json</code> as trials complete.", export=True),

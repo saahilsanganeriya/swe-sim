@@ -115,23 +115,20 @@ def _matches(row: dict, f, keys: Iterable[str]) -> bool:
     return True
 
 
-def _in_window(value, f) -> bool:
-    since, until = getattr(f, "since", None), getattr(f, "until", None)
-    if not since and not until:
+def _in_window(value, f, prefix: str) -> bool:
+    """``f.<prefix>_from`` <= value <= ``f.<prefix>_to`` (either bound optional); a value without a timestamp fails a bounded window."""
+    lo, hi = getattr(f, f"{prefix}_from", None), getattr(f, f"{prefix}_to", None)
+    if not lo and not hi:
         return True
     dt = _dt(value)
     if dt is None:
         return False
-    return (since is None or dt >= _dt(since)) and (until is None or dt <= _dt(until))
+    return (lo is None or dt >= _dt(lo)) and (hi is None or dt <= _dt(hi))
 
 
-def _order(items: list, f, default_key: str, reverse: bool = True) -> list:
+def _order(items: list, f, default_key: str) -> list:
     key = getattr(f, "order_by", None) or default_key
-    desc = reverse
-    if key.startswith("-"):
-        key, desc = key[1:], True
-    elif key.startswith("+"):
-        key, desc = key[1:], False
+    desc = bool(getattr(f, "desc", True))
 
     def sk(row):
         v = row.get(key) if isinstance(row, dict) else getattr(row, key, None)
@@ -246,8 +243,10 @@ class FileIndexReader:
         return self._cached("scenarios", build)
 
     def scenarios(self, f) -> Any:
-        rows = [r for r in self._all_scenarios() if getattr(f, "include_archived", False) or r.validation_status != "archived"]
-        rows = [r for r in rows if _matches(r.model_dump(mode="json"), f, ("scenario_id", "validation_status", "source", "difficulty_tier"))]
+        rows = self._all_scenarios()
+        if getattr(f, "latest_only", False):
+            rows = [r for r in rows if r.validation_status != "archived"]
+        rows = [r for r in rows if _matches(r.model_dump(mode="json"), f, ("scenario_id", "validation_status", "source", "difficulty_tier", "origin"))]
         rows = _order([r.model_dump() for r in rows], f, "updated_at")
         return _page([R.ScenarioRow.model_validate(r) for r in rows], f)
 
@@ -342,7 +341,8 @@ class FileIndexReader:
 
     def candidates(self, f) -> Any:
         rows, _hist = self._all_candidates()
-        items = [r for r in rows if _matches(r.model_dump(mode="json"), f, ("source_key", "source", "stage", "status", "gate", "scenario_id"))]
+        items = [r for r in rows if _matches(r.model_dump(mode="json"), f, ("source_key", "instance_id", "source", "repo", "stage", "status", "gate", "scenario_id"))
+                 and _in_window(r.judged_at, f, "judged")]
         items = _order([r.model_dump() for r in items], f, "updated_at")
         return _page([R.CandidateRow.model_validate(r) for r in items], f)
 
@@ -466,9 +466,9 @@ class FileIndexReader:
 
     def trials(self, f) -> Any:
         rows, _ = self._all_trials()
-        items = [r for r in rows if _matches(r.model_dump(mode="json"), f, ("trial_id", "scenario_id", "version", "model", "condition", "brief_profile",
-                                                                              "status", "outcome_code", "purpose", "origin"))
-                 and _in_window(r.started_at or r.created_at, f)]
+        items = [r for r in rows if _matches(r.model_dump(mode="json"), f, ("trial_id", "scenario_id", "version", "spec_hash", "model", "provider", "condition",
+                                                                              "brief_profile", "status", "outcome_code", "purpose", "origin", "launcher"))
+                 and (getattr(f, "success", None) is None or r.success == f.success) and _in_window(r.started_at or r.created_at, f, "started")]
         items = _order([r.model_dump() for r in items], f, "started_at")
         return _page([R.TrialRow.model_validate(r) for r in items], f)
 
@@ -542,7 +542,9 @@ class FileIndexReader:
         return self._cached("scores", build)
 
     def scores(self, f) -> list[R.ScoreRow]:
-        return [r for r in self._all_scores() if _matches(r.model_dump(mode="json"), f, ("scenario_id", "condition", "brief_profile", "model"))]
+        out = [r for r in self._all_scores() if _matches(r.model_dump(mode="json"), f, ("scenario_id", "spec_hash", "condition", "brief_profile", "model", "run_config_hash"))
+               and r.n >= int(getattr(f, "min_n", 0) or 0)]
+        return out[: int(getattr(f, "limit", 500) or 500)]
 
     def leaderboard_gate(self, include_saturated: bool = False) -> list[dict]:
         """Per current scenario: which §9.1 gates pass (valid, informative/saturated, task-sense coherent + fair_tests); not protocol."""
@@ -560,8 +562,8 @@ class FileIndexReader:
         return out
 
     def leaderboard(self, f) -> list:
-        from swesim.dashboard.render import tier_of  # tier table lives with the palette (brief §3.2 ids)
-        include_sat = bool(getattr(f, "include_saturated", False)) or ("saturated" in (getattr(f, "difficulty_tier", None) or []))
+        """Cells model × condition × brief_profile for one purpose over the gated scenarios (interfaces §9.1); ``min_n`` applies per cell."""
+        include_sat = bool(getattr(f, "include_saturated", False))
         eligible = {g["scenario_id"] for g in self.leaderboard_gate(include_sat) if g["eligible"]}
         wanted_src = getattr(f, "source", None)
         if wanted_src:
@@ -569,40 +571,29 @@ class FileIndexReader:
             eligible = {sid for sid in eligible if srcs.get(sid) in wanted_src}
         if getattr(f, "scenario_id", None):
             eligible &= set(f.scenario_id)
-        trials = [t for t in self._all_trials()[0] if t.scenario_id in eligible and t.status == "completed" and t.outcome_code in VALID
-                  and t.purpose in ("comparison", "calibration", "screen")]
-        if getattr(f, "brief_profile", None):
-            trials = [t for t in trials if t.brief_profile in f.brief_profile]
-        if getattr(f, "condition", None):
-            trials = [t for t in trials if t.condition in f.condition]
-        if getattr(f, "tier", None):
-            trials = [t for t in trials if tier_of(t.model) in f.tier]
-        scores = {(s.model, s.condition, s.brief_profile, s.scenario_id): s for s in self._all_scores() if s.scenario_id in eligible}
+        purpose = getattr(f, "purpose", "comparison") or "comparison"
+        trials = [t for t in self._all_trials()[0] if t.scenario_id in eligible and t.status == "completed" and t.outcome_code in VALID and t.purpose == purpose]
+        for key in ("brief_profile", "condition", "model", "provider"):
+            want = getattr(f, key, None)
+            if want:
+                trials = [t for t in trials if getattr(t, key) in want]
         cells: dict[tuple[str, str, str], list[R.TrialRow]] = {}
         for t in trials:
             cells.setdefault((t.model, t.condition, t.brief_profile), []).append(t)
+        min_n = int(getattr(f, "min_n", 1) or 1)
         out = []
         for (model, cond, prof), ts in sorted(cells.items()):
             n = len(ts)
+            if n < min_n:
+                continue
             succ = sum(1 for t in ts if t.success)
-            sids = sorted({t.scenario_id for t in ts})
-            pk = [scores[(model, cond, prof, sid)].pass_at_k for sid in sids if (model, cond, prof, sid) in scores and scores[(model, cond, prof, sid)].pass_at_k is not None]
-            ppk = [scores[(model, cond, prof, sid)].pass_pow_k for sid in sids if (model, cond, prof, sid) in scores and scores[(model, cond, prof, sid)].pass_pow_k is not None]
-            ks = {read_json(self.root / "scenarios" / sid / "scores.json").get(f"{cond}|{prof}|{ts[0].run_config_hash}", {}).get("requested_k") for sid in sids}
-            ks.discard(None)
             cost = sum((t.cost_usd for t in ts if t.cost_usd is not None), Decimal(0)) if any(t.cost_usd is not None for t in ts) else None
-            flags = [t.asked_before_implementing for t in ts if t.asked_before_implementing is not None]
-            ci = _wilson(succ, n)
-            note = f"n={n} valid attempt(s) over {len(sids)} scenario(s); pass rate {succ}/{n}" + (f", Wilson 95% CI {ci[0]:.2f}–{ci[1]:.2f}" if ci else "")
-            note += "; pass@k is the mean of per-scenario pass@k" + (" (k not uniform)" if len(ks) > 1 else "") if pk else "; pass@k not computed (fewer than k valid attempts per scenario)"
-            out.append(R.LeaderboardRow(model=model, condition=cond, brief_profile=prof, n=n, success_count=succ, k=next(iter(ks)) if len(ks) == 1 else None,
-                                        pass_at_k=(sum(pk) / len(pk)).quantize(Decimal("0.001")) if pk else None,
-                                        pass_pow_k=(sum(ppk) / len(ppk)).quantize(Decimal("0.001")) if ppk else None,
-                                        mean_reward=(sum((t.reward or Decimal(0)) for t in ts) / n).quantize(Decimal("0.001")) if n else None,
-                                        scenario_ids=sids, questions_asked=sum(t.questions_asked or 0 for t in ts), confirmations=sum(t.confirmations or 0 for t in ts),
-                                        asked_before_implementing_rate=Decimal(sum(1 for x in flags if x)) / Decimal(len(flags)) if flags else None,
-                                        cost_usd=cost, cost_per_solved_usd=(cost / succ).quantize(Decimal("0.0001")) if cost is not None and succ else None,
-                                        confidence_note=note))
+            out.append(R.LeaderboardRow(model=model, provider=model.split("/")[0], condition=cond, brief_profile=prof, purpose=purpose, n=n,
+                                        scenarios=len({t.scenario_id for t in ts}), success_count=succ,
+                                        pass_rate=(Decimal(succ) / Decimal(n)).quantize(Decimal("0.001")),
+                                        mean_reward=(sum((t.reward or Decimal(0)) for t in ts) / n).quantize(Decimal("0.001")),
+                                        questions_asked=sum(t.questions_asked or 0 for t in ts), confirmations=sum(t.confirmations or 0 for t in ts),
+                                        cost_usd=cost, cost_per_success=(cost / succ).quantize(Decimal("0.0001")) if cost is not None and succ else None))
         return out
 
     # ------------------------------------------------------------------ workflows (files carry none)
@@ -636,17 +627,21 @@ class FileIndexReader:
         return self._cached("costs", build)
 
     def costs(self, f) -> list[R.CostRow]:
-        return [r for r in self._all_costs() if _matches(r.model_dump(mode="json"), f, ("trial_id", "workflow_id", "role", "provider", "model")) and _in_window(r.at, f)]
+        out = [r for r in self._all_costs() if _matches(r.model_dump(mode="json"), f, ("trial_id", "workflow_id", "role", "provider", "model")) and _in_window(r.at, f, "at")]
+        out.sort(key=lambda r: r.at, reverse=True)
+        return out[: int(getattr(f, "limit", 500) or 500)]
 
     def spend(self) -> list:
-        agg: dict[tuple[str, str, str], dict] = {}
+        agg: dict[tuple[str, str], dict] = {}
         for c in self._all_costs():
-            a = agg.setdefault((c.provider, c.model, c.role), {"usd": Decimal(0), "input_tokens": 0, "output_tokens": 0, "records": 0})
+            a = agg.setdefault((c.provider, c.model), {"usd": Decimal(0), "input_tokens": 0, "output_tokens": 0, "records": 0})
             a["usd"] += c.usd
             a["input_tokens"] += c.input_tokens
             a["output_tokens"] += c.output_tokens
             a["records"] += 1
-        return [R.SpendRow(provider=p, model=m, role=r, cap_usd=self.spend_cap_usd, **a) for (p, m, r), a in sorted(agg.items())]
+        cap = self.spend_cap_usd
+        return [R.SpendRow(provider=p, model=m, cap_usd=cap, share_of_cap=(a["usd"] / cap).quantize(Decimal("0.0001")) if cap else None, **a)
+                for (p, m), a in sorted(agg.items())]
 
     # ------------------------------------------------------------------ operator actions
     @property
@@ -689,7 +684,7 @@ class FileIndexReader:
             rows = [r.model_dump(mode="json") for r in self.operator_actions(R.PageFilter(limit=500)).items]
         else:
             rows = []
-        where = getattr(f, "where", None) or {}
+        where = dict(getattr(f, "where", None) or {})
         rows = [r for r in rows if all(str(r.get(k)) == str(v) for k, v in where.items()) and _matches(r, f, ())]
         rows = _order(rows, f, "updated_at" if rows and "updated_at" in rows[0] else "created_at")
         return _page(rows, f)

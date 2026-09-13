@@ -127,7 +127,7 @@ def page(p: render.Page, body: str, reader, identity: Identity, settings: Settin
 # ----------------------------------------------------------------------------- counts and home data
 
 def counts(reader, settings: Settings) -> dict:
-    scen = reader.scenarios(R.ScenarioFilter(validation_status=["valid"], limit=1))
+    scen = reader.scenarios(R.ScenarioFilter(validation_status=["valid"], latest_only=True, limit=1))
     running = reader.trials(R.TrialFilter(status=["running", "launched"], limit=1))
     pending = reader.candidates(R.CandidateFilter(status=["pending"], limit=1))
     wf = reader.workflows(R.WorkflowFilter(status=["running"], limit=1))
@@ -166,7 +166,7 @@ async def home_data(reader, settings: Settings) -> dict:
     running = reader.trials(R.TrialFilter(status=["running", "launched", "planned"], limit=100))
     completed = reader.trials(R.TrialFilter(status=["completed"], limit=1))
     unresolved = reader.trials(R.TrialFilter(status=["unresolved", "runner-error", "launch-failed", "unit-failed", "cancelled"], limit=1))
-    recent = reader.trials(R.TrialFilter(order_by="-finished_at", limit=15))
+    recent = reader.trials(R.TrialFilter(order_by="finished_at", desc=True, limit=15))
     live, err = await live_jobs()
     wviews, _ = workflow_views(reader, live, settings, R.WorkflowFilter(limit=15))
     spend = reader.spend()
@@ -201,7 +201,7 @@ def api_counts(reader=Depends(reader_dep), settings: Settings = Depends(settings
 @app.get("/scenarios", response_class=HTMLResponse)
 def scenarios(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
     offset, limit = _paging(request, 200)
-    f = R.ScenarioFilter(**_lists(request, "validation_status", "source", "difficulty_tier"), include_archived=request.query_params.get("archived") == "1", offset=offset, limit=limit)
+    f = R.ScenarioFilter(**_lists(request, "validation_status", "source", "difficulty_tier"), latest_only=request.query_params.get("latest") == "1", offset=offset, limit=limit)
     pg = reader.scenarios(f)
     p = render.Page("Scenarios", "scenarios", "scenarios", crumbs=(("Scenarios", None),))
     return page(p, render_scenario.scenarios_body(pg, counts(reader, settings)), reader, identity, settings)
@@ -247,8 +247,8 @@ def _trial_filter(request: Request, default_limit: int = 200) -> R.TrialFilter:
     if status and "unresolved" in status:
         status = sorted(set(status) | {"runner-error", "launch-failed", "unit-failed", "cancelled"})
     return R.TrialFilter(**lists, status=status, version=_ints(request.query_params.getlist("version")), outcome_code=_ints(request.query_params.getlist("outcome_code")),
-                         since=_date(request.query_params.get("since")), until=_date(request.query_params.get("until"), end=True),
-                         order_by=request.query_params.get("order_by") or None, offset=offset, limit=limit)
+                         started_from=_date(request.query_params.get("since")), started_to=_date(request.query_params.get("until"), end=True),
+                         order_by=request.query_params.get("order_by") or None, desc=request.query_params.get("asc") != "1", offset=offset, limit=limit)
 
 
 @app.get("/trials", response_class=HTMLResponse)
@@ -373,31 +373,85 @@ def runs_redirect() -> RedirectResponse:
 # ----------------------------------------------------------------------------- leaderboard
 
 def _lb_filter(request: Request) -> tuple[R.LeaderboardFilter, dict]:
-    lists = _lists(request, "brief_profile", "source", "tier", "condition")
+    lists = _lists(request, "brief_profile", "source", "condition", "tier")
+    tiers = lists.pop("tier")
     include_sat = request.query_params.get("include_saturated") == "1"
-    f = R.LeaderboardFilter(**lists, include_saturated=include_sat)
+    purpose = request.query_params.get("purpose") or "comparison"
+    if purpose not in ("calibration", "comparison", "demonstration", "screen"):
+        purpose = "comparison"
+    models = sorted({m for t in (tiers or []) for m in render.TIERS.get(t, ())}) or None  # model tier -> the brief's verbatim ids
+    f = R.LeaderboardFilter(**lists, model=models, purpose=purpose, include_saturated=include_sat)
     current = {k: v or [] for k, v in lists.items()}
-    current["include_saturated"] = include_sat
+    current.update(tier=tiers or [], include_saturated=include_sat, purpose=purpose)
     return f, current
+
+
+def leaderboard_gate(reader, include_saturated: bool) -> list[dict]:
+    """Interfaces §9.1 applied to the current scenario versions: valid · informative (saturated with the toggle; broken never) · task-sense coherent + fair_tests."""
+    out = []
+    for s in reader.scenarios(R.ScenarioFilter(latest_only=True, limit=500)).items:
+        ts = s.task_sense if isinstance(s.task_sense, dict) else {}
+        checks = {"valid": s.validation_status == "valid",
+                  "difficulty": s.difficulty_tier == "informative" or (include_saturated and s.difficulty_tier == "saturated"),
+                  "task_sense": bool(ts.get("coherent")) and bool(ts.get("fair_tests"))}
+        out.append({"scenario_id": s.scenario_id, "version": s.version, "validation_status": s.validation_status, "difficulty_tier": s.difficulty_tier, "source": s.source,
+                    "task_sense": {k: ts.get(k) for k in ("coherent", "fair_tests", "plausible_withholding")} if ts else None, "checks": checks, "eligible": all(checks.values())})
+    return out
+
+
+def _wilson(successes: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
+    if n <= 0:
+        return None
+    import math
+    p = successes / n
+    den = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / den
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def board_views(reader, rows: list, eligible: set[str], f: R.LeaderboardFilter) -> list[dict]:
+    """LeaderboardRow cells joined with what the row model does not carry: mean per-scenario pass@k / pass^k from the scores
+    table, the asked-before-implementing rate and a confidence note (Wilson 95% CI on the pass rate)."""
+    scores = reader.scores(R.ScoreFilter(scenario_id=sorted(eligible) or None, condition=f.condition, brief_profile=f.brief_profile, model=f.model)) if eligible else []
+    trials = reader.trials(R.TrialFilter(scenario_id=sorted(eligible) or None, purpose=[f.purpose], status=["completed"], limit=500)).items if eligible else []
+    views = []
+    for r in rows:
+        d = r.model_dump(mode="json")
+        cell_scores = [s for s in scores if s.model == r.model and s.condition == r.condition and s.brief_profile == r.brief_profile and s.scenario_id in eligible]
+        pk = [s.pass_at_k for s in cell_scores if s.pass_at_k is not None]
+        ppk = [s.pass_pow_k for s in cell_scores if s.pass_pow_k is not None]
+        d["pass_at_k"] = str((sum(pk) / len(pk)).quantize(Decimal("0.001"))) if pk else None
+        d["pass_pow_k"] = str((sum(ppk) / len(ppk)).quantize(Decimal("0.001"))) if ppk else None
+        flags = [t.asked_before_implementing for t in trials if t.model == r.model and t.condition == r.condition and t.brief_profile == r.brief_profile and t.asked_before_implementing is not None]
+        d["asked_first_rate"] = f"{sum(1 for x in flags if x) / len(flags):.3f}" if flags else None
+        ci = _wilson(r.success_count, r.n)
+        d["confidence_note"] = (f"n={r.n} valid attempt(s) over {r.scenarios} scenario(s); pass rate {r.success_count}/{r.n}" + (f", Wilson 95% CI {ci[0]:.2f}–{ci[1]:.2f}" if ci else "")
+                                + ("; pass@k is the mean of per-scenario pass@k (k as scored per scenario)" if pk else "; pass@k not computed (fewer than k valid attempts per scenario)"))
+        d["key"] = f"{r.model}|{r.condition}|{r.brief_profile}"
+        views.append(d)
+    return views
 
 
 @app.get("/leaderboard", response_class=HTMLResponse)
 def leaderboard(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
     f, current = _lb_filter(request)
     rows = reader.leaderboard(f)
-    gate_fn = getattr(reader, "leaderboard_gate", None)
-    gate = gate_fn(f.include_saturated) if callable(gate_fn) else []
-    eligible = {g["scenario_id"] for g in gate if g["eligible"]} if gate else {sid for r in rows for sid in r.scenario_ids}
-    saturated_rows = []
+    gate = leaderboard_gate(reader, f.include_saturated)
+    eligible = {g["scenario_id"] for g in gate if g["eligible"] and (not f.source or g["source"] in f.source)}
+    saturated_views: list[dict] = []
     if not f.include_saturated:
-        sat = reader.leaderboard(R.LeaderboardFilter(**{k: getattr(f, k) for k in ("brief_profile", "source", "tier", "condition")}, include_saturated=True))
-        informative_ids = eligible
-        saturated_rows = [r for r in sat if not set(r.scenario_ids) <= informative_ids]
-    trials = [t for t in reader.trials(R.TrialFilter(scenario_id=sorted(eligible) or None, status=["completed"], limit=500)).items if t.scenario_id in eligible] if eligible else []
-    if f.condition:
-        trials = [t for t in trials if t.condition in f.condition]
-    if f.brief_profile:
-        trials = [t for t in trials if t.brief_profile in f.brief_profile]
+        sat_ids = {g["scenario_id"] for g in leaderboard_gate(reader, True) if g["eligible"] and g["difficulty_tier"] == "saturated"}
+        if sat_ids:
+            sat_rows = reader.leaderboard(R.LeaderboardFilter(purpose=f.purpose, condition=f.condition, brief_profile=f.brief_profile, model=f.model, source=f.source,
+                                                              scenario_id=sorted(sat_ids), include_saturated=True))
+            saturated_views = board_views(reader, sat_rows, sat_ids, f)
+    views = board_views(reader, rows, eligible, f)
+    trials = [t for t in reader.trials(R.TrialFilter(scenario_id=sorted(eligible) or None, purpose=[f.purpose], status=["completed"], limit=500)).items if t.scenario_id in eligible] if eligible else []
+    for key in ("condition", "brief_profile", "model"):
+        want = getattr(f, key)
+        if want:
+            trials = [t for t in trials if getattr(t, key) in want]
     models = sorted({t.model for t in trials}, key=lambda m: (render.family_of(m)[2] or 99, m))
     by_cell: dict[tuple[str, str], list] = {}
     for t in trials:
@@ -407,21 +461,22 @@ def leaderboard(request: Request, reader=Depends(reader_dep), identity: Identity
         ts = [t for t in by_cell.get((sid, model), []) if t.outcome_code in (1, 2, 3, 4)]
         if not ts:
             return None, 0, f"{sid} · {model}: no valid attempts"
-        rate = sum(1 for t in ts if t.success) / len(ts)
-        return rate, len(ts), f"{sid} · {model}: {sum(1 for t in ts if t.success)}/{len(ts)} valid attempts succeeded"
+        return sum(1 for t in ts if t.success) / len(ts), len(ts), f"{sid} · {model}: {sum(1 for t in ts if t.success)}/{len(ts)} valid attempts succeeded"
 
     matrix_html = pages.charts.matrix(sorted(eligible), models, cell, chart_id="chart-matrix", title="pass rate per scenario × model",
-                                      col_label=lambda m: m.split("/")[-1][:18]) if eligible and models else "<p class='empty'>No eligible scenario has completed trials.</p>"
-    chart_rows = [{"model": r.model, "condition": r.condition, "pass_at_k": float(r.pass_at_k) if r.pass_at_k is not None else (r.success_count / r.n if r.n else None), "n": r.n} for r in rows]
-    chart_html = pages.charts.grouped_bars(chart_rows, metric="pass_at_k", chart_id="chart-lb", title="pass@k (or pass rate when k is not uniform) per model per condition")
+                                      col_label=lambda m: m.split("/")[-1][:18]) if eligible and models else "<p class='empty'>No eligible scenario has completed trials for this purpose.</p>"
+    chart_rows = [{"model": r.model, "condition": r.condition, "pass_rate": float(r.pass_rate) if r.pass_rate is not None else None, "n": r.n} for r in rows]
+    chart_html = pages.charts.grouped_bars(chart_rows, metric="pass_rate", chart_id="chart-lb", title="pass rate per model per condition")
     p = render.Page("Leaderboard", "leaderboard", "leaderboard", crumbs=(("Leaderboard", None),))
-    return page(p, pages.leaderboard_body(rows, gate, current, matrix_html, chart_html, saturated_rows), reader, identity, settings)
+    return page(p, pages.leaderboard_body(views, gate, current, matrix_html, chart_html, saturated_views), reader, identity, settings)
 
 
 @app.get("/api/leaderboard")
 def api_leaderboard(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
     f, _ = _lb_filter(request)
-    return _json(200, {"items": [_dump(r) for r in reader.leaderboard(f)]})
+    gate = leaderboard_gate(reader, f.include_saturated)
+    eligible = {g["scenario_id"] for g in gate if g["eligible"]}
+    return _json(200, {"items": board_views(reader, reader.leaderboard(f), eligible, f), "gate": gate})
 
 
 # ----------------------------------------------------------------------------- episode
@@ -510,14 +565,14 @@ async def review_item(sid: str, workflow_id: str = "", reader=Depends(reader_dep
 
 @app.get("/create", response_class=HTMLResponse)
 def create_form(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
-    repos = sorted({r.source_ref for r in reader.scenarios(R.ScenarioFilter(source=["github-repo"], limit=500)).items if str(r.source_ref).startswith("http")})
+    repos = sorted({r.source_ref for r in reader.scenarios(R.ScenarioFilter(source=["github-repo"], latest_only=True, limit=500)).items if str(r.source_ref).startswith("http")})
     p = render.Page("Create tasks", "create", "create", crumbs=(("Create", None),))
     return page(p, render_console.create_body(console.defaults(), repos, settings.spend_cap_usd), reader, identity, settings)
 
 
 @app.get("/run", response_class=HTMLResponse)
 def run_form(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
-    valid = [r for r in reader.scenarios(R.ScenarioFilter(validation_status=["valid"], limit=500)).items if r.registry_json]
+    valid = [r for r in reader.scenarios(R.ScenarioFilter(validation_status=["valid"], latest_only=True, limit=500)).items if r.registry_json]
     p = render.Page("Run trials", "run", "run", crumbs=(("Run", None),))
     return page(p, render_console.run_body(console.defaults(), valid, settings.spend_cap_usd), reader, identity, settings)
 
@@ -525,7 +580,7 @@ def run_form(reader=Depends(reader_dep), identity: Identity = Depends(identity_d
 @app.get("/spend", response_class=HTMLResponse)
 def spend(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
     wid = request.query_params.get("workflow_id") or None
-    costs = reader.costs(R.CostFilter(workflow_id=[wid] if wid else None, order_by="-at", limit=500))
+    costs = reader.costs(R.CostFilter(workflow_id=[wid] if wid else None, limit=500))
     by_run: dict[str, dict] = {}
     for c in costs:
         if c.workflow_id:
@@ -568,7 +623,7 @@ def _table_filter(request: Request) -> R.TableFilter:
     col, val = request.query_params.get("where_col"), request.query_params.get("where_val")
     if col and val:
         where[col] = val
-    return R.TableFilter(where=where or None, q=request.query_params.get("q") or None, order_by=request.query_params.get("order_by") or None, offset=offset, limit=limit)
+    return R.TableFilter(where=where, q=request.query_params.get("q") or None, order_by=request.query_params.get("order_by") or None, offset=offset, limit=limit)
 
 
 @app.get("/db", response_class=HTMLResponse)
@@ -700,7 +755,7 @@ def _describe(action: str, params: dict, reader, settings: Settings) -> tuple[di
         p, errs = console.validate_create(params)
         return p, errs, console.cli_for_create(p), "Start a creation job (CreateTasksWorkflow) over the listed sources.", ",".join(p.get("repos") or p.get("instance_ids") or ["swebench:A"])
     if action == "run":
-        valid = {r.scenario_id for r in reader.scenarios(R.ScenarioFilter(validation_status=["valid"], limit=500)).items if r.registry_json}
+        valid = {r.scenario_id for r in reader.scenarios(R.ScenarioFilter(validation_status=["valid"], latest_only=True, limit=500)).items if r.registry_json}
         p, errs = console.validate_run(params, valid)
         return p, errs, console.cli_for_run(p), "Start a run (RunTasksWorkflow): k attempts per model per condition on the selected scenarios.", ",".join(p.get("scenario_ids") or [])
     if action == "cancel":
