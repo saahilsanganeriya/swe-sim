@@ -222,6 +222,35 @@ def _deletion_range(text: str, a: int, b: int) -> tuple[int, int]:
     return s, b
 
 
+def _kept_text(natural: str, ranges: list[tuple[int, int]]) -> tuple[str, list[tuple[int, int]], list[tuple[int, int]]]:
+    """(brief, deleted, kept) for stripped removal ranges of `natural`: ranges are merged, widened to their line-aware
+    deletion ranges (`_deletion_range`), and the brief is the concatenation of what remains, byte for byte. The natural's
+    missing trailing newline is never gained by the brief."""
+    merged = _merge(ranges)
+    deleted = _merge([_deletion_range(natural, a, b) for a, b in merged])
+    if deleted and deleted[-1][1] == len(natural) and not natural.endswith("\n") and natural[deleted[-1][0] - 1:deleted[-1][0]] == "\n":
+        deleted[-1] = (deleted[-1][0] - 1, deleted[-1][1])  # the natural has no trailing newline: the brief must not gain one
+    kept, pos = [], 0
+    for a, b in deleted:
+        if a > pos:
+            kept.append((pos, a))
+        pos = b
+    if pos < len(natural):
+        kept.append((pos, len(natural)))
+    return "".join(natural[a:b] for a, b in kept), deleted, kept
+
+
+def reconstruct_withheld(natural: str, excerpts: list[str]) -> str:
+    """The withheld brief that exactly `excerpts` (the recorded removals, each a whole sentence/line of `natural`) produce:
+    every occurrence of each excerpt, matched after `_norm` and widened to sentence/line segments like `withhold` does, is
+    deleted line-aware and everything else is kept byte for byte. `withhold` checks its own brief against this, and the
+    approval gate (and, by patch, `ScenarioSpec._integrity`) recompute it from the spec alone, so a sentence can never
+    disappear from the brief without a ledger entry (B-P1-2)."""
+    segs = _segments(natural)
+    ranges = [_extend(span, segs) for e in excerpts for span in _find_spans(natural, e)]
+    return _kept_text(natural, ranges)[0]
+
+
 def verbatim_fact_text(span: str) -> str:
     """The ledger text of a withheld fact is code-owned: the removed span itself, whitespace-normalized and trimmed, cut to
     MAX_FACT_TEXT_CHARS with an ellipsis, prefixed so the stakeholder quotes the reporter rather than paraphrasing."""
@@ -248,13 +277,15 @@ def withhold(natural_issue: str, model_id: str) -> dict:
     """Category-targeted withholding where the model only SELECTS spans and code performs the deletion.
 
     Each selected excerpt (at least MIN_EXCERPT_CHARS / MIN_EXCERPT_TOKENS after `_norm`) must match the natural issue
-    verbatim (after `_norm`); it is extended to whole sentence/line boundaries and every occurrence is deleted. Deletion
-    is line-aware (`_deletion_range`): whole lines go with their newline, mid-line deletions splice with one space, and
-    every other byte of the natural issue is preserved, so code blocks, tracebacks and paragraph breaks survive and no text
-    can be added or disappear undeclared. The title line is never deletable, at most `MAX_REMOVED_FRACTION` of the
-    sentence segments may go, at least one removal is required, duplicate selections collapse, `fact_text` is bounded and
-    may not introduce content words absent from the span/issue, and every removed span must be absent from the brief.
-    Malformed selections and violations get one correction round, then ValueError.
+    verbatim (after `_norm`); every occurrence is extended to whole sentence/line boundaries and each distinct extended
+    occurrence becomes its own removal record (its own ledger fact and withholding operation), so a phrase that occurs in
+    two sentences records both (B-P1-2). Deletion is line-aware (`_deletion_range`): whole lines go with their newline,
+    mid-line deletions splice with one space, and every other byte of the natural issue is preserved, so code blocks,
+    tracebacks and paragraph breaks survive and no text can be added or disappear undeclared: the brief must equal
+    `reconstruct_withheld(natural, recorded excerpts)`. The title line is never deletable, at most `MAX_REMOVED_FRACTION`
+    of the sentence segments may go, at least one removal is required, duplicate selections collapse, `fact_text` is
+    bounded and may not introduce content words absent from the span/issue, and every removed span must be absent from the
+    brief. Malformed selections and violations get one correction round, then ValueError.
 
     Zero removals is a valid outcome, not a failure: when the model selects nothing, or every selection is rejected after the
     correction round, the result has `removed == []`, `withheld_brief is None` and `stats.reason`; the draft then keeps only
@@ -263,7 +294,8 @@ def withhold(natural_issue: str, model_id: str) -> dict:
 
     Returns {"withheld_brief", "removed": [{category, kind, discovery, fact_text, paraphrase, selected, excerpt, start, end,
     occurrences}], "deleted": [(start, end)], "kept": [(start, end)], "stats": {...}}; `natural[start:end] == excerpt`
-    for every removal, kept + deleted partition the natural text, and the brief is the kept text byte for byte."""
+    for every removal (`occurrences` is that single range, kept for readers of draft.meta.json), kept + deleted partition
+    the natural text, and the brief is the kept text byte for byte."""
     messages = [{"role": "user", "content": natural_issue}]
     title_a, title_b = _title_range(natural_issue)
     title = natural_issue[title_a:title_b]
@@ -325,40 +357,33 @@ def withhold(natural_issue: str, model_id: str) -> dict:
                 rejected.append(f"excerpt is not a verbatim span of the issue: {selected!r}; closest lines: "
                                 f"{json.dumps(closest_lines(needle, [natural_issue]), ensure_ascii=False)}")
                 continue
-            extended = [_extend(s, segs) for s in spans]
+            extended = sorted({_extend(s, segs) for s in spans})
             if any(a < title_b and b > title_a for a, b in extended):
                 rejected.append(f"the title line cannot be withheld: {selected!r}")
                 continue
-            if extended[0] in seen_ranges:
+            fresh = [r for r in extended if r not in seen_ranges]
+            if not fresh:
                 duplicates += 1
                 continue
-            seen_ranges.add(extended[0])
-            ranges.extend(extended)
-            a, b = extended[0]
-            span = natural_issue[a:b]
-            removed.append({"category": item.get("category"), "kind": item.get("kind"), "discovery": item.get("discovery"),
-                            "fact_text": verbatim_fact_text(span), "paraphrase": paraphrase, "selected": selected, "excerpt": span,
-                            "start": a, "end": b, "occurrences": [{"start": x, "end": y} for x, y in extended]})
+            for a, b in fresh:  # B-P1-2: every expanded occurrence is its own recorded removal (one fact, one operation each)
+                seen_ranges.add((a, b))
+                ranges.append((a, b))
+                span = natural_issue[a:b]
+                removed.append({"category": item.get("category"), "kind": item.get("kind"), "discovery": item.get("discovery"),
+                                "fact_text": verbatim_fact_text(span), "paraphrase": paraphrase, "selected": selected, "excerpt": span,
+                                "start": a, "end": b, "occurrences": [{"start": a, "end": b}]})
         merged = _merge(ranges)
         removed_segs = sum(1 for s in segs if any(a <= s[0] and s[1] <= b for a, b in merged))
         if segs and removed_segs / len(segs) > MAX_REMOVED_FRACTION:
             bad.append(f"removed {removed_segs} of {len(segs)} sentences; the cap is {int(MAX_REMOVED_FRACTION * 100)}%")
-        deleted = _merge([_deletion_range(natural_issue, a, b) for a, b in merged])
-        if deleted and deleted[-1][1] == len(natural_issue) and not natural_issue.endswith("\n") and natural_issue[deleted[-1][0] - 1:deleted[-1][0]] == "\n":
-            deleted[-1] = (deleted[-1][0] - 1, deleted[-1][1])  # the natural has no trailing newline: the brief must not gain one
-        kept, pos = [], 0
-        for a, b in deleted:
-            if a > pos:
-                kept.append((pos, a))
-            pos = b
-        if pos < len(natural_issue):
-            kept.append((pos, len(natural_issue)))
-        brief = "".join(natural_issue[a:b] for a, b in kept)
+        brief, deleted, kept = _kept_text(natural_issue, ranges)
         if title and title not in brief:
             bad.append("missing title")
         for r in removed:
             if r["excerpt"].casefold() in brief.casefold():
                 bad.append(f"removed span still visible in the brief: {r['excerpt']!r}")
+        if removed and reconstruct_withheld(natural_issue, [r["excerpt"] for r in removed]) != brief:
+            bad.append("the recorded excerpts do not reconstruct the withheld brief (an excerpt occurs where no removal was recorded)")
         def success() -> dict:
             return {"withheld_brief": brief, "removed": removed, "deleted": deleted, "kept": kept,
                     "stats": {"sentences_total": len(segs), "sentences_removed": removed_segs,

@@ -18,7 +18,8 @@ ENV UV_COMPILE_BYTECODE=1 \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --create-home --uid 1000 --user-group --shell /usr/sbin/nologin swesim
+ && useradd --create-home --uid 1000 --user-group --shell /usr/sbin/nologin swesim \
+ && mkdir -p /app && chown swesim:swesim /app
 
 WORKDIR /app
 COPY --chown=swesim:swesim pyproject.toml uv.lock README.md ./

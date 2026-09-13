@@ -6,7 +6,7 @@
 #
 # The source is `git archive <sha>` (that commit and nothing untracked), submitted with cloudbuild.yaml and run as the
 # deployer service account (created by Terraform). Tags: <repo>/worker:<sha7> and :latest. The digest is read back from
-# Artifact Registry, never parsed from build logs.
+# Artifact Registry, never parsed from build logs. A sha that already has an image is not rebuilt (FORCE_BUILD=1).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -16,6 +16,14 @@ SHA=$(git rev-parse --verify "${3:-HEAD}^{commit}")
 SHORT=${SHA:0:7}
 REPO="$REGION-docker.pkg.dev/$PROJECT/swesim"
 BUILD_SA="projects/$PROJECT/serviceAccounts/swesim-deployer@$PROJECT.iam.gserviceaccount.com"
+
+# Idempotent per commit: an image already tagged with this sha is reused (FORCE_BUILD=1 rebuilds it).
+if [ "${FORCE_BUILD:-0}" != "1" ]; then
+  existing=$(gcloud artifacts docker images describe "$REPO/worker:$SHORT" --project "$PROJECT" --format 'value(image_summary.digest)' 2>/dev/null || true)
+  case $existing in
+    sha256:*) echo "reusing $REPO/worker:$SHORT (already built from $SHA)" >&2; echo "$REPO/worker@$existing"; exit 0 ;;
+  esac
+fi
 
 src=$(mktemp -d)
 trap 'rm -rf "$src"' EXIT

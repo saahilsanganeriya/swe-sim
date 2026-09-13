@@ -220,6 +220,18 @@ def test_disclosure_targeted_separates_targeted_volunteered_and_undeclared_facts
     assert d.targeted is False and d.volunteered == ["f99"]
 
 
+def test_conveyed_requirements_finds_test_only_requirements_restated_by_a_reply():
+    reqs = [{"id": "r01", "text": "Recovery must only happen in non-strict mode; strict mode must raise.", "fact_id": "f03"},
+            {"id": "r03", "text": "Bound the backward recovery scan so crafted files without a recoverable pointer fail quickly "
+                                  "rather than scanning indefinitely.", "fact_id": None}]
+    reply = ("The remaining requirement is bounding the backward scan so a crafted file without a recoverable pointer fails "
+             "quickly rather than scanning indefinitely.")
+    assert R.conveyed_requirements(reply, reqs) == ["r03"]
+    assert R.conveyed_requirements(reply, reqs, ungrounded_only=True) == ["r03"]
+    assert R.conveyed_requirements("Only in non-strict mode; strict mode must still raise.", reqs, ungrounded_only=True) == []
+    assert R.conveyed_requirements("Yes, that matches.", reqs) == []
+
+
 def test_test_or_identifier_disclosed_uses_the_reply_filter_term_semantics():
     terms = ["test_interval_with_bools", "IntervalProperty", "test_", "regression test", "bounded"]
     assert R.test_or_identifier_disclosed("Use IntervalProperty for that.", terms) == ["IntervalProperty"]
@@ -229,6 +241,11 @@ def test_test_or_identifier_disclosed_uses_the_reply_filter_term_semantics():
     assert R.test_or_identifier_disclosed("Then test_x passes.", terms) == ["test_"]
     assert R.test_or_identifier_disclosed("Booleans act like 0 and 1.", terms) == []
     assert R.test_or_identifier_disclosed("anything", []) == []
+    # builtin names are never test-derived, whatever the deny-list says
+    assert R.test_or_identifier_disclosed("Raise ValueError, not KeyError; all of them.", ["ValueError", "KeyError", "all", "bounded"]) == []
+    # only code-like hits and the fixed test vocabulary are unambiguous evidence
+    assert R.code_like_hits(["bounded", "IntervalProperty", "regression test", "raises", "test_x", "tests/", "scales.py", "_setup("]) == [
+        "IntervalProperty", "regression test", "test_x", "tests/", "scales.py", "_setup("]
 
 
 # ---------------------------------------------------------------- patience

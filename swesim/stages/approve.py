@@ -13,11 +13,29 @@ from pydantic import ValidationError
 
 from swesim.models import Discovery, OperationType, ScenarioSpec
 from swesim.paths import Workspace, atomic_json
-from swesim.stages.draft_spec import HUMAN_PROVENANCE, excerpt_grounds
+from swesim.stages.draft_spec import HUMAN_PROVENANCE, excerpt_grounds, reconstruct_withheld
 from swesim.stages.judge import norm_text
 
-AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "withholding-leak", "controls"]
+AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "withholding-leak", "withheld-reconstructs", "controls"]
 HUMAN_GATES = ["schema", "assets"]
+
+
+def withheld_reconstruction_failures(spec: ScenarioSpec) -> list[str]:
+    """Gate reason when the withheld brief is not the natural issue minus exactly the recorded removals (B-P1-2): the
+    brief is recomputed from the withholding operations' fact excerpts alone, so an unrecorded deletion (or an added
+    sentence) is caught even when every recorded excerpt is absent and the title survives."""
+    withheld = next((b for b in spec.briefs if b.profile == "withheld"), None)
+    if withheld is None:
+        return []
+    natural = next(b for b in spec.briefs if b.profile == "natural")
+    facts = {f.id: f for f in spec.ledger}
+    targets = [o.target for o in spec.operations if o.type == OperationType.WITHHOLDING]
+    excerpts = [facts[t].source_excerpt for t in targets if t in facts and facts[t].source_excerpt]
+    expected = reconstruct_withheld(natural.text, excerpts)
+    if expected != withheld.text:
+        return [f"withheld brief is not the natural issue minus exactly the recorded excerpts ({len(excerpts)} recorded removal(s); "
+                f"reconstruction has {len(expected)} chars, the brief {len(withheld.text)})"]
+    return []
 
 
 def human_corpora(spec: ScenarioSpec) -> dict[str, str]:
@@ -80,6 +98,7 @@ def auto_gates(spec: ScenarioSpec, sdir) -> list[str]:
                 fails.append(f"withheld brief still contains excerpt of {f.id}")
         title = next(b for b in spec.briefs if b.profile == "natural").text.strip().splitlines()[0][:60].casefold()
         if title and title not in withheld.text.casefold(): fails.append("withheld brief lost the natural title line")
+        fails += withheld_reconstruction_failures(spec)
     if not spec.controls.plausible_wrong or not any(c.cls == "incorrect-exploit" for c in spec.controls.tamper): fails.append("controls incomplete")
     return fails
 
