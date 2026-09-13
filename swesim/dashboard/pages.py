@@ -124,10 +124,20 @@ def home_body(data: dict, settings) -> str:
                       empty="<strong>Nothing is running.</strong> Start a run on <a href='/run'>Run</a>; rows appear here within 5 s of launch.", export=False))
     body.append("<div class='side-by-side'><div><h2>Recent workflows</h2>" + table("workflows", tuple(c for c in WORKFLOW_COLUMNS if c.key in ("workflow_id", "status", "temporal")), data["workflows"], key="execution_key",
                                                                                   empty="<strong>No workflows listed.</strong> " + h(data.get("workflow_error") or "Start one on Create or Run."), export=False)
-                + "</div><div><h2>Creation funnel</h2>" + charts.funnel(data["funnel"], "chart-home-funnel") + "</div></div>")
+                + "</div><div><h2>Creation funnel</h2><div id='home-charts' data-live-charts>" + charts.funnel(data["funnel"], "chart-home-funnel") + "</div></div></div>")
     body.append("<h2>Recently finished</h2>")
     body.append(table("recent", TRIAL_COLUMNS, data["recent"], key="trial_id", empty="<strong>No finished trials yet.</strong>", export=False))
+    body.append(health_panel())
     return "".join(body)
+
+
+def health_panel() -> str:
+    """The page renders immediately; a bounded JSON request fills the observation independently of the index."""
+    return ("<section class='card health-panel' data-health-source='/api/health'><h2>Worker queue polling</h2>"
+            "<p class='lead'>Recent Temporal pollers show that a worker has contacted a queue. They do not measure backlog, available capacity, or successful execution.</p>"
+            "<p data-health-state role='status'>Awaiting a queue observation…</p><p class='muted small' data-health-time>Not checked yet.</p>"
+            "<div data-health-rows></div><p class='muted small'>Cloud Run resource status: not measured. Queue polling is observed separately from resource readiness.</p>"
+            "<p class='small'><a href='/api/health'>Observation JSON</a> · <a href='/health'>Worker health</a></p></section>")
 
 
 # ----------------------------------------------------------------------------- trials
@@ -166,8 +176,9 @@ def candidates_body(page, views: list[dict], funnel_steps: list[dict], hist: dic
             "projected from the index into the histogram below.</p>",
             f"<form class='toolbar' method='get' action='/candidates'><label>source key<select name='source_key'><option value=''>all sources</option>{sel}</select></label>"
             "<button type='submit' class='button'>Filter</button></form>",
-            "<div class='side-by-side'><div>", charts.funnel(funnel_steps, "chart-funnel"), "</div><div>",
-            charts.hbars(list(hist.items()), "chart-rejects", "rejects by gate"), "</div></div>",
+            "<p class='muted small'>Discovery counts are decisions per source scan; overlapping sources can include the same PR.</p>",
+            "<div class='side-by-side' id='candidate-charts' data-live-charts>", charts.funnel(funnel_steps, "chart-funnel"),
+            charts.hbars(list(hist.items()), "chart-rejects", "rejects by gate"), "</div>",
             "<h2>Every candidate</h2>",
             table("candidates", CANDIDATE_COLUMNS, views, key="instance_id", total=page.total, offset=page.offset, limit=page.limit, source="/api/candidates",
                   empty="<strong>No candidate rows.</strong> A creation job's mining step writes <code>candidates/&lt;key&gt;.jsonl</code>; judged and probed rows follow.")]
@@ -270,10 +281,11 @@ def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_
             "pass the task-sense audit (coherent, fair tests) enter the board; saturated scenarios are excluded by default; broken never appear. Nothing is shown without n; "
             "purposes are never pooled.</p>",
             hero(f"{len(eligible)} / {len(gate)}", "scenarios on the board (eligible / current versions)", "/scenarios"), form,
-            leaderboard_comparison(views), "<h2>Scores and interaction details</h2>",
-            table("leaderboard", LB_COLUMNS, views, key="key", total=len(views), empty="<strong>No cells with n ≥ 1 on eligible scenarios.</strong> The gate table below says why each scenario is excluded; "
+            "<p><a class='button' href='/trends'>Historical trends…</a></p>",
+            "<div id='leaderboard-comparison' data-live-fragment>", leaderboard_comparison(views), "</div><h2>Scores and interaction details</h2>",
+            table("leaderboard", LB_COLUMNS, views, key="key", total=len(views), source="/api/leaderboard", empty="<strong>No cells with n ≥ 1 on eligible scenarios.</strong> The gate table below says why each scenario is excluded; "
                                                                                        "run the difficulty screen (<a href='/run'>Run</a>, purpose = screen) and the task-sense audit to admit scenarios.", export=True),
-            "<h2>Per-scenario matrix</h2>", matrix_html, "<h2>Pass rate by condition</h2>", chart_html]
+            "<div id='leaderboard-charts' data-live-charts><h2>Per-scenario matrix</h2>", matrix_html, "<h2>Pass rate by condition</h2>", chart_html, "</div>"]
     if saturated_views:
         body.append("<h2>Saturated scenarios (shown separately)</h2>" + table("saturated", LB_COLUMNS, saturated_views, key="key", empty="none", export=False))
     body.append("<h2>Gate</h2><p class='muted small'>Interfaces §9.1: valid · difficulty informative (saturated only with the toggle; broken never) · task-sense coherent and fair_tests.</p>"

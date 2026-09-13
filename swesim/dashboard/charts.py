@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from datetime import date
 from html import escape
 
 from swesim.dashboard.render import family_of
@@ -206,3 +207,100 @@ def matrix(rows: list[str], cols: list[str], cell_of, *, chart_id: str = "chart-
 
 def dec(v) -> float | None:
     return float(v) if isinstance(v, (int, float, Decimal)) else _num(v)
+
+
+def history(rows: list[dict], *, metric: str, chart_id: str, title: str, sample_key: str = "n", unit: str = "", ymax: float | None = None) -> str:
+    """UTC daily cumulative lines, direct labels, sample-count tooltips and a complete evidence table.
+
+Missing values break lines. Families keep their categorical slot; distinct models
+and asking cohorts have named series and dash patterns. At most three families and
+twelve series share a plot; every series remains in its table.
+"""
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        grouped.setdefault((row["model"], row.get("cohort", "")), []).append(row)
+    for series in grouped.values():
+        series.sort(key=lambda row: row["day"])
+    names = sorted(grouped, key=lambda key: (family_of(key[0])[2] or 99, key))
+    families = list(dict.fromkeys(family_of(model)[0] for model, _ in names))[:MAX_FAMILIES_PER_AXIS]
+    shown = [key for key in names if family_of(key[0])[0] in families][:12]
+    days = sorted({row["day"] for row in rows})
+    first = date.fromisoformat(days[0]).toordinal() if days else 0
+    last = date.fromisoformat(days[-1]).toordinal() if days else first
+    values = [_num(row.get(metric)) for row in rows]
+    peak = max([v for v in values if v is not None] + [0.0])
+    maximum = ymax if ymax is not None else (peak * 1.1 if peak > 0 else 1.0)
+    left, top, plot_width, plot_height, right = 80, 24, 500, max(180, len(shown) * 18), 230
+    width, height = left + plot_width + right, top + plot_height + 36
+
+    def x(day):
+        return left + plot_width * ((date.fromisoformat(day).toordinal() - first) / (last - first) if last != first else 0.5)
+
+    def y(value):
+        return top + plot_height * (1 - value / maximum)
+
+    parts = [f"<svg class='chart history-chart' viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' aria-label='{_h(title)}'>"]
+    for value in (0, maximum / 2, maximum):
+        parts.append(f"<line class='grid' x1='{left}' x2='{left + plot_width}' y1='{y(value):.1f}' y2='{y(value):.1f}'/>"
+                     f"<text class='tick' x='{left - 8}' y='{y(value) + 4:.1f}' text-anchor='end'>{value:.2g}{_h(unit)}</text>")
+    ticks = sorted({0, len(days) // 2, len(days) - 1}) if days else []
+    for i in ticks:
+        day = days[i]
+        parts.append(f"<text class='cat' x='{x(day):.1f}' y='{height - 10}' text-anchor='middle'>{_h(day)}</text>")
+    last_labels = []
+    for number, key in enumerate(shown):
+        model, cohort = key
+        label = model.split("/")[-1] + (f" · {cohort}" if cohort else "")
+        short_model = model.split("/")[-1]
+        short_label = (short_model[:14] + "…" if len(short_model) > 14 else short_model) + (" · asked" if cohort == "asked" else " · no ask" if cohort else "")
+        slot = family_of(model)[2]
+        pattern = "6 3" if cohort == "did-not-ask" else ("", "8 3", "2 3")[number % 3]
+        segments, segment = [], []
+        for row in grouped[key]:
+            value = _num(row.get(metric))
+            if value is None:
+                if segment:
+                    segments.append(segment)
+                    segment = []
+                continue
+            segment.append((x(row["day"]), y(value)))
+            tooltip = f"{row['day']} · {label} · {metric}={value:.4g}{unit} · n={row.get(sample_key, 0)} · {row['scenarios']} scenarios"
+            parts.append(f"<a href='{_h(row['evidence_url'])}' tabindex='0'><title>{_h(tooltip)}</title>"
+                         f"<circle class='history-point fam-{slot}' cx='{x(row['day']):.1f}' cy='{y(value):.1f}' r='3'/></a>")
+        if segment:
+            segments.append(segment)
+        for points in segments:
+            parts.append(f"<polyline class='history-line fam-{slot}' stroke-dasharray='{pattern}' points='"
+                         + " ".join(f"{xx:.1f},{yy:.1f}" for xx, yy in points) + "'/>")
+        valid = [row for row in grouped[key] if _num(row.get(metric)) is not None]
+        if valid:
+            row = valid[-1]
+            last_labels.append((y(float(row[metric])), label, short_label, float(row[metric]), row["evidence_url"]))
+    labels = sorted(last_labels)
+    positions = []
+    for desired, *_ in labels:
+        positions.append(max(desired, positions[-1] + 18 if positions else top))
+    if positions and positions[-1] > top + plot_height:
+        overflow = positions[-1] - top - plot_height
+        positions = [position - overflow for position in positions]
+    for placed, (_desired, label, short_label, value, href) in zip(positions, labels):
+        parts.append(f"<a href='{_h(href)}'><text class='lbl' x='{left + plot_width + 12}' y='{placed + 4:.1f}'><title>{_h(label)}</title>"
+                     f"{_h(short_label)} {value:.3g}{_h(unit)}</text></a>")
+    if not any(v is not None for v in values):
+        parts.append(f"<text class='lbl' x='{left + 20}' y='{top + plot_height / 2}'>No estimates with sufficient observations.</text>")
+    parts.append("</svg>")
+    legend = "<ul class='legend'>" + "".join(f"<li><i class='swatch fam-{family_of(model)[2]}'></i>{_h(model)}{_h(' · ' + cohort if cohort else '')}</li>" for model, cohort in shown) + "</ul>"
+    cells = []
+    for row in rows:
+        value = _num(row.get(metric))
+        value_text = f"{value:.4g}{unit}" if value is not None else "unknown"
+        n = row.get(sample_key, row["n"])
+        cells.append(f"<tr><td>{_h(row['model'])}{_h(' · ' + row['cohort'] if row.get('cohort') else '')}</td><td>{_h(row['day'])}</td>"
+                     f"<td class='num'><a href='{_h(row['evidence_url'])}'>{n}</a></td><td class='num'>{row['scenarios']}</td>"
+                     f"<td class='num'><a href='{_h(row['evidence_url'])}'>{_h(value_text)}</a></td></tr>")
+    table = ("<div class='table-wrap'><table><thead><tr><th>model / cohort</th><th>through UTC day</th><th class='num'>n observed</th>"
+             f"<th class='num'>scenarios</th><th class='num'>{_h(title)}</th></tr></thead><tbody>{''.join(cells)}</tbody></table></div>")
+    caption = "Cumulative through each UTC completion day; n is the observed denominator. Select a point or value for its trials. Missing values break the line."
+    if len(shown) < len(names):
+        caption += f" {len(names) - len(shown)} additional series are in the table."
+    return figure(title, "".join(parts) + legend, table, caption, chart_id)

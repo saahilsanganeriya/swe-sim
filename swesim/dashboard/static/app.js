@@ -223,6 +223,81 @@
   function patchCounts(counts) {
     document.querySelectorAll("[data-count]").forEach((n) => { const k = n.dataset.count; if (k && k in counts) n.textContent = counts[k] === null || counts[k] === undefined ? "" : counts[k]; });
   }
+  /* Chart markup is emitted by the same escaped server renderer as the initial page.
+     Parse only a restricted chart vocabulary; replace content without script execution,
+     preserving table tabs, scrolling and keyboard focus across updates. */
+  function patchCharts(target, charts) {
+    if (!target || !charts) return;
+    const selected = new Map();
+    target.querySelectorAll("figure[id]").forEach((fig) => {
+      const table = fig.querySelector(".table-wrap"), button = fig.querySelector("[data-chart-tabs] [aria-selected=true]");
+      selected.set(fig.id, { view: button ? button.dataset.view : "chart", left: table ? table.scrollLeft : 0, top: table ? table.scrollTop : 0 });
+    });
+    const active = target.contains(document.activeElement) ? document.activeElement : null;
+    const focus = active ? { figure: active.closest("figure")?.id, view: active.dataset.view, href: active.getAttribute("href") } : null;
+    const nodes = [], parser = new DOMParser();
+    const allowed = new Set("div span section h2 h3 h4 p em strong figure figcaption ul li i button table caption thead tbody tr th td a svg g polyline path rect circle line text title tspan".split(" "));
+    const attributes = new Set("class id role title type tabindex href style scope colspan rowspan viewbox width height x y x1 y1 x2 y2 cx cy r rx d points text-anchor transform stroke-dasharray data-view data-chart-tabs".split(" "));
+    Object.values(charts).forEach((markup) => {
+      const doc = parser.parseFromString(markup, "text/html");
+      doc.body.querySelectorAll("*").forEach((node) => {
+        if (!allowed.has(node.localName.toLowerCase())) throw new Error("unsupported chart element");
+        Array.from(node.attributes).forEach((attr) => {
+          const name = attr.name.toLowerCase();
+          if (!attributes.has(name) && !name.startsWith("aria-")) node.removeAttribute(attr.name);
+          if (name === "href" && (!attr.value.startsWith("/") || attr.value.startsWith("//"))) node.removeAttribute(attr.name);
+          if (name === "style" && !/^background:var\(--seq-\d+\)$/.test(attr.value)) node.removeAttribute(attr.name);
+        });
+      });
+      Array.from(doc.body.childNodes).forEach((node) => nodes.push(document.importNode(node, true)));
+    });
+    target.replaceChildren(...nodes);
+    target.querySelectorAll("figure[id]").forEach((fig) => {
+      const state = selected.get(fig.id); if (!state) return;
+      fig.querySelectorAll("[data-chart-tabs] button").forEach((button) => button.setAttribute("aria-selected", String(button.dataset.view === state.view)));
+      fig.querySelectorAll("[data-view]").forEach((node) => { if (node.tagName !== "BUTTON") node.classList.toggle("hidden", node.dataset.view !== state.view); });
+      const table = fig.querySelector(".table-wrap"); if (table) { table.scrollLeft = state.left; table.scrollTop = state.top; }
+    });
+    if (focus && focus.figure) {
+      const figure = document.getElementById(focus.figure);
+      const node = figure && Array.from(figure.querySelectorAll("button, a")).find((item) => focus.view ? item.dataset.view === focus.view : item.getAttribute("href") === focus.href);
+      if (node) node.focus({ preventScroll: true });
+    }
+  }
+
+  function showHealth(panel, data) {
+    const labels = { ok: "Recent pollers on all queues", degraded: "Some queues have no recent pollers or could not be observed", unavailable: "Queue observation unavailable", stale: "Current observation unavailable; retained observation is stale" };
+    const state = panel.querySelector("[data-health-state]");
+    state.replaceChildren(chip(labels[data.state] || data.state, data.state === "ok" ? "good" : "serious"));
+    if (data.reason) state.appendChild(document.createTextNode(" " + data.reason));
+    panel.querySelector("[data-health-time]").textContent = "Checked " + data.checked_at + " · cache age " + data.age_seconds + "s · recent means last " + data.recent_within_seconds + "s at observation" + (data.last_success_at ? " · last complete observation " + data.last_success_at : " · no successful observation yet");
+    const table = el("table"), head = el("thead"), header = el("tr");
+    ["Queue", "Type", "Observation", "Recent pollers", "Last poll (UTC)", "Error class"].forEach((label) => { const cell = el("th", null, label); cell.scope = "col"; header.appendChild(cell); });
+    head.appendChild(header); table.appendChild(head);
+    const tbody = el("tbody");
+    (data.queues || []).forEach((queue) => {
+      const row = el("tr"); row.appendChild(el("td", "mono", queue.queue)); row.appendChild(el("td", null, queue.kind));
+      const status = el("td"); status.appendChild(chip(queue.state, queue.state === "polling" ? "good" : queue.state === "no_recent_pollers" ? "critical" : "serious")); row.appendChild(status);
+      const count = el("td", "num", queue.recent_pollers ?? "—");
+      if (data.stale && data.last_success) {
+        const known = data.last_success.pollers[queue.queue + "/" + queue.kind];
+        if (known !== undefined) count.appendChild(el("div", "muted small", "last known: " + known));
+      }
+      row.appendChild(count); row.appendChild(el("td", "mono", queue.last_polled_at || "unknown"));
+      row.appendChild(el("td", null, queue.error_class || (queue.unknown_timestamps ? queue.unknown_timestamps + " timestamp(s) unknown" : "—")));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody); const wrap = el("div", "table-wrap"); wrap.appendChild(table);
+    panel.querySelector("[data-health-rows]").replaceChildren(wrap);
+    panel.dataset.checkedAt = data.checked_at;
+  }
+  document.querySelectorAll("[data-health-source]").forEach((panel) => {
+    const refresh = async () => {
+      try { showHealth(panel, await getJSON(panel.dataset.healthSource)); }
+      catch (error) { panel.querySelector("[data-health-state]").textContent = "Observation refresh unavailable; displayed data may be stale. Last shown: " + (panel.dataset.checkedAt || "never") + ". " + error; }
+    };
+    refresh(); poll(15000, refresh);
+  });
   /* nav counts: every page, every 10 s */
   poll(10000, async () => { const c = await getJSON("/api/counts"); patchCounts(c); });
   /* page data: body[data-source] is a JSON endpoint whose keys match [data-tile] keys and [data-table] ids */
@@ -233,13 +308,17 @@
       try {
         const data = await getJSON(body.dataset.source);
         if (data.tiles) patchTiles(data.tiles);
-        document.querySelectorAll("[data-table]").forEach((t) => { const items = data[t.dataset.table]; if (Array.isArray(items)) setRows(t, items); else if (items && Array.isArray(items.items)) setRows(t, items.items); });
+        if (data.charts) patchCharts(document.getElementById(body.dataset.chartTarget), data.charts);
+        if (data.fragments) Object.entries(data.fragments).forEach(([id, content]) => { const target = document.getElementById(id); if (target && target.hasAttribute("data-live-fragment")) patchCharts(target, content); });
+        if (data.coverage && document.getElementById("trend-coverage")) document.getElementById("trend-coverage").textContent = data.coverage;
+        document.querySelectorAll("[data-table]").forEach((t) => { const same = t.dataset.source && new URL(t.dataset.source, location.origin).pathname === new URL(body.dataset.source, location.origin).pathname; const items = data[t.dataset.table] || (same ? data.items : null); if (Array.isArray(items)) setRows(t, items); else if (items && Array.isArray(items.items)) setRows(t, items.items); });
         lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
       } finally { main.classList.remove("refetching"); }
     });
   }
   /* tables with their own source (no page source) */
   document.querySelectorAll("[data-table][data-source]").forEach((t) => {
+    if (body.dataset.source && new URL(t.dataset.source, location.origin).pathname === new URL(body.dataset.source, location.origin).pathname) return;
     poll(parseInt(body.dataset.pollMs || "8000", 10), async () => {
       const url = new URL(t.dataset.source, window.location.origin);
       new URLSearchParams(window.location.search).forEach((value, key) => url.searchParams.append(key, value));
@@ -324,12 +403,14 @@
   }));
 
   /* ------------------------------------------------------------ chart table-view toggle, tabs, evaluator toggle */
-  document.querySelectorAll("[data-chart-tabs]").forEach((tabs) => {
-    tabs.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
+  document.addEventListener("click", (event) => {
+    const b = event.target.closest("[data-chart-tabs] button");
+    if (b) {
+      const tabs = b.closest("[data-chart-tabs]");
       tabs.querySelectorAll("button").forEach((x) => x.setAttribute("aria-selected", x === b ? "true" : "false"));
       const fig = tabs.parentElement;
-      fig.querySelectorAll("[data-view]").forEach((v) => v.classList.toggle("hidden", v.dataset.view !== b.dataset.view));
-    }));
+      fig.querySelectorAll("[data-view]").forEach((v) => { if (v.tagName !== "BUTTON") v.classList.toggle("hidden", v.dataset.view !== b.dataset.view); });
+    }
   });
   document.querySelectorAll("[role=tablist] [role=tab]").forEach((tab) => tab.addEventListener("click", () => {
     const list = tab.closest("[role=tablist]");
