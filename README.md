@@ -27,6 +27,13 @@ validate (nop, oracle, plausible-wrong, tamper, reachability; all on Modal) -> r
 
 ## Quick start on a laptop
 
+> **Runs and task creation go through Temporal, never the stage commands.** The operator entry points are `swesim create`
+> (task creation from repo URLs or the SWE-bench pool), `swesim run-tasks` (graded trials on selected scenarios and models),
+> `swesim workflows list|progress|cancel|approve`, and the console's Create/Run/Jobs/Review pages, all executed by the VM
+> worker with launch-once trial identity and reconciliation. The stage-by-stage commands shown below with `SWESIM_DIRECT=1`
+> are the building blocks those workflows call; they are hidden from `--help` and refuse to run without that variable. Use
+> them only to debug one stage. The trials recorded during the first night were run this way and are labelled as such.
+
 ```bash
 uv sync --extra dev --frozen
 uv run --frozen --offline python -m pytest -q tests      # offline suite
@@ -42,15 +49,15 @@ bash scripts/deploy_stakeholder.sh                        # Modal Secret swesim-
 Scenario ids are the instance id lower-cased with `__` replaced by `--`.
 
 ```bash
-uv run swesim mine --source swebench-annotated --pool A --instance scikit-learn__scikit-learn-13584
-uv run swesim judge workspace/candidates/swebench-annotated.jsonl --model openai/gpt-5.5
-uv run swesim probe --judged workspace/candidates/swebench-annotated.judged.jsonl --instance scikit-learn__scikit-learn-13584
-uv run swesim draft workspace/candidates/swebench-annotated.judged.probed.jsonl scikit-learn__scikit-learn-13584 --model anthropic/claude-sonnet-5
-uv run swesim approve --auto scikit-learn--scikit-learn-13584
-uv run swesim compile scikit-learn--scikit-learn-13584
-uv run swesim validate scikit-learn--scikit-learn-13584
+SWESIM_DIRECT=1 uv run swesim mine --source swebench-annotated --pool A --instance scikit-learn__scikit-learn-13584
+SWESIM_DIRECT=1 uv run swesim judge workspace/candidates/swebench-annotated.jsonl --model openai/gpt-5.5
+SWESIM_DIRECT=1 uv run swesim probe --judged workspace/candidates/swebench-annotated.judged.jsonl --instance scikit-learn__scikit-learn-13584
+SWESIM_DIRECT=1 uv run swesim draft workspace/candidates/swebench-annotated.judged.probed.jsonl scikit-learn__scikit-learn-13584 --model anthropic/claude-sonnet-5
+SWESIM_DIRECT=1 uv run swesim approve --auto scikit-learn--scikit-learn-13584
+SWESIM_DIRECT=1 uv run swesim compile scikit-learn--scikit-learn-13584
+SWESIM_DIRECT=1 uv run swesim validate scikit-learn--scikit-learn-13584
 uv run swesim register scikit-learn--scikit-learn-13584
-uv run swesim run scikit-learn--scikit-learn-13584 --condition interactive --attempt 0 --model anthropic/claude-haiku-4-5-20251001
+SWESIM_DIRECT=1 uv run swesim run scikit-learn--scikit-learn-13584 --condition interactive --attempt 0 --model anthropic/claude-haiku-4-5-20251001
 uv run swesim score scikit-learn--scikit-learn-13584 --k 3
 uv run swesim export scikit-learn--scikit-learn-13584
 ```
@@ -60,10 +67,10 @@ uv run swesim export scikit-learn--scikit-learn-13584
 ### Repository-URL path
 
 ```bash
-uv run swesim mine --source github-repo --repo https://github.com/py-pdf/pypdf --since 2026-06-01 --max-prs 400 --max-builds 3 --kind bugfix
-uv run swesim judge workspace/candidates/github-repo--py-pdf__pypdf.jsonl
-uv run swesim probe --judged workspace/candidates/github-repo--py-pdf__pypdf.judged.jsonl --instance py-pdf__pypdf-3826
-uv run swesim draft workspace/candidates/github-repo--py-pdf__pypdf.judged.probed.jsonl py-pdf__pypdf-3826
+SWESIM_DIRECT=1 uv run swesim mine --source github-repo --repo https://github.com/py-pdf/pypdf --since 2026-06-01 --max-prs 400 --max-builds 3 --kind bugfix
+SWESIM_DIRECT=1 uv run swesim judge workspace/candidates/github-repo--py-pdf__pypdf.jsonl
+SWESIM_DIRECT=1 uv run swesim probe --judged workspace/candidates/github-repo--py-pdf__pypdf.judged.jsonl --instance py-pdf__pypdf-3826
+SWESIM_DIRECT=1 uv run swesim draft workspace/candidates/github-repo--py-pdf__pypdf.judged.probed.jsonl py-pdf__pypdf-3826
 ```
 
 Then `approve --auto`, `compile`, `validate`, `register`, `run`, `score`, `export` on `py-pdf--pypdf-3826`. Discovery lists merged PRs, resolves linked issues (closing keyword, timeline reference or plain mention, tier recorded), keeps code-plus-test PRs in band (`feature`: 200 to 1,500 code lines, `bugfix`: 20 to 600), writes a rejection histogram to `.rejects.json`, and builds the first `--max-builds` candidates on Modal to derive test lists from a real Dockerfile. `--pr N` pins one PR (recorded as `repo_only=false`); `probe-tests` re-probes one candidate.

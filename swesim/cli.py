@@ -1,7 +1,8 @@
 """swesim command-line entry point.
 
-Pipeline: mine -> judge -> draft -> approve -> compile -> validate -> register -> run -> score -> export.
-Orchestrated variants: pipeline / matrix / worker (Temporal). Viewing: dashboard.
+Operator entry points (Temporal): `swesim create` (task creation), `swesim run-tasks` (graded runs), `swesim workflows ...`, and the
+console (`swesim dashboard`). The stage commands (mine, judge, probe, draft, approve, compile, validate, run) are the building blocks
+those workflows call; they are hidden and refuse to run directly unless SWESIM_DIRECT=1 (debugging only).
 See docs/superpowers/specs/2026-09-12-swe-simulator-design.md, section 7, and docs/architecture.md.
 
 Every stage import is lazy so `swesim --help` works without optional services, and every command is a thin
@@ -64,12 +65,31 @@ def _worker_secret(value: str) -> str:
     return secret
 
 
+DIRECT_STAGE_HINT = {
+    "mine": "swesim create --source <repo URL | swebench:A[:ids]>", "judge": "swesim create ...", "probe": "swesim create ...",
+    "draft": "swesim create ...", "approve": "swesim create ... --approval-mode hold  +  swesim workflows approve", "compile": "swesim create ...",
+    "validate": "swesim create ...", "run": "swesim run-tasks --scenario-ids <id> --models <ids> --conditions <c> --k <n>",
+    "probe-tests": "swesim create ...",
+}
+
+
+def _direct_stage(name: str) -> None:
+    """Task creation and graded runs go through Temporal (`swesim create`, `swesim run-tasks`, or the console), which gives
+    every trial a launch-once identity, reconciliation and laptop-independent execution. The stage commands below are the
+    building blocks those workflows call; running them directly is for debugging only and must be opted into."""
+    if os.environ.get("SWESIM_DIRECT") == "1":
+        return
+    typer.echo(f"swesim {name}: direct stage execution is disabled. Use Temporal: `{DIRECT_STAGE_HINT.get(name, 'swesim create / swesim run-tasks')}` "
+               f"(or the console's Create/Run pages). For debugging only, set SWESIM_DIRECT=1.", err=True)
+    raise typer.Exit(code=3)
+
+
 # ----------------------------------------------------------------------------------------------------------
 # Sources
 # ----------------------------------------------------------------------------------------------------------
 
 
-@app.command()
+@app.command(hidden=True)
 def mine(
     source: str = typer.Option("swebench-annotated", help="swebench-annotated | github-repo"),
     pool: str = typer.Option("A", help="SWE-bench annotated pool (A = underspecified >= 2, valid tests)"),
@@ -83,6 +103,7 @@ def mine(
     kind: str = typer.Option("feature", help="github-repo: feature | bugfix band"),
 ) -> None:
     """Discover candidates: SWE-bench annotated pool A, or any GitHub repository URL (issues + linked merged PRs)."""
+    _direct_stage("mine")
     from swesim.stages import mine as mine_stage
 
     if source == "swebench-annotated":
@@ -98,13 +119,14 @@ def mine(
     typer.echo(str(out))
 
 
-@app.command()
+@app.command(hidden=True)
 def judge(
     candidates: Path,
     model: str = typer.Option(JUDGE_MODEL_DEFAULT, help="Judge model id (explicit; differs from the draft model)"),
     limit: int = typer.Option(20),
 ) -> None:
     """Per-gap underspecification judgement for each candidate row; writes <candidates>.judged.jsonl."""
+    _direct_stage("judge")
     from swesim.stages.judge import judge_candidate
 
     rows = _rows(candidates)[:limit]
@@ -148,13 +170,14 @@ def judge_calibrate(
     typer.echo(json.dumps({k: v for k, v in result.items() if k != "per_instance"}, indent=1))
 
 
-@app.command()
+@app.command(hidden=True)
 def draft(
     judged: Path,
     instance_id: str,
     model: str = typer.Option(DRAFT_MODEL_DEFAULT, help="Draft model id (explicit; differs from the judge model)"),
 ) -> None:
     """Draft scenario.draft.json + assets for one judged candidate (natural + withheld briefs, ledger, controls)."""
+    _direct_stage("draft")
     from swesim.stages.draft_spec import draft as draft_stage
 
     row = next((r for r in _rows(judged) if r["instance_id"] == instance_id), None)
@@ -166,9 +189,10 @@ def draft(
     typer.echo(str(path))
 
 
-@app.command("probe-tests")
+@app.command("probe-tests", hidden=True)
 def probe_tests(candidates: Path, instance_id: str) -> None:
     """Re-probe one github-repo candidate on Modal: base vs gold test runs -> fail_to_pass / pass_to_pass."""
+    _direct_stage("probe-tests")
     from swesim.sources import github_repo
 
     row = next((r for r in _rows(candidates) if r["instance_id"] == instance_id), None)
@@ -184,12 +208,13 @@ def probe_tests(candidates: Path, instance_id: str) -> None:
 # ----------------------------------------------------------------------------------------------------------
 
 
-@app.command()
+@app.command(hidden=True)
 def approve(
     scenario_id: str,
     auto: bool = typer.Option(False, "--auto", help="Unattended: code-owned gates decide; recorded as approved_by=auto-validators, review_needed=true"),
 ) -> None:
     """Freeze scenario.draft.json into scenario.json (human command, or --auto gates)."""
+    _direct_stage("approve")
     from swesim.stages.approve import approve_scenario
 
     out = approve_scenario(WS, scenario_id, auto=auto)
@@ -197,7 +222,7 @@ def approve(
     raise typer.Exit(code=0 if out.get("approved") else 1)
 
 
-@app.command()
+@app.command(hidden=True)
 def compile(
     scenario_id: str,
     stakeholder_url: str = typer.Option("", envvar="SWESIM_STAKEHOLDER_URL", help="Compiled into allowed_hosts; empty = model hosts only"),
@@ -205,6 +230,7 @@ def compile(
     resolve_digest: bool = typer.Option(True, "--resolve-digest/--no-resolve-digest"),
 ) -> None:
     """Render the Harbor task directories (full, hidden, interactive) for an approved scenario."""
+    _direct_stage("compile")
     from swesim.stages.compile import compile_scenario
 
     spec = _load(scenario_id)
@@ -212,12 +238,13 @@ def compile(
     typer.echo(json.dumps({"task_dirs": {k: str(v) for k, v in res.task_dirs.items()}, "image_digest": res.image_digest, "compile_json": str(res.compile_json)}))
 
 
-@app.command()
+@app.command(hidden=True)
 def validate(
     scenario_id: str,
     stakeholder_url: str = typer.Option("", envvar="SWESIM_STAKEHOLDER_URL"),
 ) -> None:
     """Run the control sweep on Modal (base, gold, controls, tamper exploits, reachability probe) -> validation.json."""
+    _direct_stage("validate")
     from swesim.stages.validate import validate_scenario
 
     spec = _load(scenario_id)
@@ -239,7 +266,7 @@ def register(scenario_id: str) -> None:
     typer.echo(json.dumps(register_scenario(WS, _load(scenario_id))))
 
 
-@app.command()
+@app.command(hidden=True)
 def run(
     scenario_id: str,
     condition: str = typer.Option("interactive", help="full | hidden | interactive"),
@@ -251,6 +278,7 @@ def run(
     worker_secret: str = typer.Option("", envvar="SWESIM_WORKER_SECRET", show_default=False),
 ) -> None:
     """Run one graded trial on Modal through Harbor and bind its stakeholder transcript (writes workspace/trials/<trial_id>/)."""
+    _direct_stage("run")
     from swesim.stages.run import run_trial
 
     spec = _load(scenario_id)
@@ -287,13 +315,14 @@ def dashboard(host: str = typer.Option("127.0.0.1"), port: int = typer.Option(80
     uvicorn.run("swesim.dashboard.app:app", host=host, port=port)
 
 
-@app.command()
+@app.command(hidden=True)
 def probe(
     judged: Path = typer.Option(..., "--judged", help="A .judged.jsonl (or .probed.jsonl) file"),
     instance: list[str] = typer.Option(None, "--instance", help="Restrict to these instance ids (repeatable)"),
     max_builds: int = typer.Option(3, help="How many candidates to probe on Modal in this call"),
 ) -> None:
     """Measure the contract offline (base vs gold on Modal) before drafting; writes <judged>.probed.jsonl."""
+    _direct_stage("probe")
     from swesim.stages.mine import probe_candidates
 
     out = probe_candidates(WS, judged, instance or None, max_builds)

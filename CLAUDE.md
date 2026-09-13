@@ -61,6 +61,9 @@ outcomes; 200–1,500 source lines does not guarantee a capability gradient.
 - `gh auth token` supplies the GitHub token for mining; write it to the ignored env file the VM scripts copy, never into tracked files.
 - No step may wait for a human. If something genuinely needs a person (a provider outage, an exhausted quota, a missing permission), write it to `docs/ops.md` with the evidence and continue with independent work.
 
+## Execution rule (user directive, 2026-09-13)
+- Task creation and graded runs go through Temporal only: `swesim create`, `swesim run-tasks`, `swesim workflows ...`, or the console's Create/Run pages, executed by the VM worker. Never launch trials or validations with the stage commands directly. The stage commands (`mine`, `judge`, `probe`, `draft`, `approve`, `compile`, `validate`, `run`) are the building blocks the workflows call; they are hidden from `--help` and refuse to run unless `SWESIM_DIRECT=1` is set, which is for debugging a single stage only. The 28 laptop trials recorded on 2026-09-12/13 predate this rule and are labelled as CLI-run demonstrations in the docs.
+
 ## Subagent model rule (user directive, 2026-09-12)
 - Code work, design work, and review work run on `fable` (the session model): implementers, integrators, debuggers, task and final reviewers, anyone editing or judging code, specs, or plans. Pass `model: fable` explicitly.
 - Reconnaissance and simple mechanical work run on `opus` or `sonnet`: reading files or docs to answer a question, searching the codebase or web, collecting logs and evidence, copying artifacts, formatting reports, running a documented command and reporting its output.

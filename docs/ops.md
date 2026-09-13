@@ -52,6 +52,13 @@ the next run uses a new attempt index and is a fresh launch, never a relaunch.
 
 Why per-trial units: `systemd-run` places the Harbor process in its own unit under the user manager (lingering enabled), so `systemctl --user restart swesim-worker` cannot kill it. The worker records `launch.json` (intent, then acknowledgement) before and after the single `systemd-run`; every later poll reads that file and the unit state and never launches again (`swesim/workflows/activities.py: decide_launch`).
 
+## Execution rule
+
+All task creation and all graded runs are Temporal workflows executed by the VM worker (`swesim create`, `swesim run-tasks`,
+the console). The stage commands are hidden and refuse to run without `SWESIM_DIRECT=1`; that opt-in exists to debug one
+stage and must never be used to produce dataset records. Records produced before this rule (the laptop trials of
+2026-09-12/13) are identified by their `run_config.json` and were run through the same `run_trial` code path.
+
 ## Deploy (VM)
 
 Prerequisites on the laptop:
