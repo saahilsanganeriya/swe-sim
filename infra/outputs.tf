@@ -81,3 +81,7 @@ output "temporal_namespace" {
 output "github_repository" {
   value = var.github_repository
 }
+
+output "index_maintenance_job" {
+  value = var.deploy_workloads ? module.run[0].index_maintenance_job : "swesim-index-maintenance"
+}

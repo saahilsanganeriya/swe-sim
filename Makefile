@@ -106,17 +106,15 @@ pin-image: require-project
 
 deploy: require-project pin-image
 	$(MAKE) apply
+	$(MAKE) migrate
 	$(MAKE) verify-cloud
 
 verify-cloud:
 	EVIDENCE_DIR=$(EVIDENCE_DIR) bash scripts/cloud/verify_cloud.sh
 
-# The index lives behind the Cloud SQL connection: from a laptop this needs SWESIM_DATABASE_URL through a Cloud SQL
-# Auth Proxy; otherwise run `swesim index migrate` from a Cloud Run Job. Never fatal for the bootstrap.
+# Run migrations where the Cloud SQL socket exists. A failed migration stops deployment.
 migrate:
-	if $(UV) swesim index --help >/dev/null 2>&1; then \
-	  $(UV) swesim index migrate || echo "notice: 'swesim index migrate' failed here; run it where Cloud SQL is reachable (see infra/README.md)"; \
-	else echo "notice: 'swesim index' is not available in this checkout; migrate skipped"; fi
+	gcloud run jobs execute "$$($(TF) output -raw index_maintenance_job)" --project $(PROJECT) --region $(REGION) --wait
 
 pull:
 	bash scripts/cloud/pull.sh

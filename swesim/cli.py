@@ -456,14 +456,17 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
     typer.echo(asyncio.run(start_create(params)))
 
 @app.command("run-tasks")
-def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenario ids"), models: str = typer.Option(SOLVER_MODEL_DEFAULT),
-              conditions: str = typer.Option("full,hidden,interactive"), k: int = typer.Option(3), purpose: str = typer.Option("comparison"),
+def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenario ids"), models: str | None = typer.Option(None, help="Comma-separated model ids; defaults to the screen model for screening, otherwise Haiku 4.5."),
+              conditions: str = typer.Option("full,hidden,interactive"), k: int = typer.Option(3), purpose: str = typer.Option("comparison", help="calibration | comparison | demonstration | screen"),
               brief_profile: str = typer.Option("withheld"), stakeholder_model: str = typer.Option("", help="resolved stakeholder id (workspace/evidence/model-probe.json)"),
-              attempt_offset: int = typer.Option(0), max_parallel_trials: int = typer.Option(1, help="1 on a laptop; raise on the VM"),
+              attempt_offset: int = typer.Option(0), max_parallel_trials: int = typer.Option(1, help="Maximum concurrent trial Jobs for this workflow"),
               stakeholder_url: str = typer.Option("", envvar="SWESIM_STAKEHOLDER_URL")) -> None:
     """Run selected task ids on selected models: one RunTasksWorkflow, TrialWorkflow children with REJECT_DUPLICATE ids."""
     import asyncio
     from swesim.workflows.client import start_run
+    if purpose not in ("calibration", "comparison", "demonstration", "screen"):
+        raise typer.BadParameter("purpose must be calibration, comparison, demonstration or screen")
+    models = models or (ROLE_CHAINS["screen_model"][0] if purpose == "screen" else SOLVER_MODEL_DEFAULT)
     params = {"scenario_ids": scenario_ids.split(","), "models": models.split(","), "conditions": conditions.split(","), "k": k, "purpose": purpose,
               "brief_profile": brief_profile, "attempt_offset": attempt_offset, "max_parallel_trials": max_parallel_trials, "stakeholder_url": _stakeholder_url(stakeholder_url)}
     if stakeholder_model:
@@ -474,6 +477,17 @@ workflows_app = typer.Typer(help="Inspect and steer Temporal workflows.")
 app.add_typer(workflows_app, name="workflows")
 from swesim.index.cli import index_app  # noqa: E402  (mounted after the root app exists)
 app.add_typer(index_app, name="index")
+from swesim.audit.cli import app as audit_app  # noqa: E402
+app.add_typer(audit_app, name="audit")
+
+
+@workflows_app.command("open-types")
+def workflows_open_types() -> None:
+    """List open execution counts by workflow type; no output means none are open."""
+    import asyncio
+    from swesim.workflows.client import open_types
+    for row in asyncio.run(open_types()):
+        typer.echo(f"{row['type']}\t{row['open_count']}")
 
 @workflows_app.command("list")
 def workflows_list(kind: str = typer.Argument("all", help="create | candidate | run | pipeline | matrix | trial | all"), limit: int = typer.Option(50)) -> None:

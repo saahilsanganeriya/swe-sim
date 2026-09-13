@@ -10,3 +10,7 @@ output "console_uri" {
 output "console_urls" {
   value = google_cloud_run_v2_service.console.urls
 }
+
+output "index_maintenance_job" {
+  value = google_cloud_run_v2_job.index_maintenance.name
+}

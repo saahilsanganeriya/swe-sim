@@ -17,6 +17,16 @@ def test_defaults_are_the_cloud_only_neutral_values(tmp_path):
     assert not any("Documents" in str(v) for v in s.model_dump().values() if isinstance(v, (str, Path)))
 
 
+def test_trial_launcher_configuration_survives_environment_loading(tmp_path):
+    s = S.Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env"),
+                            "SWESIM_WORKER_IMAGE": "registry/worker@sha256:" + "a" * 64,
+                            "SWESIM_WORKER_SERVICE_ACCOUNT": "worker@example.iam.gserviceaccount.com",
+                            "SWESIM_SQL_CONNECTION_NAME": "project:region:index"})
+    assert s.worker_image == "registry/worker@sha256:" + "a" * 64
+    assert s.worker_service_account == "worker@example.iam.gserviceaccount.com"
+    assert s.sql_connection_name == "project:region:index"
+
+
 def test_env_file_supplies_non_secret_keys_but_process_env_wins(tmp_path):
     f = tmp_path / ".env"
     f.write_text("TEMPORAL_ADDRESS=us-central1.gcp.api.temporal.io:7233\nTEMPORAL_NAMESPACE=swesim.abcde\nANTHROPIC_API_KEY=sk-file\n"

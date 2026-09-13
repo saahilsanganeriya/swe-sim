@@ -123,6 +123,10 @@ jobs:
         run: |
           terraform -chdir=infra apply -input=false -no-color plan.out
           terraform -chdir=infra output -json > infra/outputs.json
+      - name: Migrate index
+        run: |
+          gcloud run jobs execute "$(terraform -chdir=infra output -raw index_maintenance_job)" \
+            --project "$GCP_PROJECT" --region "$GCP_REGION" --wait
       - name: Verify
         run: |
           set -o pipefail
