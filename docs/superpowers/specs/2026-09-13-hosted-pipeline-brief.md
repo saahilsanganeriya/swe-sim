@@ -240,6 +240,28 @@ pages. Requirements, each checked before the cutover:
   Job template defaults), `ingress` (static IP, serverless NEG, managed cert, IAP OAuth client + allowlist), `logging`
   (log-based metrics, alert policy on worker crash loops and reconcile > 1).
 
+#### 2.6.1 Deploy path through GitHub
+
+- **Identity:** a GitHub Actions Workload Identity Federation provider in the GCP project and a deployer service account
+  `swesim-deployer` (roles: Cloud Build editor, Artifact Registry writer, Cloud Run admin, Secret Manager viewer for the
+  names only, storage object viewer on the Terraform state bucket, service account user on `swesim-worker`). No long-lived
+  keys in GitHub; the repository holds only the provider name and project id as variables.
+- **`.github/workflows/ci.yml`:** on every push and pull request: `uv sync --extra dev --frozen`, the offline suite, the
+  contract suite, `ruff --select E9,F`, `terraform fmt -check` and `terraform validate`. Required to pass before deploy.
+- **`.github/workflows/deploy.yml`:** on `workflow_dispatch` (with a `sha` input) and on tags `v*`: authenticate with WIF,
+  `gcloud builds submit` the worker image tagged with the commit sha, resolve its digest, `terraform apply -var
+  image=<digest>` (state in a GCS backend bucket, locked), wait for the pools and the console to become ready, run
+  `scripts/cloud/verify_cloud.sh`, and post the digest, the Terraform plan summary and the verify output as the job
+  summary. A failed verify marks the deploy failed and the previous revisions stay serving (Cloud Run keeps them).
+- **Open-executions check:** the deploy job runs `swesim workflows open-types` (a small CLI that lists open executions per
+  workflow type through the Temporal client) and refuses to roll worker pools when a workflow type whose code changed in
+  the deployed range has open executions and the change is not behind `workflow.patched`; the operator can override with
+  an input that is recorded.
+- **Local equivalent:** `make deploy SHA=<sha>` runs the same steps with the operator's `gcloud` identity, for the night;
+  the GitHub path is the documented way afterwards.
+- **Versioned releases:** the image tag, the Terraform variable and the `worker_image_digest` in every record all refer to
+  one digest; `git tag v<date>-<n>` marks each deploy that ran a sweep.
+
 ### 2.7 What is retired, what remains
 - The VM keeps running until the new stack passes the smoke workflows; then its worker is stopped (`systemctl --user
   disable --now swesim-worker`) and the VM is documented as the fallback path in `docs/ops.md`. The Temporal dev server on
