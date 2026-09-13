@@ -6,12 +6,15 @@ Task creation and graded trials run through Temporal. The hosted implementation 
 
 ## Start here
 
-Follow [cloud setup](docs/setup.md) for credentials and a new deployment, then [the runbook](docs/runbook.md) for operations. The setup uses a git-ignored `.env`, Python 3.12 through `uv`, Terraform, `gcloud`, GitHub and Modal credentials, and a Temporal Cloud namespace. Local Docker is not required.
+A stranger needs: a billing-enabled GCP project, a Temporal Cloud namespace with an API key, Modal, Anthropic/OpenAI/OpenRouter and GitHub credentials, and `git`, `uv`, Terraform, `gcloud`, `gh` on the laptop. Follow [cloud setup](docs/setup.md) step by step (seven steps, each with its check), then [the runbook](docs/runbook.md) for operations. Configuration lives in a git-ignored `./.env` (or the file named by `SWESIM_ENV_FILE`) generated from `.env.example`, which explains every variable. Local Docker is not required.
 
 ```bash
-make check
+uv sync --extra dev --frozen
+uv run --frozen --offline python -m pytest -q tests --ignore=tests/integration
 uv run --frozen swesim --help
 ```
+
+The first two lines are `make check`; the integration tests under `tests/integration` need credentials and are not part of the offline suite.
 
 After the setup prerequisites:
 
@@ -19,7 +22,7 @@ After the setup prerequisites:
 make cloud-bootstrap PROJECT=YOUR_PROJECT REGION=us-central1 SWESIM_ENV_FILE=./.env
 ```
 
-The console URL is the Terraform `console_url` output. Sign in with an IAP-allowed Google account. Browse **Scenarios**, **Trials**, **Workflows**, **Candidates**, **Database** and the artifact views over the preserved record. Mutations require confirmation; evaluator-only artifacts require a verified IAP identity on the evaluator list. The current priority is the working hosted website; new discovery and experiments are deferred.
+The console URL is the Terraform `console_url` output. Sign in with an IAP-allowed Google account. Browse **Scenarios**, **Trials**, **Workflows**, **Candidates**, **Database** and the artifact views. Mutations require confirmation; evaluator-only artifacts require a verified IAP identity on the evaluator list.
 
 Workflow inspection is also available from the CLI:
 
@@ -28,7 +31,7 @@ uv run --frozen swesim workflows list all
 uv run --frozen swesim workflows progress WORKFLOW_ID
 ```
 
-Replace uppercase placeholders. When experiments resume, use the console's Create/Run pages or `swesim create` and `swesim run-tasks`, after current validation. The stage commands are internal building blocks; their direct execution switch is for debugging one stage, not operating the pipeline.
+Replace uppercase placeholders. Task creation and graded runs start from the console's Create/Run pages or `swesim create` and `swesim run-tasks`; both go through Temporal. The stage commands are internal building blocks; their direct execution switch is for debugging one stage, not operating the pipeline.
 
 ## How a task is created
 
@@ -56,26 +59,19 @@ Repository discovery has explicit `bugfix` and `feature` bands. Diff size is a c
 
 Eight automatic approval gates cover schema, asset hashes, judge acceptance, an on-request fact linked to FAIL_TO_PASS, grounded requirements, withholding leaks, exact brief reconstruction, and controls. Validation then executes the no-op, oracle, plausible-wrong and tamper controls and checks gold reachability. Infrastructure failure does not count as a defeated attack.
 
-## Measured status — 2026-09-13
+## Hosted state — 2026-09-13
 
-The hosted infrastructure has passed an authenticated Temporal Cloud and runtime-poller check. Evidence `workspace/evidence/cloud/verify_cloud-20260913T164426Z.txt` records API-key authentication, activity pollers on all four queues, workflow pollers, IAP HTTP 302, Ready resources, and image parity. The index maintenance Job also completed its migration.
+Console: <https://<console-host>> (native IAP; an unauthenticated request is redirected to Google sign-in, `workspace/evidence/cloud/iap-headers-20260913T183003Z.txt`). Project `YOUR_PROJECT`, region `us-central1`, Temporal Cloud namespace `swesim.abcde`.
 
-**Website acceptance requires imported-record/index parity, authenticated page checks and the final deployed image/schema.** New hosted creation, graded trials, worker-restart experiments and the model sweep are deferred. The verification file explicitly reports no trial Jobs and skips remote SQL status; it does not establish complete bucket/index parity. The earlier 09:17 UTC verification used localhost Temporal and missed a trials-worker crash loop; it is not hosted workflow evidence.
+| Fact | Value | Source |
+|---|---|---|
+| Deployed commit and image | `1ca70a6` (`1ca70a66d142210bb25b4a6edf3744e204bcad30`), image `worker@sha256:e21881d64fbed1597cfd637f3f595c0082d193b7d2718d321cd45ae98dc8e271`; Terraform 0 added / 6 changed / 0 destroyed with the recorded open-executions override; migration execution `swesim-index-maintenance-c8tmb` completed; `verify_cloud` `result: OK` at 18:52:10 UTC (API-key Temporal with pollers on all four queues, IAP 302, four pools and console Ready on the pinned image). The previous verified deploy was `609f923` / `f2b26505…` (18:30 UTC). | `workspace/evidence/cloud/deploy-1ca70a6.log`, `verify_cloud-20260913T185210Z.txt`, `open-types-20260913T184221Z.txt`; `deploy-609f923.log`, `verify_cloud-20260913T183003Z.txt` |
+| Hosted creation workflows | `create-fa2489a292574fd19ba88796c0c18087` (`swebench:A:pytest-dev__pytest-7283`) and `create-3b1513db47894549a189f678343774b9` (`encode/httpx`, bugfix), started 18:31 UTC — the first workflows in the namespace; both blocked on a worker image without `gh` (fixed in `Dockerfile.worker`, commit `1555810`, carried by the deployed `1ca70a6`); resubmission not yet recorded | `workspace/evidence/smoke/`, [ops.md](docs/ops.md#hosted-smoke-2026-09-13) |
+| Hosted graded trials | none yet (`NOTE no swesim-trial-* Jobs yet`) | `verify_cloud-20260913T185210Z.txt` |
+| Preserved laptop/VM record | 50 trial records, 19 matching the three registered version-2 specs (`mwaskom--seaborn-3190`, `scikit-learn--scikit-learn-13584`, `py-pdf--pypdf-3826`), 13 correct / 6 incorrect; not a hosted comparison | [grading.md](docs/grading.md#preserved-inventory--2026-09-13) |
+| Model roles in force | judge `openai/gpt-5.5`, drafter/stakeholder/audit `openai/gpt-5.6-sol`, screen `openrouter/deepseek/deepseek-v3.2` — fallbacks after the Anthropic workspace limit; the configured judge stays `anthropic/claude-opus-5` by directive | `workspace/evidence/model-probe-takeover.json`, [ops.md](docs/ops.md#model-role-fallbacks-in-force) |
 
-The preserved laptop/VM record contains:
-
-| Inventory | Count |
-|---|---:|
-| Historical trial records | 50 |
-| Records matching the three current version-2 specs | 19 |
-| Registered version-2 scenarios | 3 |
-| New hosted graded outcomes established by the evidence above | 0 |
-
-The 19 current-spec records comprise 13 correct and 6 incorrect historical outcomes across different models and conditions. They are not a new hosted comparison. The registered scenarios are `mwaskom--seaborn-3190`, `scikit-learn--scikit-learn-13584`, and `py-pdf--pypdf-3826`; their older approval and validation records predate the new build-manifest and base-parity checks. New execution requires current compilation and validation.
-
-The takeover model probe found the configured Anthropic primaries quota-limited. Its recorded resolution is judge `openai/gpt-5.5`, drafter/stakeholder/audit `openai/gpt-5.6-sol`, and screen `openrouter/deepseek/deepseek-v3.2`. These are observed fallbacks, not graded results; later workflows record their own resolved ids.
-
-See [operations evidence](docs/ops.md) for commands, dates and pending checks, and [grading](docs/grading.md) for historical results and their limits.
+Everything a finishing stream cut on 2026-09-13 is listed with its destination in [ops.md](docs/ops.md#deferred-from-the-2026-09-13-finishing-run). See [grading](docs/grading.md) for the grading contract, the historical results and their limits.
 
 ## Trust and measurement
 

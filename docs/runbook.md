@@ -2,7 +2,7 @@
 
 Use this after [setup](setup.md). Commands run from the checkout with a filled ignored dotenv file. Replace uppercase placeholders and use your configured project and region. The authoritative record is the bucket; never repair a result by editing its reward, report, spec or launch files.
 
-Current measured results and outstanding acceptance checks are in [ops.md](ops.md). The immediate priority is the hosted website over preserved records; new discovery and experiments are deferred. The trial procedures below are for later operation or recovery of existing work.
+Current measured results and outstanding acceptance checks are in [ops.md](ops.md). The hosted smoke started on 2026-09-13 (two `CreateTasksWorkflow` executions; see [Hosted smoke](ops.md#hosted-smoke-2026-09-13)); the goal is a running pipeline to iterate on task generation, reward and tuning. Polish that was cut is listed in [Deferred from the 2026-09-13 finishing run](ops.md#deferred-from-the-2026-09-13-finishing-run).
 
 ## Deploy a commit
 
@@ -12,9 +12,23 @@ uv run --frozen swesim workflows open-types
 make deploy PROJECT=YOUR_PROJECT REGION=us-central1 SHA=COMMIT_SHA SWESIM_ENV_FILE=./.env
 ```
 
-The deployment guard records open workflow types and stops before building if any are open. Finish or cancel them, or verify Temporal patch compatibility and record an explicit `OVERRIDE_OPEN_EXECUTIONS=1` override. A new implementation must retain the old `workflow.patched` branches while matching executions remain open.
+The deployment guard (`make open-executions`) writes the open workflow types to `workspace/evidence/cloud/open-types-<UTC>.txt` and stops before building if any are open. It needs the env file in its environment: a guard that reports `127.0.0.1:7233 … Connection refused` never reached the Cloud namespace (measured in `deploy-1976af3.log`; the report file is then empty, not "no open workflows"). Finish or cancel the open executions, or override:
 
-Deployment builds the selected Git commit with Cloud Build, pins its digest in ignored `infra/image.auto.tfvars.json`, applies Terraform, executes the index-maintenance Job, then verifies the hosted runtime. A failed migration or verification stops the target. Keep the build id, commit, image digest, Terraform output, migration execution id and verification path together.
+```bash
+make deploy PROJECT=YOUR_PROJECT REGION=us-central1 SHA=COMMIT_SHA SWESIM_ENV_FILE=./.env OVERRIDE_OPEN_EXECUTIONS=1
+```
+
+`OVERRIDE_OPEN_EXECUTIONS=1` is legitimate only when every changed workflow command sequence between the running image's commit and `COMMIT_SHA` is behind a `workflow.patched` marker (the old branch retained while matching executions remain open) and the open executions' remaining commands are unchanged in shape. Write that reasoning and the cost if wrong into ops.md; the Makefile appends `# Explicit operator override: OVERRIDE_OPEN_EXECUTIONS=1` to the guard's report. If a command sequence changed without a patch marker, the open execution fails with a non-determinism error at its next workflow task and must be re-run as a new execution; cancel it first instead of overriding. The GitHub deploy workflow has the same switch (`override_open_executions`).
+
+Deployment then builds the selected Git commit with Cloud Build, pins its digest in the ignored `infra/image.auto.tfvars.json`, applies Terraform with `FORCE_PIN=1`, publishes the applied pin, executes the index-maintenance Job, then verifies the hosted runtime. A failed migration or verification stops the target. Keep the build id, commit, image digest, Terraform apply summary, migration execution id and verification path together (the `609f923` row in [ops.md](ops.md#hosted-smoke-2026-09-13) is the shape).
+
+The image pin is one authoritative digest. `make apply` runs `scripts/cloud/pin_guard.py check` first and refuses when the pin file disagrees with what the pools and the console run: `pin-missing` (fresh clone; a plain apply would roll the workloads to `:latest`), `mismatch` (stale laptop file after a GitHub deploy, or an unapplied build), `mixed` (half-rolled stack) or `unknown` (gcloud failed, which is not "no workloads"). Each refusal prints its fix. Before a plain `make plan`/`make apply` on a laptop after a GitHub deploy, fetch the published pin:
+
+```bash
+make pull-pin PROJECT=YOUR_PROJECT
+```
+
+It copies `gs://YOUR_PROJECT-swesim-tfstate/image.auto.tfvars.json` into the pin file, or exits 1 when no deploy has published one yet. `FORCE_PIN=1` turns a refusal into a recorded `forced` pass; `make deploy` and `make cloud-bootstrap` set it for the apply that follows their own `pin-image` because rolling is their purpose. Do not pass `FORCE_PIN=1` to a plain `make apply` unless you intend to roll the workloads to whatever the pin file names. `write-pin` reads the applied image back from `terraform output -raw image` (never from a build log) and `push-pin` publishes it, so a laptop and CI agree on one digest.
 
 The GitHub deployment workflow uses WIF and the deployer service account. It is restricted to runtime resources; IAM, storage and SQL changes need an operator's reviewed Terraform apply. `make gh-variables` sets the repository variables from Terraform outputs.
 
@@ -30,9 +44,34 @@ uv run --frozen swesim workflows progress WORKFLOW_ID
 uv run --frozen swesim workflows cancel WORKFLOW_ID
 ```
 
-Use the console's spend view and cost rows for recorded provider usage. Unknown usage or price remains unknown, not zero. `SWESIM_SPEND_CAP_USD` stops planning new trials once recorded spend crosses the cap; it is not an external billing limit and does not retroactively cancel work already in flight.
+`swesim workflows progress WORKFLOW_ID` returns the workflow's `status`, `stopped_reason` and (for a refused frontier run) `admission`. The console's Workflows page does not show `stopped_reason` yet (deferred list). Outcome vocabulary:
+
+| Value | Where | Meaning |
+|---|---|---|
+| `complete` | `RunTasksWorkflow`, `CreateTasksWorkflow`, per-scenario rows | Run: every requested scenario reached `complete`. Create: at least one candidate registered as `valid`. |
+| `complete-with-failures` | `RunTasksWorkflow`, `CreateTasksWorkflow` | Run: some scenario was skipped, blocked or errored, or no scenario was planned. Create: no candidate became valid. Read the per-scenario/per-candidate rows; a legitimate rejection is not a service failure. |
+| `complete-no-trials` | per-scenario row (legacy `PipelineWorkflow`) | The scenario registered but the probe found the requested solver unavailable; nothing may substitute it, so no trial was launched (`solver_unavailable`, `needs_human`). |
+| `blocked` | `RunTasksWorkflow` | The frontier gate refused before any probe or plan; `stopped_reason` is `frontier-gate` and `admission.reasons` says why. |
+| `skipped` with `reason: spend-cap` | per-scenario row | The spend check found recorded spend over the cap before this scenario was planned. |
+| `withholding-leak` | approval gate name (`CandidateWorkflow`) | Not a run status: the leak gate rejected a draft; the workflow re-drafts once, then takes the next candidate. Appears in candidate receipts and approval evidence, never as `stopped_reason`. |
+
+`stopped_reason` values: `spend-cap` (recorded spend crossed the cap in force; no new trials are planned, in-flight trials finish), `frontier-gate` (Tier D/E admission refused; see below), `model-unavailable` (the pre-run probe could not reach a required role model; `probe.needs_human` lists what needs a person). `null` means the run stopped for none of these. Trial-level statuses (`duplicate-rejected`, `unresolved`, `launch-failed`) are on the trial rows, not the run.
+
+Use the console's spend view and cost rows for recorded provider usage. Unknown usage or price remains unknown, not zero. `SWESIM_SPEND_CAP_USD` stops planning new trials once recorded spend crosses the cap; it is not an external billing limit and does not retroactively cancel work already in flight. A run's own `spend_cap_usd` lowers the cap for that run only.
 
 Keep `purpose=screen`, `comparison`, `calibration` and `demonstration` separate. A screen checks hidden/full success before a larger comparison. Frontier tiers require the brief's gate; no requested model is silently substituted.
+
+### Frontier gate (Tier D/E solvers)
+
+A `RunTasksWorkflow` that names a Tier D or E model (`swesim/roles.py` `TIERS`) runs `frontier_gate_activity` before probing: the gate writes a durable decision to `evidence/sweep/frontier-<identity>.json` (identity = SHA256 of models, conditions, k, purpose, brief profile, `include_saturated` and the ordered target scenario ids) and every later planning step re-reads that file and refuses a plan it does not admit. A refused run returns `status: blocked`, `stopped_reason: frontier-gate` and `admission`, whose `reasons` are the exact conditions not met, verbatim from `swesim/stages/frontier.py`:
+
+- "Requires 15 current audited scenarios with at least two outcomes per arm on every core Tier A–C baseline." — fewer than 15 qualified scenarios (valid, audited, informative or saturated screen, n ≥ 2 per arm for each of the six core baselines from `purpose=comparison`, current spec and build, `origin=cloudrun`).
+- "Full must exceed hidden on a majority of the qualified scenarios." — the pooled full-over-hidden ordering does not hold.
+- "No eligible target scenarios remain." — every requested scenario was excluded; `admission.excluded_scenarios` names each with its reason ("Requires valid controls, task-sense audit and a completed difficulty screen." or "Saturated scenarios are excluded by default.").
+- "<model> requires a completed k=1 trial before increasing repeats." — Tier E starts at k=1.
+- "A positive spend cap is required for frontier runs." / "Spend accounting is incomplete; unknown usage cannot be treated as zero." / "A forecast requires measured baseline token usage." / "No verified price for <model>." / "Projected spend exceeds the remaining cap." — the forecast (largest observed baseline token counts × 1.25 × trials) plus known spend must fit under the lower of the run's `spend_cap_usd` and `SWESIM_SPEND_CAP_USD`; `admission.forecast_usd` and `forecast_basis` show the arithmetic.
+
+Saturated scenarios are excluded unless the request carries `include_saturated: true`; the decision binds that flag, so a decision made without it never admits a plan that includes a saturated scenario. Neither `swesim run-tasks` nor the console's Run form exposes the flag yet (deferred list); until they do, the only way to include a saturated scenario is to start the workflow with `include_saturated` in its request through `swesim.workflows.client.start_run`, which still runs the gate. Tier A–C requests carry no admission and are never gated. The gate never launches a trial and never substitutes a model.
 
 ## Diagnose a missing or stuck trial
 
