@@ -2,7 +2,7 @@
 
 This is the path from a fresh checkout to the hosted pipeline. All builds and graded environments run in Cloud Build or Modal; Cloud Run hosts the orchestrator clients and console. Your computer needs no Docker daemon and does not host Temporal.
 
-The procedure below follows the current scripts. A fresh remote clone at `1fb1530` passed `make check` (895 passed, 3 skipped). Infrastructure connectivity has been measured; fresh-clone cloud bootstrap and the authenticated browser walkthrough are still pending. The current release priority is the website over preserved records. Task discovery and experiments are deferred. Check [the evidence ledger](ops.md) for newer results.
+The procedure below follows the current scripts. A fresh remote clone at `1fb1530` passed `make check` (895 passed, 3 skipped). Infrastructure connectivity has been measured and the first hosted creation workflows ran on 2026-09-13 ([Hosted smoke](ops.md#hosted-smoke-2026-09-13)); fresh-clone cloud bootstrap and the authenticated browser walkthrough are still pending. Check [the evidence ledger](ops.md) for newer results.
 
 ## 1. Accounts and tools
 
@@ -85,6 +85,20 @@ uv run --frozen swesim run-tasks --help
 
 `make check` synchronizes the pinned development dependencies and runs the offline suite excluding `tests/integration`. Optional disposable-Postgres tests require their own explicit test URL. A passing check establishes local code health; it does not establish a hosted run.
 
+Then, before the first `swesim create`/`run-tasks`, register swesim's six Keyword search attributes on the Temporal Cloud namespace you configured in step 2:
+
+```bash
+make bootstrap-namespace SWESIM_ENV_FILE=./.env
+```
+
+`make cloud-bootstrap` (step 5) also runs it after the secrets. The script connects with the configured API key, prints only the address, namespace and auth mode, and registers whatever is missing. On Temporal Cloud the SDK cannot register them (the OperatorService answers `PERMISSION_DENIED`, and Temporal Cloud denies even `ListSearchAttributes`, measured on 2026-09-13), so the script verifies presence with a read-only visibility probe (`count_workflows` per attribute). When something is missing or unverifiable it prints the exact command
+
+```text
+tcld namespace search-attributes add --namespace <ns> --search-attribute swesim_scenario_id=Keyword --search-attribute swesim_model=Keyword --search-attribute swesim_condition=Keyword --search-attribute swesim_status=Keyword --search-attribute swesim_version=Keyword --search-attribute swesim_purpose=Keyword
+```
+
+(or: cloud.temporal.io → Namespaces → your namespace → Edit → Custom Search Attributes → add each as Keyword → Save) and exits 2. Run that once, re-run the make target, and it exits 0 with `search attributes: all 6 present on <ns> (verified by visibility queries; the OperatorService answers PERMISSION_DENIED on Temporal Cloud)`. Exit 1 is a connection or authentication error (class and gRPC status only, never the key). Exit 2 stops `cloud-bootstrap` until the operator step is done; a re-run is then a no-op.
+
 ## 4. Configure Modal
 
 Configure Modal before bootstrap:
@@ -113,7 +127,7 @@ The script reuses an existing Modal secret; it does not rotate its values. See [
 make cloud-bootstrap PROJECT=YOUR_PROJECT REGION=us-central1 SWESIM_ENV_FILE=./.env
 ```
 
-The target enables APIs, initializes a versioned Terraform-state bucket, checks for open workflows, deploys the stakeholder, generates non-secret tfvars, creates infrastructure, uploads secret values through stdin, seeds an empty registry only when the workspace bucket has none, builds the selected Git commit in Cloud Build, pins the image digest, deploys the worker pools and console, runs the Cloud Run index-maintenance Job, then verifies runtime connectivity. If the dotenv file has no stakeholder URL, tfvars generation uses the newly written `.stakeholder_url`.
+The target enables APIs, initializes a versioned Terraform-state bucket, checks for open workflows, deploys the stakeholder, generates non-secret tfvars, creates infrastructure, uploads secret values through stdin, registers the namespace's search attributes (exit 2 means: do the printed `tcld`/UI step once, then re-run), seeds an empty registry only when the workspace bucket has none, builds the selected Git commit in Cloud Build, pins the image digest, deploys the worker pools and console, publishes the applied pin to the state bucket, runs the Cloud Run index-maintenance Job, then verifies runtime connectivity. If the dotenv file has no stakeholder URL, tfvars generation uses the newly written `.stakeholder_url`.
 
 The initial IAP and evaluator allowlists contain the active gcloud account. The GitHub repository trusted by WIF comes from `origin`. Review `infra/env.auto.tfvars.json` and the Terraform plan before expanding access. Generated tfvars and `infra/outputs.json` are ignored; they must not be committed.
 
