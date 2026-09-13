@@ -97,7 +97,8 @@ def test_cancelling_trial_stops_runtime_once_without_relaunch(monkeypatch):
     w = W.TrialWorkflow()
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(w.run({'trial_id': 'a' * 24}))
-    assert names == ['launch_trial_activity', 'await_trial_activity', 'cancel_trial_activity', 'index_trial_activity']
+    # the launched row (P1-4) sits between the acknowledgement and the await; the cancel stops the runtime once, then the row says cancelled
+    assert names == ['launch_trial_activity', 'index_trial_activity', 'await_trial_activity', 'cancel_trial_activity', 'index_trial_activity']
     assert w.state['stage'] == 'cancelled'
 
 

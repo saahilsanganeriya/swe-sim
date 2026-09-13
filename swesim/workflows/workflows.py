@@ -48,6 +48,7 @@ PATCH_FROZEN_RETRY = "20260913-frozen-candidate-retry"
 PATCH_LIFECYCLE = "20260913-lifecycle-bookkeeping"  # operator workflows: running row before any probe/gate; failed/cancelled rows on exit
 PATCH_RECEIPTS = "20260913-candidate-receipts"      # index_candidate_event_activity at every terminal candidate decision (P1-7)
 PATCH_RESOLVED = "20260913-resolved-models"         # operator workflows: a second running row after the probe with the resolved roles
+PATCH_LIVE_TRIALS = "20260913-live-trial-rows"      # TrialWorkflow: a `launched` trial row right after the launch acknowledgement (P1-4)
 CHILDREN_PER_RUN = 100
 HOOK_MINUTES = 2
 CONTROL_MINUTES = 60                           # one Harbor control run on Modal (validate_scenario's whole set had 180)
@@ -322,7 +323,8 @@ class TrialWorkflow:
         audit = None
         if result.get("status") == "completed" and p.get("condition") == "interactive":
             audit = await audit_stage("audit_transcript_activity", {"trial_id": tid, "audit_model": p.get("audit_model")})
-        index = await hook("index_trial_activity", {"trial_id": tid})
+        # The verdict travels with the payload: without record.json the files alone cannot say how the trial ended (P1-4).
+        index = await hook("index_trial_activity", {"trial_id": tid, "status": result.get("status"), "request_path": p.get("request_path")})
         cleanup: dict
         if _patched(PATCH_HOOKS):
             try:
@@ -345,13 +347,14 @@ class TrialWorkflow:
         except Exception as e:  # noqa: BLE001 - the runtime may already be gone; the operator reads the reason
             _raise_if_cancelled(e)
             self.state["cancel"] = {"cancelled": False, "reason": _err(e)}
-        self.state["index"] = await asyncio.shield(hook("index_trial_activity", {"trial_id": tid}))
+        self.state["index"] = await asyncio.shield(hook("index_trial_activity", {"trial_id": tid, "status": "cancelled",
+                                                                                 "request_path": self.params.get("request_path")}))
         await asyncio.shield(index_workflow("cancelled", params_summary(self.params)))
         self.state["stage"] = "cancelled"
 
     @workflow.run
     async def run(self, p: dict) -> dict:
-        launch = None; tid = p.get("trial_id"); self.params = p
+        launch = None; live = None; tid = p.get("trial_id"); self.params = p
         self.state = {"stage": "launching", "trial_id": tid}
         await index_workflow("running", params_summary(p))
         try:
@@ -362,6 +365,9 @@ class TrialWorkflow:
                 # Poll the same unit/id; never relaunch it. The await activity reads the recorded evidence.
                 launch = {"trial_id": tid, "launched": False, "error": str(e)[:500]}
             self.state = {"stage": "awaiting", "trial_id": tid, "launch": launch}
+            if _patched(PATCH_LIVE_TRIALS) and launch.get("launched"):
+                # P1-4: the trial is live from this acknowledgement; its row says so before the first terminal file exists.
+                self.state["live"] = live = await hook("index_trial_activity", {"trial_id": tid, "status": "launched", "request_path": p.get("request_path")})
             try:
                 result = await act("await_trial_activity", p, 180, retry=retries.READ)
             except Exception as e:  # noqa: BLE001 - deadline or repeated read failures: unresolved, not relaunched
@@ -371,7 +377,7 @@ class TrialWorkflow:
             await self._on_cancel(tid, launch)
             raise
         try:
-            out = {**result, "launch": launch}
+            out = {**result, "launch": launch, **({"live": live} if live is not None else {})}
             out["bookkeeping"] = await self._bookkeeping(p, out)
             self.state = {"stage": "done", "trial_id": tid, "status": out.get("status"), "launch": launch, "indexed": out["bookkeeping"]["indexed"]}
             self.state["audit"] = out["bookkeeping"]["audit"]

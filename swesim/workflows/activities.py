@@ -846,12 +846,16 @@ async def plan_trials_activity(p: dict) -> dict:
 @swesim_activity
 async def prepare_trial_plan_activity(p: dict) -> dict:
     """The immutable trial plan for one scenario of a RunTasksWorkflow. A cached plan is returned only under the same admission
-    check a fresh plan needs (a plan page is never a way around the frontier gate)."""
+    check a fresh plan needs (a plan page is never a way around the frontier gate). A `planned` row per trial is indexed
+    in-process before the workflow fans out (P1-4)."""
     path = batching.plan_path(WS, p["workflow_id"], p["scenario_id"])
     if path.exists():
         await blocking(lambda: _frontier_admission(p))
-        return batching.write_plan(path, [])
-    return await blocking(lambda: batching.trial_plan(WS, path, plan_trials(p)["trials"]))
+        prepared = batching.write_plan(path, [])
+    else:
+        prepared = await blocking(lambda: batching.trial_plan(WS, path, plan_trials(p)["trials"]))
+    await _index_planned(path)
+    return prepared
 
 
 @swesim_activity
@@ -972,6 +976,50 @@ def launch_once(p: dict) -> dict:
     return _launch_once(_layout(), launcher(), p, image_digest=SETTINGS.worker_image_digest, origin=SETTINGS.origin)
 
 
+def _index_live_trial_sync(payload: dict) -> dict:
+    from swesim.index import activities as IA  # the index stream's module, imported lazily: this module imports without it
+
+    return IA.index_trial(payload, SETTINGS)
+
+
+async def index_live_trial(trial_id: str, status: str, request_path: str | None) -> dict:
+    """A live trial row (P1-4: `planned` from the planner on CONTROL, `running` from the await on TRIALS) written in-process:
+    these pools have no workflow to hook from. The index is disposable bookkeeping: a disabled or unreachable database is
+    reported and logged, never raised."""
+    payload = {"trial_id": trial_id, "status": status, "request_path": request_path}
+    try:
+        return await asyncio.to_thread(_index_live_trial_sync, payload)
+    except Exception as e:  # noqa: BLE001 - bookkeeping never decides a stage's outcome
+        reason = f"{type(e).__name__}: {str(e)[:200]}"
+        log.warning("live trial row not indexed trial=%s status=%s: %s", trial_id, status, reason)
+        return {"indexed": False, "reason": reason}
+
+
+async def _index_planned(plan_path: Path) -> None:
+    """`planned` rows for every trial of a plan, before the workflow fans out; the cached plan re-upserts the same rows."""
+    try:
+        items = json.loads(plan_path.read_text()).get("items") or []
+    except (OSError, ValueError, AttributeError):
+        return
+    for item in items:
+        if isinstance(item, dict) and item.get("trial_id"):
+            await index_live_trial(item["trial_id"], "planned", item.get("request_path"))
+
+
+def _record_verdict(d: Path, tid: str, status: str, reason: str) -> None:
+    """Make the await's verdict durable when no file carries it yet (status.json, write-then-rename), so a rebuild of the index
+    reads what the workflow saw. record.json, runner-error.json or a terminal status.json already there are left alone (the
+    launcher's evidence rules read them first); a record.json that lands later still wins."""
+    if not d.is_dir() or (d / "record.json").exists() or (d / "runner-error.json").exists():
+        return
+    existing = _read_json(d / "status.json")
+    if existing.get("status") not in (None, "", "running"):
+        return
+    atomic_json(d / "status.json", {**existing, "trial_id": tid, "status": status, "started_at": existing.get("started_at"), "finished_at": time.time(),
+                                    "reason": reason, "verdict_source": "await_trial_activity", "origin": SETTINGS.origin,
+                                    "worker_image_digest": SETTINGS.worker_image_digest})
+
+
 @swesim_activity
 async def launch_trial_activity(p: dict) -> dict:
     if p.get("request_path"):
@@ -989,8 +1037,11 @@ async def launch_trial_activity(p: dict) -> dict:
 
 @swesim_activity
 async def await_trial_activity(p: dict) -> dict:
-    """Read-only, retryable, heartbeating poll until terminal evidence exists. Never launches."""
+    """Read-only, retryable, heartbeating poll until terminal evidence exists. Never launches. The first poll that sees the runtime
+    running indexes a `running` row (P1-4); a verdict the files do not carry (unresolved, unit-failed) is made durable in
+    status.json (`_record_verdict`) so the index rebuilds to what the workflow saw."""
     tid = p["trial_id"]; d = trial_dir(tid); unit = unit_name(tid); deadline = time.monotonic() + AWAIT_DEADLINE_SEC; polls = 0
+    reported_running = False
     while True:
         polls += 1
         ev = read_evidence(tid)
@@ -1004,12 +1055,16 @@ async def await_trial_activity(p: dict) -> dict:
             # flushing. Fall through: keep polling while the runtime runs; report incomplete evidence once it has stopped.
         if ev.has_runner_error:
             return {"trial_id": tid, "status": "runner-error", "unit": unit, "error": _read_json(d / "runner-error.json").get("error")}
+        if not reported_running and ev.runtime_state == "running":
+            reported_running = True
+            await index_live_trial(tid, "running", p.get("request_path"))
         decision = decide_launch(ev)
         if decision == "launch-failed":
             return {"trial_id": tid, "status": "launch-failed", "unit": unit, "reason": "launcher refused or returned nonzero; nothing ran; never relaunch automatically"}
         if decision == "unresolved":
-            return {"trial_id": tid, "status": "unresolved", "unit": unit,
-                    "reason": "launch evidence exists but the runtime is gone without a terminal record (VM loss or manual cleanup); inspect the runtime's logs and Harbor job; never relaunch"}
+            reason = "launch evidence exists but the runtime is gone without a terminal record (VM loss or manual cleanup); inspect the runtime's logs and Harbor job; never relaunch"
+            _record_verdict(d, tid, "unresolved", reason)
+            return {"trial_id": tid, "status": "unresolved", "unit": unit, "reason": reason}
         if decision == "launch" and polls >= LAUNCH_GRACE_POLLS:
             return {"trial_id": tid, "status": "launch-failed", "unit": unit, "reason": "no launch evidence for this trial; the launch activity did not reach the launcher"}
         if decision == "ingest" and ev.runtime_state != "running":
@@ -1018,11 +1073,14 @@ async def await_trial_activity(p: dict) -> dict:
                     "reason": "terminal evidence incomplete (status.json terminal without record.json, or record.json unreadable) and the runtime is not running; read its logs; never relaunch"}
         if decision == "reconcile":
             if ev.runtime_state == "failed":
-                return {"trial_id": tid, "status": "unit-failed", "unit": unit, "runtime": ev.runtime_detail,
-                        "reason": "runtime failed without a terminal record; read its logs; never relaunch"}
+                reason = "runtime failed without a terminal record; read its logs; never relaunch"
+                _record_verdict(d, tid, "unit-failed", reason)
+                return {"trial_id": tid, "status": "unit-failed", "unit": unit, "runtime": ev.runtime_detail, "reason": reason}
             if ev.runtime_state in ("succeeded", "unknown"):
-                return {"trial_id": tid, "status": "unresolved", "unit": unit, "runtime": ev.runtime_detail,
-                        "reason": "runtime finished (or cannot be seen from this worker) without terminal evidence; inspect its logs; never relaunch"}
+                reason = "runtime finished (or cannot be seen from this worker) without terminal evidence; inspect its logs; never relaunch"
+                if ev.runtime_state == "succeeded":  # a runtime this worker cannot see gets no verdict written on its behalf
+                    _record_verdict(d, tid, "unresolved", reason)
+                return {"trial_id": tid, "status": "unresolved", "unit": unit, "runtime": ev.runtime_detail, "reason": reason}
         if time.monotonic() >= deadline:
             raise ApplicationError("no terminal evidence before the await deadline; inspect the same runtime; never relaunch", non_retryable=True)
         await asyncio.sleep(POLL_SECONDS)

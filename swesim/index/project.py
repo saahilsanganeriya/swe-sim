@@ -12,9 +12,13 @@ Contract
 - Money is `Decimal` (through `dec`), never float. Times are tz-aware UTC (through `aware`): epoch numbers and ISO
   strings are accepted; a naive ISO string is taken as UTC.
 - `origin` is the file's own label when it carries one, else the caller's (`Settings.origin`).
-- Trial status from files: record.json / status.json `completed|finished` -> completed, `running` -> running,
-  `error` -> runner-error; runner-error.json -> runner-error; launch.json `failed` -> launch-failed; launch.json
-  without status.json or record.json -> unresolved; request.json only -> planned.
+- Trial status from files: record.json `completed|finished` -> completed (a status.json saying so without record.json is
+  `unresolved`: nothing was recorded); status.json `running` -> running, `error` -> runner-error, any verdict the await
+  activity or a cancellation wrote (unresolved, unit-failed, launch-failed, cancelled) -> itself; runner-error.json ->
+  runner-error; launch.json alone (`launch_status`): `failed` or a refused acknowledgement -> launch-failed, an intended or
+  acknowledged launch by a live launcher (cloudrun, subprocess) -> launched, by the retired VM launcher -> unresolved;
+  request.json only -> planned. A workflow's own report (`project_trial(status=...)`) is folded in by `trial_status`: it
+  climbs planned -> launched -> running, never descends, and never regresses a terminal row.
 - Scenario validation status from files: scenario.json + validation.json valid -> valid; validation.json not valid
   -> invalid; a reject decision -> rejected; compile.json -> validating; approval.json -> compiling; else drafting;
   `archive/v<n>/` -> archived (one row per version).
@@ -56,6 +60,9 @@ TRIAL_STATUS: dict[str, str] = {"completed": "completed", "finished": "completed
                                 "cancelled": "cancelled", "unresolved": "unresolved", "requested": "planned", "planned": "planned",
                                 "launched": "launched", "unreadable-record": "unresolved"}
 PROBE_REJECTS: tuple[str, ...] = ("not-reproducible-offline", "probe-failed")
+TRIAL_STATUSES: tuple[str, ...] = M.TrialStatus.__args__
+LIVE_TRIAL_STATUSES: dict[str, int] = {"planned": 0, "launched": 1, "running": 2}  # the live ladder; every other TrialStatus is terminal
+RETIRED_LAUNCHERS: frozenset[str] = frozenset({"systemd"})  # brief §2.7: the VM runtime is retired; nothing it launched can still be running
 _PR_RE = re.compile(r"-(\d+)$")
 
 
@@ -714,30 +721,70 @@ def _success(value: Any) -> bool | None:
     return None
 
 
-def project_trial(layout: Layout, trial_id: str, *, origin: str | None = None, now: datetime | None = None
-                  ) -> tuple[M.TrialRow, list[M.ExchangeRow], list[M.CostRow]]:
-    """The trial row plus its exchanges (from the frozen transcript) and priced cost records (from costs.json)."""
+def launch_status(launch: dict) -> str:
+    """The status of a trial whose only lifecycle file is launch.json (no status.json, record.json or runner-error.json), by the
+    launcher's own evidence rules (`swesim.workflows.launchers.base.decide_launch`): a failed launch or a refused acknowledgement
+    is `launch-failed`; an intended or acknowledged launch is `launched` (the files cannot see the runtime, so the launch is the
+    last durable lifecycle fact) unless the launcher is retired or unnamed, when nothing can still be running: `unresolved`."""
+    phase = launch.get("phase")
+    if phase == "failed" or (phase == "acknowledged" and launch.get("returncode") not in (None, 0)):
+        return "launch-failed"
+    if phase not in ("intent", "acknowledged") or not launch.get("launcher") or launch.get("launcher") in RETIRED_LAUNCHERS:
+        return "unresolved"
+    return "launched"
+
+
+def trial_status(files: str, reported: str | None, has_record: bool) -> str:
+    """Fold a workflow's report into the file-derived status. A report outside `TrialStatus` is ignored; terminal files win over
+    any report; among live statuses the higher rung wins (a late `planned` never lowers `running`); a terminal verdict from the
+    workflow (the await's unresolved / unit-failed / launch-failed, a cancellation) closes a live row, except a `completed`
+    claim, which needs record.json and is otherwise `unresolved`."""
+    if reported not in TRIAL_STATUSES or files not in LIVE_TRIAL_STATUSES:
+        return files
+    if reported in LIVE_TRIAL_STATUSES:
+        return max(files, reported, key=LIVE_TRIAL_STATUSES.__getitem__)
+    if reported == "completed" and not has_record:
+        return "unresolved"
+    return reported
+
+
+def project_trial(layout: Layout, trial_id: str, *, origin: str | None = None, now: datetime | None = None,
+                  request: dict | None = None, status: str | None = None) -> tuple[M.TrialRow, list[M.ExchangeRow], list[M.CostRow]]:
+    """The trial row plus its exchanges (from the frozen transcript) and priced cost records (from costs.json).
+
+    `request` is the trial's request payload (the planner's `<plan>/<trial_id>.json`) for a trial whose directory holds no
+    request.json yet (planned, or a bare verdict marker); `status` is the workflow's report (planned | launched | running, or
+    its terminal verdict), folded into the file-derived status by `trial_status`."""
     origin = _default_origin(origin)
     now = now or M.utcnow()
     d = layout.trial_dir(trial_id)
-    if not d.is_dir():
+    payload = _dict(request)
+    if payload and payload.get("trial_id") not in (None, trial_id):
+        raise ProjectionError(f"{trial_id}: the request payload names trial {payload.get('trial_id')!r}")
+    if not d.is_dir() and not payload:
         raise ProjectionError(f"{trial_id}: no trial directory")
     raw = read_json(d / "record.json") if (d / "record.json").exists() else None
     has_record = isinstance(raw, dict) and bool(raw)
-    request, launch, status_file = _dict(read_json(d / "request.json")), _dict(read_json(d / "launch.json")), _dict(read_json(d / "status.json"))
+    launch, status_file = _dict(read_json(d / "launch.json")), _dict(read_json(d / "status.json"))
+    request = _dict(read_json(d / "request.json")) or payload
     if has_record:
         rec = normalize_record(raw, d)
         status_raw = rec.get("status") or status_file.get("status") or "completed"
+    elif not d.is_dir():
+        rec, status_raw = {}, "planned"  # nothing launched yet: the row is the plan's promise
     else:
         u = unresolved_attempt(d)
         if u is None:
             raise ProjectionError(f"{trial_id}: no record.json and no launch evidence")
         rec = u
         if launch and not status_file and not (d / "runner-error.json").exists():
-            status_raw = "launch-failed" if launch.get("phase") == "failed" else "unresolved"
+            status_raw = launch_status(launch)
         else:
             status_raw = u["status"]
-    status = TRIAL_STATUS.get(str(status_raw).lower(), "unresolved")
+    files_status = TRIAL_STATUS.get(str(status_raw).lower(), "unresolved")
+    if files_status == "completed" and not has_record:
+        files_status = "unresolved"  # a terminal status.json without record.json: nothing was recorded, so nothing completed
+    status = trial_status(files_status, status, has_record)
     rc = _dict(rec.get("run_config")) or _dict(request.get("run_config"))
     identity = {
         "scenario_id": rec.get("scenario_id") or request.get("scenario_id"),
@@ -745,7 +792,7 @@ def project_trial(layout: Layout, trial_id: str, *, origin: str | None = None, n
         "condition": rec.get("condition") or rc.get("condition") or request.get("condition"),
         "model": rec.get("model") or rc.get("model") or request.get("model"),
         "run_config_hash": rec.get("run_config_hash") or request.get("run_config_hash"),
-        "attempt_index": rec.get("attempt_index", request.get("attempt_index")),
+        "attempt_index": rec.get("attempt_index") if rec.get("attempt_index") is not None else request.get("attempt_index"),
     }
     missing = [k for k, v in identity.items() if v in (None, "")]
     if missing:

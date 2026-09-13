@@ -2257,3 +2257,110 @@ def test_connect_kwargs_falls_back_to_the_env_file_for_temporal_keys(tmp_path, m
         assert C.connect_kwargs() == {"target_host": "localhost:7233", "namespace": "default"}   # process env wins; no key -> plain
     finally:
         reset_settings()
+
+
+# ---------------------------------------------------------------- live trial rows (P1-4)
+
+def test_trial_workflow_reports_launched_and_its_terminal_verdict_to_the_index(monkeypatch):
+    """After `launch_trial_activity` says `launched`, a `launched` row is hooked before the await; the terminal bookkeeping carries
+    the await's verdict (`status`) and the plan's request path; a launch that started nothing reports nothing live; cancellation
+    reports `cancelled`; executions started before the patch replay without the launched hook."""
+    async def scenario():
+        calls = []
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "launch_trial_activity": return {"trial_id": p["trial_id"], "launched": True, "handle": "h"}
+            if name == "await_trial_activity": return {"trial_id": p["trial_id"], "status": "unresolved", "reason": "runtime gone"}
+            if name == "cleanup_trial_activity": return {"trial_id": p["trial_id"], "cleaned": False}
+            return {"indexed": True, "rows": 1, "status": "launched"}
+        monkeypatch.setattr(W, "act", act)
+        r = await W.TrialWorkflow().run({"trial_id": "t1", "request_path": "/ws/evidence/workflows/x/t1.json"})
+        names = [n for n, _ in calls]
+        live = [p for n, p in calls if n == "index_trial_activity"]
+        assert [p.get("status") for p in live] == ["launched", "unresolved"]
+        assert all(p["request_path"] == "/ws/evidence/workflows/x/t1.json" for p in live)
+        assert names.index("launch_trial_activity") < names.index("index_trial_activity") < names.index("await_trial_activity")
+        assert r["status"] == "unresolved" and r["live"] == {"indexed": True, "rows": 1, "status": "launched"}
+        # a launch that did not start anything (reconcile / failure) reports nothing live; the terminal row still carries the verdict
+        calls.clear()
+        async def act2(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "launch_trial_activity": return {"trial_id": p["trial_id"], "launched": False, "decision": "reconcile"}
+            if name == "await_trial_activity": return {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0}}
+            return {}
+        monkeypatch.setattr(W, "act", act2)
+        r2 = await W.TrialWorkflow().run({"trial_id": "t1"})
+        assert [p.get("status") for n, p in calls if n == "index_trial_activity"] == ["completed"] and "live" not in r2
+        # cancellation while awaiting: the runtime is stopped and the row says cancelled
+        calls.clear()
+        async def act3(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "launch_trial_activity": return {"trial_id": p["trial_id"], "launched": True}
+            if name == "await_trial_activity": raise asyncio.CancelledError()
+            return {}
+        monkeypatch.setattr(W, "act", act3)
+        with pytest.raises(asyncio.CancelledError):
+            await W.TrialWorkflow().run({"trial_id": "t1"})
+        assert [p.get("status") for n, p in calls if n == "index_trial_activity"] == ["launched", "cancelled"]
+        # executions started before the patch replay without the launched hook
+        monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_LIVE_TRIALS)
+        calls.clear(); monkeypatch.setattr(W, "act", act)
+        await W.TrialWorkflow().run({"trial_id": "t1"})
+        assert [p.get("status") for n, p in calls if n == "index_trial_activity"] == ["unresolved"]
+    asyncio.run(scenario())
+
+
+def test_prepare_trial_plan_indexes_planned_rows_in_process_and_never_fails_the_plan(ws, monkeypatch):
+    """P1-4: the planner (CONTROL pool) upserts a `planned` row per trial of the plan before the workflow fans out, by request
+    path; the cached plan indexes the same rows again (idempotent upserts); the index is bookkeeping and never fails the plan."""
+    from swesim.index import activities as IA
+    spec = frozen_scenario(ws); seen = []
+    def fake_index(payload, settings=None): seen.append(payload); return {"indexed": True, "rows": 1, "status": "planned"}
+    monkeypatch.setattr(IA, "index_trial", fake_index)
+    base = {"scenario_id": spec.id, "models": ["openrouter/deepseek/deepseek-v3.2"], "conditions": ["hidden", "full"], "k": 2, "stakeholder_url": "https://s", "workflow_id": "run-x"}
+    prepared = asyncio.run(A.prepare_trial_plan_activity(base))
+    items = json.loads(Path(prepared["plan_path"]).read_text())["items"]
+    assert prepared["total"] == 4 and [p["trial_id"] for p in seen] == [i["trial_id"] for i in items]
+    assert all(p == {"trial_id": i["trial_id"], "status": "planned", "request_path": i["request_path"]} for p, i in zip(seen, items))
+    seen.clear(); asyncio.run(A.prepare_trial_plan_activity(base))
+    assert len(seen) == 4
+    def broken(payload, settings=None): raise RuntimeError("index down")
+    monkeypatch.setattr(IA, "index_trial", broken)
+    assert asyncio.run(A.prepare_trial_plan_activity(base))["total"] == 4
+
+
+def test_await_reports_running_once_and_records_its_verdict_durably(ws, systemd, monkeypatch):
+    """P1-4: the first poll that sees the runtime running upserts one `running` row in-process (the TRIALS pool has no workflow
+    to hook from); a verdict the files do not carry (unresolved, unit-failed) is written to status.json so a rebuild reads what
+    the workflow saw; a verdict launch.json already carries is not re-written; a late record.json still wins."""
+    from swesim.index import activities as IA
+    spec = frozen_scenario(ws); p = {**trial_request(ws, spec), "request_path": "/ws/evidence/workflows/x/r.json"}; d = ws.root / "trials" / p["trial_id"]
+    unit = "swesim-trial-" + p["trial_id"]; seen = []
+    monkeypatch.setattr(IA, "index_trial", lambda payload, settings=None: seen.append(payload) or {"indexed": True})
+    atomic_json(d / "launch.json", {"trial_id": p["trial_id"], "unit": unit, "phase": "acknowledged", "returncode": 0, "launcher": "systemd"})
+    systemd.units[unit] = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running", "Result": "success"}
+    polls = {"n": 0}; real_read = A.read_evidence
+    def read_evidence(tid):
+        polls["n"] += 1
+        if polls["n"] == 4: systemd.units.pop(unit)                   # the unit vanished without a record
+        return real_read(tid)
+    monkeypatch.setattr(A, "read_evidence", read_evidence)
+    r = asyncio.run(A.await_trial_activity(p))
+    assert r["status"] == "unresolved" and polls["n"] == 4
+    assert seen == [{"trial_id": p["trial_id"], "status": "running", "request_path": p["request_path"]}]      # once, on the first running poll
+    status = json.loads((d / "status.json").read_text())
+    assert status["status"] == "unresolved" and status["trial_id"] == p["trial_id"] and status["verdict_source"] == "await_trial_activity"
+    assert "never relaunch" in status["reason"] and status["origin"] == A.SETTINGS.origin and status["finished_at"]
+    assert asyncio.run(A.await_trial_activity(p))["status"] == "unresolved" and len(seen) == 1   # the verdict answers a retry at once
+    # a verdict launch.json already carries (the launcher refused) is not re-written
+    q = trial_request(ws, spec, attempt=1); e = ws.root / "trials" / q["trial_id"]
+    atomic_json(e / "launch.json", {"trial_id": q["trial_id"], "unit": "u", "phase": "acknowledged", "returncode": 1, "launcher": "systemd"})
+    assert asyncio.run(A.await_trial_activity(q))["status"] == "launch-failed" and not (e / "status.json").exists()
+    # a failed unit without a record: unit-failed, durable
+    f = trial_request(ws, spec, attempt=2); fd = ws.root / "trials" / f["trial_id"]; funit = "swesim-trial-" + f["trial_id"]
+    atomic_json(fd / "launch.json", {"trial_id": f["trial_id"], "unit": funit, "phase": "acknowledged", "returncode": 0, "launcher": "systemd"})
+    systemd.units[funit] = {"LoadState": "loaded", "ActiveState": "failed", "SubState": "failed", "Result": "exit-code"}
+    assert asyncio.run(A.await_trial_activity(f))["status"] == "unit-failed" and json.loads((fd / "status.json").read_text())["status"] == "unit-failed"
+    # a record.json that lands late still wins over the verdict marker
+    atomic_json(d / "record.json", {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}})
+    assert asyncio.run(A.await_trial_activity(p))["status"] == "completed"

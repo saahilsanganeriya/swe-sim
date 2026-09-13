@@ -441,3 +441,77 @@ def test_leaderboard_gate(record: Record, registry: dict):
     assert R.compute_leaderboard(trials, ungated, M.LeaderboardFilter(purpose="calibration")) == []
     broken = [s.model_copy(update={"difficulty_tier": "broken"}) for s in scenarios]
     assert R.compute_leaderboard(trials, broken, M.LeaderboardFilter(purpose="calibration", include_saturated=True)) == []
+
+
+# ----------------------------------------------------------------------------- live trial rows (P1-4)
+
+def _live_ws(tmp_path: Path):
+    spec = make_spec()
+    ws = make_workspace(tmp_path, spec)
+    return spec, ws, Layout(root=ws.root)
+
+
+def test_launch_evidence_projects_as_launched_for_a_live_launcher_and_unresolved_for_a_retired_one(tmp_path: Path):
+    """No record.json: request.json only -> planned; a Cloud Run launch acknowledged (or intended) without any later file ->
+    launched (the files cannot see the runtime; the launch is the last durable lifecycle fact); the same shape left by the
+    retired VM launcher -> unresolved (nothing can still be running there); a refused launch -> launch-failed; a terminal
+    status.json without record.json is never `completed`."""
+    spec, ws, layout = _live_ws(tmp_path)
+    planned = write_unresolved(ws, spec, kind="request-only", attempt=0)
+    assert P.project_trial(layout, planned, origin="cloudrun")[0].status == "planned"
+    launched = write_unresolved(ws, spec, kind="request-only", attempt=1)
+    _w(ws.root / "trials" / launched / "launch.json", {"trial_id": launched, "phase": "acknowledged", "launcher": "cloudrun", "handle": "swesim-trial-" + launched,
+                                                       "returncode": 0, "started_at": T0 + 5, "image_digest": "sha256:" + "d" * 64, "origin": "cloudrun",
+                                                       "workflow_id": launched, "run_id": "r-9"})
+    row = P.project_trial(layout, launched, origin="laptop")[0]
+    assert (row.status, row.launcher, row.job_name, row.started_at, row.origin) == ("launched", "cloudrun", "swesim-trial-" + launched, P.aware(T0 + 5), "cloudrun")
+    assert (row.workflow_id, row.run_id, row.worker_image_digest) == (launched, "r-9", "sha256:" + "d" * 64) and row.finished_at is None
+    intent = write_unresolved(ws, spec, kind="request-only", attempt=2)
+    _w(ws.root / "trials" / intent / "launch.json", {"trial_id": intent, "phase": "intent", "launcher": "cloudrun", "started_at": T0})
+    assert P.project_trial(layout, intent, origin="laptop")[0].status == "launched"
+    retired = write_unresolved(ws, spec, kind="request-only", attempt=3)
+    _w(ws.root / "trials" / retired / "launch.json", {"trial_id": retired, "phase": "acknowledged", "launcher": "systemd", "unit": "u", "returncode": 0})
+    assert P.project_trial(layout, retired, origin="laptop")[0].status == "unresolved"
+    refused = write_unresolved(ws, spec, kind="request-only", attempt=4)
+    _w(ws.root / "trials" / refused / "launch.json", {"trial_id": refused, "phase": "acknowledged", "launcher": "cloudrun", "returncode": 1})
+    assert P.project_trial(layout, refused, origin="laptop")[0].status == "launch-failed"
+    _w(ws.root / "trials" / launched / "status.json", {"status": "completed", "trial_id": launched, "started_at": T0 + 5, "finished_at": T0 + 50})
+    assert P.project_trial(layout, launched, origin="laptop")[0].status == "unresolved"   # no record.json: not completed
+    _w(ws.root / "trials" / launched / "status.json", {"status": "unresolved", "trial_id": launched, "finished_at": T0 + 50})
+    assert P.project_trial(layout, launched, origin="laptop")[0].status == "unresolved"
+
+
+def test_workflow_report_folds_into_the_file_status_without_regressing_a_terminal_row(tmp_path: Path):
+    """`status` from the workflow (planned | launched | running, or its terminal verdict) never lowers what the files show and
+    never regresses a terminal row; a trial that has no directory yet projects from its request payload."""
+    spec, ws, layout = _live_ws(tmp_path)
+    assert P.trial_status("planned", "launched", False) == "launched" and P.trial_status("launched", "planned", False) == "launched"
+    assert P.trial_status("launched", "running", False) == "running" and P.trial_status("running", "running", False) == "running"
+    assert P.trial_status("unresolved", "running", False) == "unresolved" and P.trial_status("completed", "planned", True) == "completed"
+    assert P.trial_status("launched", "unresolved", False) == "unresolved" and P.trial_status("launched", "unit-failed", False) == "unit-failed"
+    assert P.trial_status("launched", "completed", False) == "unresolved"           # a completion claim without record.json
+    assert P.trial_status("launched", "unknown", False) == "launched" and P.trial_status("launched", None, False) == "launched"
+    tid = write_unresolved(ws, spec, kind="request-only", attempt=0)
+    request = json.loads((ws.root / "trials" / tid / "request.json").read_text())
+    import shutil
+    shutil.rmtree(ws.root / "trials" / tid)
+    with pytest.raises(P.ProjectionError):
+        P.project_trial(layout, tid, origin="laptop")
+    row = P.project_trial(layout, tid, origin="laptop", request=request, status="planned")[0]
+    assert row.status == "planned" and row.scenario_id == spec.id and row.spec_hash == spec.spec_hash and row.model == HAIKU
+    assert row.condition == "interactive" and row.brief_profile == "withheld" and row.purpose == "calibration" and row.attempt_index == 0
+    assert row.run_config_hash == request["run_config_hash"] and row.started_at is None and row.launcher is None and row.origin == "laptop"
+    assert P.project_trial(layout, tid, origin="laptop", request=request, status="running")[0].status == "running"
+    with pytest.raises(P.ProjectionError):                                                 # a request that names another trial
+        P.project_trial(layout, tid, origin="laptop", request={**request, "trial_id": "0" * 24}, status="planned")
+    _w(ws.root / "trials" / tid / "request.json", request)
+    _w(ws.root / "trials" / tid / "launch.json", {"trial_id": tid, "phase": "acknowledged", "launcher": "cloudrun", "returncode": 0, "handle": "h"})
+    assert P.project_trial(layout, tid, origin="laptop", status="planned")[0].status == "launched"
+    assert P.project_trial(layout, tid, origin="laptop", status="running")[0].status == "running"
+    _w(ws.root / "trials" / tid / "status.json", {"status": "cancelled", "trial_id": tid})
+    assert P.project_trial(layout, tid, origin="laptop", status="running")[0].status == "cancelled"
+    # a directory whose only file is the verdict marker still identifies itself through the request payload
+    marker = write_unresolved(ws, spec, kind="stale-running", attempt=5)
+    with pytest.raises(P.ProjectionError):
+        P.project_trial(layout, marker, origin="laptop")
+    assert P.project_trial(layout, marker, origin="laptop", request={**request, "trial_id": marker, "attempt_index": 5}, status="launch-failed")[0].status == "launch-failed"

@@ -4,6 +4,7 @@ files cannot satisfy, idempotent upserts."""
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -13,6 +14,7 @@ from temporalio.exceptions import ApplicationError
 
 from swesim.index import activities as IA
 from swesim.index import models as M
+from swesim.index import project as P
 from swesim.index.files import FileIndexReader
 from swesim.index.store import IndexStore
 from swesim.settings import QUEUES, Settings, get_settings, reset_settings
@@ -216,3 +218,89 @@ def test_rebuild_activity_returns_counts_and_a_bounded_skip_list(enabled: Settin
     assert IA.store_for(enabled).trial(record.tids["done"]).origin == "vm-systemd"
     with pytest.raises(ApplicationError):
         run(IA.index_rebuild_activity, {"origin": "moon"})
+
+
+# ----------------------------------------------------------------------------- live trial rows (P1-4)
+
+try:
+    from test_index_project import _w
+    from test_score import T0, make_spec, make_workspace, write_trial, write_unresolved
+except ImportError:  # pragma: no cover
+    from tests.test_index_project import _w
+    from tests.test_score import T0, make_spec, make_workspace, write_trial, write_unresolved
+
+
+@pytest.fixture
+def live(tmp_path, monkeypatch) -> tuple[Settings, Record]:
+    """A fresh record and index for the live-row tests (the shared `record` is module-scoped and must not grow)."""
+    spec = make_spec()
+    ws = make_workspace(tmp_path / "rec", spec)
+    for key in ("SWESIM_DATABASE_URL", "SWESIM_WORKSPACE", "SWESIM_REGISTRY", "SWESIM_ENV_FILE", "SWESIM_ORIGIN", "SWESIM_WORKER_IMAGE_DIGEST"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SWESIM_ENV_FILE", str(tmp_path / "none.env"))
+    monkeypatch.setenv("SWESIM_DATABASE_URL", f"sqlite:///{tmp_path / 'live.db'}")
+    monkeypatch.setenv("SWESIM_WORKSPACE", str(ws.root))
+    monkeypatch.setenv("SWESIM_REGISTRY", str(ws.registry_path))
+    monkeypatch.setenv("SWESIM_ORIGIN", "cloudrun")
+    reset_settings()
+    IA.reset_store()
+    s = get_settings()
+    IA.store_for(s).migrate()
+    yield s, Record(ws=ws, layout=Layout(root=ws.root), registry_path=ws.registry_path, spec=spec)
+    reset_settings()
+    IA.reset_store()
+
+
+def test_trial_activity_upserts_live_rows_and_never_regresses_a_terminal_one(live):
+    """The launcher stream's contract (frontier-2 concern 4): `{"trial_id", "status", "request" | "request_path"}` builds a row
+    before any trial file exists; later reports climb planned -> launched -> running and never descend; a terminal row (files
+    or the workflow's verdict) is never reopened by a live report; a completion claim without record.json is unresolved."""
+    import shutil
+    s, rec = live
+    store = IA.store_for(s)
+    spec = rec.spec
+    tid = write_unresolved(rec.ws, spec, kind="request-only", attempt=0)
+    d = rec.ws.root / "trials" / tid
+    request = json.loads((d / "request.json").read_text())
+    shutil.rmtree(d)
+    plan = rec.ws.root / "evidence" / "workflows" / "plan" / f"{tid}.json"
+    _w(plan, request)
+    out = run(IA.index_trial_activity, {"trial_id": tid, "status": "planned", "request_path": str(plan)})
+    assert out == {"indexed": True, "rows": 1, "status": "planned"}
+    row = store.trial(tid)
+    assert row.status == "planned" and row.scenario_id == spec.id and row.started_at is None and row.origin == "cloudrun" and row.launcher is None
+    assert run(IA.index_trial_activity, {"trial_id": tid, "status": "planned", "request": request}) == out and store.trials(M.TrialFilter()).total == 1
+    with pytest.raises(ApplicationError) as e:                                     # a request path outside the workspace
+        run(IA.index_trial_activity, {"trial_id": tid, "status": "planned", "request_path": str(rec.ws.root.parent / "elsewhere.json")})
+    assert e.value.type == "projection" and e.value.non_retryable
+    with pytest.raises(ApplicationError):                                          # nothing identifies the trial
+        run(IA.index_trial_activity, {"trial_id": "1" * 24, "status": "planned"})
+    # launched: the launcher wrote request.json and launch.json
+    _w(d / "request.json", request)
+    _w(d / "launch.json", {"trial_id": tid, "phase": "acknowledged", "launcher": "cloudrun", "handle": "swesim-trial-" + tid, "returncode": 0,
+                           "started_at": T0 + 1, "image_digest": "sha256:" + "a" * 64})
+    assert run(IA.index_trial_activity, {"trial_id": tid, "status": "launched"})["status"] == "launched"
+    row = store.trial(tid)
+    assert (row.launcher, row.job_name, row.started_at, row.worker_image_digest) == ("cloudrun", "swesim-trial-" + tid, P.aware(T0 + 1), "sha256:" + "a" * 64)
+    assert run(IA.index_trial_activity, {"trial_id": tid, "status": "planned"})["status"] == "launched"     # a late planned report never lowers the row
+    assert run(IA.index_trial_activity, {"trial_id": tid, "status": "running", "request_path": str(plan)})["status"] == "running"
+    assert run(IA.index_trial_activity, {"trial_id": tid})["status"] == "launched"                         # without a report the files decide
+    # the await's verdict, durable in status.json: terminal; no live report reopens it
+    _w(d / "status.json", {"status": "unresolved", "trial_id": tid, "finished_at": T0 + 90})
+    assert run(IA.index_trial_activity, {"trial_id": tid, "status": "running"})["status"] == "unresolved"
+    assert run(IA.index_trial_activity, {"trial_id": tid, "status": "launched"})["status"] == "unresolved"
+    assert store.trial(tid).status == "unresolved" and store.trials(M.TrialFilter(status=["running", "launched", "planned"])).total == 0
+    # the workflow's own terminal verdict without a record is applied, except a completion claim, which needs record.json
+    other = write_unresolved(rec.ws, spec, kind="request-only", attempt=1)
+    _w(rec.ws.root / "trials" / other / "launch.json", {"trial_id": other, "phase": "acknowledged", "launcher": "cloudrun", "returncode": 0})
+    assert run(IA.index_trial_activity, {"trial_id": other, "status": "completed"})["status"] == "unresolved"
+    assert run(IA.index_trial_activity, {"trial_id": other, "status": "unit-failed"})["status"] == "unit-failed"
+    assert run(IA.index_trial_activity, {"trial_id": other, "status": "planned"}) == {"indexed": True, "rows": 0, "status": "unit-failed"}
+    assert store.trial(other).status == "unit-failed"
+    # a recorded trial: the files win over any report
+    done = write_trial(rec.ws, spec, attempt=2)
+    assert run(IA.index_trial_activity, {"trial_id": done, "status": "planned"})["status"] == "completed"
+    assert run(IA.index_trial_activity, {"trial_id": done, "status": "unresolved"})["status"] == "completed"
+    # the file reader and a fresh rebuild agree with the live rows
+    files = FileIndexReader(rec.layout, settings=s)
+    assert files.trial(tid).status == "unresolved" and files.trial(other).status == "launched" and files.trial(done).status == "completed"
