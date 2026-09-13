@@ -5,9 +5,11 @@ texts, persona, checks and the repo dir. It never references ``spec.assets``, ``
 ``spec.contract`` (hidden tests), so nothing downstream can leak them by accident.
 
 ``forbidden_terms`` is the code-owned deny-list the run stage adds to the session body as
-``visible_view["forbidden_terms"]``: identifiers that occur in the hidden test asset(s) but not in the natural brief,
-the visible facts or the requirements, plus fixed test vocabulary. It is a list of tokens, never content; the
-service's reply filter redacts sentences that use them and the prompt never renders them.
+``visible_view["forbidden_terms"]``: identifiers that occur in the hidden test asset(s) but not in the natural issue
+text, plus fixed test vocabulary. The natural issue is the only permitted vocabulary (A-P1-2 ruling): a requirement
+or visible fact that repeats a hidden-test identifier puts it in the stakeholder's context but never exempts it from
+redaction, because the reporter did not write it. It is a list of tokens, never content; the service's reply filter
+redacts sentences that use them and the prompt never renders them.
 """
 from __future__ import annotations
 
@@ -38,10 +40,9 @@ def visible_view(spec: ScenarioSpec) -> dict:
 
 
 def allowed_identifiers(spec: ScenarioSpec) -> set[str]:
-    """Casefolded identifiers the stakeholder legitimately knows: natural brief, visible facts, requirements."""
+    """Casefolded identifiers the reporter wrote: the natural issue text only. Visible facts and requirements are
+    stakeholder context, not reporter vocabulary, so they never widen the allow-list."""
     texts = [b.text for b in spec.briefs if b.profile == "natural"]
-    texts += [f.text for f in spec.ledger if f.discovery != Discovery.AUTHOR_ONLY]
-    texts += [r.text for r in spec.requirements]
     return {i.casefold() for t in texts for i in IDENT.findall(t)}
 
 

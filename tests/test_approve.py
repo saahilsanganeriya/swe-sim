@@ -6,7 +6,7 @@ from swesim.models import ScenarioSpec, minimal_spec_dict
 from swesim.paths import Workspace
 from swesim.stages.approve import approve_scenario, auto_gates
 
-AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "withholding-leak", "controls"]
+AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "withholding-leak", "controls"]
 
 
 def _draft(tmp_path, d=None, write_assets=True):
@@ -99,3 +99,24 @@ def test_human_mode_records_command_and_skips_auto_gates(tmp_path):
     assert out["approved"] is True and out["mode"] == "human"
     ap = json.loads((sdir / "approval.json").read_text())
     assert ap["approved_by"] == "human-command" and ap["review_needed"] is False and ap["gates"] == ["schema", "assets"]
+
+
+def test_requirements_must_be_grounded_in_a_visible_fact_or_the_thread(tmp_path):
+    """A-P1-2 / B-P1-2: a requirement with no fact_id is accepted only when its text is a verbatim thread or issue excerpt."""
+    d = minimal_spec_dict()
+    d["thread"] = {"pr_url": "https://example.com/pr/1", "reviews": [{"body": "Please raise a  ValueError\nwhen the dim is missing."}], "pr_comments": [], "review_comments": [],
+                   "linked_issues": [{"title": "t", "body": "Weighted mean silently ignores missing dims", "comments": [{"body": "Expected: raise ValueError."}]}]}
+    d["requirements"] += [{"id": "r02", "text": "Bound the recovery scan so crafted files fail quickly", "fact_id": None, "tests": ["t1"]}]
+    spec = ScenarioSpec.model_validate(d)
+    fails = auto_gates(spec, tmp_path)
+    assert any(r.startswith("requirement r02 is ungrounded") for r in fails) and not any("r01" in r for r in fails)
+    d["requirements"][1]["text"] = "raise a ValueError when the dim is missing"          # verbatim review text (whitespace/case-insensitive)
+    d["requirements"].append({"id": "r03", "text": "expected: raise valueerror.", "fact_id": None, "tests": []})   # verbatim issue-comment text
+    d["requirements"].append({"id": "r04", "text": "Weighted mean silently ignores missing dims", "fact_id": None, "tests": []})   # verbatim issue body
+    d["requirements"].append({"id": "r05", "text": "it breaks", "fact_id": None, "tests": []})                    # too short to ground anything
+    assert any(r.startswith("requirement r05 is ungrounded") for r in auto_gates(ScenarioSpec.model_validate(d), tmp_path))
+    d["requirements"].pop()
+    assert not any("ungrounded" in r for r in auto_gates(ScenarioSpec.model_validate(d), tmp_path))
+    ws, sdir, d2 = _draft(tmp_path, d)
+    assert approve_scenario(ws, d2["id"], auto=True)["approved"] is True
+    assert "requirements-grounded" in json.loads((sdir / "approval.json").read_text())["gates"]

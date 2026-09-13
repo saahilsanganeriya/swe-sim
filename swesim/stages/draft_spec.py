@@ -38,6 +38,9 @@ Rules: every fact must quote a short excerpt from the thread with its URL, or be
 Facts the agent can learn by reading the repository are discovery=repo-derivable. Facts absent from the repository that the
 maintainer decided are discovery=on-request. Private helper names chosen by the fix author are discovery=author-only and must
 not link tests. Requirements come from review comments. Checks are user-level reproducers (not the hidden tests).
+Every requirement must be grounded: its fact_id names a ledger fact that is not author-only, or its text is a verbatim excerpt of
+the issue or thread (code checks both and rejects ungrounded requirements). Requirement text follows the same rule as fact text:
+user-visible behaviour, never test construction or identifiers that exist only in the tests.
 Groups partition FAIL_TO_PASS test ids into requirement groups with weights summing to 1. Also write one plausible-wrong patch:
 a tempting incomplete or wrong fix (e.g. wrong exception type). Give control patches as `files`: the COMPLETE modified text of
 each file you change (only files the merged fix touches; code builds the diff against the base commit), and use `diff` only when
@@ -64,13 +67,15 @@ SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "ori
   "authored_rationale": null, "discovery": "brief|on-request|volunteered-at-review|repo-derivable|author-only", "tests": ["nodeid"]}],
 "operations": [{"type": "clarification|evaluator-repair|synthetic-extension", "target": "...", "rationale": "..."}],
 "persona": {"summary": "...", "tone": "...", "disclosure_style": "...", "derived_from_urls": ["..."], "role": "maintainer|reporter"},
-"requirements": [{"id": "r01", "text": "...", "fact_id": "f01", "tests": ["nodeid"], "source_url": "..."}],
+"requirements": [{"id": "r01", "text": "...", "fact_id": "f01 (a non-author-only ledger fact; null only when text is a verbatim issue/thread excerpt)", "tests": ["nodeid"], "source_url": "..."}],
 "checks": [{"id": "c01", "description": "...", "command": "python -c '...'", "expected_observation": "..."}],
 "groups": [{"id": "g01", "weight": 0.5, "tests": ["nodeid"]}],
 "plausible_wrong": {"name": "short label", "rationale": "...", "files": {"path/touched/by/the/fix.py": "COMPLETE modified file text"}, "diff": "unified diff, only if files cannot be given"},
 "alternative_correct": {"name": "short label", "rationale": "...", "files": {"path.py": "COMPLETE modified file text"}, "diff": "unified diff, only if files cannot be given"} | null,
 "protected_paths_extra": ["test-tree fixture or data files the hidden tests read (never source files; code drops anything else)"]}"""
 
+VISIBLE_DISCOVERY = {"brief", "on-request", "volunteered-at-review", "repo-derivable"}  # everything the stakeholder prompt can render
+HUMAN_PROVENANCE = ("original-issue", "issue-thread", "pr-thread", "pr-review")  # what a reporter or maintainer actually wrote
 WITHHOLD_CATEGORIES = {"reproduction", "error_message", "expected_output", "location", "version", "proposed_fix"}
 WITHHOLD_DISCOVERY = {"on-request", "repo-derivable"}  # a removed reporter statement is never author-only
 REPO_DERIVABLE_CATEGORIES = {"location", "proposed_fix"}
@@ -416,19 +421,102 @@ def closest_lines(needle: str, texts: list[str], n: int = 3) -> list[str]:
     return [by_norm[m] for m in difflib.get_close_matches(needle, list(by_norm), n=n, cutoff=0.0)]
 
 
+def excerpt_grounds(text: str | None, corpora: dict[str, str]) -> str | None:
+    """The provenance whose (normalized) corpus contains `text` verbatim, subject to the fact-excerpt minimums; None when
+    the text grounds in nothing. Used for requirements without a fact_id (their text must be a quote, not model prose)."""
+    needle = _norm(text)
+    if len(needle) < MIN_EXCERPT_CHARS or len(needle.split()) < MIN_EXCERPT_TOKENS:
+        return None
+    return next((prov for prov in HUMAN_PROVENANCE if prov in corpora and needle in corpora[prov]), None)
+
+
+def _requirement_violations(d: dict, row: dict, facts_by_id: dict[str, dict], corpora: dict[str, str], *, demote_unsafe: bool,
+                            demoted: set[str], filter_log: list[dict] | None) -> list[str]:
+    """Requirements are stakeholder-visible text and get the fact rules (A-P1-2 / B-P1-2): `unsafe_fact_text` on every
+    requirement, and every requirement grounded either by a `fact_id` naming a stakeholder-visible ledger fact or by text
+    that is a verbatim excerpt of what humans wrote (`excerpt_grounds`). Strict mode returns violations for the correction
+    round. Lenient mode (`demote_unsafe`) repairs `d["requirements"]` in place and records every decision in `filter_log`:
+    unsafe text -> dropped; a requirement whose fact the sanitizer just demoted (`demoted`) -> rewritten to that fact's own
+    excerpt when it is human text that passes the sanitizer, else dropped; model prose without any fact -> dropped. A link
+    the model itself made to an author-only or unknown fact is left for the schema to reject (the correction round already
+    named it; code never guesses what the model meant)."""
+    bad: list[str] = []
+    kept: list = []
+    human = {p: corpora[p] for p in HUMAN_PROVENANCE if p in corpora}
+    for r in d.get("requirements") or []:
+        if not isinstance(r, dict):
+            kept.append(r)  # the schema validation names the problem
+            continue
+        rid, fid = r.get("id", "?"), r.get("fact_id")
+        reasons = unsafe_fact_text(r.get("text"), row)
+        fact = facts_by_id.get(fid) if fid else None
+        by_fact = fact is not None and fact.get("discovery") in VISIBLE_DISCOVERY
+        by_excerpt = excerpt_grounds(r.get("text"), human)
+        if not demote_unsafe:
+            if reasons:
+                bad.append(f"{rid}: requirement text would tell the agent how the hidden tests are built ({'; '.join(reasons)}); state the user-visible behaviour instead")
+            if not by_fact and not by_excerpt:
+                if fid and fact is None:
+                    bad.append(f"{rid}: requirement is ungrounded: fact_id {fid!r} is not in the ledger; link a stakeholder-visible fact or make the text a verbatim excerpt of the issue or thread")
+                elif fid:
+                    bad.append(f"{rid}: requirement is ungrounded: fact {fid} is author-only; link a stakeholder-visible fact_id or make the text a verbatim excerpt of the issue or thread")
+                else:
+                    bad.append(f"{rid}: requirement is ungrounded: set fact_id to a stakeholder-visible ledger fact or make the text a verbatim excerpt of the issue or thread")
+            kept.append(r)
+            continue
+        if reasons:
+            if filter_log is not None:
+                filter_log.append({"requirement_id": rid, "source": "model", "action": "dropped", "reasons": reasons, "fact_id": fid})
+            continue
+        if by_fact:
+            kept.append(r)
+            continue
+        if by_excerpt:
+            if fid:  # the fact is author-only; the text stands on its own quote
+                r["fact_id"] = None
+                if filter_log is not None:
+                    filter_log.append({"requirement_id": rid, "source": "model", "action": "unlinked-grounded-by-excerpt", "fact_id": fid, "provenance": by_excerpt})
+            kept.append(r)
+            continue
+        if fid and fid not in demoted:
+            kept.append(r)  # the model's own author-only/unknown link: the schema rejects it, as the correction round warned
+            continue
+        excerpt = " ".join(str(fact.get("source_excerpt") or "").split()) if fact else ""
+        if fact and fact.get("provenance") in HUMAN_PROVENANCE and excerpt_grounds(excerpt, human) and not unsafe_fact_text(excerpt, row) \
+                and len(excerpt) <= MAX_FACT_TEXT_CHARS:
+            r["text"], r["fact_id"] = excerpt, None
+            if fact.get("source_url"):
+                r["source_url"] = fact["source_url"]
+            if filter_log is not None:
+                filter_log.append({"requirement_id": rid, "source": "model", "action": "rewritten-from-thread", "fact_id": fid, "provenance": fact.get("provenance")})
+            kept.append(r)
+            continue
+        if filter_log is not None:
+            filter_log.append({"requirement_id": rid, "source": "model", "action": "dropped", "fact_id": fid,
+                               "reasons": ["ungrounded: fact demoted and no verbatim human excerpt can replace the text" if fid
+                                           else "ungrounded: no fact_id and the text is not a verbatim excerpt of the issue or thread"]})
+    if demote_unsafe and isinstance(d.get("requirements"), list):
+        d["requirements"][:] = kept
+    return bad
+
+
 def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None, *, corpus_by_fact: dict[str, str] | None = None,
                       allow_reserved: bool = False, require_f2p_link: bool = True, demote_unsafe: bool = False,
                       filter_log: list[dict] | None = None) -> list[str]:
-    """Code-owned grounding of ledger facts. Every fact must quote a verbatim span (after normalization) of the text its
-    provenance names (`authored` = the merged tests/patch; `corpus_by_fact[id]` overrides the corpus, used for the withheld
-    facts whose corpus is their own removed span) and cite a URL under the repository; and, unless `require_f2p_link` is
-    off, at least one on-request fact (in the model ledger or in `extra_facts`, the code-synthesized ones) must link a
-    FAIL_TO_PASS test, otherwise interaction is not load-bearing and approval would fail anyway. Reserved id prefixes are
-    violations for model output (`allow_reserved=False`) and permitted for code-generated facts."""
+    """Code-owned grounding of ledger facts and requirements. Every fact must quote a verbatim span (after normalization) of
+    the text its provenance names (`authored` = the merged tests/patch; `corpus_by_fact[id]` overrides the corpus, used for
+    the withheld facts whose corpus is their own removed span) and cite a URL under the repository; every stakeholder-visible
+    fact (`VISIBLE_DISCOVERY`) and every requirement passes `unsafe_fact_text`; every requirement is grounded by a visible
+    fact_id or a verbatim human excerpt (`_requirement_violations`); and, unless `require_f2p_link` is off, at least one
+    on-request fact (in the model ledger or in `extra_facts`, the code-synthesized ones) must link a FAIL_TO_PASS test,
+    otherwise interaction is not load-bearing and approval would fail anyway. Reserved id prefixes are violations for model
+    output (`allow_reserved=False`) and permitted for code-generated facts. `demote_unsafe` is the lenient repair mode: an
+    unsafe fact becomes author-only (tests cleared) and the requirements that depended on it are rewritten or dropped."""
     sources = _corpus_sources(row)
     corpora = {prov: _norm("\n".join(texts)) for prov, texts in sources.items()}
     url_prefix = f"https://github.com/{row['repo']}/".casefold()
     bad = []
+    demoted: set[str] = set()
     ledger = d.get("ledger") or []
     for f in ledger:
         fid, prov = f.get("id", "?"), f.get("provenance")
@@ -448,19 +536,19 @@ def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None,
             bad.append(f"{fid}: source_excerpt is not a verbatim span of the {where}: {excerpt[:80]!r}; closest lines: {json.dumps(near, ensure_ascii=False)}")
         if not (f.get("source_url") or "").casefold().startswith(url_prefix):
             bad.append(f"{fid}: source_url must be under https://github.com/{row['repo']}/")
-        if f.get("discovery") in ("on-request", "brief"):
+        if f.get("discovery") in VISIBLE_DISCOVERY:
             reasons = unsafe_fact_text(f.get("text"), row)  # stakeholder-visible text must never describe test construction
             if reasons and demote_unsafe:
                 f["discovery"], f["tests"] = "author-only", []
-                for r in d.get("requirements") or []:
-                    if isinstance(r, dict) and r.get("fact_id") == fid:
-                        r["fact_id"] = None
+                demoted.add(fid)
                 if filter_log is not None:
                     filter_log.append({"fact_id": fid, "source": "model", "action": "demoted-author-only", "reasons": reasons})
             elif reasons:
                 bad.append(f"{fid}: fact text would tell the agent how the hidden tests are built ({'; '.join(reasons)}); state the user-visible behaviour instead")
         if require_f2p_link and f.get("discovery") == "on-request" and not (set(f.get("tests") or []) & set(row.get("fail_to_pass") or [])):
             bad.append(f"{fid}: every on-request fact must carry `tests` drawn from the FAIL_TO_PASS ids {sorted(row.get('fail_to_pass') or [])}")
+    facts_by_id = {f.get("id"): f for f in [*ledger, *(extra_facts or [])] if isinstance(f, dict)}
+    bad += _requirement_violations(d, row, facts_by_id, corpora, demote_unsafe=demote_unsafe, demoted=demoted, filter_log=filter_log)
     f2p = set(row.get("fail_to_pass") or [])
     if require_f2p_link and not any(f.get("discovery") == "on-request" and set(f.get("tests") or []) & f2p for f in [*ledger, *(extra_facts or [])]):
         bad.append(f"no on-request fact links a FAIL_TO_PASS test id (interaction would not be load-bearing); link one of {sorted(f2p)}")
