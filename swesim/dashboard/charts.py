@@ -112,36 +112,79 @@ def grouped_bars(rows: list[dict], *, metric: str = "pass_at_k", chart_id: str =
 
 # ----------------------------------------------------------------------------- funnel: stacked horizontal bars in status tokens
 
+# The five terminal states of a candidate version (`swesim.index.reports.funnel`), their status token class and legend label.
+FUNNEL_STATES: tuple[tuple[str, str, str], ...] = (
+    ("kept", "good", "kept: continues to the next stage (at the last stage: registered)"),
+    ("rejected", "critical", "rejected at this gate"),
+    ("error", "serious", "error: the infrastructure failed here"),
+    ("pending", "neutral", "pending: kept here, never advanced (not-selected, cap-cut, workflow-stopped)"),
+    ("superseded", "warn", "superseded: a later version replaced it"),
+)
+# One line per stage: what "rejected here" means.
+FUNNEL_GATES: dict[str, str] = {
+    "mined": "no row is rejected here; PRs that discovery filtered (not merged in range, no linked issue, diff or thread size) are in the rejects histogram, and pending means mined but never judged.",
+    "judged": "the judge did not keep it: not a behavioural bug fix, not underspecified in a way a stakeholder could resolve, or too large to reproduce.",
+    "probed": "FAIL_TO_PASS did not reproduce offline (nothing fails on base and passes on gold), or the probe build failed.",
+    "drafted": "the draft failed a pre-check: schema, missing assets, or hidden facts leaking into the brief.",
+    "approved": "auto-approval or the human reviewer rejected the draft, or the approval hold timed out.",
+    "compiled": "the Harbor task image did not build.",
+    "validated": "a control run failed: oracle, nop, alt-correct or plausible-wrong did not behave as the scenario requires.",
+    "registered": "nothing is rejected here: kept means the version is in registry.json; superseded means a later version replaced it.",
+}
+
+
+def _count(step: dict, key: str) -> int:
+    v = step.get(key)
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def _entered(step: dict) -> int:
+    return _count(step, "entered") or sum(_count(step, key) for key, _kind, _label in FUNNEL_STATES)
+
+
 def funnel(steps: list[dict], chart_id: str = "chart-funnel") -> str:
-    """``steps``: dicts with stage, kept, rejected, error, pending. Kept = good, rejected = critical, error = serious, pending = neutral."""
+    """``steps``: FunnelStep dicts (stage, entered, kept, rejected, error, pending, superseded, ids). One row per stage, scaled by
+    the largest ``entered``; the segments are the five terminal states in status tokens; the label reads "kept of entered".
+    Under the chart: what "rejected here" means at each stage. The caption names the registered scenarios (the last stage's
+    kept ids). Only the element/attribute vocabulary ``app.js`` accepts for live chart updates is used (no ``code``/``dl``)."""
     if not steps:
         return "<p class='empty'>No candidates yet. The funnel fills as a creation job mines, judges and probes.</p>"
-    total = max((s["kept"] + s["rejected"] + s["error"] + s["pending"]) for s in steps) or 1
-    pad_l, pad_r, row_h, bar_h, gap = 92, 110, 26, 18, 2
+    total = max(_entered(s) for s in steps) or 1
+    pad_l, pad_r, row_h, bar_h, gap = 92, 150, 26, 18, 2
     width = pad_l + 420 + pad_r
     height = row_h * len(steps) + 8
     scale = 420 / total
     parts = [f"<svg class='chart funnel' viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' aria-label='creation funnel'>"]
     for i, s in enumerate(steps):
+        stage, entered, kept = str(s.get("stage") or ""), _entered(s), _count(s, "kept")
         yy = 4 + i * row_h
-        parts.append(f"<text class='cat' x='{pad_l - 8}' y='{yy + bar_h - 5}' text-anchor='end'>{_h(s['stage'])}</text>")
+        parts.append(f"<text class='cat' x='{pad_l - 8}' y='{yy + bar_h - 5}' text-anchor='end'>{_h(stage)}</text>")
         xx = pad_l
-        for key, kind in (("kept", "good"), ("rejected", "critical"), ("error", "serious"), ("pending", "neutral")):
-            n = int(s.get(key) or 0)
+        for key, kind, _label in FUNNEL_STATES:
+            n = _count(s, key)
             if n <= 0:
                 continue
             w = max(1.0, n * scale - gap)
-            parts.append(f"<g class='bar {kind}' tabindex='0'><title>{_h(s['stage'])} · {key}: {n}</title><rect x='{xx:.1f}' y='{yy}' width='{w:.1f}' height='{bar_h}' rx='2'/></g>")
+            tip = f"{stage} · {key}: {n} of {entered} entered" + (f" — rejected here means: {FUNNEL_GATES.get(stage, '')}" if key == "rejected" else "")
+            parts.append(f"<g class='bar {kind}' tabindex='0'><title>{_h(tip)}</title><rect x='{xx:.1f}' y='{yy}' width='{w:.1f}' height='{bar_h}' rx='2'/></g>")
             xx += n * scale
-        row_total = s["kept"] + s["rejected"] + s["error"] + s["pending"]
-        parts.append(f"<text class='lbl strong' x='{xx + 6:.1f}' y='{yy + bar_h - 5}'>{s['kept']}<tspan class='lbl'> kept of {row_total}</tspan></text>")
+        parts.append(f"<text class='lbl strong' x='{xx + 6:.1f}' y='{yy + bar_h - 5}'>{kept}<tspan class='lbl'> kept of {entered}</tspan></text>")
     parts.append("</svg>")
-    legend = ("<ul class='legend'><li><i class='swatch good'></i>kept (continues)</li><li><i class='swatch critical'></i>rejected at this gate</li>"
-              "<li><i class='swatch serious'></i>error</li><li><i class='swatch neutral'></i>pending</li></ul>")
-    table = ("<div class='table-wrap'><table><thead><tr><th>stage</th><th class='num'>kept</th><th class='num'>rejected</th><th class='num'>error</th><th class='num'>pending</th></tr></thead><tbody>"
-             + "".join(f"<tr><td>{_h(s['stage'])}</td><td class='num'>{s['kept']}</td><td class='num'>{s['rejected']}</td><td class='num'>{s['error']}</td><td class='num'>{s['pending']}</td></tr>" for s in steps)
-             + "</tbody></table></div>")
-    return figure("creation funnel", "".join(parts) + legend, table, "Candidates per stage; kept continues to the next stage. Mining-gate rejects (no linked issue, diff size, …) count as rejected at 'mined'.", chart_id)
+    legend = "<ul class='legend'>" + "".join(f"<li><i class='swatch {kind}' aria-hidden='true'></i>{_h(label)}</li>" for _key, kind, label in FUNNEL_STATES) + "</ul>"
+    gates = ("<ul class='small muted funnel-gates'>"
+             + "".join(f"<li><strong>{_h(s.get('stage'))}</strong> · rejected here: {_h(FUNNEL_GATES.get(str(s.get('stage')), 'a gate of this stage said no.'))}</li>" for s in steps)
+             + "</ul>")
+    head = "".join(f"<th class='num'>{k}</th>" for k in ("entered", "kept", "rejected", "error", "pending", "superseded"))
+    body = "".join(f"<tr><td>{_h(s.get('stage'))}</td><td class='num'>{_entered(s)}</td>"
+                   + "".join(f"<td class='num'>{_count(s, key)}</td>" for key, _kind, _label in FUNNEL_STATES)
+                   + f"<td>{_h(FUNNEL_GATES.get(str(s.get('stage')), ''))}</td></tr>" for s in steps)
+    table = f"<div class='table-wrap'><table><thead><tr><th>stage</th>{head}<th>rejected here means</th></tr></thead><tbody>{body}</tbody></table></div>"
+    last = next((s for s in reversed(steps) if s.get("stage") == "registered"), steps[-1])
+    ids = [str(x) for x in (last.get("ids") or []) if x]
+    registered = (f"Registered ({len(ids)}): " + ", ".join(f"<span class='mono'>{_h(x)}</span>" for x in ids) + ".") if ids else "Registered: none yet."
+    caption = ("Candidate versions per stage: entered at a stage equals kept at the previous one; a rebuilt scenario's earlier version is counted "
+               "too and reads superseded where it stopped. " + registered)
+    return figure("creation funnel", "".join(parts) + legend + gates, table, caption, chart_id)
 
 
 # ----------------------------------------------------------------------------- histogram: single hue
