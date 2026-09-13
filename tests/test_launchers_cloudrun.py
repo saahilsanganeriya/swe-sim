@@ -78,15 +78,14 @@ def settings(tmp_path, **over) -> Settings:
            "SWESIM_TRIAL_LAUNCHER": "cloudrun", "SWESIM_ORIGIN": "cloudrun", "SWESIM_WORKER_IMAGE_DIGEST": "sha256:" + "a" * 64,
            "SWESIM_STAKEHOLDER_URL": "https://stake.example", "SWESIM_SPEND_CAP_USD": "1500", "TEMPORAL_ADDRESS": "us-central1.gcp.api.temporal.io:7233",
            "TEMPORAL_NAMESPACE": "swesim.abcde", "SWESIM_ENV_FILE": str(tmp_path / "absent.env"), "ANTHROPIC_API_KEY": "fake-anthropic-value-123456",
-           "SWESIM_WORKER_SECRET": "fake-worker-secret-xyz", **over}
+           "SWESIM_WORKER_SECRET": "fake-worker-secret-xyz", "SWESIM_WORKER_IMAGE": "us-central1-docker.pkg.dev/proj/swesim/worker@sha256:" + "a" * 64,
+           "SWESIM_WORKER_SERVICE_ACCOUNT": "swesim-worker@proj.iam.gserviceaccount.com", **over}
     return Settings.from_env({k: v for k, v in env.items() if v is not None})
 
 
 @pytest.fixture
 def cloud(tmp_path, monkeypatch):
     fake = FakeCloudRun(); s = settings(tmp_path)
-    monkeypatch.setattr(CR, "WORKER_IMAGE", "us-central1-docker.pkg.dev/proj/swesim/worker@sha256:" + "a" * 64)
-    monkeypatch.setattr(CR, "WORKER_SERVICE_ACCOUNT", "swesim-worker@proj.iam.gserviceaccount.com")
     monkeypatch.setattr(CR, "SQL_CONNECTION_NAME", "proj:us-central1:swesim")
     launcher = CR.CloudRunLauncher.from_settings(s, jobs=fake, executions=fake)
     return fake, launcher, B.WorkspaceLayout(s.workspace), s
@@ -101,10 +100,8 @@ def request(run_workflow_id="run-abc123", solver_timeout=2400):
 
 
 def test_from_settings_fails_closed_without_image_service_account_project_or_bucket(tmp_path, monkeypatch):
-    monkeypatch.setattr(CR, "WORKER_IMAGE", None); monkeypatch.setattr(CR, "WORKER_SERVICE_ACCOUNT", None)
     with pytest.raises(B.LauncherConfigError, match="SWESIM_WORKER_IMAGE.*SWESIM_WORKER_SERVICE_ACCOUNT"):
-        CR.CloudRunLauncher.from_settings(settings(tmp_path))
-    monkeypatch.setattr(CR, "WORKER_IMAGE", "img@sha256:1"); monkeypatch.setattr(CR, "WORKER_SERVICE_ACCOUNT", "sa")
+        CR.CloudRunLauncher.from_settings(settings(tmp_path, SWESIM_WORKER_IMAGE=None, SWESIM_WORKER_SERVICE_ACCOUNT=None))
     with pytest.raises(B.LauncherConfigError, match="SWESIM_GCP_PROJECT"):
         CR.CloudRunLauncher.from_settings(settings(tmp_path, SWESIM_GCP_PROJECT=None))
     with pytest.raises(B.LauncherConfigError, match="SWESIM_BUCKET"):
