@@ -41,8 +41,10 @@ def stamped(d: dict) -> dict:
 
 
 @contextlib.asynccontextmanager
-async def workers(env, workflows, activities):
-    """One Worker per swesim queue: `act()` routes each activity to its queue, so every queue needs a poller (fakes everywhere)."""
+async def workers(env, workflows, activities, **worker_options):
+    """One Worker per swesim queue: `act()` routes each activity to its queue, so every queue needs a poller (fakes everywhere).
+    `worker_options` are forwarded to every `Worker` (e.g. `max_heartbeat_throttle_interval` for a test that depends on prompt
+    activity-cancellation delivery)."""
     from temporalio.worker import Worker  # noqa: PLC0415 - kept local so the offline tests import without a worker
     from temporalio import activity
     from swesim.workflows.search_attributes import ensure_registered
@@ -108,7 +110,7 @@ async def workers(env, workflows, activities):
     activities = [*activities, *extra]
     async with contextlib.AsyncExitStack() as stack:
         for q in QUEUES:
-            await stack.enter_async_context(Worker(env.client, task_queue=q, workflows=workflows, activities=activities))
+            await stack.enter_async_context(Worker(env.client, task_queue=q, workflows=workflows, activities=activities, **worker_options))
         yield
 BIG = {"candidates_path": "c", "judged_path": "j", "instance_ids": ["a"], "scenario_id": "aaa", "draft_path": "d",
        "status": "valid", "failures": [], "trials": [], "spec_hash": "h"}
