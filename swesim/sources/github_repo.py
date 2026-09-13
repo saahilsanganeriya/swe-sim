@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from swesim.sources import threads
+from swesim.sources.observations import DiscoveryPRObservation
 
 log = logging.getLogger(__name__)
 LINK = re.compile(r"(?:[Ff]ix(?:es|ed)?|[Cc]los(?:es|ed)?|[Rr]esolves?)\s*:?\s*#(\d+)")
@@ -131,40 +132,67 @@ def _candidate(repo: str, p: dict, patch: str) -> dict:
             "test_files": _DIFF_HEADER.findall(tst), "issue": None, "issue_body": None, "thread": None, "linked_prs": [], "linked_missing": []}
 
 
-def _merged_details(repo: str, since: str, max_prs: int, pr: int | None) -> list[dict]:
-    if pr:
-        return [threads._gh(f"repos/{repo}/pulls/{pr}")]
-    summaries = []
-    for page in range(1, (max_prs + 99) // 100 + 1):
-        rows = threads._gh(f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}")
-        if not isinstance(rows, list):
-            raise ValueError("expected page array")
-        summaries.extend(rows)
-        if len(rows) < 100:
-            break
+def _observed_update(observations: list[DiscoveryPRObservation], seq: int, **changes) -> None:
+    observations[seq] = DiscoveryPRObservation.model_validate({**observations[seq].model_dump(), **changes})
+
+
+def _merged_details(repo: str, since: str, max_prs: int, pr: int | None, observations: list[DiscoveryPRObservation]) -> list[dict]:
+    summaries = [{"number": pr}] if pr else []
+    if not pr:
+        for page in range(1, (max_prs + 99) // 100 + 1):
+            rows = threads._gh(f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}")
+            if not isinstance(rows, list):
+                raise ValueError("expected page array")
+            summaries.extend(rows)
+            if len(rows) < 100:
+                break
     details = []
-    for p in summaries[:max_prs]:
-        # List rows already tell us closed-unmerged and pre-`since` merges; everything else needs the detail (labels, base sha, stats).
-        if "merged_at" in p and (p["merged_at"] is None or p["merged_at"] < since):
+    for summary in summaries[:max_prs]:
+        number = int(summary['number']); seq = len(observations)
+        observations.append(DiscoveryPRObservation(seq=seq, pr_number=number, pr_url=f'https://github.com/{repo}/pull/{number}',
+                                                    stages=['listed'], status='pending'))
+        if 'merged_at' in summary and (summary['merged_at'] is None or summary['merged_at'] < since):
+            _observed_update(observations, seq, status='rejected', reason='not-merged' if summary['merged_at'] is None else 'before-since')
             continue
-        details.append(threads._gh(f"repos/{repo}/pulls/{p['number']}"))
+        try:
+            detail = threads._gh(f"repos/{repo}/pulls/{number}")
+            if detail.get('number') != number:
+                raise ValueError('PR detail does not match listed identity')
+            if not detail.get('merged_at') or detail['merged_at'] < since:
+                _observed_update(observations, seq, status='rejected', reason='not-merged' if not detail.get('merged_at') else 'before-since')
+                continue
+            _observed_update(observations, seq, stages=['listed', 'merged-in-range'],
+                             base_commit=(detail.get('base') or {}).get('sha'), merge_commit=detail.get('merge_commit_sha'))
+            details.append({**detail, '_observation_seq': seq})
+        except (subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+            _observed_update(observations, seq, status='error', reason='fetch-error', error_class=type(error).__name__)
     return details
 
 
 def discover(repo: str, since: str, max_prs: int = 400, min_comments: int = 4, diff_min: int = 20, diff_max: int = 600, pr: int | None = None,
-             kind: str = "feature") -> tuple[list[dict], dict]:
-    """Candidates and a reject histogram for merged PRs of `repo` since `since` (ISO date), bounded by `max_prs` list rows."""
+             kind: str = "feature", observations: list[DiscoveryPRObservation] | None = None) -> tuple[list[dict], dict]:
+    """Candidates and legacy reject counts; an optional sink preserves every listed PR and its measured stage.
+
+    Fetch errors have status=error, never task rejection. Error details are classified
+    without storing gh stderr. Prefilter observations do not change legacy histograms.
+    """
     repo = normalize_repo(repo)
+    if max_prs < 1:
+        raise ValueError('max_prs must be positive')
     if kind == "feature":
         min_comments, diff_min, diff_max = FEATURE_BAND["min_comments"], FEATURE_BAND["diff_min"], FEATURE_BAND["diff_max"]
     elif kind != "bugfix":
         raise ValueError("kind must be feature or bugfix")
-    prs = [p for p in _merged_details(repo, since, max_prs, pr) if p.get("merged_at") and p["merged_at"] >= since]
-    cands, rejects = [], Counter()
+    observed = observations if observations is not None else []
+    prs = _merged_details(repo, since, max_prs, pr, observed)
+    cands, rejects = [], Counter(o.reason for o in observed if o.status == 'error')
     for p in prs:
+        seq = p['_observation_seq']
         try:
             targets = threads.linked_targets(repo, p["number"], threads.closing_text(p))
             issues = targets["issues"]
+            _observed_update(observed, seq, linked_issue_numbers=list(issues),
+                             stages=[*observed[seq].stages, *(['linked-issue'] if issues else [])])
             c = _candidate(repo, p, _pr_diff(repo, p["number"]))
             c["linked_prs"], c["linked_missing"], c["link_kind"] = targets["prs"], targets["missing"], targets.get("link_kind")
             if issues:
@@ -173,23 +201,29 @@ def discover(repo: str, since: str, max_prs: int = 400, min_comments: int = 4, d
                 c["issue_body"] = c["thread"]["linked_issues"][0]["body"] if c["thread"]["linked_issues"] else None
                 c["comments_total"] = (len(c["thread"]["pr_comments"]) + len(c["thread"]["review_comments"])
                                        + sum(len(i["comments"]) for i in c["thread"]["linked_issues"]))
-        except (subprocess.CalledProcessError, ValueError) as e:
-            log.warning("github-repo: PR %s/%s fetch failed: %s", repo, p.get("number"), e)
+            _observed_update(observed, seq, source_changed_lines=c['additions']+c['deletions'], source_file_count=len(c['source_files']),
+                             test_file_count=len(c['test_files']), comment_count=c.get('comments_total'))
+        except (subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+            log.warning("github-repo PR %s/%s fetch failed (%s)", repo, p.get("number"), type(error).__name__)
             rejects["fetch-error"] += 1
+            _observed_update(observed, seq, status='error', reason='fetch-error', error_class=type(error).__name__)
             continue
         c["labels"] = [x["name"].lower() for x in p.get("labels") or []]
-        r = reject_reason(c, min_comments, diff_min, diff_max)
-        if not r and kind == "feature":
+        reason = reject_reason(c, min_comments, diff_min, diff_max)
+        if not reason and kind == "feature":
             lo, hi = FEATURE_BAND["source_files"]
             if not lo <= len(c["source_files"]) <= hi:
-                r = "feature-source-file-band"
+                reason = "feature-source-file-band"
             elif not any(any(word in label for word in FEATURE_LABEL_WORDS) for label in c["labels"]):
-                r = "feature-label-missing"
+                reason = "feature-label-missing"
         c["discovery"] = {"kind": kind, "repo_only": pr is None, "since": since, "max_prs": max_prs}
-        if r:
-            rejects[r] += 1
+        c['_observation_seq'] = seq
+        if reason:
+            rejects[reason] += 1
+            _observed_update(observed, seq, status='rejected', reason=reason)
         else:
             cands.append(c)
+            _observed_update(observed, seq, stages=[*observed[seq].stages, 'band-passed', 'retained'], status='retained')
     return cands, dict(rejects)
 
 
