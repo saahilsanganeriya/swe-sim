@@ -1,6 +1,6 @@
 # Grading and measurement
 
-This document describes the implemented grading contract and the preserved experimental record shown by the website. The hosted smoke started on 2026-09-13 and has produced **no graded hosted outcome yet** ([ops.md](ops.md#hosted-smoke-2026-09-13)); no new task yield, treatment effect or hosted model comparison is claimed.
+This document describes the implemented grading contract and the experimental record shown by the website. The first hosted graded results — 29 Cloud Run trials on one SWE-bench-sourced scenario on 2026-09-13 — are in [First hosted results](#first-hosted-results-2026-09-13) with their sample sizes; they are a smoke of the pipeline on one task. No task-yield, treatment-effect or cross-task model claim is made from them ([ops.md](ops.md#hosted-runs-2026-09-13-afternoon) has the operational record).
 
 ## Reward and outcomes
 
@@ -60,7 +60,7 @@ Probe jobs record the binding of the measured inputs and the grading identity. C
 
 A fallback plausible-wrong patch must come from fetched Python source, apply, parse, and differ from gold in executable AST after docstrings are excluded. Lexical state carries through diff-hunk gaps and continued strings. This prevents a docstring edit from masquerading as an incorrect control; executed validation still decides whether the behavior is wrong.
 
-The eight automatic approval gates cover strict schema, verified assets, judge acceptance, a load-bearing on-request fact, grounded requirements, withholding leaks, exact reconstruction and controls. Every identical removed occurrence needs its own ledger entry. Every requirement links to a visible fact or a verbatim human statement. Author-only facts remain unavailable to the stakeholder.
+The nine automatic approval gates cover strict schema, verified assets, judge acceptance, a load-bearing on-request fact, grounded requirements, withholding leaks, exact reconstruction, controls and — the ninth, added on 2026-09-13 after the pytest-7283 result below — fact scope: a stakeholder-visible fact may not assert behaviour that only a PASS_TO_PASS test carries (`fact-scope`, commit `86bc2e6`, `.superpowers/sdd/2026-09-13-hosted-pipeline/reports/fact-scope-2.md`). Every identical removed occurrence needs its own ledger entry. Every requirement links to a visible fact or a verbatim human statement. Author-only facts remain unavailable to the stakeholder.
 
 ## Metrics and grouping
 
@@ -76,6 +76,45 @@ Both use draws without replacement and remain null when there are fewer than `k`
 Groups preserve spec hash, condition, profile, model, purpose, compiled build and effective scaffold identity. Legacy runs whose configuration lacks `agent_config` derive that identity from `report.agent_config_sha256`. Calibration, screen, comparison and demonstration records never pool. Old documentation that pooled scaffold and default-agent runs does not establish a valid pass@k estimate for the new grouping.
 
 Difficulty is measured by hidden/full screening with a specified solver and attempt budget. Diff size is a discovery filter. The leaderboard additionally requires current validation, an informative screen and coherent/fair task-sense labels. A saturated toy task or unfair hidden test is not evidence of model separation.
+
+## First hosted results (2026-09-13)
+
+One scenario, **`pytest-dev--pytest-7283`** (source `swebench-annotated (pool A)`), registered on the hosted stack by `create-b788cb22d7064a4d8bcbe63bb943c709` through seven executed controls (judge `openai/gpt-5.5`, drafter `openai/gpt-5.6-sol` — the pre-roll fallbacks, [ops.md](ops.md#model-role-fallbacks-in-force)). Contract: 1 FAIL_TO_PASS, 51 PASS_TO_PASS (the first trial's report: `f2p 0/1, p2p 51/51`). Three `RunTasksWorkflow`s produced 29 trials, every one a Cloud Run Job with one execution ([ops.md](ops.md#hosted-runs-2026-09-13-afternoon)):
+
+| Run | Purpose | Cells |
+|---|---|---|
+| `run-ef32bb35557448578cd757b236a44805` | demonstration | `openrouter/deepseek/deepseek-v3.2` hidden k=1 (trial `50d797789546d178d8add487`: valid-incorrect, reward 0.0, $0.43879) |
+| `run-5c7c7c788a394238ae7ae69ab5a24cc7` | screen | `deepseek-v3.2` hidden k=2, full k=1 → `difficulty_label` tier `broken` (hidden 1/2, full 0/1), labelled 20:02:53Z |
+| `run-2528e1bd073e4953a170f797a848822e` | comparison | `deepseek-v3.2`, `deepseek-v4.1-flash`, `glm-5.3`, `gpt-5-mini` × full/hidden/interactive × k=2 = 24 trials; stakeholder `anthropic/claude-opus-5` |
+
+Evidence: `workspace/evidence/sweep/pytest-7283-comparison-2026-09-13.json` (generated 20:28:21Z), whose cells aggregate the three runs by model × condition, and `workspace/evidence/cloudrun/executions-50d797789546d178d8add487.json` for the first trial. Cost per trial below is the cell's `cost_usd` divided by its `n`, as recorded in each trial's `costs.json` (price source per record; OpenRouter generations name the served provider).
+
+| Model (JSON name) | Condition | Solved / n | Cost per trial (cell total) | Integrity flags |
+|---|---|---:|---|---:|
+| `deepseek-v3.2` | full | 0 / 3 | $0.281 ($0.8435) | 0 |
+| `deepseek-v3.2` | hidden | 3 / 5 | $0.235 ($1.1759) | 4 |
+| `deepseek-v3.2` | interactive | 2 / 2 | $0.233 ($0.4651) | 0 |
+| `deepseek-v4.1-flash` | full | 3 / 3 | $0.0040 ($0.0120) | 1 |
+| `deepseek-v4.1-flash` | hidden | 2 / 2 | $0.0016 ($0.0032) | 0 |
+| `deepseek-v4.1-flash` | interactive | 2 / 2 | $0.0023 ($0.0045) | 2 |
+| `glm-5.3` | full | 2 / 2 | $0.045 ($0.0897) | 2 |
+| `glm-5.3` | hidden | 2 / 2 | $0.054 ($0.1078) | 2 |
+| `glm-5.3` | interactive | 2 / 2 | $0.048 ($0.0962) | 2 |
+| `gpt-5-mini` | full | 0 / 2 | $0.035 ($0.0692) | 0 |
+| `gpt-5-mini` | hidden | 1 / 2 | $0.039 ($0.0785) | 0 |
+| `gpt-5-mini` | interactive | 2 / 2 | $0.033 ($0.0667) | 0 |
+
+`total_trials: 29`, `total_cost_usd: 3.0124`. The `deepseek-v3.2` hidden and full cells pool three purposes (demonstration 0/1 hidden; screen 1/2 hidden, 0/1 full; comparison the rest), which the grouping rule above forbids for pass@k: the comparison-only `deepseek-v3.2` cells are therefore **full 0/2, hidden 2/2, interactive 2/2** (derived: 3−0−1 hidden successes over 5−1−2 trials; 0 full successes over 3−1 trials). `deepseek-v4.1-flash` full has n=3 against a k=2 request; the JSON does not attribute trials to runs, so the third attempt's run is not identified. No pass@k is reported: no single-purpose cell has three attempts.
+
+**Inverted ordering, full < hidden < interactive, for two models.** `deepseek-v3.2` 0/3 < 3/5 < 2/2 and `gpt-5-mini` 0/2 < 1/2 < 2/2. The full brief is the natural issue plus every stakeholder-visible fact; hidden is the selected brief alone. Fact `f05` of this scenario ("same skipped lifecycle behaviour applies to … pytest's skip marker") asserts behaviour beyond the single FAIL_TO_PASS test (`testing/test_unittest.py::test_pdb_teardown_skipped[@unittest.skip]`): the sibling parametrisation `[@pytest.mark.skip]` is a PASS_TO_PASS test that penalises implementing it. One `gpt-5-mini` full attempt did exactly that — 50/51 PASS_TO_PASS, and the regression rule set its reward to 0 (ledger entries labelled 12:58 and 13:20; the JSON's first note). The extra information in full was wrong for the contract, so full underperformed hidden; the interactive cells (the hidden brief plus the channel) solved 2/2 for both models — whether and what they asked is not yet audited on the hosted stack. This is a task-authoring defect, not a property of asking: `fair_tests` in the saved `audit.json` (`openai/gpt-5.6-sol`, 19:06Z) checks tests ⇐ facts and passed the scenario, because nothing checked facts ⇒ contract. The `facts_within_contract` label and the `fact-scope` gate (above) exist because of this trial.
+
+**Integrity flags.** Every flag in the table is a `protected-path-edit` of `testing/test_unittest.py`: the agent edited the contract's test file; the verifier dropped the edit and graded the allowed source change (see "Build, collector and verifier"). Reward is unaffected by the dropped edit; the trial is flagged. Counts: `deepseek-v3.2` 4 (all hidden), `deepseek-v4.1-flash` 3, `glm-5.3` 6 (every one of its trials), `gpt-5-mini` 0. The flag says the model touched tests, not that it gamed anything; a dropped edit that changes the source's behaviour is graded on that source.
+
+**Difficulty is model-relative.** `deepseek-v4.1-flash` (7/7) and `glm-5.3` (6/6) saturate this task in every condition; `deepseek-v3.2` and `gpt-5-mini` separate the conditions. The screen labelled the scenario `broken` because the screen model (`deepseek-v3.2`) scored full 0/1 — one failure at k=1 — so it is off the leaderboard by rule, while for two other models it is saturated and for two it is informative. The label was not hand-edited; a multi-model screen or a k=2 full screen is a design follow-up ([ops.md](ops.md#deferred-from-the-2026-09-13-finishing-run)).
+
+**Cost.** Per trial: `deepseek-v3.2` $0.23–0.28 (the first trial $0.43879 on 3,141,695 input / 31,655 output tokens, served by StreamLake and SiliconFlow); `deepseek-v4.1-flash` $0.0016–0.0040; `glm-5.3` $0.045–0.054; `gpt-5-mini` $0.033–0.039. 29 trials cost $3.0124 in total. Cost is not a difficulty signal; it varies two orders of magnitude across models at the same success.
+
+**Caveat.** n is 2–5 per cell, all on one scenario, one stakeholder prompt version, one screen model, and the interactive cells' asks and replies have not been audited on the hosted stack. Nothing here supports a cross-task claim about conditions or models; the numbers are what the pipeline measured on its first task end to end.
 
 ## Preserved inventory — 2026-09-13
 
@@ -174,6 +213,6 @@ Ruling (ledger, 2026-09-13): **the judge stays `anthropic/claude-opus-5`** by th
 
 ## Deferred experimental evidence
 
-The hosted creation smoke has started and no hosted trial has run ([ops.md](ops.md#hosted-smoke-2026-09-13)). Difficulty screening, Tier A–C comparisons, frontier-gated runs and a new disclosure/integrity sweep have not been executed on the hosted stack. As each runs, record actual commands, ids, sample sizes, model substitutions, cost/unknown usage and failures. Keep old builds, origins and configuration groups separate, and leave unsupported metrics null.
+The hosted stack has run one scenario end to end ([First hosted results](#first-hosted-results-2026-09-13); [ops.md](ops.md#hosted-runs-2026-09-13-afternoon)). Not yet run on it: a screen on a novel (repository-sourced) scenario, Tier A–C comparisons behind the frontier gate, and a disclosure/integrity audit of the hosted interactive trials; the since-2023 both-band creation sweep is running. As each runs, record actual commands, ids, sample sizes, model substitutions, cost/unknown usage and failures. Keep old builds, origins and configuration groups separate, and leave unsupported metrics null.
 
 [Operations evidence](ops.md) tracks website verification, import parity and the deferred checks.
