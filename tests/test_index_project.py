@@ -233,6 +233,49 @@ def test_validation_status_is_derived_from_the_files(record: Record, registry: d
         assert P.validation_status_of(present, full) == expected, (present, expected)
 
 
+def test_scenario_in_progress_projects_from_whatever_files_exist(tmp_path: Path):
+    """The candidate workflow indexes `version: 1` after every stage, from judging on: before any scenario file exists that is
+    "nothing yet" (`NoScenarioFiles`), not the hosted `ProjectionError: no version 1 (current None)`; the first draft files
+    give a `drafting` row of the version in progress; a genuinely unknown version of a recorded scenario still raises."""
+    layout = Layout(root=tmp_path); sid = "pytest-dev--pytest-7283"
+    with pytest.raises(P.NoScenarioFiles, match="no scenario files yet") as e:
+        P.project_scenario(layout, sid, 1, registry={}, origin="cloudrun")
+    assert e.value.reason == "no scenario files yet" and isinstance(e.value, P.ProjectionError)
+    with pytest.raises(P.NoScenarioFiles):
+        P.project_scenario(layout, sid, registry={}, origin="cloudrun")
+    with pytest.raises(P.NoScenarioFiles):
+        P.project_scenario_versions(layout, sid, registry={}, origin="cloudrun")
+    sdir = layout.scenario_dir(sid)
+    (sdir / "assets").mkdir(parents=True)  # the drafter writes assets first
+    with pytest.raises(P.NoScenarioFiles, match="no scenario files yet"):
+        P.project_scenario(layout, sid, 1, registry={}, origin="cloudrun")
+    _w(sdir / "judge.json", {"keep": True, "verified_rubric_score": 2, "complexity": 3, "model_id": GPT})
+    with pytest.raises(P.NoScenarioFiles, match="no scenario spec yet") as e:
+        P.project_scenario(layout, sid, 1, registry={}, origin="cloudrun")
+    assert e.value.reason == "no scenario spec yet"
+    _w(sdir / "scenario.draft.json", {"id": sid, "source": "swebench-annotated", "source_ref": "pytest-dev__pytest-7283"})  # no version key
+    row = P.project_scenario(layout, sid, 1, registry={}, origin="cloudrun")
+    assert row.validation_status == "drafting" and row.version == 1 and row.source_ref == "pytest-dev__pytest-7283" and row.spec_hash is None
+    assert row.registry_json is None and row.archived_at is None and row.origin == "cloudrun"
+    _w(sdir / "draft.meta.json", {"version": 1, "spec_hash": "h" * 64})
+    row = P.project_scenario(layout, sid, 1, registry={}, origin="cloudrun")
+    assert row.validation_status == "drafting" and row.version == 1 and row.spec_hash == "h" * 64
+    assert P.project_scenario(layout, sid, registry={}, origin="cloudrun").version == 1
+    with pytest.raises(P.ProjectionError, match="no version 2 \\(current 1\\)") as e:
+        P.project_scenario(layout, sid, 2, registry={}, origin="cloudrun")
+    assert not isinstance(e.value, P.NoScenarioFiles)
+    # a spec without a source is malformed, not "nothing yet"
+    _w(layout.scenario_dir("no-source") / "scenario.draft.json", {"id": "no-source", "version": 1})
+    with pytest.raises(P.ProjectionError, match="source and source_ref are unknown") as e:
+        P.project_scenario(layout, "no-source", 1, registry={}, origin="cloudrun")
+    assert not isinstance(e.value, P.NoScenarioFiles)
+    # the compiled and validated scenario projects as before
+    _w(sdir / "scenario.json", {"id": sid, "version": 1, "source": "swebench-annotated", "source_ref": "pytest-dev__pytest-7283"})
+    _w(sdir / "validation.json", {"status": "valid", "failures": [], "spec_hash": "h" * 64, "compiled_hash": "c" * 64, "image_digest": IMAGE})
+    row = P.project_scenario(layout, sid, 1, registry={}, origin="cloudrun")
+    assert row.validation_status == "valid" and row.version == 1 and row.image_digest == IMAGE
+
+
 # ----------------------------------------------------------------------------- candidates
 
 def test_candidates_reach_their_furthest_stage(record: Record, registry: dict):

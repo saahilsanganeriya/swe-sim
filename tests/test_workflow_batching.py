@@ -119,8 +119,12 @@ def test_search_attributes_are_versioned_on_child_starts(monkeypatch):
 
 
 def test_threaded_launch_finishes_before_cancellation_stops_runtime():
+    """Cancelling the workflow while the launch thread runs must not stop the runtime before the thread has finished, and the
+    workflow must still end cancelled. Activity cancellation reaches the activity only through a heartbeat response, so the
+    workers heartbeat unthrottled and the test waits for the activity's own cancel receipt instead of sleeping."""
     import asyncio
     import threading
+    from datetime import timedelta
 
     from temporalio import activity
     from temporalio.client import WorkflowFailureError
@@ -129,30 +133,42 @@ def test_threaded_launch_finishes_before_cancellation_stops_runtime():
     from swesim.workflows import activities as A
     from swesim.workflows import queues as Q
     from swesim.workflows import workflows as W
-    entered = threading.Event(); release = threading.Event(); order = []
+    entered = threading.Event(); release = threading.Event(); cancel_seen = threading.Event(); order = []
     def launch_thread():
         entered.set()
         assert release.wait(timeout=10)
         order.append('created')
         return {'launched': True}
     @activity.defn(name='launch_trial_activity')
-    async def launch(p): return await A.blocking(launch_thread, every=0.01)
+    async def launch(p):
+        async def watch():
+            while not activity.is_cancelled():
+                await asyncio.sleep(0.005)
+            cancel_seen.set()
+        watcher = asyncio.ensure_future(watch())
+        try:
+            return await A.blocking(launch_thread, every=0.01)
+        finally:
+            watcher.cancel()
     @activity.defn(name='cancel_trial_activity')
     async def cancel(p):
         order.append('cancelled'); return {'cancelled': True}
     @activity.defn(name='await_trial_activity')
     async def await_trial(p): return {'trial_id': p['trial_id'], 'status': 'completed'}
+    async def wait_for(event, what):
+        for _ in range(1000):
+            if event.is_set():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(what)
     async def scenario(env):
-        async with workers(env, workflows=[W.TrialWorkflow], activities=[launch, cancel, await_trial]):
+        async with workers(env, workflows=[W.TrialWorkflow], activities=[launch, cancel, await_trial],
+                           max_heartbeat_throttle_interval=timedelta(milliseconds=10)):
             h = await env.client.start_workflow(W.TrialWorkflow.run, {'trial_id': 'a' * 24}, id='cancel-thread', task_queue=Q.AUTHORING)
-            for _ in range(100):
-                if entered.is_set():
-                    break
-                await asyncio.sleep(0.01)
-            assert entered.is_set()
+            await wait_for(entered, 'the launch thread never started')
             await h.cancel()
-            await asyncio.sleep(0.05)
-            assert order == []
+            await wait_for(cancel_seen, 'the launch activity never observed the cancellation')
+            assert order == []  # the thread is still running: the runtime has not been stopped underneath it
             release.set()
             with pytest.raises(WorkflowFailureError):
                 await h.result()
