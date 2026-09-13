@@ -14,6 +14,9 @@ from pathlib import Path
 class LLMError(RuntimeError):
     pass
 
+ANTHROPIC_THINKING_BUDGET = 8000  # max_tokens headroom for Claude's adaptive thinking block, on top of the caller's max_tokens
+ANTHROPIC_EFFORT = "low"        # output_config.effort for structured-JSON calls (judge/draft/stakeholder), bounded latency
+
 
 _SECRET_KEYS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
 # OpenAI gpt-5.x and o-series reject non-default temperature; Anthropic SDK 1.x (Claude 5 family) has no temperature
@@ -64,8 +67,21 @@ def chat_json(model_id: str, system: str, messages: list[dict], schema_hint: str
     if provider == "anthropic":
         import anthropic
         client = anthropic.Anthropic(api_key=_secret("ANTHROPIC_API_KEY"), timeout=120, max_retries=1)
-        r = client.messages.create(model=name, system=sys_prompt, messages=messages, max_tokens=max_tokens)
-        return _extract_json("".join(b.text for b in r.content if getattr(b, "type", "") == "text"))
+        # Claude 5 models think by default and the thinking block shares max_tokens with the answer: an 8k budget can
+        # be consumed entirely by thinking (observed: stop_reason max_tokens, blocks ['thinking'], no text). Claude 5
+        # only accepts thinking.type=adaptive (with output_config.effort) or disabled. Try adaptive thinking at low
+        # effort with headroom for the thinking block, then fall back to no thinking if no text block arrives.
+        attempts = ({"thinking": {"type": "adaptive"}, "output_config": {"effort": ANTHROPIC_EFFORT}, "headroom": ANTHROPIC_THINKING_BUDGET},
+                    {"thinking": {"type": "disabled"}, "headroom": 0})
+        last = None
+        for a in attempts:
+            kwargs = {k: v for k, v in a.items() if k != "headroom"}
+            r = client.messages.create(model=name, system=sys_prompt, messages=messages, max_tokens=max_tokens + a["headroom"], **kwargs)
+            text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
+            if text.strip():
+                return _extract_json(text)
+            last = f"stop_reason={r.stop_reason} blocks={[getattr(b, 'type', '?') for b in r.content]} thinking={a['thinking']['type']}"
+        raise LLMError(f"no text block from {model_id}: {last}")
     from openai import OpenAI
     client = OpenAI(api_key=_secret("OPENAI_API_KEY"), timeout=120, max_retries=1)
     r = client.chat.completions.create(model=name, messages=[{"role": "system", "content": sys_prompt}, *messages], **_openai_kwargs(name, temperature, max_tokens))
