@@ -232,7 +232,9 @@ async def home_data(reader, settings: Settings) -> dict:
     wviews, _ = workflow_views(reader, live, settings, R.WorkflowFilter(limit=15))
     spend = reader.spend()
     total = sum((Decimal(str(s.usd)) for s in spend), Decimal(0))
-    tiles = {**c, "trials_completed": completed.total, "trials_unresolved": unresolved.total, "spend_usd": float(total), "spend_text": f"${total:,.2f}"}
+    gap = gradient.frontier_gap(board_trials(reader, R.LeaderboardFilter(purpose="comparison")))
+    tiles = {**c, "trials_completed": completed.total, "trials_unresolved": unresolved.total, "spend_usd": float(total), "spend_text": f"${total:,.2f}",
+             "frontier_gap": gap, "frontier_gap_text": pages.gap_text(gap)}
     funnel = [_dump(s) for s in reader.funnel()]
     return {"tiles": tiles, "running": trial_views(reader, running.items),
             "recent": trial_views(reader, [t for t in recent.items if t.status != "running"]),

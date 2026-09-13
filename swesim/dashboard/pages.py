@@ -111,11 +111,31 @@ def workflow_view(w: dict, settings) -> dict:
 
 # ----------------------------------------------------------------------------- home
 
+def gap_text(gap: dict | None) -> str:
+    """The frontier-vs-last-gen tile's value: signed percentage points (typographic minus), a dash until it can be computed."""
+    if not gap:
+        return "—"
+    pp = float(gap["gap_pp"])
+    return "0 pp" if abs(pp) < 0.05 else f"{pp:+.0f} pp".replace("-", "−")
+
+
+def gap_note(gap: dict | None) -> str:
+    if not gap:
+        return ("needs hidden trials (purpose comparison) from a tier A model and a tier D/E model on the same scenarios; "
+                "the <a href='/trends'>capability gradient</a> explains the axis")
+    hi, lo = gap["best_high"], gap["best_low"]
+    return (f"hidden · best tier D/E <span class='mono'>{h(hi['model'].split('/')[-1])}</span> {hi['success_count']}/{hi['n']} vs best tier A "
+            f"<span class='mono'>{h(lo['model'].split('/')[-1])}</span> {lo['success_count']}/{lo['n']} · n={gap['n']} on {gap['scenarios']} shared scenario(s) · "
+            f"{h(gap['brief_profile'])} brief · <span title='{h(gap['cohort_label'])}'>one cohort</span>")
+
+
 def home_body(data: dict, settings) -> str:
     """``data``: what app.py assembles for /api/home (tiles, running, recent, workflows, funnel, spend)."""
     t = data["tiles"]
     cap = settings.spend_cap_usd
     spend_note = f"cap ${cap:,.2f}" if cap is not None else "no cap configured (SWESIM_SPEND_CAP_USD)"
+    gap = t.get("frontier_gap")
+    gap_kind = "" if not gap else ("good" if float(gap["gap_pp"]) > 0 else "serious" if float(gap["gap_pp"]) < 0 else "")
     body = ["<h1>Home</h1><p class='lead'>What is running and what changed. Counts come from the index; every number links to its list.</p>",
             tiles([tile("running trials", t["trials_running"], href="/trials?status=running", key="trials_running", kind="run"),
                    tile("completed trials", t["trials_completed"], href="/trials?status=completed", key="trials_completed"),
@@ -124,7 +144,9 @@ def home_body(data: dict, settings) -> str:
                    tile("awaiting review", t["review_pending"], href="/review", key="review_pending", kind="run" if t["review_pending"] else ""),
                    tile("candidates pending", t["candidates_pending"], href="/candidates?status=pending", key="candidates_pending"),
                    tile("spend (recorded)", f"${t['spend_usd']:,.2f}", href="/spend", key="spend_text", note=spend_note),
-                   tile("workflows running", t["workflows_running"], href="/workflows?status=running", key="workflows_running")])]
+                   tile("workflows running", t["workflows_running"], href="/workflows?status=running", key="workflows_running"),
+                   tile("frontier vs last-gen gap", t.get("frontier_gap_text", "—"), href="/trends?purpose=comparison&condition=hidden", key="frontier_gap_text",
+                        kind=gap_kind, note=gap_note(gap))])]
     body.append("<h2>Running now</h2>")
     body.append(table("running", TRIAL_COLUMNS, data["running"], key="trial_id",
                       empty="<strong>Nothing is running.</strong> Start a run on <a href='/run'>Run</a>; rows appear here within 5 s of launch.", export=False))
