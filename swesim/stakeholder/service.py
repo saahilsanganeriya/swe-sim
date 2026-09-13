@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from swesim.llm import chat_json
 from swesim.models import StakeholderConfig
 from swesim.paths import atomic_json
-from swesim.stakeholder.session import Session
+from swesim.stakeholder.session import DIFF_REVIEW_UNAVAILABLE, Session
 
 app = FastAPI(title="swesim stakeholder")
 LOCK = asyncio.Lock()                                  # short: persistence steps and the session-lock registry only
@@ -113,6 +113,11 @@ class Ask(Strict):
     question: str = Field(min_length=1, max_length=20000)
 
 
+class Confirm(Strict):
+    request_id: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=4000)
+
+
 class Review(Strict):
     request_id: str = Field(min_length=1, max_length=100)
     diff: str = Field(max_length=200000)
@@ -137,6 +142,8 @@ def _check_view(view: dict) -> None:
     for f in view["facts"]:
         if not isinstance(f, dict) or not isinstance(f.get("id"), str) or f.get("discovery") == "author-only":
             raise HTTPException(400, "invalid visible view")
+    terms = view.get("forbidden_terms", [])
+    if not isinstance(terms, list) or not all(isinstance(t, str) and t for t in terms): raise HTTPException(400, "invalid forbidden_terms")
 
 
 # -- endpoints -------------------------------------------------------------------------------------------------
@@ -169,7 +176,8 @@ async def exchange(kind: str, body, auth: str | None) -> dict:
     _, tid = _bearer(auth)
     async with await _session_lock(tid):
         p, d = await _load(auth); s = Session.restore(d["session"])
-        payload = (body.question,) if kind == "ask" else (body.diff, body.files)
+        payload = (body.question,) if kind == "ask" else (body.description,) if kind == "confirm" else (body.diff, body.files)
+        if kind == "review" and not s.diff_review_enabled: raise HTTPException(403, DIFF_REVIEW_UNAVAILABLE)   # channel disabled by run config
         try: hit = s.lookup(body.request_id, kind, *payload)          # frozen / cached / conflict: no writes, no commits
         except Session.Frozen: raise HTTPException(410, "frozen")
         except Session.Conflict: raise HTTPException(409, "request id changed")
@@ -179,7 +187,11 @@ async def exchange(kind: str, body, auth: str | None) -> dict:
         d["pending"] = {"request_id": body.request_id, "kind": kind}; await _write(p, d)
         try:
             fn = lambda sy, m, sc: call_llm(sy, m, sc, s.cfg)  # noqa: E731
-            reply = await s.ask(body.request_id, body.question, fn) if kind == "ask" else await s.review(body.request_id, body.diff, body.files, fn)
+            if kind == "ask": reply = await s.ask(body.request_id, body.question, fn)
+            elif kind == "confirm": reply = await s.confirm(body.request_id, body.description, fn)
+            else: reply = await s.review(body.request_id, body.diff, body.files, fn)
+        except Session.Unavailable as e:
+            d["pending"] = None; await _write(p, d); raise HTTPException(403, str(e))
         except Session.Frozen:
             d["pending"] = None; await _write(p, d); raise HTTPException(410, "frozen")
         except Session.Conflict:
@@ -198,6 +210,11 @@ async def exchange(kind: str, body, auth: str | None) -> dict:
 @app.post("/ask")
 async def ask(body: Ask, authorization: str | None = Header(default=None)):
     return await exchange("ask", body, authorization)
+
+
+@app.post("/confirm")
+async def confirm(body: Confirm, authorization: str | None = Header(default=None)):
+    return await exchange("confirm", body, authorization)
 
 
 @app.post("/review")

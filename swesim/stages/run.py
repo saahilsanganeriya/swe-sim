@@ -20,7 +20,7 @@ from swesim import harbor_cli
 from swesim.models import RunConfig, ScenarioSpec
 from swesim.models import trial_id as make_trial_id
 from swesim.paths import Workspace
-from swesim.stakeholder.view import visible_view
+from swesim.stakeholder.view import forbidden_terms, visible_view
 
 PROVIDER_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
 OUTCOME_NAMES = {3: "agent-invalid-submission", 4: "agent-runtime-failure", 7: "evaluator-failure"}
@@ -105,9 +105,11 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     provider_host = PROVIDER_HOSTS[provider]
 
     if rc.condition == "interactive":
+        view = visible_view(spec)
+        view["forbidden_terms"] = forbidden_terms(spec, sdir)     # deny-list of tokens from the hidden tests; never content
         token = _post(f"{stakeholder_url}/sessions",
                       {"trial_id": tid, "spec_hash": spec.spec_hash, "condition": rc.condition, "run_config_hash": rc.run_config_hash,
-                       "visible_view": visible_view(spec), "stakeholder_config": rc.stakeholder.model_dump(), "image": spec.environment.image},
+                       "visible_view": view, "stakeholder_config": rc.stakeholder.model_dump(), "image": spec.environment.image},
                       {"X-Worker-Secret": worker_secret})["token"]
     task = materialize_trial_task(ws, compiled, tid, token)
     tc = tomllib.loads((task / "task.toml").read_text())

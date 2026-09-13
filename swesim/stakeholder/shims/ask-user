@@ -1,20 +1,32 @@
 #!/usr/local/bin/swesim-python -I
-# swesim stakeholder shim. Installed root-owned on the agent's PATH as both `ask-user` and `request-review`;
-# the basename selects the endpoint. Standard library only. The shim does not enforce anything: budget,
-# request-id binding and freeze live on the service, which the agent could also reach directly over HTTP.
-# Every failure is one readable line on stderr with exit 1; never a traceback.
+# swesim stakeholder shim. Installed root-owned on the agent's PATH as `ask-user`, `confirm-behavior` and
+# `request-review`; the basename selects the endpoint. Standard library only. The shim does not enforce anything:
+# budget, request-id binding, channel availability and freeze live on the service, which the agent could also reach
+# directly over HTTP. Every failure is one readable line on stderr with exit 1; never a traceback.
+#   ask-user "question"                      -> POST /ask      (question_cost)
+#   confirm-behavior "behavior description"  -> POST /confirm  (review_cost; plain language, <= 4000 chars, no code)
+#   request-review                           -> POST /review   (diff review; only when review_mode is "diff-only")
 import http.client, json, os, pathlib, subprocess, sys, uuid, urllib.error, urllib.request
 
+DIFF_REVIEW_UNAVAILABLE = 'diff review is not available for this stakeholder; use confirm-behavior'
 base = os.environ.get('SWESIM_STAKEHOLDER_URL', '').rstrip('/'); token = os.environ.get('SWESIM_SESSION_TOKEN', '')
 if not token or not base:
     print('No stakeholder is available in this task.'); raise SystemExit(0)
-kind = 'ask' if pathlib.Path(sys.argv[0]).name == 'ask-user' else 'review'
+name = pathlib.Path(sys.argv[0]).name
+kind = {'ask-user': 'ask', 'confirm-behavior': 'confirm'}.get(name, 'review')
 body = {'request_id': uuid.uuid4().hex}
 if kind == 'ask':
     question = ' '.join(sys.argv[1:]).strip()
     if not question: raise SystemExit('usage: ask-user "your question for the stakeholder"')
     body['question'] = question
+elif kind == 'confirm':
+    description = ' '.join(sys.argv[1:]).strip()
+    if not description: raise SystemExit('usage: confirm-behavior "plain-language description of the behavior change, optionally with a before/after example"')
+    if len(description) > 4000: raise SystemExit('confirm-behavior: description exceeds 4000 characters; describe the behavior, not the code')
+    body['description'] = description
 else:
+    mode = os.environ.get('SWESIM_REVIEW_MODE', '')
+    if mode and mode != 'diff-only': print(DIFF_REVIEW_UNAVAILABLE); raise SystemExit(0)
     repo = os.environ.get('SWESIM_REPO_DIR', '')
     if not repo or not os.path.isdir(repo): raise SystemExit('request-review: SWESIM_REPO_DIR is not set to a directory')
     git = ['/usr/bin/git', '-c', 'core.hooksPath=/dev/null']
@@ -52,6 +64,7 @@ except urllib.error.HTTPError as e:
     if isinstance(detail, list):                        # FastAPI validation errors: join the human-readable msg fields
         detail = '; '.join(str(item.get('msg', item)) if isinstance(item, dict) else str(item) for item in detail)
     if e.code == 410: print('Stakeholder session closed.')
+    elif e.code == 403 and kind == 'review': print(str(detail) or DIFF_REVIEW_UNAVAILABLE)   # channel disabled: not an error
     elif e.code == 503: raise SystemExit('Stakeholder is temporarily unavailable; try again with a fresh question.')
     elif 400 <= e.code < 500: raise SystemExit('Stakeholder rejected the request (HTTP ' + str(e.code) + '): ' + str(detail))
     else: raise SystemExit('Stakeholder transport failed: HTTP ' + str(e.code))

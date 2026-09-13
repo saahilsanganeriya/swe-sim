@@ -234,8 +234,94 @@ def test_shims_end_to_end_against_local_service(svc, monkeypatch, tmp_path):
         assert p.returncode == 1 and p.stderr.strip().startswith("Stakeholder rejected the request (HTTP 401)") and "Traceback" not in p.stderr
         p = _shim("ask-user", "q" * 20_001, env=env)                                              # FastAPI list-shaped detail
         assert p.returncode == 1 and p.stderr.strip() == "Stakeholder rejected the request (HTTP 422): String should have at most 20000 characters"
+        # confirm-behavior shim: plain-language acceptance check through the same auth; the session is frozen now -> closed.
+        p = _shim("confirm-behavior", "Boolean values act like 0 and 1 now.", env=env)
+        assert p.returncode == 0 and p.stdout.strip() == "Stakeholder session closed."
     finally:
         server.should_exit = True; th.join(timeout=10)
+
+
+@pytest.mark.skipif(not pathlib.Path("/usr/bin/git").exists(), reason="shim uses /usr/bin/git")
+def test_confirm_shim_end_to_end_against_local_service(svc, monkeypatch):
+    import uvicorn
+    monkeypatch.setattr(service, "call_llm", lambda *a: {"reply": "Yes, that matches what I asked for.", "disclosed_fact_ids": []})
+    port = _free_port(); server = uvicorn.Server(uvicorn.Config(service.app, host="127.0.0.1", port=port, log_level="warning"))
+    th = threading.Thread(target=server.run, daemon=True); th.start(); base = f"http://127.0.0.1:{port}"
+    for _ in range(100):
+        try: httpx.get(base + "/health", timeout=1); break
+        except Exception: time.sleep(0.05)
+    try:
+        cfg = {**CFG, "patience_profile": {"start": 4, "question_cost": 1, "review_cost": 2, "terse_below": 1, "refuse_at": 0}}
+        tok = httpx.post(base + "/sessions", headers={"X-Worker-Secret": "s3"}, json=body(stakeholder_config=cfg)).json()["token"]
+        env = {"SWESIM_STAKEHOLDER_URL": base, "SWESIM_SESSION_TOKEN": tok, "SWESIM_TRIAL_ID": "t1"}
+        p = _shim("confirm-behavior", "Boolean", "values", "now", "act", "like", "0", "and", "1.", env=env)
+        assert p.returncode == 0 and p.stdout.splitlines() == ["Yes, that matches what I asked for.", "[availability remaining: 2]"]
+        t = httpx.get(base + "/transcript/t1", headers={"X-Worker-Secret": "s3"}).json()
+        user = [e for e in t["events"] if e["kind"] == "message" and e["role"] == "user"][0]
+        assert user["exchange"] == "confirm" and user["content"].endswith("Boolean values now act like 0 and 1.") and "diff" not in user["content"]
+    finally:
+        server.should_exit = True; th.join(timeout=10)
+
+
+def test_leaked_reply_is_redacted_through_the_service(svc, monkeypatch):
+    """The agent only ever sees the redacted text; redaction annotations live on the transcript event."""
+    leak = "Looks fine. Add a test that calls IntervalProperty on a boolean series and asserts the mapping. Nothing else is missing."
+    monkeypatch.setattr(service, "call_llm", lambda *a: {"reply": leak, "disclosed_fact_ids": ["f01"]})
+    c = TestClient(service.app); w = {"X-Worker-Secret": "s3"}
+    view = {**VIEW, "forbidden_terms": ["IntervalProperty", "assert", "test_"]}
+    tok = c.post("/sessions", headers=w, json=body(visible_view=view)).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
+    a = c.post("/ask", headers=h, json={"request_id": "1", "question": "what else?"}).json()
+    assert set(a) == {"reply", "patience_remaining", "tier"} and a["reply"] == "Looks fine. [withheld] Nothing else is missing."
+    ev = [e for e in c.get("/transcript/t1", headers=w).json()["events"] if e["kind"] == "message" and e["role"] == "assistant"][0]
+    assert ev["redacted_terms"] == ["IntervalProperty"] and ev["redaction_count"] == 1 and ev["regenerated"] is True
+    assert ev["withheld_sentences"] == ["Add a test that calls IntervalProperty on a boolean series and asserts the mapping."]
+    assert c.post("/ask", headers=h, json={"request_id": "1", "question": "what else?"}).json()["reply"] == a["reply"]   # cached, still redacted
+    assert c.post("/sessions", headers=w, json=body(trial_id="t9", visible_view={**VIEW, "forbidden_terms": "assert"})).status_code == 400
+    assert c.post("/sessions", headers=w, json=body(trial_id="t8", visible_view={**VIEW, "forbidden_terms": ["ok", 3]})).status_code == 400
+
+
+def _behavior_mode_supported():
+    import typing
+    from swesim.models import StakeholderConfig
+    return "behavior" in typing.get_args(StakeholderConfig.model_fields["review_mode"].annotation)
+
+
+def test_confirm_endpoint_costs_review_cost_and_is_filtered(svc, monkeypatch):
+    leak = "Yes, that is what I wanted. Add a test_bool case asserting IntervalProperty output. Nothing seems unmet."
+    monkeypatch.setattr(service, "call_llm", lambda *a: {"reply": leak, "disclosed_fact_ids": ["f01"]})
+    c = TestClient(service.app); w = {"X-Worker-Secret": "s3"}
+    cfg = {**CFG, "patience_profile": {"start": 4, "question_cost": 1, "review_cost": 2, "terse_below": 1, "refuse_at": 0}}
+    view = {**VIEW, "forbidden_terms": ["IntervalProperty", "test_"]}
+    tok = c.post("/sessions", headers=w, json=body(visible_view=view, stakeholder_config=cfg)).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
+    r = c.post("/confirm", headers=h, json={"request_id": "c1", "description": "Boolean values act like 0 and 1 now; before, it raised."})
+    assert r.status_code == 200 and r.json() == {"reply": "Yes, that is what I wanted. [withheld] Nothing seems unmet.", "patience_remaining": 2, "tier": "full"}
+    ev = [e for e in c.get("/transcript/t1", headers=w).json()["events"] if e["kind"] == "message"]
+    assert [e["exchange"] for e in ev] == ["confirm", "confirm"] and ev[1]["redacted_terms"] == ["IntervalProperty", "test_"] and ev[1]["redaction_count"] == 1
+    assert c.post("/confirm", headers=h, json={"request_id": "c2", "description": "x" * 4001}).status_code == 422
+    assert c.post("/confirm", headers=h, json={"request_id": "c3", "description": ""}).status_code == 422
+    assert c.post("/confirm", headers=h, json={"request_id": "c4", "description": "d", "diff": "x"}).status_code == 422   # no diff on this channel
+    r2 = c.post("/confirm", headers=h, json={"request_id": "c5", "description": "Also the other case still works."}).json()
+    assert r2["patience_remaining"] == 0 and r2["tier"] == "full"
+    assert c.post("/confirm", headers=h, json={"request_id": "c6", "description": "more"}).json()["tier"] == "refused"
+
+
+@pytest.mark.skipif(not _behavior_mode_supported(), reason="models.StakeholderConfig.review_mode does not accept 'behavior' yet (integrator change)")
+def test_diff_review_returns_403_in_behavior_mode(svc, monkeypatch):
+    monkeypatch.setattr(service, "call_llm", lambda *a: {"reply": "ok", "disclosed_fact_ids": []})
+    c = TestClient(service.app); w = {"X-Worker-Secret": "s3"}
+    tok = c.post("/sessions", headers=w, json=body(stakeholder_config={**CFG, "review_mode": "behavior"})).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
+    r = c.post("/review", headers=h, json={"request_id": "v1", "diff": "diff --git a/a b/a\n", "files": {}})
+    assert r.status_code == 403 and r.json()["detail"] == "diff review is not available for this stakeholder; use confirm-behavior"
+    t = c.get("/transcript/t1", headers=w).json(); assert t["service_failure"] is None and t["pending"] is None and t["patience_end"] == 2
+    assert c.post("/confirm", headers=h, json={"request_id": "c1", "description": "It works now."}).status_code == 200
+
+
+def test_review_shim_is_a_no_op_in_behavior_mode():
+    env = {"SWESIM_STAKEHOLDER_URL": f"http://127.0.0.1:{_free_port()}", "SWESIM_SESSION_TOKEN": "t1.x", "SWESIM_TRIAL_ID": "t1", "SWESIM_REVIEW_MODE": "behavior"}
+    p = _shim("request-review", env=env)                                  # no network call is made: the port is closed
+    assert p.returncode == 0 and p.stdout.strip() == "diff review is not available for this stakeholder; use confirm-behavior" and p.stderr == ""
+    p = _shim("confirm-behavior", env=env); assert p.returncode == 1 and p.stderr.strip().startswith("usage: confirm-behavior")
+    p = _shim("confirm-behavior", "x" * 4001, env=env); assert p.returncode == 1 and "4000 characters" in p.stderr
 
 
 @pytest.mark.skipif(not pathlib.Path("/usr/bin/git").exists(), reason="shim uses /usr/bin/git")

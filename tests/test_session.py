@@ -193,3 +193,158 @@ def test_system_prompt_mentions_checks_by_description_only():
 
 def test_reply_dataclass_defaults():
     r = Reply("x", [], 1, "full"); assert r.tool_calls == [] and r.reviewed_diff_sha256 is None
+    assert r.redacted_terms == [] and r.redaction_count == 0 and r.regenerated is False and r.withheld_sentences == []
+
+
+# -- code-owned reply filter (forbidden terms from the hidden tests) --------------------------------------------------
+TERMS = ["Continuous", "IntervalProperty", "Series", "assert", "pytest", "test_", "_setup(", "tests/"]
+VIEW_F = {**VIEW, "forbidden_terms": TERMS}
+LEAK = ("The change looks right. I'd want the regression to cover calling Continuous()._setup on a boolean pandas Series "
+        "and observing mapped output [1, 0, 0]. The original case should still not raise.")
+CLEAN = "The change looks right. Please make sure the original case still does not raise."
+
+
+class SeqLLM:
+    """Returns the scripted replies in order (the last one repeats) and records every call."""
+    def __init__(self, *replies): self.replies = list(replies); self.calls = 0; self.seen = []
+    def __call__(self, system, messages, schema):
+        self.seen.append((system, messages, schema)); r = self.replies[min(self.calls, len(self.replies) - 1)]; self.calls += 1
+        return {"reply": r, "disclosed_fact_ids": ["f01"]}
+
+
+def test_term_patterns_match_tokens_prefixes_and_literals():
+    from swesim.stakeholder.session import find_forbidden
+    assert find_forbidden("a TimeSeries object", ["Series"]) == []                      # whole-token identifiers
+    assert find_forbidden("a pandas Series object", ["Series"]) == ["Series"]
+    assert find_forbidden("see test_bool_series", ["test_"]) == ["test_"]              # trailing underscore is a prefix
+    assert find_forbidden("call Continuous()._setup(x)", ["_setup("]) == ["_setup("]  # literal substring
+    assert find_forbidden("in tests/test_scales.py", ["tests/"]) == ["tests/"]
+    assert find_forbidden("nothing here", TERMS) == []
+    assert find_forbidden("Please add a Regression Test for this.", ["regression test"]) == ["regression test"]   # phrases: any case
+    assert find_forbidden("this is a regression from 0.12", ["regression test"]) == []                            # the reporter may say "regression"
+    assert find_forbidden("I'd want a test that shows it", ["a test that"]) == ["a test that"]
+
+
+def test_forbidden_reply_is_regenerated_then_redacted():
+    s = Session("t1", VIEW_F, cfg(start=6, terse_below=0)); llm = SeqLLM(LEAK, LEAK)
+    r = asyncio.run(s.ask("q1", "Anything else you need?", llm))
+    assert llm.calls == 2
+    from swesim.stakeholder.prompts import STRICT_INSTRUCTION
+    assert STRICT_INSTRUCTION not in llm.seen[0][0] and STRICT_INSTRUCTION in llm.seen[1][0]   # second attempt is stricter
+    assert r.reply == "The change looks right. [withheld] The original case should still not raise."
+    assert r.regenerated is True and r.redaction_count == 1 and r.redacted_terms == ["Continuous", "Series"]   # "._setup on": no "(" so the literal does not fire
+    assert r.withheld_sentences == ["I'd want the regression to cover calling Continuous()._setup on a boolean pandas Series and observing mapped output [1, 0, 0]."]
+    for t in ("Continuous", "IntervalProperty", "_setup(", "Series"): assert t not in r.reply
+    assert set(r.public()) == {"reply", "patience_remaining", "tier"} and r.disclosed_fact_ids == ["f01"] and r.patience_remaining == 5
+    ev = [e for e in s.events if e["kind"] == "message" and e["role"] == "assistant"][0]
+    assert ev["content"] == r.reply and ev["redacted_terms"] == r.redacted_terms and ev["redaction_count"] == 1 and ev["regenerated"] is True
+    assert ev["withheld_sentences"] == r.withheld_sentences
+    # The redacted text (never the draft) is what later turns see as history, and the deny-list is not in the prompt.
+    asyncio.run(s.ask("q2", "And?", llm)); system, messages, _ = llm.seen[-1]
+    assert messages[1]["content"] == r.reply and "IntervalProperty" not in system and "forbidden" not in system.lower()
+
+
+def test_clean_reply_passes_unchanged():
+    s = Session("t1", VIEW_F, cfg()); llm = SeqLLM(CLEAN)
+    r = asyncio.run(s.ask("q1", "Anything else?", llm))
+    assert llm.calls == 1 and r.reply == CLEAN and r.redaction_count == 0 and r.redacted_terms == [] and r.regenerated is False
+    ev = [e for e in s.events if e["kind"] == "message" and e["role"] == "assistant"][0]
+    assert ev["redacted_terms"] == [] and ev["redaction_count"] == 0 and ev["regenerated"] is False and ev["withheld_sentences"] == []
+
+
+def test_leak_then_clean_regeneration_keeps_the_second_draft():
+    s = Session("t1", VIEW_F, cfg()); llm = SeqLLM(LEAK, CLEAN)
+    r = asyncio.run(s.ask("q1", "Anything else?", llm))
+    assert llm.calls == 2 and r.reply == CLEAN and r.regenerated is True and r.redaction_count == 0 and r.redacted_terms == []
+
+
+def test_regeneration_failure_falls_back_to_redacting_the_first_draft():
+    class Flaky(SeqLLM):
+        def __call__(self, system, messages, schema):
+            if self.calls == 1: self.calls += 1; raise RuntimeError("provider hiccup")
+            return super().__call__(system, messages, schema)
+    s = Session("t1", VIEW_F, cfg()); llm = Flaky(LEAK)
+    r = asyncio.run(s.ask("q1", "Anything else?", llm))
+    assert llm.calls == 2 and r.regenerated is False and r.redaction_count == 1 and "[withheld]" in r.reply and "Continuous" not in r.reply
+
+
+def test_review_reply_is_filtered_too_and_no_terms_means_no_filter():
+    s = Session("t1", VIEW_F, cfg(start=6, terse_below=0)); llm = SeqLLM(LEAK)
+    diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+    r = asyncio.run(s.review("v1", diff, {}, llm)); assert r.redaction_count == 1 and "Continuous" not in r.reply and r.reviewed_diff_sha256
+    s2 = Session("t2", VIEW, cfg()); llm2 = SeqLLM(LEAK)                       # no deny-list: nothing is scanned
+    r2 = asyncio.run(s2.ask("q1", "x", llm2)); assert llm2.calls == 1 and r2.reply == LEAK and r2.redaction_count == 0
+    # Redaction of an all-forbidden reply leaves a single [withheld] marker, never an empty reply.
+    s3 = Session("t3", VIEW_F, cfg()); r3 = asyncio.run(s3.ask("q1", "x", SeqLLM("Use Continuous()._setup(x).")))
+    assert r3.reply == "[withheld]" and r3.redaction_count == 1
+
+
+def test_system_prompt_speaks_as_the_reporter_and_never_lists_forbidden_terms():
+    from swesim.stakeholder.prompts import OPTIONS_RULE, STRICT_INSTRUCTION, system_prompt
+    out = system_prompt(VIEW_F, VIEW_F["persona"], {"tier": "full", "remaining": 3}, "diff-only")
+    assert "who filed this request" in out and "Never propose tests" in out and "have not executed" in out
+    assert "which requirement still seems unmet" in out and "requirement level" in out and OPTIONS_RULE in out
+    for t in TERMS: assert t not in out, t
+    assert STRICT_INSTRUCTION not in out and STRICT_INSTRUCTION in system_prompt(VIEW_F, VIEW_F["persona"], {"tier": "full", "remaining": 3}, "diff-only", strict=True)
+    beh = system_prompt(VIEW_F, VIEW_F["persona"], {"tier": "full", "remaining": 3}, "behavior")
+    assert "cannot read code and you will not be shown diffs" in beh and "do not review diffs" in beh and "have not executed" in beh
+    assert "cannot read code and you will not be shown diffs" not in out       # diff-only mode is shown the diff, still not a programmer
+
+
+def test_option_picks_are_filtered_like_identifiers():
+    """Agent offers (a)/(b)/(c) code paths; the model echoes a pick plus internal names: regenerated, then rewritten so no
+    option letter selection and no identifier absent from the brief/facts survives."""
+    from swesim.stakeholder.session import option_markers
+    view = {**VIEW, "forbidden_terms": ["Color", "Property", "ContinuousBase", "default_scale", "_setup("]}
+    question = ("Which do you prefer? (a) change Color.default_scale, (b) change Property.default_scale, "
+                "(c) cast in ContinuousBase._setup.")
+    assert option_markers(question) == ["(a)", "(b)", "(c)"]
+    pick = ("I'd go with (c): cast in ContinuousBase._setup so booleans act like 0 and 1. Option (a) is too broad. "
+            "Boolean color values should act like 0 and 1 on a continuous scale; how scales are inferred for other properties must not change.")
+    s = Session("t1", view, cfg(start=6, terse_below=0)); llm = SeqLLM(pick, pick)
+    r = asyncio.run(s.ask("q1", question, llm))
+    assert llm.calls == 2 and r.regenerated is True and r.redaction_count == 2
+    assert r.reply == "[withheld] [withheld] Boolean color values should act like 0 and 1 on a continuous scale; how scales are inferred for other properties must not change."
+    assert option_markers(r.reply) == [] and not any(t in r.reply for t in view["forbidden_terms"])
+    assert r.redacted_terms == ["(a)", "(c)", "ContinuousBase"]
+    # "Option B" phrasing counts as a pick too; a reply that is only a pick becomes a single [withheld].
+    s2 = Session("t2", view, cfg()); r2 = asyncio.run(s2.ask("q1", question, SeqLLM("Option B, please.")))
+    assert r2.reply == "[withheld]" and r2.redacted_terms == ["(b)"]
+    # Without options in the agent's message, "(a)" in a reply is ordinary text.
+    s3 = Session("t3", view, cfg()); r3 = asyncio.run(s3.ask("q1", "What exactly is wrong?", SeqLLM("See item (a) of my report: it breaks.")))
+    assert r3.redaction_count == 0 and "(a)" in r3.reply
+
+
+def _behavior_cfg(**patience):
+    """A StakeholderConfig in behavior mode. Built without validation while models.py still pins review_mode to 'diff-only'."""
+    from swesim.models import PatienceProfile
+    base = {"start": 3, "question_cost": 1, "review_cost": 2, "terse_below": 2, "refuse_at": 0}
+    return StakeholderConfig.model_construct(model_id="openai/gpt-5.5", prompt_version="v1", temperature=0.0,
+                                             patience_profile=PatienceProfile(**{**base, **patience}), review_mode="behavior",
+                                             max_tool_calls_per_activation=2)
+
+
+def test_confirm_costs_review_cost_is_filtered_and_recorded_as_confirm():
+    s = Session("t1", VIEW_F, cfg(start=4, terse_below=1)); llm = SeqLLM(LEAK)
+    r = asyncio.run(s.confirm("c1", "Boolean values now act like 0 and 1 on a continuous scale; before, plotting them raised an error.", llm))
+    assert r.patience_remaining == 2 and r.tier == "full" and r.redaction_count == 1 and "Continuous" not in r.reply and r.reviewed_diff_sha256 is None
+    ev = [e for e in s.events if e["kind"] == "message"]
+    assert ev[0]["exchange"] == "confirm" and ev[0]["role"] == "user" and ev[0]["content"].endswith("raised an error.") and "reviewed_diff_sha256" not in ev[0]
+    assert ev[1]["exchange"] == "confirm" and set(ev[1]) >= {"disclosed_fact_ids", "tool_calls", "redacted_terms", "redaction_count", "regenerated", "withheld_sentences"}
+    assert ev[1]["tool_calls"] == [] and set(r.public()) == {"reply", "patience_remaining", "tier"}
+    assert "do not name code" in llm.seen[0][1][-1]["content"]                    # confirmation framing precedes the description
+    cached = asyncio.run(s.confirm("c1", "Boolean values now act like 0 and 1 on a continuous scale; before, plotting them raised an error.", llm))
+    assert cached.reply == r.reply and llm.calls == 2
+    with pytest.raises(Session.Conflict): asyncio.run(s.confirm("c1", "something else", llm))
+    with pytest.raises(Session.BadRequest): asyncio.run(s.confirm("c2", "x" * 4001, llm))
+    with pytest.raises(Session.BadRequest): asyncio.run(s.confirm("c3", "   ", llm))
+    assert llm.calls == 2 and s.remaining == 2
+
+
+def test_diff_review_is_disabled_unless_review_mode_is_diff_only():
+    s = Session("t1", VIEW, _behavior_cfg()); llm = FakeLLM()
+    assert s.diff_review_enabled is False
+    with pytest.raises(Session.Unavailable): asyncio.run(s.review("v1", "diff --git a/a b/a\n", {}, llm))
+    assert llm.calls == 0 and s.events == [] and s.remaining == 3
+    ok = asyncio.run(s.confirm("c1", "It no longer breaks on boolean input.", llm)); assert ok.tier == "full" and s.remaining == 1
+    assert Session("t2", VIEW, cfg()).diff_review_enabled is True                 # explicit diff-only keeps the channel

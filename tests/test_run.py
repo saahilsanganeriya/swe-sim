@@ -8,9 +8,42 @@ from swesim.models import RunConfig, ScenarioSpec, minimal_spec_dict, trial_id
 from swesim.paths import Workspace
 from swesim.stages import run
 from swesim.stages.run import TrialRecord, materialize_trial_task, run_trial
-from swesim.stakeholder.view import visible_view
+from swesim.stakeholder.view import FIXED_FORBIDDEN, forbidden_terms, visible_view
 
 URL = "https://swesim-stakeholder-web.modal.run"
+
+HIDDEN_TEST_PATCH = """diff --git a/tests/test_scales.py b/tests/test_scales.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tests/test_scales.py
+@@ -0,0 +1,8 @@
++import pytest
++from pkg.scales import Continuous, IntervalProperty
++
++
++def test_bool_series_maps_to_interval(bool_series):
++    out = Continuous()._setup(bool_series, IntervalProperty())
++    assert out == [1, 0, 0]  # a ValueError must never be raised here
+"""
+
+
+def test_forbidden_terms_come_from_hidden_tests_minus_what_the_reporter_said(tmp_path):
+    d = minimal_spec_dict()
+    d["ledger"] += [{"id": "f02", "text": "The mapping should use IntervalProperty semantics", "kind": "behavior", "provenance": "authored", "authored_rationale": "x", "discovery": "on-request"},
+                    {"id": "f09", "text": "Continuous is the class to patch", "kind": "interface", "provenance": "authored", "authored_rationale": "x", "discovery": "author-only"}]
+    spec = ScenarioSpec.model_validate(d)
+    (tmp_path / "assets").mkdir(); (tmp_path / "assets" / "test.patch").write_text(HIDDEN_TEST_PATCH)
+    terms = forbidden_terms(spec, tmp_path)
+    assert terms == sorted(set(terms))                                                   # deterministic, unique
+    for t in ("Continuous", "_setup", "bool_series", "test_bool_series_maps_to_interval", "pkg", "scales", "out", "must", "never", "raised", "here"):
+        assert t in terms, t                                                            # in the hidden test, unknown to the reporter
+    for t in FIXED_FORBIDDEN: assert t in terms, t
+    assert "ValueError" not in terms and "Raise" not in terms                            # said by the reporter (requirements / facts)
+    assert "IntervalProperty" not in terms                                              # named in a visible fact
+    assert "Continuous" in terms                                                        # author-only facts do not count as visible
+    for t in ("import", "from", "def", "diff", "git", "index", "mode", "dev", "null", "file"): assert t not in terms, t   # keywords and patch framing
+    assert all(t.casefold() not in {"valueerror", "raise", "intervalproperty", "breaks"} for t in terms)
 
 
 def test_visible_view_drops_author_only():
@@ -57,6 +90,7 @@ def scene(tmp_path, monkeypatch):
     sdir = ws.scenario_dir(spec.id); sdir.mkdir(parents=True)
     (sdir / "compile.json").write_text(json.dumps({"compiled_hash": "c" * 8, "image_digest": "sha256:" + "d" * 64}))
     (sdir / "validation.json").write_text(json.dumps({"status": "valid", "spec_hash": spec.spec_hash, "compiled_hash": "c" * 8}))
+    (sdir / "assets").mkdir(); (sdir / "assets" / "test.patch").write_text(HIDDEN_TEST_PATCH)   # the hidden test asset
     from pathlib import Path as _P
     scaffold = _P(run.__file__).resolve().parent.parent / "templates" / "mini_swe_agent.interactive.yaml"
     for cond in ("interactive", "hidden"):
@@ -110,6 +144,9 @@ def test_run_trial_interactive_end_to_end(scene):
     assert url == URL + "/sessions" and headers == {"X-Worker-Secret": "secret"} and body["trial_id"] == tid and body["condition"] == "interactive"
     assert body["spec_hash"] == spec.spec_hash and body["run_config_hash"] == effective.run_config_hash and body["image"] == "ubuntu:24.04"
     assert body["visible_view"]["facts"][0]["id"] == "f01" and body["stakeholder_config"]["patience_profile"]["start"] == 6
+    ft = body["visible_view"]["forbidden_terms"]                                        # deny-list of tokens from the hidden test
+    assert {"Continuous", "IntervalProperty", "_setup", "_setup(", "assert", "pytest", "tests/", "test_"} <= set(ft) and "ValueError" not in ft
+    assert HIDDEN_TEST_PATCH.splitlines()[-1].strip("+ ") not in json.dumps(body)        # tokens, never test content
     assert calls["post"][1][0] == URL + "/freeze" and calls["post"][1][2] == {"Authorization": "Bearer t1.tok"}
     assert calls["get"] == [(URL + f"/transcript/{tid}", {"X-Worker-Secret": "secret"})]
     # Materialized task: token and trial id in the env, metadata carries lineage, instruction re-rendered, provider host allowed.
