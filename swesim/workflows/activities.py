@@ -283,38 +283,76 @@ async def probe_candidate_activity(p: dict) -> dict:
     if idx is None:
         raise ApplicationError(f"candidate {iid} not in {judged_path}", non_retryable=True)
     row = rows[idx]
-    if not (row.get("probe") or {}).get("measured"):
+    if not _probe_measured(row):
         M = importlib.import_module("swesim.stages.mine")
         probe_candidates = getattr(M, "probe_candidates", None)
-        result = None
+        dropped: dict = {}
         if probe_candidates is not None:
-            result = await blocking(lambda: probe_candidates(WS, judged_path, [iid], int(p.get("max_builds", 1))))
+            # Contract (swesim.stages.mine.probe_candidates): writes <judged>.probed.jsonl (+ .probed.summary.json) with the
+            # measured fail_to_pass / pass_to_pass replacing the source lists (originals under swebench_*), probe metadata
+            # (`probe.statuses`, which draft requires), and reject_reason not-reproducible-offline | probe-failed.
+            out = Path(str(await blocking(lambda: probe_candidates(WS, judged_path, [iid], int(p.get("max_builds", 1))))))
+            probed = _read_row(out, iid)
+            if probed is None:
+                raise RuntimeError(f"probe_candidates wrote no row for {iid} to {out}")
+            error = str((probed.get("probe") or {}).get("error") or "")
+            if error and not error.startswith("ValueError"):
+                # HarborRunError / build / digest failures are infrastructure: fail the child (rerunnable), no terminal status.
+                raise RuntimeError(f"probe infrastructure failure for {iid}: {error}")
+            summary = _read_json(out.with_suffix(".summary.json"))
+            dropped = {k: v for k, v in summary.items() if k not in ("rows", "probed")}
+            row = {**row, **probed}
         else:
             gr = importlib.import_module("swesim.sources.github_repo")
             probe_tests = getattr(gr, "probe_tests", None)
             if probe_tests is None:
-                raise ApplicationError("no probe available: swesim.stages.mine.probe_candidates / github_repo.probe_tests missing", non_retryable=True)
-            result = await blocking(lambda: probe_tests(row, WS))
-        # Accept the probe's contract flexibly: a dict with the measured lists, a path to a rewritten judged file, or an
-        # in-place rewrite of judged_path.
-        measured: dict = {}
-        if isinstance(result, dict) and "fail_to_pass" in result:
-            measured = result
-        else:
-            source = Path(str(result)) if isinstance(result, (str, Path)) and Path(str(result)).is_file() else judged_path
-            fresh = next((json.loads(line) for line in source.read_text().splitlines() if line.strip() and json.loads(line).get("instance_id") == iid), None)
-            if fresh is not None:
-                measured = {k: fresh.get(k) for k in ("fail_to_pass", "pass_to_pass", "probe_dir", "dockerfile", "test_python") if k in fresh}
-                row = {**row, **{k: v for k, v in fresh.items() if k not in ("probe",)}}
-        row.update({k: v for k, v in measured.items() if k in ("fail_to_pass", "pass_to_pass", "dockerfile", "test_python")})
-        row["probe"] = {"measured": True, "fail_to_pass": list(row.get("fail_to_pass") or []), "pass_to_pass": list(row.get("pass_to_pass") or []),
-                        "probe_dir": measured.get("probe_dir"), "at": time.time()}
+                raise ApplicationError("no probe available: swesim.stages.mine.probe_candidates (sources branch) and "
+                                       "swesim.sources.github_repo.probe_tests are both missing", non_retryable=True)
+            row = {**row, "swebench_fail_to_pass": list(row.get("fail_to_pass") or []), "swebench_pass_to_pass": list(row.get("pass_to_pass") or [])}
+            try:
+                res = await blocking(lambda: probe_tests(row, WS))
+            except ValueError as e:
+                # Measured but unusable (nothing fails on base and passes with gold; unreliable base/gold statuses): terminal.
+                row.update(fail_to_pass=[], probe={**(row.get("probe") or {}), "error": f"ValueError: {e}"}, reject_reason="not-reproducible-offline")
+                dropped = {"probe-error": str(e)}
+            else:
+                row.update(fail_to_pass=list(res.get("fail_to_pass") or []), pass_to_pass=list(res.get("pass_to_pass") or []),
+                           probe=res.get("probe") or {k: res.get(k) for k in ("statuses", "probe_dir", "dropped") if k in res})
+                for k in ("test_python", "dockerfile"):
+                    if res.get(k):
+                        row[k] = res[k]
+                dropped = dict(res.get("dropped") or {})
+                if not row["fail_to_pass"]:
+                    row["reject_reason"] = "not-reproducible-offline"
+        row["probe_workflow"] = {"measured_at": time.time(), "dropped": dropped}
         rows[idx] = row
         tmp = judged_path.with_name(judged_path.name + ".tmp"); tmp.write_text("".join(json.dumps(r) + "\n" for r in rows)); os.replace(tmp, judged_path)
+    probe = row.get("probe") or {}
     f2p = list(row.get("fail_to_pass") or []); p2p = list(row.get("pass_to_pass") or [])
-    return {"judged_path": str(judged_path), "instance_id": iid, "scenario_id": sid, "fail_to_pass": f2p, "pass_to_pass": p2p,
-            "probe_dir": (row.get("probe") or {}).get("probe_dir"), "reproducible": bool(f2p),
-            "reason": None if f2p else "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold in the offline probe"}
+    reproducible = bool(f2p) and not probe.get("error") and row.get("reject_reason") not in ("not-reproducible-offline", "probe-failed")
+    reason = None if reproducible else (probe.get("error") or row.get("reject_reason") or
+                                        "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold in the offline probe")
+    return {"judged_path": str(judged_path), "instance_id": iid, "scenario_id": sid, "fail_to_pass": f2p if reproducible else [], "pass_to_pass": p2p,
+            "probe_dir": probe.get("probe_dir") or row.get("probe_dir"), "reproducible": reproducible, "reason": reason,
+            "dropped": (row.get("probe_workflow") or {}).get("dropped") or probe.get("dropped") or {}}
+
+
+def _probe_measured(row: dict) -> bool:
+    """A row already carries offline probe evidence: probe metadata (`statuses`) or a recorded probe error from
+    probe_candidates/probe_tests, or mine's own probe output (`probe_dir`), or this activity's marker."""
+    probe = row.get("probe") or {}
+    return bool(probe.get("statuses") or probe.get("error") or row.get("probe_dir") or row.get("probe_workflow"))
+
+
+def _read_row(path: Path, iid: str) -> dict | None:
+    if not path.is_file():
+        return None
+    for line in path.read_text().splitlines():
+        if line.strip():
+            r = json.loads(line)
+            if r.get("instance_id") == iid:
+                return r
+    return None
 
 
 @activity.defn

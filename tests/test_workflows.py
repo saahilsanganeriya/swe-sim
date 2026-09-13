@@ -1006,7 +1006,7 @@ def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress()
             prog = await h.query(W.CreateTasksWorkflow.progress)
             assert prog["stage"] == "complete" and set(prog["candidates"]) == {"a--1", "a--2", "a--3", "a--4", "a--5", "b--1"} and prog["awaiting_approval"] == []
             c1 = prog["candidates"]["a--1"]
-            assert c1["status"] == "valid" and c1["stage"] == "done" and c1["candidate_workflow_id"] == "create:a--1" and c1["source"] in ("github-repo:https://github.com/x/a", "swebench-annotated:A")
+            assert c1["status"] == "valid" and c1["stage"] == "done" and c1["candidate_workflow_id"] == "create:a--1" and c1["source"] in ("github-repo:x/a", "swebench-annotated:a")   # normalized keys
             assert ["judging", "probing", "auto-approving", "compiling", "validating", "registering"] == [s for s in c1["stages"] if s in ("judging", "probing", "auto-approving", "compiling", "validating", "registering")]
             assert "registering" not in prog["candidates"]["a--5"]["stages"] and prog["candidates"]["a--3"]["stages"] == ["judging"]
             assert prog["candidates"]["a--2"]["stages"] == ["judging", "probing"]
@@ -1091,49 +1091,120 @@ def test_create_tasks_rejects_duplicate_source_keys_before_any_activity(monkeypa
     async def scenario():
         async def act(*a, **k): raise AssertionError("no activity may run for an invalid batch")
         monkeypatch.setattr(W, "act", act)
-        with pytest.raises(ApplicationError, match="duplicate sources.*swebench-annotated:A"):
+        with pytest.raises(ApplicationError, match="duplicate sources.*swebench-annotated:a"):
             await W.CreateTasksWorkflow().run({"sources": [{"kind": "swebench-annotated", "pool": "A", "limit": 3}, {"kind": "swebench-annotated", "pool": "A", "instance_ids": ["x__1"]}]})
         with pytest.raises(ApplicationError, match="duplicate sources"):
             await W.CreateTasksWorkflow().run({"sources": [{"kind": "github-repo", "repo": "https://github.com/x/y", "since": "2026-06-01"}, {"kind": "github-repo", "repo": "https://github.com/x/y", "since": "2026-07-01"}]})
         with pytest.raises(ApplicationError, match="empty"):
             await W.CreateTasksWorkflow().run({"sources": []})
+        # spellings mine merges into one output file are one key (casefold, trailing slash, .git, URL forms)
+        with pytest.raises(ApplicationError, match="duplicate sources.*github-repo:x/a"):
+            await W.CreateTasksWorkflow().run({"sources": [{"kind": "github-repo", "repo": "https://github.com/X/A/"}, {"kind": "github-repo", "repo": "x/a.git"}]})
+        with pytest.raises(ApplicationError, match="duplicate sources"):
+            await W.CreateTasksWorkflow().run({"sources": [{"kind": "swebench-annotated", "pool": "A"}, {"kind": "swebench-annotated", "pool": "a "}]})
+    asyncio.run(scenario())
+    assert W._source_key({"kind": "github-repo", "repo": "git@github.com:X/A.git"}) == "github-repo:x/a" == W._source_key({"kind": "github-repo", "repo": "github.com/x/a/"})
+
+
+def test_candidate_failure_message_names_the_failing_stage(monkeypatch):
+    # Minor 4: the stage is captured before _done marks the candidate done.
+    from types import SimpleNamespace
+    from temporalio.exceptions import ApplicationError
+    async def scenario():
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None))
+        async def act(name, p, minutes=10): raise RuntimeError("judge provider down")
+        monkeypatch.setattr(W, "act", act)
+        w = W.CandidateWorkflow()
+        with pytest.raises(ApplicationError, match="failed at stage judging: RuntimeError: judge provider down"):
+            await w.run({"instance_id": "x__1", "candidates_path": "c", "judge_model": "j", "draft_model": "d"})
+        assert w.progress()["status"] == "error" and w.progress()["reasons"][0].startswith("judging: RuntimeError")
     asyncio.run(scenario())
 
 
-def test_probe_candidate_activity_writes_measured_row_and_is_retained(ws, monkeypatch):
+def _fake_probe_candidates(outcome: dict, calls: list):
+    """Mimics swesim.stages.mine.probe_candidates (sources branch c30994c): writes <judged>.probed.jsonl and .probed.summary.json,
+    measured lists replace the source lists (originals under swebench_*), probe metadata with `statuses`, reject_reason on failure."""
+    def probe_candidates(ws_, judged_path, instance_ids, max_builds):
+        calls.append((str(judged_path), list(instance_ids), max_builds)); out = Path(judged_path).with_suffix(".probed.jsonl"); summary = {"rows": 1, "probed": 1}
+        rows = [json.loads(line) for line in Path(judged_path).read_text().splitlines() if line.strip()]
+        with open(out, "w") as f:
+            for r in rows:
+                if r["instance_id"] not in instance_ids: continue
+                r["swebench_fail_to_pass"] = list(r.get("fail_to_pass") or []); r["swebench_pass_to_pass"] = list(r.get("pass_to_pass") or [])
+                if "error" in outcome:
+                    r["probe"] = {"error": outcome["error"]}; r["reject_reason"] = "probe-failed"; r.setdefault("judge", {})["keep"] = False; summary["probe-failed"] = 1
+                else:
+                    r["fail_to_pass"], r["pass_to_pass"] = outcome["f2p"], outcome["p2p"]; r["test_python"] = "/opt/py/bin/python"
+                    r["probe"] = {"kind": "swebench", "statuses": {"base": {"t1": "failed"}, "gold": {"t1": "passed"}}, "probe_dir": "/jobs/probe/x", "dropped": {"missing-on-gold": 1}}
+                    if not r["fail_to_pass"]: r["reject_reason"] = "not-reproducible-offline"; r.setdefault("judge", {})["keep"] = False; summary["not-reproducible-offline"] = 1
+                    else: summary["reproducible"] = 1
+                f.write(json.dumps(r) + "\n")
+        out.with_suffix(".summary.json").write_text(json.dumps(summary)); return out
+    return probe_candidates
+
+
+def test_probe_candidate_activity_follows_probe_candidates_contract_and_is_retained(ws, monkeypatch):
     judged = ws.candidates_dir / "judged" / "a--1.judged.jsonl"; judged.parent.mkdir(parents=True)
     judged.write_text(json.dumps({"instance_id": "a__1", "fail_to_pass": ["published::t1"], "pass_to_pass": [], "judge": {"keep": True}}) + "\n")
     calls = []
-    def probe_candidates(ws_, judged_path, instance_ids, max_builds):
-        calls.append((str(judged_path), list(instance_ids), max_builds))
-        rows = [json.loads(line) for line in Path(judged_path).read_text().splitlines()]
-        for r in rows:
-            if r["instance_id"] in instance_ids: r["fail_to_pass"] = ["measured::t1", "measured::t2"]; r["pass_to_pass"] = ["measured::t0"]; r["probe_dir"] = "/jobs/probe/x"
-        Path(judged_path).write_text("".join(json.dumps(r) + "\n" for r in rows)); return Path(judged_path)
-    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=probe_candidates))
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"f2p": ["t1"], "p2p": ["t0"]}, calls)))
     r = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "a__1", "scenario_id": "a--1", "max_builds": 2}))
-    assert r["reproducible"] is True and r["fail_to_pass"] == ["measured::t1", "measured::t2"] and r["pass_to_pass"] == ["measured::t0"] and r["probe_dir"] == "/jobs/probe/x"
+    assert r["reproducible"] is True and r["fail_to_pass"] == ["t1"] and r["pass_to_pass"] == ["t0"] and r["probe_dir"] == "/jobs/probe/x"
+    assert r["dropped"] == {"reproducible": 1} and calls == [(str(judged), ["a__1"], 2)]
     row = json.loads(judged.read_text().splitlines()[0])
-    assert row["fail_to_pass"] == ["measured::t1", "measured::t2"] and row["probe"]["measured"] is True and row["judge"]["keep"] is True   # draft reads the probed row
-    assert calls == [(str(judged), ["a__1"], 2)]
+    assert row["fail_to_pass"] == ["t1"] and row["swebench_fail_to_pass"] == ["published::t1"] and row["probe"]["statuses"] and row["judge"]["keep"] is True   # draft's require_probe reads probe.statuses
     again = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "a__1"}))
-    assert again["fail_to_pass"] == ["measured::t1", "measured::t2"] and len(calls) == 1                               # retained: no second Modal run
-    # an empty measured F2P is not reproducible offline; a dict-returning probe is accepted too
+    assert again["fail_to_pass"] == ["t1"] and len(calls) == 1                                                        # retained: no second Modal run
+    # nothing fails on base and passes with gold -> terminal not-reproducible-offline, with the probe's accounting
     judged2 = judged.with_name("b--2.judged.jsonl"); judged2.write_text(json.dumps({"instance_id": "b__2", "fail_to_pass": ["published::t9"], "judge": {"keep": True}}) + "\n")
-    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=lambda ws_, jp, ids, mb: {"fail_to_pass": [], "pass_to_pass": ["t0"], "probe_dir": "/jobs/probe/y"}))
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"f2p": [], "p2p": ["t0"]}, calls)))
     r2 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged2), "instance_id": "b__2"}))
-    assert r2["reproducible"] is False and r2["fail_to_pass"] == [] and "FAIL_TO_PASS is empty" in r2["reason"] and r2["probe_dir"] == "/jobs/probe/y"
-    assert json.loads(judged2.read_text())["fail_to_pass"] == []
-    # until probe_candidates lands, github_repo.probe_tests(row, ws) is the fallback for every source kind
+    assert r2["reproducible"] is False and r2["fail_to_pass"] == [] and r2["reason"] == "not-reproducible-offline" and r2["dropped"] == {"not-reproducible-offline": 1}
+    assert json.loads(judged2.read_text())["reject_reason"] == "not-reproducible-offline"
+    # probe_tests' ValueError recorded by probe_candidates is measured-but-unusable -> terminal, not an infrastructure error
     judged3 = judged.with_name("c--3.judged.jsonl"); judged3.write_text(json.dumps({"instance_id": "c__3", "judge": {"keep": True}}) + "\n")
-    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine"))
-    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo", probe_tests=lambda row, ws_: {"fail_to_pass": ["t1"], "pass_to_pass": [], "dockerfile": "FROM x", "test_python": "/usr/bin/python3"}))
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"error": "ValueError: probe needs target failure and regression coverage"}, calls)))
     r3 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged3), "instance_id": "c__3"}))
-    assert r3["reproducible"] is True and json.loads(judged3.read_text())["dockerfile"] == "FROM x"
-    with pytest.raises(Exception, match="not in"): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged3), "instance_id": "zz__1"}))
-    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo"))
+    assert r3["reproducible"] is False and "probe needs target failure" in r3["reason"] and r3["dropped"] == {"probe-failed": 1}
+    # a Harbor/build failure recorded by probe_candidates is infrastructure: the activity fails (the child fails, rerunnable)
     judged4 = judged.with_name("d--4.judged.jsonl"); judged4.write_text(json.dumps({"instance_id": "d__4", "judge": {"keep": True}}) + "\n")
-    with pytest.raises(Exception, match="no probe available"): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged4), "instance_id": "d__4"}))
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"error": "HarborRunError: no trial dir; harbor stdout tail: ..."}, calls)))
+    with pytest.raises(RuntimeError, match="probe infrastructure failure.*HarborRunError"): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged4), "instance_id": "d__4"}))
+    assert "probe" not in json.loads(judged4.read_text())                                                              # nothing recorded as measured; rerun probes again
+    # rows mine already probed (probe.statuses / probe_dir) are not re-probed
+    judged5 = judged.with_name("e--5.judged.jsonl"); judged5.write_text(json.dumps({"instance_id": "e__5", "fail_to_pass": ["t1"], "pass_to_pass": [], "probe_dir": "/jobs/probe/e", "judge": {"keep": True}}) + "\n")
+    n = len(calls); r5 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged5), "instance_id": "e__5"}))
+    assert r5["reproducible"] is True and r5["probe_dir"] == "/jobs/probe/e" and len(calls) == n
+    with pytest.raises(Exception, match="not in"): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged5), "instance_id": "zz__1"}))
+
+
+def test_probe_candidate_activity_fallback_probe_tests_maps_value_error(ws, monkeypatch):
+    # Until probe_candidates lands on main, github_repo.probe_tests(row, ws) is the fallback for every source kind.
+    judged = ws.candidates_dir / "judged" / "f--6.judged.jsonl"; judged.parent.mkdir(parents=True)
+    judged.write_text(json.dumps({"instance_id": "f__6", "fail_to_pass": ["published::t1"], "judge": {"keep": True}}) + "\n")
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine"))
+    ok = {"fail_to_pass": ["t1"], "pass_to_pass": ["t0"], "dropped": {"missing-on-gold": 2}, "statuses": {"base": {}, "gold": {}}, "dockerfile": "FROM x",
+          "probe_dir": "/jobs/probe/f", "test_python": "/usr/bin/python3", "probe": {"kind": "github", "statuses": {"base": {}, "gold": {}}, "probe_dir": "/jobs/probe/f"}}
+    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo", probe_tests=lambda row, ws_: ok))
+    r = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "f__6"}))
+    row = json.loads(judged.read_text())
+    assert r["reproducible"] is True and r["dropped"] == {"missing-on-gold": 2} and row["probe"]["statuses"] is not None and row["dockerfile"] == "FROM x" and row["swebench_fail_to_pass"] == ["published::t1"]
+    # the real fallback raises ValueError when nothing fails on base and passes with gold: terminal, not infrastructure
+    judged2 = judged.with_name("g--7.judged.jsonl"); judged2.write_text(json.dumps({"instance_id": "g__7", "fail_to_pass": ["published::t1"], "judge": {"keep": True}}) + "\n")
+    def unusable(row, ws_): raise ValueError("probe needs target failure and regression coverage")
+    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo", probe_tests=unusable))
+    r2 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged2), "instance_id": "g__7"}))
+    assert r2["reproducible"] is False and r2["fail_to_pass"] == [] and "probe needs target failure" in r2["reason"] and r2["dropped"] == {"probe-error": "probe needs target failure and regression coverage"}
+    assert json.loads(judged2.read_text())["reject_reason"] == "not-reproducible-offline"
+    # HarborRunError-like failures propagate (the child fails and stays rerunnable)
+    judged3 = judged.with_name("h--8.judged.jsonl"); judged3.write_text(json.dumps({"instance_id": "h__8", "judge": {"keep": True}}) + "\n")
+    class HarborRunError(RuntimeError): pass
+    def broken(row, ws_): raise HarborRunError("no trial dir")
+    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo", probe_tests=broken))
+    with pytest.raises(HarborRunError): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged3), "instance_id": "h__8"}))
+    # neither probe importable: the error names the missing function
+    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo"))
+    with pytest.raises(Exception, match="swesim.stages.mine.probe_candidates"): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged3), "instance_id": "h__8"}))
 
 
 def test_env_run_tasks_two_scenarios_bounded_and_progress():
@@ -1236,12 +1307,19 @@ def test_setup_script_contract():
 
 def test_update_script_contract():
     text = (ROOT / "scripts/vm/update.sh").read_text(); setup = (ROOT / "scripts/vm/setup.sh").read_text()
-    for needle in ("git status -sb", "[ahead", "refusing to update", "gcloud compute ssh --quiet", "cd /opt/swesim", "pull --ff-only",
-                   "uv sync --extra dev --frozen", "systemctl --user restart swesim-worker swesim-dashboard", "is-active", "git rev-parse --short HEAD",
-                   "GCP_PROJECT", "GCP_ZONE", "SWESIM_ENV_FILE"):
+    for needle in ("git fetch --quiet origin main", "git rev-list --count origin/main..HEAD", "refusing to update", "gcloud compute ssh --quiet", "cd /opt/swesim",
+                   "pull --ff-only", "uv sync --extra dev --frozen", "systemctl --user restart swesim-worker swesim-dashboard", "is-active", "git rev-parse --short HEAD",
+                   "is not origin/main", "FAILED_UNITS", "GCP_PROJECT", "GCP_ZONE", "SWESIM_ENV_FILE"):
         assert needle in text, needle
+    assert "[ahead" not in text                                                                                # guard compares against origin/main, not the branch upstream
     assert "swesim-temporal" in text and "restart swesim-temporal" not in text and "swesim-trial" not in text   # never restarts the server or trial units
     assert "checkout --quiet -B main" in setup and "--set-upstream-to=origin/main" in setup                  # pull --ff-only needs a tracking branch
+    # guard logic: refuses when HEAD carries commits origin/main lacks, passes when it does not
+    refuse = 'AHEAD=2; if [ "$AHEAD" != "0" ]; then echo refusing; exit 1; fi; echo ok'
+    cp = subprocess.run(["bash", "-c", refuse], capture_output=True, text=True); assert cp.returncode == 1 and "refusing" in cp.stdout
+    # the VM-side unit check exits non-zero when a unit is not active
+    units = 'FAILED_UNITS=0; for state in active failed active; do [ "$state" = "active" ] || FAILED_UNITS=1; done; [ "$FAILED_UNITS" = "0" ] || exit 1'
+    assert subprocess.run(["bash", "-c", units]).returncode == 1
     # the clone stores no credentials: both scripts hand GH_TOKEN to git through a transient helper, never .git/config
     helper = "credential.helper=!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f"
     assert helper in text and "-c credential.helper= -c" in text and "env_get /etc/swesim/env GH_TOKEN" in text
@@ -1250,10 +1328,6 @@ def test_update_script_contract():
     cp = subprocess.run(["bash", "-c", "f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f"], capture_output=True, text=True, env={**os.environ, "GH_TOKEN": "fake-token-value"})
     assert cp.stdout == "username=x-access-token\npassword=fake-token-value\n"
     # the refusal really triggers on an "ahead" status line (function-level check of the guard logic)
-    guard = 'STATUS_LINE="## main...origin/main [ahead 2]"; if printf "%s" "$STATUS_LINE" | grep -q "\\[ahead"; then echo refusing; exit 1; fi; echo ok'
-    cp = subprocess.run(["bash", "-c", guard], capture_output=True, text=True); assert cp.returncode == 1 and "refusing" in cp.stdout
-    ok = 'STATUS_LINE="## main...origin/main"; if printf "%s" "$STATUS_LINE" | grep -q "\\[ahead"; then echo refusing; exit 1; fi; echo ok'
-    cp = subprocess.run(["bash", "-c", ok], capture_output=True, text=True); assert cp.returncode == 0 and "ok" in cp.stdout
     doc = (ROOT / "docs/ops.md").read_text()
     assert "scripts/vm/update.sh" in doc and "git pull --ff-only" in doc
 

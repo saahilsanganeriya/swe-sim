@@ -35,10 +35,13 @@ Candidate ids and reruns: a candidate that reached a terminal outcome (`valid`, 
 (provider outage, Harbor/Modal error, a cancelled parent) FAILS the candidate workflow (`error` in the parent's result, with
 the cause), and the child id uses `ALLOW_DUPLICATE_FAILED_ONLY`: to recover, start another `CreateTasksWorkflow` with the
 same source (only the failed candidates run again; judged/probed/drafted files on disk are retained, so the rerun resumes
-from the first missing artifact), or start the single candidate with `swesim create --source <repo-or-pool> --max-candidates 1`
-after fixing the cause. Sources: one mine output file per pool/repo, so a batch must not list the same pool/repo twice
-(`CreateTasksWorkflow` refuses duplicate source keys before running anything); run one `CreateTasksWorkflow` per source at a
-time, because two concurrent batches on the same source would rewrite the same candidates file.
+from the first missing artifact). To rerun exactly one candidate, give the batch a single-candidate source: github-repo
+`{kind: "github-repo", repo, pr: <number>}` or swebench-annotated `{kind: "swebench-annotated", pool, instance_ids: ["<id>"]}`
+(the `swesim create --source ...` CLI that builds these is pending integrator wiring; until then start `CreateTasksWorkflow`
+through `swesim.workflows.client.start_create`). Sources: one mine output file per pool/repo, so a batch must not list the
+same pool/repo twice (`CreateTasksWorkflow` refuses duplicate source keys before running anything; keys are normalized, so
+`https://github.com/X/A/`, `x/a.git` and `x/a` count as the same repo); run one `CreateTasksWorkflow` per source at a time,
+because two concurrent batches on the same source would rewrite the same candidates file.
 
 `RunTasksWorkflow` runs selected scenario ids on selected models: `plan_trials` per scenario, `TrialWorkflow` children (id = trial
 id, `REJECT_DUPLICATE`) at most `max_parallel_trials` at a time (default 1; raise it on the VM), then score + export per
@@ -78,14 +81,16 @@ verified with `systemd-analyze --user verify`, then `systemctl --user enable --n
 Update the VM to the current `origin/main` (routine deploys):
 
 ```bash
-git push                         # update.sh refuses while `git status -sb` shows the branch is ahead of its upstream
+git push                         # update.sh fetches origin/main and refuses while HEAD has commits origin/main lacks
 bash scripts/vm/update.sh        # on the VM: cd /opt/swesim && git pull --ff-only && uv sync --extra dev --frozen
                                  #            && systemctl --user restart swesim-worker swesim-dashboard
 ```
 
-It prints the three unit states (`swesim-temporal`, `swesim-worker`, `swesim-dashboard`) and the checked-out commit. It never
+It asserts that the VM's `HEAD` equals `origin/main` after the pull, prints the three unit states (`swesim-temporal`,
+`swesim-worker`, `swesim-dashboard`) and the checked-out commit, and exits non-zero if any unit is not `active`. It never
 restarts the Temporal server or a trial unit; a restarted worker resumes polling running trials (the launch-once rule
-applies). `/opt/swesim` is a `main` checkout tracking `origin/main` (set up by `setup.sh`) with no stored credentials; the
+applies). A VM bootstrapped by an earlier `setup.sh` (detached `HEAD`) fails the pull with "You are not currently on a
+branch" and restarts nothing; migrate it once with `git -C /opt/swesim checkout -B main origin/main` or rerun `setup.sh`. `/opt/swesim` is a `main` checkout tracking `origin/main` (set up by `setup.sh`) with no stored credentials; the
 pull reads the read-only `GH_TOKEN` from `/etc/swesim/env` with the `env_get` line parser and passes it through a transient
 credential helper (`git -c credential.helper= -c 'credential.helper=!f() { ... }; f' pull --ff-only`, token in the process
 environment only, never in `.git/config`). Full re-bootstrap (packages, Temporal CLI, units) or pinning a specific commit:

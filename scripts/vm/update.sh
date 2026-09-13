@@ -28,16 +28,16 @@ GCP_PROJECT=${GCP_PROJECT:-$(env_get "$ENV_FILE" GCP_PROJECT || true)}
 GCP_ZONE=${GCP_ZONE:-$(env_get "$ENV_FILE" GCP_ZONE || true)}
 : "${GCP_PROJECT:?GCP_PROJECT missing (environment or $ENV_FILE)}" "${GCP_ZONE:?GCP_ZONE missing (environment or $ENV_FILE)}"
 
-STATUS_LINE=$(git status -sb | head -n1)
-if printf '%s' "$STATUS_LINE" | grep -q '\[ahead'; then
-  echo "refusing to update: this branch has unpushed commits ($STATUS_LINE); push first so origin/main carries them" >&2
+# The VM deploys origin/main, so the guard compares HEAD against origin/main explicitly (not the branch's own upstream):
+# any local commit that origin/main does not carry would be missing from the deployment.
+git fetch --quiet origin main
+AHEAD=$(git rev-list --count origin/main..HEAD)
+if [ "$AHEAD" != "0" ]; then
+  echo "refusing to update: HEAD has $AHEAD commit(s) that origin/main does not carry ($(git status -sb | head -n1)); merge/push to main first" >&2
   exit 1
 fi
-if ! printf '%s' "$STATUS_LINE" | grep -q '\.\.\.'; then
-  echo "warning: the current branch has no upstream; cannot tell whether it is pushed ($STATUS_LINE)" >&2
-fi
-LOCAL_MAIN=$(git rev-parse --short origin/main 2>/dev/null || echo unknown)
-echo "updating $VM_NAME to origin/main (laptop sees origin/main at $LOCAL_MAIN; run 'git fetch' first if that is stale)" >&2
+LOCAL_MAIN=$(git rev-parse origin/main)
+echo "updating $VM_NAME to origin/main ${LOCAL_MAIN:0:12}" >&2
 
 # Runs on the VM. The clone stores no credentials: GH_TOKEN is read from /etc/swesim/env with the env_get line parser and
 # handed to git through a transient credential helper for this one pull (process environment only; never .git/config).
@@ -61,13 +61,25 @@ env_get() {
 TOKEN=$(env_get /etc/swesim/env GH_TOKEN) || { echo "GH_TOKEN missing from /etc/swesim/env" >&2; exit 1; }
 GH_TOKEN="$TOKEN" git -c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f' pull --ff-only
 unset TOKEN
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+  echo "HEAD $(git rev-parse --short HEAD) is not origin/main $(git rev-parse --short origin/main) after the pull; refusing to restart" >&2
+  exit 1
+fi
 uv sync --extra dev --frozen --python 3.12
 systemctl --user restart swesim-worker swesim-dashboard
 sleep 3
 echo "units:"
+FAILED_UNITS=0
 for unit in swesim-temporal swesim-worker swesim-dashboard; do
-  printf '  %s: %s\n' "$unit" "$(systemctl --user is-active "$unit" || true)"
+  state=$(systemctl --user is-active "$unit" || true)
+  printf '  %s: %s\n' "$unit" "$state"
+  [ "$state" = "active" ] || FAILED_UNITS=1
 done
 echo "commit: $(git rev-parse --short HEAD) $(git log -1 --format=%s)"
+if [ "$FAILED_UNITS" != "0" ]; then
+  echo "a unit is not active after the restart; inspect with: journalctl --user -u swesim-worker -n 50" >&2
+  exit 1
+fi
 REMOTE_EOF
 gcloud compute ssh --quiet "$VM_NAME" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --command "$REMOTE"
+echo "VM $VM_NAME is at origin/main ${LOCAL_MAIN:0:12}." >&2

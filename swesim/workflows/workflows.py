@@ -310,7 +310,7 @@ class CandidateWorkflow:
             # published lists do not always reproduce offline. One attempt; harbor_cli reconciles an existing job.
             await self._stage("probing", scenario_id=sid)
             probed = await act("probe_candidate_activity", {"judged_path": judged["judged_path"], "instance_id": iid, "scenario_id": sid,
-                                                            "max_builds": p.get("max_builds", 1)}, 150)
+                                                            "max_builds": p.get("max_builds", 1)}, 160)  # probe_tests' Harbor deadline is 150 min
             if not probed.get("fail_to_pass"):
                 return self._done(sid, "not-reproducible-offline", [probed.get("reason") or "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold"], None)
             judged = {**judged, "judged_path": probed["judged_path"]}  # the probed row (measured lists) is what draft reads
@@ -327,8 +327,9 @@ class CandidateWorkflow:
         except Exception as e:
             # Infrastructure failure (LLM, Harbor, a lost parent): FAIL the child so `create:<sid>` can be started again
             # (ALLOW_DUPLICATE_FAILED_ONLY); the parent records `error` from the cause and siblings are unaffected.
-            self._done(sid, "error", [f"{self.state.get('stage')}: {_err(e)}"], None)
-            raise ApplicationError(f"candidate {iid} failed at stage {self.state.get('stage')}: {_err(e)}", non_retryable=True) from e
+            stage = self.state.get("stage")
+            self._done(sid, "error", [f"{stage}: {_err(e)}"], None)
+            raise ApplicationError(f"candidate {iid} failed at stage {stage}: {_err(e)}", non_retryable=True) from e
 
 
 def _mine_params(src: dict) -> dict:
@@ -339,8 +340,23 @@ def _mine_params(src: dict) -> dict:
     return {k: v for k, v in out.items() if v is not None}
 
 
+def _normalize_repo(repo: str) -> str:
+    """`https://github.com/X/A/`, `x/a.git`, `git@github.com:x/a` -> `x/a` (the same spellings mine merges into one output file)."""
+    r = str(repo).strip().casefold()
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:", "github.com/"):
+        if r.startswith(prefix):
+            r = r[len(prefix):]
+    r = r.rstrip("/")
+    if r.endswith(".git"):
+        r = r[:-4]
+    return r.rstrip("/")
+
+
 def _source_key(src: dict) -> str:
-    return f"{src.get('kind', 'swebench-annotated')}:{src.get('repo') or src.get('pool', 'A')}"
+    kind = src.get("kind", "swebench-annotated")
+    if kind == "github-repo":
+        return f"{kind}:{_normalize_repo(src.get('repo') or '')}"
+    return f"{kind}:{str(src.get('pool', 'A')).strip().casefold()}"
 
 
 @workflow.defn
