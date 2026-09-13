@@ -122,6 +122,7 @@ def write_trial(ws: Workspace, spec: ScenarioSpec, *, model: str = SONNET, condi
 
 def test_stakeholder_version_from_run_config_then_transcript_annotations():
     assert REC.stakeholder_version({"stakeholder": {"prompt_version": "v2"}}, {"events": []}) == ("v2", "run_config.stakeholder.prompt_version")
+    assert REC.stakeholder_version({"stakeholder": {"prompt_version": "v3"}}, {"events": v2_events()}) == ("v3", "run_config.stakeholder.prompt_version")
     v, why = REC.stakeholder_version({"stakeholder": {"prompt_version": "v1"}}, {"events": v2_events()})
     assert v == "v2" and "regenerated" in why
     v, why = REC.stakeholder_version({"stakeholder": {"prompt_version": "v1"}}, {"events": v2_events(annotated=False)[:2]})

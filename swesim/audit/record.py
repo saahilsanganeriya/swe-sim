@@ -239,15 +239,22 @@ def load_scenario(layout, scenario_id: str) -> ScenarioBundle:
 
 # ---------------------------------------------------------------- trials
 
+_PROMPT_VERSION = re.compile(r"^v(\d+)$")
+
+
 def stakeholder_version(run_config: dict, transcript: dict | None) -> tuple[str | None, str]:
-    """("v1" | "v2" | None, evidence). See the module contract."""
+    """("v1" | "v2" | "v3" ... | None, evidence). A run_config prompt version of v2 or later is taken as written (v3 = the v2
+    prompt on Opus 5; versions never pool). A v1 run_config is not trusted alone because the v2 stakeholder shipped without
+    bumping the default: replies carrying the v2 reply-filter annotations or the confirm channel mean v2; replies without
+    them mean v1 (legacy); no reply at all leaves the version undeterminable (None)."""
     pv = ((run_config or {}).get("stakeholder") or {}).get("prompt_version")
-    if pv == "v2":
-        return "v2", "run_config.stakeholder.prompt_version"
+    m = _PROMPT_VERSION.match(pv) if isinstance(pv, str) else None
+    if m and int(m.group(1)) >= 2:
+        return pv, "run_config.stakeholder.prompt_version"
     replies = [e for e in ((transcript or {}).get("events") or [])
                if isinstance(e, dict) and e.get("kind") == "message" and e.get("role") == "assistant"]
     if not replies:
-        return None, "no exchange in the transcript to tell the stakeholder version from"
+        return None, f"no exchange in the transcript to tell the stakeholder version from (run_config says {pv!r})"
     if any(k in e for e in replies for k in V2_ANNOTATION_KEYS) or any(e.get("exchange") == "confirm" for e in replies):
         return "v2", "replies carry the v2 reply-filter annotations (regenerated/redacted_terms) or the confirm channel"
     return "v1", f"run_config.stakeholder.prompt_version={pv!r} and replies carry no filter annotations"

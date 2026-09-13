@@ -151,7 +151,7 @@ class TrialAudit(Label):
     trial_id: str
     scenario_id: str | None
     spec_hash: str | None
-    stakeholder_version: str | None     # "v1" | "v2" | None (no exchange to tell from)
+    stakeholder_version: str | None     # "v1" | "v2" | "v3" ... | None (no exchange to tell from); versions never pool
     legacy: bool                        # stakeholder v1: labelled, never pooled with v2, not read by the model
     questions: list[QuestionLabel]
     replies: list[ReplyLabel]
