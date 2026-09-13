@@ -18,7 +18,7 @@ tests/_core/test_scales.py::TestNominal::test_object_order_subset
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 ================================================================================================ PASSES ================================================================================================
-------------------------------------------------------------------- generated xml file: /tmp/swesim-work/results-wvkfjed4/junit.xml --------------------------------------------------------------------
+------------------------------------------------------------------- generated xml file: /tmp/swesim-work/results-tq1hkjun/junit.xml --------------------------------------------------------------------
 ======================================================================================= short test summary info ========================================================================================
 PASSED tests/_core/test_scales.py::TestContinuous::test_coordinate_defaults
 PASSED tests/_core/test_scales.py::TestContinuous::test_coordinate_transform
@@ -105,4 +105,4 @@ PASSED tests/_core/test_scales.py::TestTemporal::test_tick_locator
 PASSED tests/_core/test_scales.py::TestTemporal::test_tick_upto
 PASSED tests/_core/test_scales.py::TestTemporal::test_label_formatter
 PASSED tests/_core/test_scales.py::TestTemporal::test_label_concise
-==================================================================================== 85 passed, 2 warnings in 2.05s ====================================================================================
+==================================================================================== 85 passed, 2 warnings in 2.41s ====================================================================================

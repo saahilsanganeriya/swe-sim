@@ -2,7 +2,9 @@ FROM swebench/sweb.eval.x86_64.mwaskom_1776_seaborn-3190@sha256:5ce876a52439385a
 RUN cd /testbed && git reset --hard 4a9e54962a29c12a8b103d75f838e0e795a6974d
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends curl bash git ca-certificates procps && rm -rf /var/lib/apt/lists/*
+# build-essential: Harbor's mini-swe-agent setup checks for gcc/make and otherwise runs apt-get inside the sandbox, where the
+# strict allowlist blocks it (observed on the python@digest pypdf image: NetworkConnectionError before the agent started).
+RUN apt-get update && apt-get install -y --no-install-recommends curl bash git ca-certificates procps build-essential && rm -rf /var/lib/apt/lists/*
 RUN if id agent >/dev/null 2>&1; then echo 'agent user pre-exists in base image; rejected for this pilot' >&2; exit 1; fi && useradd -m agent
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && uv --version
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python

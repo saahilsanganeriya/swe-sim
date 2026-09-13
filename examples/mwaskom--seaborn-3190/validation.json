@@ -306,19 +306,19 @@
     "hits_block_found": true
   },
   "trial_dirs": {
-    "nop": "workspace/jobs/validate/mwaskom--seaborn-3190/750e014c977e71c3/mwaskom--seaborn-3190--nop/mwaskom--seaborn-3190__full__QuHBJu4",
-    "oracle": "workspace/jobs/validate/mwaskom--seaborn-3190/750e014c977e71c3/mwaskom--seaborn-3190--oracle/mwaskom--seaborn-3190__full__aiS8tM9",
-    "plausible-wrong:xor-based-boolean-handling": "workspace/jobs/validate/mwaskom--seaborn-3190/750e014c977e71c3/mwaskom--seaborn-3190--plausible-wrong-xor-based-boolean-handling/mwaskom--seaborn-3190__full__67vXEC2",
-    "tamper:tamper-root-conftest": "workspace/jobs/validate/mwaskom--seaborn-3190/750e014c977e71c3/mwaskom--seaborn-3190--tamper-tamper-root-conftest/mwaskom--seaborn-3190__full__G7Xhtuv",
-    "tamper:tamper-sitecustomize": "workspace/jobs/validate/mwaskom--seaborn-3190/750e014c977e71c3/mwaskom--seaborn-3190--tamper-tamper-sitecustomize/mwaskom--seaborn-3190__full__Y2oHWX5",
-    "tamper:tamper-skip-marker": "workspace/jobs/validate/mwaskom--seaborn-3190/750e014c977e71c3/mwaskom--seaborn-3190--tamper-tamper-skip-marker/mwaskom--seaborn-3190__full__3FeCWYL",
-    "probe": "workspace/jobs/validate/mwaskom--seaborn-3190/750e014c977e71c3/mwaskom--seaborn-3190--probe/mwaskom--seaborn-3190__full__vezKGC7"
+    "nop": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--nop/mwaskom--seaborn-3190__full__8PQCZhG",
+    "oracle": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--oracle/mwaskom--seaborn-3190__full__JxCGXMK",
+    "plausible-wrong:xor-based-boolean-handling": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--plausible-wrong-xor-based-boolean-handling/mwaskom--seaborn-3190__full__bWCyoou",
+    "tamper:tamper-root-conftest": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--tamper-tamper-root-conftest/mwaskom--seaborn-3190__full__F2ezArT",
+    "tamper:tamper-sitecustomize": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--tamper-tamper-sitecustomize/mwaskom--seaborn-3190__full__j9EmqYY",
+    "tamper:tamper-skip-marker": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--tamper-tamper-skip-marker/mwaskom--seaborn-3190__full__JG5Ycer",
+    "probe": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--probe/mwaskom--seaborn-3190__full__ijcdJHW"
   },
   "spec_hash": "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b",
   "source": "swebench-annotated",
   "source_ref": "mwaskom__seaborn-3190",
   "environment_provider": "modal",
   "image_digest": "sha256:5ce876a52439385a2638f21617febf25a333c24b0db555cb9e37230b4db2cdcc",
-  "compiled_hash": "750e014c977e71c35690029a96337399f29bde25a1ac14598699247580c55fd7",
+  "compiled_hash": "cfa48d128c0f11c80557e151867823bb7c7cc4453081050adf623aadbbabbfec",
   "run_config_hash": "0b03142e1e3016e0b2cbb69e4afd1203616a6c66d3b6fdc9a1acf3939255cbcf"
 }

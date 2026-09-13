@@ -14,7 +14,7 @@ spec_hash = "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b"
 condition = "full"
 brief_profile = "natural"
 run_config_hash = "0b03142e1e3016e0b2cbb69e4afd1203616a6c66d3b6fdc9a1acf3939255cbcf"
-compiled_hash = "750e014c977e71c35690029a96337399f29bde25a1ac14598699247580c55fd7"
+compiled_hash = "cfa48d128c0f11c80557e151867823bb7c7cc4453081050adf623aadbbabbfec"
 annotated_difficulty = "\u003c15 min fix"
 image_digest = "sha256:5ce876a52439385a2638f21617febf25a333c24b0db555cb9e37230b4db2cdcc"
 
