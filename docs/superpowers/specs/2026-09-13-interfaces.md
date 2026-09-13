@@ -301,8 +301,10 @@ pools and Jobs, read-only on the console.
 - `trials/<tid>/costs.json` — list of `CostRecord` (models stream, `swesim/costs.py`); projected to `costs` and `TrialRow.cost_usd/input_tokens/output_tokens`.
 - Worker registration: `worker.py` registers `swesim.workflows.activities.ALL + swesim.index.activities.ALL + swesim.audit.activities.ALL`,
   each imported inside a `try/except ImportError` so the worker starts while a stream's module is not merged yet.
-- Leaderboard gate (storage implements in `leaderboard()`, console shows): a scenario appears only when `validation_status == "valid"`,
-  `difficulty_tier in ("informative",)` (saturated shown separately, broken never), and `task_sense.coherent and task_sense.fair_tests`.
+- Leaderboard gate (storage implements in `leaderboard()`, console shows; user ruling 2026-09-13 14:50 PDT): a scenario appears when
+  `validation_status == "valid" ∧ task_sense.coherent ∧ task_sense.fair_tests`. `difficulty_tier` is informational — a chip on the row and an
+  optional operator filter, never a gate: difficulty is model-dependent and is read on `/trends` as the capability gradient
+  (`swesim/dashboard/gradient.py`). Until 14:50 the gate additionally required `difficulty_tier == "informative"` (saturated separate, broken never).
 
 ## 10. Ownership (disjoint; ask the integrator for anything else)
 
