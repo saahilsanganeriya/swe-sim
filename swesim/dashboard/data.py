@@ -1,44 +1,50 @@
-"""Workspace readers for the dashboard.
+"""Artifact readers for one trial or one scenario, and the live-transcript client.
 
-Everything here reads files the pipeline already writes (``workspace/scenarios/<id>/*``, ``workspace/trials/<id>/*``,
-``registry.json``) and returns plain dicts for the renderer and the JSON APIs. Every reader is defensive: a missing
-or malformed file is an empty state, never a 500. The stakeholder service is contacted only for the live transcript
-of a running trial (``fetch_live_transcript``), with a short cache for the overview poll.
+Contract
+- Lists, filters, funnels and scores come from the ``IndexReader`` (``swesim.dashboard.access``); this module never
+  globs the workspace for lists. It reads the artifacts one page shows: the files of one trial (record, transcript,
+  trajectory, report, reward, instruction) or one scenario (spec, validation, approval, compile, judge, difficulty,
+  audit), through the ``Layout`` paths.
+- Every reader is defensive: a missing or malformed file is an empty state, never a 500.
+- ``fetch_live_transcript`` contacts the stakeholder service for a running trial with ``Settings.stakeholder_url`` and the
+  worker secret read at the point of use (``swesim.settings.secret``); errors degrade to a type name, never a URL or secret.
 """
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
-from swesim.stages.score import (
-    OUTCOME_NAMES,
-    UNRESOLVED_FILES,
-    count_exchanges,
-    normalize_record,
-    outcome_code,
-    unresolved_attempt,
-)
+from swesim.settings import MissingSecret, Settings, secret
+from swesim.stages.score import OUTCOME_NAMES, normalize_record, outcome_code, unresolved_attempt
 
-TRIAL_RE = re.compile(r"[a-f0-9]{24}")
-ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{2,63}")
-LIVE_TIMEOUT = 10.0          # episode page / timeline API: one trial, the reviewer is waiting for it
-LIVE_POLL_TIMEOUT = 2.0      # overview poll: per-trial fetch timeout
-LIVE_BUDGET = 2.0            # overview poll: total wall-clock budget for all live fetches together
-LIVE_CACHE_TTL = 6.0         # >= the 5 s poll so a trial is fetched at most once per poll cycle
+TRIAL_RE = re.compile(r"^[a-f0-9]{24}$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
+LIVE_TIMEOUT = 10.0
+LIVE_CACHE_TTL = 6.0
 REFUSAL_PREFIX = "I have to step away now"
-STAGES = ("candidate", "judged", "drafted", "approved", "compiled", "validated", "registered")
-SCENARIO_FILES = ("scenario.json", "scenario.draft.json", "draft.meta.json", "judge.json", "approval.json", "compile.json",
-                  "validation.json", "scores.json")
 _live_cache: dict[str, tuple[float, dict, str | None]] = {}
-_LIVE_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="swesim-live")
+# Files a reader may open from the episode page. Fixed names only; nothing else under the trial dir is served.
+TRIAL_FILES: dict[str, tuple[str, str]] = {
+    "record.json": ("trial", "record.json"), "reward.json": ("trial", "reward.json"), "report.json": ("trial", "report.json"),
+    "transcript.json": ("trial", "transcript.json"), "run_config.json": ("trial", "run_config.json"), "spec.json": ("trial", "spec.json"),
+    "status.json": ("trial", "status.json"), "label.json": ("trial", "label.json"), "request.json": ("trial", "request.json"),
+    "runner-error.json": ("trial", "runner-error.json"), "launch.json": ("trial", "launch.json"), "costs.json": ("trial", "costs.json"),
+    "audit.json": ("trial", "audit.json"), "launcher.log": ("trial", "launcher.log"),
+    "harbor-result.json": ("harbor", "result.json"), "trajectory.json": ("harbor", "agent/trajectory.json"),
+    "verifier-reward.json": ("harbor", "verifier/reward.json"), "verifier-report.json": ("harbor", "verifier/report.json"),
+    "patch.diff": ("harbor", "verifier/patch.diff"),
+}
+# Evaluator-only artifacts (Codex B-P2-6): raw record/transcript/spec carry facts, redactions and hidden test ids; the
+# audit carries labels; scenario.json/draft carry author-only facts and hidden assets; judge/draft metadata is internal.
+EVALUATOR_TRIAL_FILES = frozenset(TRIAL_FILES) - frozenset({"reward.json", "report.json", "status.json", "costs.json", "label.json", "patch.diff"})
+SCENARIO_FILES = ("scenario.json", "scenario.draft.json", "draft.meta.json", "judge.json", "approval.json", "compile.json", "validation.json",
+                  "difficulty.json", "audit.json", "scores.json")
+EVALUATOR_SCENARIO_FILES = frozenset({"scenario.json", "scenario.draft.json", "draft.meta.json", "judge.json", "audit.json"})
 
 
 # ----------------------------------------------------------------------------- primitives
@@ -59,7 +65,7 @@ def to_ts(value) -> float | None:
     if isinstance(value, str) and value.strip():
         s = value.strip()
         try:
-            dt = datetime.fromisoformat(s)  # Python 3.11+ accepts a trailing 'Z'
+            dt = datetime.fromisoformat(s)
         except ValueError:
             try:
                 return float(s)
@@ -77,55 +83,38 @@ def clock(ts: float | None) -> str:
     return datetime.fromtimestamp(ts, UTC).strftime("%H:%M:%S") if ts is not None else "no timestamp"
 
 
-def mtime(p: Path) -> float | None:
-    try:
-        return p.stat().st_mtime
-    except OSError:
-        return None
-
-
-def short(x, n: int = 12) -> str:
-    s = "" if x is None else str(x)
-    return s if len(s) <= n else s[:n] + "…"
-
-
 # ----------------------------------------------------------------------------- live transcript
 
-def fetch_live_transcript(tid: str, timeout: float | None = None) -> tuple[dict, str | None]:
-    """``GET {SWESIM_STAKEHOLDER_URL}/transcript/{tid}`` with the worker secret. Returns (transcript, error).
-    Reads only the two keys it needs from the environment (python-dotenv, SWESIM_ENV_FILE); never logs them."""
-    from dotenv import load_dotenv
-    load_dotenv(os.environ.get("SWESIM_ENV_FILE", str(Path.home() / "Documents" / ".env")), override=False)
-    base = os.environ.get("SWESIM_STAKEHOLDER_URL", "").rstrip("/")
-    secret = os.environ.get("SWESIM_WORKER_SECRET", "")
+def fetch_live_transcript(tid: str, settings: Settings, timeout: float | None = None) -> tuple[dict, str | None]:
+    """``GET {stakeholder_url}/transcript/{tid}`` with the worker secret. Returns (transcript, error-type-or-None)."""
+    base = (settings.stakeholder_url or "").rstrip("/")
     if not base:
         return {}, "SWESIM_STAKEHOLDER_URL not configured"
-    if not secret:
+    try:
+        token = secret("SWESIM_WORKER_SECRET", settings)
+    except MissingSecret:
         return {}, "SWESIM_WORKER_SECRET not configured"
     try:
-        r = httpx.get(f"{base}/transcript/{tid}", headers={"X-Worker-Secret": secret}, timeout=LIVE_TIMEOUT if timeout is None else timeout)
+        r = httpx.get(f"{base}/transcript/{tid}", headers={"X-Worker-Secret": token}, timeout=LIVE_TIMEOUT if timeout is None else timeout)
         r.raise_for_status()
         data = r.json()
         return (data if isinstance(data, dict) else {}), None
-    # Any failure degrades to "no live transcript", reported by exception type only (never URL or secret).
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 - any failure degrades to "no live transcript", reported by type only
         return {}, type(e).__name__
 
 
-def live_transcript_cached(tid: str, now: float | None = None, timeout: float | None = None) -> tuple[dict, str | None]:
-    """The overview polls every few seconds for every running trial; bound the calls to one per trial per TTL
-    (errors are cached too, so a dead stakeholder cannot slow every poll)."""
+def live_transcript_cached(tid: str, settings: Settings, now: float | None = None) -> tuple[dict, str | None]:
     now = time.time() if now is None else now
     hit = _live_cache.get(tid)
     if hit and now - hit[0] < LIVE_CACHE_TTL:
         return hit[1], hit[2]
-    transcript, error = fetch_live_transcript(tid, LIVE_POLL_TIMEOUT if timeout is None else timeout)
+    transcript, error = fetch_live_transcript(tid, settings)
     _live_cache[tid] = (now, transcript, error)
     return transcript, error
 
 
 def patience_of(transcript: dict, run_config: dict | None = None) -> dict:
-    """{start, end, tier, questions, reviews} from a transcript (live or frozen), start falling back to the run config."""
+    """{start, end, tier, questions, confirmations, reviews} from a transcript; start falls back to the run config."""
     events = [e for e in (transcript or {}).get("events") or [] if isinstance(e, dict) and e.get("kind") == "message"]
     last_reply = next((e for e in reversed(events) if e.get("role") == "assistant"), None)
     start = (transcript or {}).get("patience_start")
@@ -136,308 +125,127 @@ def patience_of(transcript: dict, run_config: dict | None = None) -> dict:
         end = last_reply.get("patience_remaining")
     return {"start": start, "end": end, "tier": (last_reply or {}).get("tier"),
             "questions": sum(1 for e in events if e.get("role") == "user" and e.get("exchange") == "ask"),
+            "confirmations": sum(1 for e in events if e.get("role") == "user" and e.get("exchange") == "confirm"),
             "reviews": sum(1 for e in events if e.get("role") == "user" and e.get("exchange") == "review")}
 
 
-# ----------------------------------------------------------------------------- trials
+# ----------------------------------------------------------------------------- one trial
 
-def trial_dirs(root: Path) -> list[Path]:
-    trials = root / "trials"
-    if not trials.is_dir():
-        return []
-    return sorted(p for p in trials.iterdir() if p.is_dir() and TRIAL_RE.fullmatch(p.name)
-                  and any((p / name).exists() for name in ("record.json", *UNRESOLVED_FILES)))
+def _row(ts, seq, actor, kind, text, meta) -> dict:
+    return {"ts": ts, "ts_iso": iso(ts), "no_timestamp": ts is None, "seq": seq, "actor": actor, "kind": kind, "text": text, "meta": meta}
 
 
-def trial_row(d: Path, now: float | None = None, live: bool = False) -> dict:
-    """One board row from status.json plus record.json, or from whatever an unresolved attempt left behind.
-    With ``live=True`` a running trial's patience is fetched from the stakeholder service (cached)."""
-    now = time.time() if now is None else now
+def merge_timeline(traj: dict, transcript: dict, report: dict | None = None, reward: dict | None = None, status: dict | None = None) -> list[dict]:
+    """Interleave ATIF agent steps, stakeholder transcript messages (each stakeholder ``tool_calls`` entry its own row) and
+    one verifier outcome row, sorted by time; rows without a timestamp sort last and carry ``no_timestamp: True``."""
+    rows: list[dict] = []
+    for i, s in enumerate((traj or {}).get("steps") or []):
+        if not isinstance(s, dict):
+            continue
+        source = s.get("source", "agent")
+        actor = "agent" if source == "agent" else "harness"
+        kind = "agent-step" if source == "agent" else ("prompt" if source == "user" else "system")
+        rows.append(_row(to_ts(s.get("timestamp")), i, actor, kind, str(s.get("message") or ""), s))
+    last_exchange = None
+    for i, e in enumerate((transcript or {}).get("events") or []):
+        if not isinstance(e, dict) or e.get("kind") != "message":
+            continue
+        ts = to_ts(e.get("ts"))
+        if e.get("role") == "user":
+            actor, last_exchange = "agent", e.get("exchange") or last_exchange or "ask"
+            kind = last_exchange
+        else:
+            actor, kind = "stakeholder", e.get("exchange") or last_exchange or "reply"
+        rows.append(_row(ts, i, actor, kind, str(e.get("content") or ""), e))
+        for tool in e.get("tool_calls") or []:
+            rows.append(_row(ts, i, "stakeholder", "tool_call", json.dumps(tool), tool))
+    report, reward, status = report or {}, reward or {}, status or {}
+    if report.get("outcome") or reward.get("outcome_code") is not None:
+        name = report.get("outcome") or OUTCOME_NAMES[outcome_code({"reward": reward})]
+        text = name if not reward else f"{name}: reward={reward.get('reward')} success={reward.get('success')}"
+        ts = next((to_ts(status.get(k)) for k in ("finished_at", "completed_at", "ended_at", "updated_at") if status.get(k)), None)
+        ts = ts if ts is not None else to_ts(report.get("finished_at"))
+        rows.append(_row(ts, 1 << 30, "verifier", "outcome", text, {"report": report, "reward": reward, "status": status}))
+    return sorted(rows, key=lambda r: (r["ts"] is None, r["ts"] or 0.0, r["seq"]))
+
+
+def _trajectory(layout, tid: str, record: dict) -> dict:
+    if record.get("trial_dir"):
+        traj = read_json(Path(record["trial_dir"]) / "agent" / "trajectory.json")
+        if traj:
+            return traj
+    found = sorted((layout.jobs_dir("runs") / tid).glob("*/agent/trajectory.json"))
+    return read_json(found[0]) if len(found) == 1 else {}
+
+
+def load_trial(layout, tid: str, settings: Settings) -> dict | None:
+    """The artifact bundle of one trial (None when the directory does not exist)."""
+    if not TRIAL_RE.fullmatch(tid):
+        return None
+    d = layout.trial_dir(tid)
+    if not d.is_dir():
+        return None
     status = read_json(d / "status.json")
     raw = read_json(d / "record.json") if (d / "record.json").exists() else {}
     has_record = bool(raw)
-    rec = normalize_record(raw, d) if has_record else {}
-    u = ({} if has_record else unresolved_attempt(d)) or {}
+    record = normalize_record(raw, d) if has_record else {}
+    unresolved = None if has_record else unresolved_attempt(d)
     request = read_json(d / "request.json")
-    rc = rec.get("run_config") or request.get("run_config") or u.get("run_config") or {}
-    label = read_json(d / "label.json", default=None) or {}
-    code = outcome_code(rec) if rec.get("reward") else None
-    state = status.get("status") or u.get("status") or ("finished" if has_record else "unknown")
-    running = state == "running" and not has_record
-    started_at = status.get("started_at") or rec.get("started_at") or u.get("started_at")
-    finished_at = status.get("finished_at") or rec.get("finished_at") or u.get("finished_at")
-    started_ts, finished_ts = to_ts(started_at), to_ts(finished_at)
-    elapsed = None
-    if started_ts is not None:
-        end = finished_ts if finished_ts is not None else (now if running else None)
-        elapsed = max(0.0, end - started_ts) if end is not None else None
-    patience = patience_of(rec.get("transcript") or {}, rc) if has_record else {"start": None, "end": None, "tier": None,
-                                                                                     "questions": None, "reviews": None}
+    rc = record.get("run_config") or request.get("run_config") or (unresolved or {}).get("run_config") or {}
+    live = status.get("status") == "running" and not has_record
     live_error = None
-    if running and live:
-        transcript, live_error = live_transcript_cached(d.name, now)
-        if transcript:
-            patience = patience_of(transcript, rc)
-        elif patience["start"] is None:
-            patience = patience_of({}, rc)
-    elif running and patience["start"] is None:
-        patience = patience_of({}, rc)
-    report = rec.get("report") or {}
-    return {
-        "trial_id": d.name, "status": state, "running": running, "unresolved": not has_record,
-        "error_type": u.get("error_type"), "source_file": u.get("source_file"),
-        "scenario_id": rec.get("scenario_id") or request.get("scenario_id") or u.get("scenario_id"),
-        "condition": rec.get("condition") or request.get("condition") or u.get("condition"),
-        "brief_profile": rec.get("brief_profile") or rc.get("brief_profile") or u.get("brief_profile"),
-        "model": rec.get("model") or request.get("model") or rc.get("model") or u.get("model"),
-        "purpose": rec.get("purpose") or rc.get("purpose") or u.get("purpose"),
-        "attempt_index": rec.get("attempt_index", request.get("attempt_index")),
-        "outcome": OUTCOME_NAMES[code] if code is not None else None, "outcome_code": code,
-        "success": (rec.get("reward") or {}).get("success"), "reward": (rec.get("reward") or {}).get("reward"),
-        "questions": count_exchanges(rec, "ask") if has_record else patience.get("questions"),
-        "reviews": count_exchanges(rec, "review") if has_record else patience.get("reviews"),
-        "patience_start": patience.get("start"), "patience_end": patience.get("end"),  # the tier is a stakeholder internal: evaluator-only
-        "label": label.get("label"), "started_at": started_at, "finished_at": finished_at,
-        "started_ts": started_ts, "finished_ts": finished_ts, "elapsed_s": elapsed,
-        "simulator_validity": report.get("simulator_validity"), "transcript_binding_valid": report.get("transcript_binding_valid"),
-        "live_error": live_error, "spec_hash": rec.get("spec_hash") or request.get("spec_hash"),
-        "run_config_hash": rec.get("run_config_hash") or request.get("run_config_hash") or u.get("run_config_hash"),
-        "_rc": rc,
+    if live:
+        transcript, live_error = live_transcript_cached(tid, settings)
+    else:
+        transcript = record.get("transcript") or read_json(d / "transcript.json")
+    report = record.get("report") or read_json(d / "report.json")
+    reward = record.get("reward") or read_json(d / "reward.json")
+    traj = _trajectory(layout, tid, record)
+    ins = next((p for p in (d / "task" / "instruction.md", Path(record["task_dir"]) / "instruction.md" if record.get("task_dir") else None)
+                if p is not None and p.exists()), None)
+    u = unresolved or {}
+    meta = {
+        "scenario_id": record.get("scenario_id") or request.get("scenario_id") or u.get("scenario_id"),
+        "condition": record.get("condition") or request.get("condition") or u.get("condition"),
+        "brief_profile": record.get("brief_profile") or rc.get("brief_profile") or u.get("brief_profile"),
+        "model": record.get("model") or request.get("model") or rc.get("model") or u.get("model"),
+        "purpose": record.get("purpose") or rc.get("purpose") or u.get("purpose"),
+        "attempt_index": record.get("attempt_index", request.get("attempt_index")),
+        "spec_hash": record.get("spec_hash") or request.get("spec_hash"),
+        "run_config_hash": record.get("run_config_hash") or request.get("run_config_hash") or u.get("run_config_hash"),
+        "compiled_hash": record.get("compiled_hash") or rc.get("compiled_hash") or u.get("compiled_hash"),
+        "image_digest": (report or {}).get("image_digest"), "trial_dir": record.get("trial_dir"),
+        "stakeholder_model": (rc.get("stakeholder") or {}).get("model_id") or request.get("stakeholder_model"),
+        "started_at": status.get("started_at") or record.get("started_at"), "finished_at": status.get("finished_at") or record.get("finished_at"),
     }
+    patch = None
+    if record.get("trial_dir"):
+        p = Path(record["trial_dir"]) / "verifier" / "patch.diff"
+        if p.is_file():
+            try:
+                patch = p.read_text(errors="replace")
+            except OSError:
+                patch = None
+    return {"trial_id": tid, "dir": d, "status": {**{k: v for k, v in meta.items() if k in ("started_at", "finished_at") and v}, **status},
+            "record": record, "request": request, "live": live, "unresolved": unresolved, "live_transcript_error": live_error,
+            "transcript": transcript or {}, "report": report or {}, "reward": reward or {}, "trajectory": traj,
+            "instruction": ins.read_text() if ins else None, "label": read_json(d / "label.json", default=None) or None, "meta": meta,
+            "patience": patience_of(transcript or {}, rc), "files": list(TRIAL_FILES), "patch": patch,
+            "costs": read_json(d / "costs.json", default=[]), "audit": read_json(d / "audit.json")}
 
 
-def apply_live(row: dict, transcript: dict, error: str | None) -> None:
-    """Fold a live transcript (or its error) into a board row produced with live=False."""
-    row["live_error"] = error
-    if transcript:
-        pt = patience_of(transcript, row.get("_rc") or {})
-        row.update(patience_start=pt["start"], patience_end=pt["end"], questions=pt["questions"], reviews=pt["reviews"])
+def resolve_trial_file(layout, t: dict, name: str) -> Path | None:
+    base, rel = TRIAL_FILES[name]
+    if base == "trial":
+        return t["dir"] / rel
+    trial_dir = t["meta"].get("trial_dir")
+    if trial_dir:
+        return Path(trial_dir) / rel
+    found = sorted((layout.jobs_dir("runs") / t["trial_id"]).glob(f"*/{rel}"))
+    return found[0] if len(found) == 1 else None
 
 
-def trial_board(root: Path, now: float | None = None, live: bool = False) -> list[dict]:
-    now = time.time() if now is None else now
-    rows = [trial_row(d, now, live) for d in trial_dirs(root)]
-    rows.sort(key=lambda r: (r["started_ts"] or 0.0, r["trial_id"]), reverse=True)
-    for r in rows:
-        r.pop("_rc", None)
-    return rows
-
-
-async def trial_board_async(root: Path, now: float | None = None, budget: float | None = None) -> list[dict]:
-    """Board rows with live patience for running trials, fetched concurrently in threads within ``budget`` seconds total.
-    Trials whose fetch did not finish in time keep their file-derived values and say so; the fetch completes in the
-    background and fills the cache for the next poll."""
-    now = time.time() if now is None else now
-    budget = LIVE_BUDGET if budget is None else budget
-    rows = [trial_row(d, now, live=False) for d in trial_dirs(root)]
-    running = [r for r in rows if r["running"]]
-    if running:
-        loop = asyncio.get_running_loop()
-        # A dedicated bounded pool: stakeholder fetches never occupy the default executor, and an event loop that is torn
-        # down after the response (asyncio.run, TestClient) does not wait for stragglers still inside the 2 s timeout.
-        tasks = {r["trial_id"]: asyncio.ensure_future(loop.run_in_executor(_LIVE_POOL, live_transcript_cached, r["trial_id"], now, LIVE_POLL_TIMEOUT))
-                 for r in running}
-        done, _pending = await asyncio.wait(tasks.values(), timeout=budget)
-        for r in running:
-            task = tasks[r["trial_id"]]
-            if task in done and not task.cancelled() and task.exception() is None:
-                transcript, error = task.result()
-                apply_live(r, transcript, error)
-            elif task in done:
-                apply_live(r, {}, type(task.exception()).__name__ if task.exception() else "error")
-            else:
-                apply_live(r, {}, "live fetch budget exceeded")
-    rows.sort(key=lambda r: (r["started_ts"] or 0.0, r["trial_id"]), reverse=True)
-    for r in rows:
-        r.pop("_rc", None)
-    return rows
-
-
-# ----------------------------------------------------------------------------- scenarios
-
-def source_label(source: str | None, source_ref: str | None) -> tuple[str, str | None]:
-    """Human label and an optional URL for a scenario source."""
-    ref = source_ref or ""
-    if source == "swebench-annotated":
-        m = re.fullmatch(r"([A-Za-z0-9_.-]+)__([A-Za-z0-9_.-]+)-(\d+)", ref)
-        url = f"https://github.com/{m.group(1)}/{m.group(2)}/pull/{m.group(3)}" if m else None
-        return f"SWE-bench · {ref}", url
-    if source == "github-repo":
-        return f"GitHub · {ref}", ref if ref.startswith("http") else None
-    return f"{source or 'unknown source'} · {ref}".strip(" ·"), ref if ref.startswith("http") else None
-
-
-def _candidate_refs(root: Path) -> set[str]:
-    refs: set[str] = set()
-    cdir = root / "candidates"
-    if not cdir.is_dir():
-        return refs
-    for p in cdir.glob("*.jsonl"):
-        try:
-            for line in p.read_text().splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                if isinstance(row, dict):
-                    for key in ("instance_id", "source_ref", "pr_url", "url"):
-                        if row.get(key):
-                            refs.add(str(row[key]))
-        except (OSError, ValueError):
-            continue
-    return refs
-
-
-def scores_summary(sdir: Path) -> dict:
-    """{groups: [...], unreadable: bool, exists: bool} from scores.json."""
-    p = sdir / "scores.json"
-    if not p.exists():
-        return {"exists": False, "unreadable": False, "groups": []}
-    groups = read_json(p, default="unreadable")
-    if not isinstance(groups, dict):
-        return {"exists": True, "unreadable": True, "groups": []}
-    out = []
-    for key, g in sorted(groups.items()):
-        if not isinstance(g, dict):
-            continue
-        out.append({"key": key, "condition": g.get("condition"), "brief_profile": g.get("brief_profile"), "model": g.get("model"),
-                    "purpose": g.get("purpose"), "requested_k": g.get("requested_k"), "n_valid": g.get("n_valid"),
-                    "n_total": g.get("n_total"), "attempts_total": g.get("attempts_total"),
-                    "attempts_unresolved": g.get("attempts_unresolved"), "success_count": g.get("success_count"),
-                    "pass_at_k": g.get("pass_at_k"), "pass_pow_k": g.get("pass_pow_k"), "mean_reward": g.get("mean_reward"),
-                    "outcomes": g.get("outcomes") or {}, "labels": g.get("labels") or {}, "trial_ids": g.get("trial_ids") or [],
-                    "unresolved": g.get("unresolved") or [], "unresolved_by_status": g.get("unresolved_by_status") or {},
-                    "inconsistent_reward": g.get("inconsistent_reward") or []})
-    return {"exists": True, "unreadable": False, "groups": out}
-
-
-def scenario_stages(sdir: Path, registry_entry: dict | None, candidate_refs: set[str], spec: dict, judge: dict,
-                    approval: dict, compiled: dict, validation: dict) -> list[dict]:
-    """Stage chips derived from the files that exist: candidate -> judged -> drafted -> approved -> compiled -> validated -> registered."""
-    stages: list[dict] = []
-    ref = spec.get("source_ref")
-    has_draft = (sdir / "scenario.draft.json").exists() or (sdir / "draft.meta.json").exists()
-    stages.append({"stage": "candidate", "state": "done" if (ref in candidate_refs or has_draft or spec) else "pending",
-                   "detail": "candidate row present" if ref in candidate_refs else ("consumed by drafting" if has_draft else "")})
-    if judge:
-        keep = judge.get("keep")
-        stages.append({"stage": "judged", "state": "done" if keep else ("failed" if keep is False else "done"),
-                       "detail": f"keep={keep} · rubric {judge.get('verified_rubric_score')}/3 · complexity {judge.get('complexity')}"})
-    else:
-        stages.append({"stage": "judged", "state": "pending", "detail": "swesim judge writes judge.json"})
-    stages.append({"stage": "drafted", "state": "done" if has_draft else "pending",
-                   "detail": "scenario.draft.json" if has_draft else "swesim draft writes scenario.draft.json + assets/"})
-    if approval:
-        stages.append({"stage": "approved", "state": "done", "detail": f"{approval.get('approved_by')}"
-                       + (" · review needed" if approval.get("review_needed") else "") + f" · v{approval.get('version')}"})
-    else:
-        stages.append({"stage": "approved", "state": "pending", "detail": "swesim approve --auto <id> writes approval.json + scenario.json"})
-    if compiled:
-        stages.append({"stage": "compiled", "state": "done", "detail": f"image {short(compiled.get('image_digest'), 19)} · "
-                                                                      f"build {short(compiled.get('compiled_hash'), 8)}"})
-    else:
-        stages.append({"stage": "compiled", "state": "pending", "detail": "swesim compile <id> writes compile.json and the task dirs"})
-    if validation:
-        failures = validation.get("failures") or []
-        state = "done" if validation.get("status") == "valid" else "failed"
-        detail = "valid" if state == "done" else f"invalid · {len(failures)} failure(s)" + (f" · {failures[0]}" if failures else "")
-        stages.append({"stage": "validated", "state": state, "detail": detail})
-    else:
-        stages.append({"stage": "validated", "state": "pending", "detail": "swesim validate <id> runs the controls on Modal"})
-    stages.append({"stage": "registered", "state": "done" if registry_entry else "pending",
-                   "detail": "in registry.json" if registry_entry else "swesim register <id> after a valid validation"})
-    return stages
-
-
-def scenario_entry(sdir: Path, registry: dict, candidate_refs: set[str]) -> dict:
-    sid = sdir.name
-    spec = read_json(sdir / "scenario.json") or read_json(sdir / "scenario.draft.json") or {}
-    if not isinstance(spec, dict):
-        spec = {}
-    judge = read_json(sdir / "judge.json") or (spec.get("difficulty") or {}).get("judged") or {}
-    approval = read_json(sdir / "approval.json")
-    compiled = read_json(sdir / "compile.json")
-    validation = read_json(sdir / "validation.json")
-    meta = read_json(sdir / "draft.meta.json")
-    entry = registry.get(sid)
-    ledger = spec.get("ledger") or []
-    by_discovery: dict[str, int] = {}
-    for f in ledger:
-        if isinstance(f, dict):
-            by_discovery[str(f.get("discovery"))] = by_discovery.get(str(f.get("discovery")), 0) + 1
-    controls = spec.get("controls") or {}
-    label, url = source_label(spec.get("source"), spec.get("source_ref"))
-    files = [name for name in SCENARIO_FILES if (sdir / name).exists()]
-    stamps = [t for t in (mtime(sdir / n) for n in files) if t is not None]
-    spec_hash = approval.get("spec_hash") or compiled.get("spec_hash") or validation.get("spec_hash") or meta.get("spec_hash") \
-        or (entry or {}).get("spec_hash")
-    stages = scenario_stages(sdir, entry, candidate_refs, spec, judge if isinstance(judge, dict) else {}, approval, compiled, validation)
-    return {
-        "id": sid, "version": spec.get("version") or (entry or {}).get("version"), "frozen": (sdir / "scenario.json").exists(),
-        "source": spec.get("source"), "source_ref": spec.get("source_ref"), "source_label": label, "source_url": url,
-        "repo_url": (spec.get("environment") or {}).get("repo_url"), "spec_hash": spec_hash,
-        "created_at": spec.get("created_at") or meta.get("created_at"),
-        "judge": {"keep": judge.get("keep"), "verified_rubric_score": judge.get("verified_rubric_score"),
-                  "complexity": judge.get("complexity"), "test_behavioralness": judge.get("test_behavioralness"),
-                  "self_contained": judge.get("self_contained"), "alternatives_accepted": judge.get("alternatives_accepted"),
-                  "model_id": judge.get("model_id")} if isinstance(judge, dict) and judge else None,
-        "facts": len(ledger), "facts_by_discovery": by_discovery, "requirements": len(spec.get("requirements") or []),
-        "groups": len(spec.get("groups") or []), "checks": len(spec.get("checks") or []),
-        "controls": {"oracle": controls.get("oracle"), "plausible_wrong": len(controls.get("plausible_wrong") or []),
-                     "alternative_correct": len(controls.get("alternative_correct") or []), "tamper": len(controls.get("tamper") or [])},
-        "briefs": [b.get("profile") for b in spec.get("briefs") or [] if isinstance(b, dict)],
-        "stages": stages, "validation_status": validation.get("status"), "validation_failures": validation.get("failures") or [],
-        "image_digest": compiled.get("image_digest"), "compiled_hash": compiled.get("compiled_hash"),
-        "task_dirs": compiled.get("task_dirs") or {}, "registered": entry is not None,
-        "approval": {"approved_by": approval.get("approved_by"), "review_needed": bool(approval.get("review_needed")),
-                     "approved_at": approval.get("approved_at"), "spec_hash": approval.get("spec_hash")} if approval else None,
-        "awaiting_approval": bool((sdir / "scenario.draft.json").exists() and not approval
-                                  and read_json(sdir / "review.json").get("decision") != "reject"),
-        "runs": {k: len((entry or {}).get(f"{k}_runs") or []) for k in ("calibration", "comparison", "demonstration", "unresolved")},
-        "scores": scores_summary(sdir), "files": files, "updated_ts": max(stamps) if stamps else None,
-    }
-
-
-def scenario_board(root: Path, registry_path: Path) -> list[dict]:
-    registry = (read_json(registry_path).get("scenarios") or {}) if registry_path.exists() else {}
-    if not isinstance(registry, dict):
-        registry = {}
-    refs = _candidate_refs(root)
-    out = []
-    sdirs = root / "scenarios"
-    seen = set()
-    if sdirs.is_dir():
-        for sdir in sorted(p for p in sdirs.iterdir() if p.is_dir() and ID_RE.fullmatch(p.name)):
-            seen.add(sdir.name)
-            out.append(scenario_entry(sdir, registry, refs))
-    for sid in sorted(set(registry) - seen):  # registered but no scenario dir in this workspace copy
-        if ID_RE.fullmatch(sid):
-            out.append(scenario_entry(sdirs / sid, registry, refs))
-    return out
-
-
-def _summary(scenarios: list[dict], trials: list[dict]) -> dict:
-    return {"scenarios": len(scenarios), "valid": sum(1 for s in scenarios if s["validation_status"] == "valid"),
-               "trials": len(trials), "running": sum(1 for t in trials if t["running"]),
-               "finished": sum(1 for t in trials if not t["unresolved"]),
-               "unresolved": sum(1 for t in trials if t["unresolved"] and not t["running"]),
-               "succeeded": sum(1 for t in trials if t["success"] == 1)}
-
-
-def overview(root: Path, registry_path: Path, live: bool = False, now: float | None = None) -> dict:
-    now = time.time() if now is None else now
-    scenarios = scenario_board(root, registry_path)
-    trials = trial_board(root, now, live)
-    return {"generated_at": iso(now), "now": now, "summary": _summary(scenarios, trials), "scenarios": scenarios, "trials": trials}
-
-
-async def overview_async(root: Path, registry_path: Path, now: float | None = None, budget: float | None = None) -> dict:
-    now = time.time() if now is None else now
-    scenarios = scenario_board(root, registry_path)
-    trials = await trial_board_async(root, now, budget)
-    return {"generated_at": iso(now), "now": now, "summary": _summary(scenarios, trials), "scenarios": scenarios, "trials": trials}
-
-
-# ----------------------------------------------------------------------------- scenario detail
+# ----------------------------------------------------------------------------- one scenario
 
 def highlight_spans(text: str, excerpts: list[str]) -> list[tuple[str, bool]]:
     """Split ``text`` into (segment, removed) pairs where removed segments are the withheld excerpts (case-insensitive,
@@ -445,8 +253,7 @@ def highlight_spans(text: str, excerpts: list[str]) -> list[tuple[str, bool]]:
     spans: list[tuple[int, int]] = []
     lower = text.lower()
     for ex in sorted({e for e in excerpts if e and e.strip()}, key=len, reverse=True):
-        start = 0
-        needle = ex.lower()
+        start, needle = 0, ex.lower()
         while True:
             i = lower.find(needle, start)
             if i < 0:
@@ -468,16 +275,15 @@ def highlight_spans(text: str, excerpts: list[str]) -> list[tuple[str, bool]]:
     return out or [(text, False)]
 
 
-def scenario_detail(root: Path, registry_path: Path, sid: str, evaluator: bool = False) -> dict | None:
-    """Everything the scenario page needs. ``evaluator=False`` drops author-only facts entirely (they never reach the HTML)."""
+def scenario_detail(layout, sid: str, evaluator: bool = False, version: int | None = None) -> dict | None:
+    """Everything the scenario/review page needs from one scenario directory (or an archived version).
+    ``evaluator=False`` drops author-only facts, hidden test assets, judge/draft metadata and the withheld sentences (the
+    natural brief shows a masked placeholder where a span was removed; facts keep their text but not the excerpt)."""
     if not ID_RE.fullmatch(sid):
         return None
-    sdir = root / "scenarios" / sid
-    registry = (read_json(registry_path).get("scenarios") or {}) if registry_path.exists() else {}
-    entry = registry.get(sid) if isinstance(registry, dict) else None
-    if not sdir.is_dir() and not entry:
+    sdir = layout.scenario_dir(sid) if version is None else layout.scenario_archive_dir(sid, version)
+    if not sdir.is_dir():
         return None
-    board = scenario_entry(sdir, registry if isinstance(registry, dict) else {}, _candidate_refs(root))
     spec = read_json(sdir / "scenario.json") or read_json(sdir / "scenario.draft.json") or {}
     if not isinstance(spec, dict):
         spec = {}
@@ -491,6 +297,8 @@ def scenario_detail(root: Path, registry_path: Path, sid: str, evaluator: bool =
     withheld = (briefs.get("withheld") or {}).get("text")
     hidden_author_only = sum(1 for f in ledger if f.get("discovery") == "author-only")
     visible = [f for f in ledger if evaluator or f.get("discovery") != "author-only"]
+    if not evaluator:  # the withheld sentences themselves are evaluator-only (Codex B-P2-6): facts keep their text, not the excerpt
+        visible = [{k: v for k, v in f.items() if k != "source_excerpt"} for f in visible]
     grouped: dict[str, list[dict]] = {}
     for f in visible:
         grouped.setdefault(str(f.get("discovery")), []).append(f)
@@ -506,8 +314,8 @@ def scenario_detail(root: Path, registry_path: Path, sid: str, evaluator: bool =
                 "rationale": (item or {}).get("rationale"),
                 "expected": {k: v for k, v in (item or {}).items() if k.startswith("expected_")} if item else
                 ({"reward": 0} if name == "nop" else {"success": 1, "reward": 1} if name == "oracle" else {}),
-                "reward": res.get("reward"), "success": res.get("success"), "outcome": res.get("outcome") or
-                (OUTCOME_NAMES.get(res.get("outcome_code")) if isinstance(res.get("outcome_code"), int) else None),
+                "reward": res.get("reward"), "success": res.get("success"),
+                "outcome": res.get("outcome") or (OUTCOME_NAMES.get(res.get("outcome_code")) if isinstance(res.get("outcome_code"), int) else None),
                 "ran": bool(res), "failed": failed}
 
     controls = [control_row("nop", "no-op", None), control_row("oracle", "oracle", None)]
@@ -515,15 +323,34 @@ def scenario_detail(root: Path, registry_path: Path, sid: str, evaluator: bool =
         for item in controls_spec.get(family) or []:
             if isinstance(item, dict) and item.get("name"):
                 controls.append(control_row(item["name"], item.get("cls") or cls, item))
-    return {
-        "board": board, "spec": spec, "exists": sdir.is_dir(), "frozen": (sdir / "scenario.json").exists(),
-        "natural_segments": highlight_spans(natural, removed), "withheld": withheld, "removed_excerpts": removed,
-        "operations": ops, "ledger_groups": grouped, "hidden_author_only": 0 if evaluator else hidden_author_only,
-        "evaluator": evaluator, "requirements": spec.get("requirements") or [], "groups": spec.get("groups") or [],
-        "checks": spec.get("checks") or [], "persona": spec.get("persona") or {}, "environment": spec.get("environment") or {},
-        "contract": spec.get("contract") or {}, "controls": controls, "validation": validation, "failures": failures,
-        "probe": validation.get("probe") or {}, "trial_dirs": validation.get("trial_dirs") or {},
-        "approval": read_json(sdir / "approval.json"), "compile": read_json(sdir / "compile.json"),
-        "judge": read_json(sdir / "judge.json") or (spec.get("difficulty") or {}).get("judged") or {},
-        "difficulty": spec.get("difficulty") or {}, "registry_entry": entry,
+    approval = read_json(sdir / "approval.json")
+    compiled = read_json(sdir / "compile.json")
+    assets = spec.get("assets") if isinstance(spec.get("assets"), dict) else {}
+    contract = spec.get("contract") or {}
+    public_assets = {k: v for k, v in assets.items() if evaluator or not _hidden_asset(k, v)}
+    files = [n for n in SCENARIO_FILES if (sdir / n).exists() and (evaluator or n not in EVALUATOR_SCENARIO_FILES)]
+    out = {
+        "scenario_id": sid, "version": spec.get("version") or approval.get("version"), "frozen": (sdir / "scenario.json").exists(),
+        "spec_hash": approval.get("spec_hash") or compiled.get("spec_hash") or validation.get("spec_hash"),
+        "source": spec.get("source"), "source_ref": spec.get("source_ref"), "created_at": spec.get("created_at"),
+        "natural_segments": [(seg if evaluator or not is_removed else f"[withheld span · {len(seg)} chars]", is_removed) for seg, is_removed in highlight_spans(natural, removed)],
+        "withheld": withheld, "removed_excerpts": removed if evaluator else [None] * len(removed), "operations": ops,
+        "ledger_groups": grouped, "hidden_author_only": 0 if evaluator else hidden_author_only, "evaluator": evaluator,
+        "requirements": spec.get("requirements") or [], "groups": spec.get("groups") or [], "checks": spec.get("checks") or [],
+        "persona": spec.get("persona") or {}, "environment": spec.get("environment") or {},
+        "contract": {"fail_to_pass": len(contract.get("fail_to_pass") or []), "pass_to_pass": len(contract.get("pass_to_pass") or []),
+                     "protected_paths": len(contract.get("protected_paths") or []),
+                     **({"fail_to_pass_ids": contract.get("fail_to_pass") or [], "pass_to_pass_ids": contract.get("pass_to_pass") or []} if evaluator else {})},
+        "controls": controls, "validation": validation, "failures": failures, "probe": validation.get("probe") or {},
+        "approval": approval, "compile": compiled, "assets": public_assets, "hidden_assets": 0 if evaluator else len(assets) - len(public_assets),
+        "difficulty": read_json(sdir / "difficulty.json"), "audit": read_json(sdir / "audit.json") if evaluator else {},
+        "judge": (read_json(sdir / "judge.json") or (spec.get("difficulty") or {}).get("judged") or {}) if evaluator else {},
+        "draft_meta": read_json(sdir / "draft.meta.json") if evaluator else {}, "review": read_json(sdir / "review.json"), "files": files, "dir": sdir,
     }
+    return out
+
+
+def _hidden_asset(name: str, item) -> bool:
+    """Hidden test assets and control diffs are evaluator-only; the base Dockerfile is not."""
+    n = name.lower()
+    return not (n.startswith("dockerfile") or n.endswith((".dockerfile", ".toml")))

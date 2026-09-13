@@ -1,358 +1,363 @@
-/* swesim dashboard: live polling, filters, tabs, label form. Vanilla JS; every value is inserted with textContent. */
+/* swesim console client. Vanilla JS, no build step. Every untrusted value is inserted with textContent.
+   Responsibilities: theme toggle; copy-on-click ids; declarative tables (sort, per-column filter, CSV export, live
+   re-render from data-cols + data-source); nav counts and stat tiles polling; the two-step action flow
+   (POST /api/<action>/preview -> confirm dialog with the exact CLI -> POST /api/<action> with the signed token);
+   episode transcript polling; chart table-view toggles; evaluator toggle. */
 (function () {
   "use strict";
   const body = document.body;
-  const page = body.dataset.page;
+  const main = document.getElementById("main");
 
+  /* ------------------------------------------------------------ helpers */
   function el(tag, cls, text) {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
     if (text !== undefined && text !== null) e.textContent = String(text);
     return e;
   }
-  function fmtElapsed(s) {
-    if (s === null || s === undefined) return "—";
-    s = Math.max(0, Math.round(s));
-    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-    return h ? h + "h " + String(m).padStart(2, "0") + "m" : m ? m + "m " + String(sec).padStart(2, "0") + "s" : sec + "s";
+  function shortId(s, n) { s = String(s); return s.length <= n ? s : s.slice(0, n) + "…"; }
+  function dayClock(v) {
+    if (!v) return "—";
+    const d = new Date(v); if (isNaN(d)) return String(v);
+    const p = (x) => String(x).padStart(2, "0");
+    return p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) + " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes());
   }
-  function statusClass(s) {
-    s = (s || "").toLowerCase();
-    if (s === "running" || s === "pending" || s === "launched" || s === "requested") return "warn pulse";
-    if (s === "finished" || s === "completed" || s === "done") return "good";
-    if (s === "failed" || s === "launch-failed" || s === "runner-error" || s === "error" || s === "unit-failed") return "critical";
-    return "";
+  const STATUS = { valid: "good", completed: "good", finished: "good", done: "good", registered: "good", kept: "good", approved: "good", accepted: "good", informative: "good",
+    running: "run", launched: "run", pending: "run", requested: "run", drafting: "run", compiling: "run", validating: "run", planned: "run", "awaiting-approval": "run", open: "run",
+    failed: "critical", invalid: "critical", "launch-failed": "critical", "runner-error": "critical", error: "critical", "unit-failed": "critical", rejected: "critical", terminated: "critical", timed_out: "critical", broken: "critical",
+    unresolved: "serious", cancelled: "serious", review_needed: "serious",
+    archived: "neutral", saturated: "neutral", continued_as_new: "neutral", unknown: "neutral", mined: "neutral" };
+  const ICON = { good: "●", run: "◐", critical: "✕", serious: "◇", neutral: "○", "": "○" };
+  function chip(text, kind) {
+    if (text === null || text === undefined || text === "") return el("span", "muted", "—");
+    const k = kind === undefined ? (STATUS[String(text).toLowerCase()] || "") : kind;
+    const c = el("span", "chip " + k);
+    const i = el("i", null, ICON[k] || "○"); i.setAttribute("aria-hidden", "true");
+    c.appendChild(i); c.appendChild(document.createTextNode(String(text)));
+    return c;
   }
-  function setChip(node, text, cls) {
-    if (!node) return;
-    node.textContent = text || "—";
-    node.className = "chip " + (cls || "");
+  const FAMILIES = [["anthropic", ["anthropic/", "openrouter/anthropic/"]], ["openai", ["openai/"]], ["deepseek", ["openrouter/deepseek/", "deepseek/"]],
+    ["glm", ["openrouter/z-ai/", "z-ai/", "zhipu/"]], ["qwen", ["openrouter/qwen/", "qwen/"]], ["kimi", ["openrouter/moonshotai/", "moonshotai/"]],
+    ["minimax", ["openrouter/minimax/", "minimax/"]], ["gpt-oss", ["openrouter/openai/gpt-oss"]]];
+  function familySlot(model) {
+    const m = String(model || "").toLowerCase();
+    if (m.startsWith("openrouter/openai/gpt-oss")) return 8;
+    for (let i = 0; i < FAMILIES.length; i++) if (FAMILIES[i][1].some((p) => m.startsWith(p))) return i + 1;
+    return 0;
   }
-  function setText(row, field, text) {
-    const n = row.querySelector('[data-f="' + field + '"]');
-    if (n) n.textContent = (text === null || text === undefined || text === "") ? "—" : String(text);
+  /* brief §3.2 tiers, verbatim ids (mirrors render.TIERS; a test keeps them in sync) */
+  const TIERS = { A: ["openrouter/deepseek/deepseek-chat-v3-0324", "openrouter/z-ai/glm-4.5", "openrouter/qwen/qwen3-coder", "openrouter/moonshotai/kimi-k2", "openrouter/minimax/minimax-m2", "openrouter/openai/gpt-oss-120b"],
+    B: ["openrouter/deepseek/deepseek-v3.2", "openrouter/deepseek/deepseek-v4-flash", "openrouter/deepseek/deepseek-v4-pro-0813", "openrouter/z-ai/glm-5.2", "openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "openrouter/qwen/qwen3.6-plus", "openrouter/moonshotai/kimi-k2.7-code", "openrouter/minimax/minimax-m3"],
+    C: ["openai/gpt-5-mini", "openai/gpt-5.6-luna", "anthropic/claude-haiku-4-5-20251001"], D: ["anthropic/claude-sonnet-5", "openai/gpt-5.6-sol"],
+    E: ["openai/gpt-6-astra", "anthropic/claude-fable-5-1", "anthropic/claude-opus-5", "openai/gpt-5.5"] };
+  const TIER_OF = {}; Object.keys(TIERS).forEach((t) => TIERS[t].forEach((m) => { TIER_OF[m] = t; }));
+  function modelChip(model) {
+    if (!model) return el("span", null, "—");
+    const s = el("span", "model");
+    const sw = el("i", "swatch fam-" + familySlot(model)); sw.setAttribute("aria-hidden", "true");
+    s.appendChild(sw); s.appendChild(el("span", "mono", model));
+    if (TIER_OF[model]) s.appendChild(el("span", "tier", TIER_OF[model]));
+    return s;
   }
-  function liveIndicator(state, text) {
-    const n = document.getElementById("live");
-    if (!n) return;
-    n.className = "live " + state;
-    n.querySelector(".txt").textContent = text;
+  function ident(value, n, href) {
+    if (value === null || value === undefined || value === "") return el("span", null, "—");
+    const s = String(value), wrap = el("span", "id"); wrap.title = s;
+    let t;
+    if (href) { t = el("a", "idlink mono", shortId(s, n)); t.href = href; } else t = el("span", "mono", shortId(s, n));
+    const b = el("button", "copy", "⧉"); b.type = "button"; b.dataset.copy = s; b.setAttribute("aria-label", "copy " + s); b.title = "copy full value";
+    wrap.appendChild(t); wrap.appendChild(b);
+    return wrap;
   }
+  function fmtHref(tpl, row) {
+    if (!tpl) return null;
+    let missing = false;
+    const out = tpl.replace(/\{([a-zA-Z0-9_]+)\}/g, (_, k) => { if (!(k in row)) missing = true; const v = row[k]; return v === null || v === undefined ? "" : String(v); });
+    return missing ? null : out;
+  }
+  function metric(v) { if (v === null || v === undefined) { const s = el("span", "muted", "n/a"); s.title = "not computed: n below k or no valid attempts"; return s; } return document.createTextNode(Number(v).toFixed(3)); }
+  function usd(v) { if (v === null || v === undefined) return el("span", "muted", "—"); const x = Number(v); return document.createTextNode(x < 1 ? "$" + x.toFixed(4) : "$" + x.toLocaleString(undefined, { maximumFractionDigits: 2 })); }
+  function renderCell(col, row) {
+    const td = document.createElement("td"); td.dataset.f = col.key;
+    const v = row[col.key], href = fmtHref(col.href, row);
+    if (col.title && row[col.title] !== null && row[col.title] !== undefined && row[col.title] !== "") td.title = String(row[col.title]);
+    if (col.kind === "num" || col.kind === "metric" || col.kind === "usd") td.className = "num"; else if (col.kind === "mono") td.className = "mono";
+    let inner;
+    if (col.kind === "id") inner = ident(v, col.n || 12, href);
+    else if (col.kind === "chip") inner = chip(v);
+    else if (col.kind === "model") inner = modelChip(v);
+    else if (col.kind === "time") { if (v) { inner = el("time", null, dayClock(v)); inner.dateTime = v; inner.title = v; } else inner = document.createTextNode("—"); }
+    else if (col.kind === "metric") inner = metric(v);
+    else if (col.kind === "usd") inner = usd(v);
+    else if (col.kind === "bool") inner = v === null || v === undefined ? document.createTextNode("—") : chip(v ? "yes" : "no", v ? "good" : "neutral");
+    else if (col.kind === "list") inner = document.createTextNode(Array.isArray(v) ? v.join(", ") : (v === null || v === undefined || v === "" ? "—" : String(v)));
+    else inner = document.createTextNode(v === null || v === undefined || v === "" ? "—" : String(v));
+    if (href && col.kind !== "id") { const a = el("a"); a.href = href; a.appendChild(inner); inner = a; }
+    td.appendChild(inner);
+    return td;
+  }
+
+  /* ------------------------------------------------------------ theme */
+  const themeBtn = document.querySelector("[data-theme-toggle]");
+  function currentTheme() {
+    const forced = document.documentElement.getAttribute("data-theme");
+    if (forced) return forced;
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  if (themeBtn) {
+    const paint = () => { const t = currentTheme(); themeBtn.textContent = t === "dark" ? "Light theme" : "Dark theme"; themeBtn.setAttribute("aria-pressed", t === "dark" ? "true" : "false"); };
+    paint();
+    themeBtn.addEventListener("click", () => {
+      const next = currentTheme() === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("swesim-theme", next); } catch (e) { /* ignore */ }
+      paint();
+    });
+  }
+
+  /* ------------------------------------------------------------ copy ids */
+  document.addEventListener("click", (ev) => {
+    const b = ev.target.closest("[data-copy]");
+    if (!b) return;
+    ev.preventDefault();
+    const v = b.dataset.copy;
+    const done = () => { b.classList.add("done"); b.textContent = "✓"; setTimeout(() => { b.classList.remove("done"); b.textContent = "⧉"; }, 1200); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(v).then(done, done); else done();
+  });
+
+  /* ------------------------------------------------------------ tables */
+  function tableState(t) {
+    if (!t._state) t._state = { sort: null, dir: "asc", filters: {}, rows: null, cols: JSON.parse(t.dataset.cols || "[]"), key: t.dataset.key };
+    return t._state;
+  }
+  function rowData(t) {
+    const st = tableState(t);
+    if (st.rows) return st.rows;
+    /* initial server-rendered rows: read their text so sorting/filtering works before the first poll */
+    st.rows = Array.from(t.querySelectorAll("tbody tr")).map((tr) => {
+      const r = { __tr: tr };
+      st.cols.forEach((c) => { const td = tr.querySelector('[data-f="' + c.key + '"]'); r[c.key] = td ? (td.title || td.textContent.trim()) : ""; });
+      return r;
+    });
+    return st.rows;
+  }
+  function cmp(a, b) {
+    const na = parseFloat(a), nb = parseFloat(b);
+    if (!isNaN(na) && !isNaN(nb) && String(a).trim() !== "" && String(b).trim() !== "") return na - nb;
+    return String(a === null || a === undefined ? "" : a).localeCompare(String(b === null || b === undefined ? "" : b));
+  }
+  function applyTable(t) {
+    const st = tableState(t), tbody = t.querySelector("tbody"), table = t.querySelector("table"), empty = t.querySelector("[data-empty]");
+    let rows = rowData(t).slice();
+    Object.keys(st.filters).forEach((k) => { const q = st.filters[k].toLowerCase(); if (q) rows = rows.filter((r) => String(r[k] === null || r[k] === undefined ? "" : r[k]).toLowerCase().includes(q)); });
+    if (st.sort) rows.sort((a, b) => (st.dir === "asc" ? 1 : -1) * cmp(a[st.sort], b[st.sort]));
+    tbody.replaceChildren();
+    rows.forEach((r) => {
+      if (r.__tr) { tbody.appendChild(r.__tr); return; }
+      const tr = document.createElement("tr"); tr.dataset.key = r[st.key];
+      st.cols.forEach((c) => tr.appendChild(renderCell(c, r)));
+      tbody.appendChild(tr);
+    });
+    const count = t.querySelector("[data-count]");
+    if (count) count.textContent = rows.length + " row" + (rows.length === 1 ? "" : "s") + (rows.length !== rowData(t).length ? " (filtered from " + rowData(t).length + ")" : "");
+    if (table) table.classList.toggle("hidden", rows.length === 0);
+    if (empty) empty.classList.toggle("hidden", rows.length !== 0);
+    t.querySelectorAll("th .sort").forEach((b) => { if (b.dataset.sort === st.sort) b.dataset.dir = st.dir; else delete b.dataset.dir; });
+  }
+  function csv(t) {
+    const st = tableState(t);
+    const esc = (v) => { const s = v === null || v === undefined ? "" : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    const lines = [st.cols.map((c) => esc(c.label)).join(",")].concat(rowData(t).map((r) => st.cols.map((c) => esc(r[c.key])).join(",")));
+    const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    const a = el("a"); a.href = URL.createObjectURL(blob); a.download = (t.dataset.table || "table") + ".csv"; a.click(); URL.revokeObjectURL(a.href);
+  }
+  document.querySelectorAll("[data-table]").forEach((t) => {
+    t.addEventListener("click", (ev) => {
+      const s = ev.target.closest("th .sort");
+      if (s) { const st = tableState(t); if (st.sort === s.dataset.sort) st.dir = st.dir === "asc" ? "desc" : "asc"; else { st.sort = s.dataset.sort; st.dir = "asc"; } applyTable(t); }
+      if (ev.target.closest("[data-csv]")) csv(t);
+    });
+    t.querySelectorAll("[data-filter]").forEach((inp) => inp.addEventListener("input", () => { tableState(t).filters[inp.dataset.filter] = inp.value; applyTable(t); }));
+  });
+  function setRows(t, items) {
+    const st = tableState(t);
+    st.rows = items.map((r) => Object.assign({}, r));
+    applyTable(t);
+  }
+
+  /* ------------------------------------------------------------ polling */
   let lastUpdate = null;
-  /* One poller per page: the next request is scheduled only after the previous one settles (no overlap), and the
-     interval doubles on each consecutive error (capped at 60 s) until a request succeeds. */
-  function poll(baseMs, fn) {
-    let delay = baseMs, failures = 0, stopped = false;
-    function schedule() { if (!stopped) setTimeout(run, delay); }
-    function run() {
-      if (document.hidden) { schedule(); return; }
-      Promise.resolve().then(fn).then(function () { failures = 0; delay = baseMs; }, function (e) {
-        failures += 1; delay = Math.min(baseMs * Math.pow(2, failures), 60000);
-        liveIndicator("err", "refresh failed (" + failures + "x, retry in " + Math.round(delay / 1000) + "s): " + e);
-      }).then(schedule);
-    }
-    schedule();
-    return { stop: function () { stopped = true; } };
+  function liveIndicator(state, text) {
+    const n = document.getElementById("live"); if (!n) return;
+    n.className = "live " + state; n.querySelector(".txt").textContent = text;
   }
   function tickAgo() {
     const n = document.getElementById("live");
-    if (!n || lastUpdate === null || n.classList.contains("err")) return;  // keep the backoff message readable
-    const ago = Math.max(0, Math.round((Date.now() - lastUpdate) / 1000));
-    n.querySelector(".txt").textContent = "updated " + ago + "s ago";
+    if (!n || lastUpdate === null || n.classList.contains("err")) return;
+    n.querySelector(".txt").textContent = "updated " + Math.max(0, Math.round((Date.now() - lastUpdate) / 1000)) + "s ago";
   }
   setInterval(tickAgo, 1000);
-
-  /* ---------------------------------------------------------------- overview */
-  function fillTrialRow(row, t) {
-    setText(row, "scenario", t.scenario_id);
-    setText(row, "condition", t.condition);
-    setText(row, "model", t.model);
-    setText(row, "profile", t.brief_profile);
-    setText(row, "purpose", t.purpose);
-    setChip(row.querySelector('[data-f="status"]'), t.status, statusClass(t.status));
-    const flag = row.querySelector('[data-f="unresolved"]');
-    if (flag) { flag.textContent = t.unresolved && !t.running ? "unresolved" : ""; flag.className = t.unresolved && !t.running ? "flag" : ""; }
-    setText(row, "elapsed", t.elapsed_s === null || t.elapsed_s === undefined ? null : fmtElapsed(t.elapsed_s) + (t.running ? " …" : ""));
-    const elapsed = row.querySelector('[data-f="elapsed"]');
-    if (elapsed) elapsed.title = "started " + (t.started_at || "—") + " · finished " + (t.finished_at || "—");
-    const pat = row.querySelector('[data-f="patience"]');
-    if (pat) {
-      pat.replaceChildren();
-      if (t.patience_start !== null && t.patience_start !== undefined) {
-        const end = t.patience_end === null || t.patience_end === undefined ? t.patience_start : t.patience_end;
-        pat.appendChild(document.createTextNode(end + " / " + t.patience_start + " "));
-        const m = el("span", "meter" + (end <= 0 ? " out" : end * 3 <= t.patience_start ? " low" : ""));
-        const i = el("i"); i.style.width = Math.max(0, Math.min(100, Math.round(100 * end / t.patience_start))) + "%";
-        m.appendChild(i); pat.appendChild(m);
-      } else { pat.textContent = t.live_error ? "live: " + t.live_error : "—"; }
+  function poll(baseMs, fn) {
+    let delay = baseMs, failures = 0;
+    function run() {
+      if (document.hidden) { setTimeout(run, delay); return; }
+      Promise.resolve().then(fn).then(() => { failures = 0; delay = baseMs; }, (e) => {
+        failures += 1; delay = Math.min(baseMs * Math.pow(2, failures), 60000);
+        liveIndicator("err", "refresh failed (" + failures + "x, retry in " + Math.round(delay / 1000) + "s): " + e);
+      }).then(() => setTimeout(run, delay));
     }
-    const out = row.querySelector('[data-f="outcome"]');
-    if (out) {
-      out.replaceChildren();
-      if (t.outcome) { out.appendChild(el("span", "chip " + (t.success === 1 ? "good" : (t.outcome_code >= 5 ? "warn" : "critical")), t.outcome)); }
-      else if (t.unresolved && !t.running) { out.appendChild(el("span", "flag", t.error_type ? "error " + t.error_type : "no verifier record")); out.appendChild(document.createTextNode(" ")); out.appendChild(el("span", "muted small", "(" + (t.source_file || "no files") + ")")); }
-      else out.textContent = "—";
-    }
-    setText(row, "reward", t.reward === null || t.reward === undefined ? null : t.reward);
-    setText(row, "label", t.label);
-    row.dataset.status = t.status || "";
+    setTimeout(run, delay);
   }
-  function fillScenarioRow(row, s) {
-    setText(row, "source", s.source_label);
-    const st = row.querySelector('[data-f="stages"]');
-    if (st) {
-      st.replaceChildren();
-      (s.stages || []).forEach(function (x) {
-        const c = el("span", "chip " + (x.state === "done" ? "good" : x.state === "failed" ? "critical" : "pending"), x.stage);
-        c.title = x.detail || ""; st.appendChild(c);
-      });
-    }
-    setText(row, "judge", s.judge ? ("keep=" + s.judge.keep + " · rubric " + s.judge.verified_rubric_score + "/3 · complexity " + s.judge.complexity) : null);
-    setText(row, "facts", s.facts);
-    setText(row, "controls", (s.controls.plausible_wrong || 0) + " wrong · " + (s.controls.alternative_correct || 0) + " alt · " + (s.controls.tamper || 0) + " tamper");
-    const v = row.querySelector('[data-f="validation"] .chip:not([data-f])');
-    if (v) setChip(v, s.validation_status || "not validated", s.validation_status === "valid" ? "good" : s.validation_status === "invalid" ? "critical" : "pending");
-    const rv = row.querySelector('[data-f="review"]');
-    if (rv) {
-      const needed = s.approval && s.approval.review_needed, awaiting = !s.approval && s.awaiting_approval;
-      rv.classList.toggle("hidden", !(needed || awaiting));
-      rv.className = "chip warn" + (awaiting ? " pulse" : "") + ((needed || awaiting) ? "" : " hidden");
-      rv.textContent = needed ? "review needed" : awaiting ? "awaiting approval" : "";
-      rv.href = "/review/" + encodeURIComponent(s.id);
-    }
-    setText(row, "runs", (s.runs.calibration || 0) + " cal · " + (s.runs.comparison || 0) + " cmp · " + (s.runs.demonstration || 0) + " demo" + (s.runs.unresolved ? " · " + s.runs.unresolved + " unresolved" : ""));
-    const sc = row.querySelector('[data-f="scores"]');
-    if (sc) {
-      sc.replaceChildren();
-      const scores = s.scores || {};
-      if (scores.unreadable) sc.appendChild(el("span", "flag", "unreadable scores.json"));
-      else if (!(scores.groups || []).length) sc.textContent = "—";
-      else (scores.groups || []).forEach(function (g, i) {
-        if (i) sc.appendChild(document.createElement("br"));
-        sc.appendChild(document.createTextNode((g.condition || g.key) + " · " + (g.model || "—") + ": pass@" + g.requested_k + " "));
-        sc.appendChild(g.pass_at_k === null || g.pass_at_k === undefined ? el("span", "muted", "n/a") : document.createTextNode(Number(g.pass_at_k).toFixed(2)));
-        sc.appendChild(el("span", "muted", " (" + g.n_valid + "/" + g.n_total + ")"));
-      });
-    }
+  async function getJSON(url) {
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
   }
-  function patchTable(tbodyId, tplId, items, key, fill, hrefBase) {
-    const tbody = document.getElementById(tbodyId), tpl = document.getElementById(tplId);
-    if (!tbody || !tpl) return;
-    const seen = new Set();
-    items.forEach(function (it) {
-      const id = it[key]; seen.add(id);
-      let row = tbody.querySelector('tr[data-id="' + (window.CSS && CSS.escape ? CSS.escape(String(id)) : String(id).replace(/["\\]/g, "\\$&")) + '"]');
-      if (!row) {
-        row = tpl.content.firstElementChild.cloneNode(true);
-        row.dataset.id = id;
-        const a = row.querySelector('[data-f="id"] a');
-        if (a) { a.textContent = id; a.href = hrefBase + encodeURIComponent(id); }
-        tbody.appendChild(row);
-      }
-      fill(row, it);
-    });
-    Array.from(tbody.querySelectorAll("tr[data-id]")).forEach(function (r) { if (!seen.has(r.dataset.id)) r.remove(); });
-    const empty = document.getElementById(tbodyId + "-empty");
-    if (empty) empty.classList.toggle("hidden", items.length > 0);
-    const table = tbody.closest("table");
-    if (table) table.classList.toggle("hidden", items.length === 0);
+  function patchTiles(data) {
+    document.querySelectorAll("[data-tile]").forEach((n) => { const k = n.dataset.tile; if (k in data) n.textContent = data[k] === null || data[k] === undefined ? "—" : data[k]; });
   }
-  function refreshOverview() {
-    return fetch("/api/overview", { cache: "no-store" }).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }).then(function (ov) {
-      patchTable("trials-body", "trial-row", ov.trials || [], "trial_id", fillTrialRow, "/trial/");
-      patchTable("scenarios-body", "scenario-row", ov.scenarios || [], "id", fillScenarioRow, "/scenario/");
-      const s = ov.summary || {};
-      Object.keys(s).forEach(function (k) { const n = document.querySelector('[data-tile="' + k + '"]'); if (n) n.textContent = s[k]; });
-      lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
-    });
+  function patchCounts(counts) {
+    document.querySelectorAll("[data-count]").forEach((n) => { const k = n.dataset.count; if (k && k in counts) n.textContent = counts[k] === null || counts[k] === undefined ? "" : counts[k]; });
   }
-  if (page === "overview") {
-    lastUpdate = Date.now();
-    poll(parseInt(body.dataset.pollMs || "5000", 10), refreshOverview);
-  }
-
-  /* ---------------------------------------------------------------- console: forms, jobs, review */
-  function showBanner(kind, title, lines, cli, links) {
-    const b = document.getElementById("banner");
-    if (!b) return;
-    b.replaceChildren();
-    b.className = "banner " + kind;
-    b.appendChild(el("strong", "", title));
-    (lines || []).forEach(function (t) { b.appendChild(el("div", "", t)); });
-    (links || []).forEach(function (l) { const a = el("a", "mono", l.text); a.href = l.href; const d = el("div"); d.appendChild(a); b.appendChild(d); });
-    if (cli) { b.appendChild(el("div", "muted small", "Equivalent command:")); b.appendChild(el("pre", "", cli)); }
-  }
-  function formJSON(form) {
-    const data = {};
-    new FormData(form).forEach(function (v, k) {
-      if (k in data) { if (!Array.isArray(data[k])) data[k] = [data[k]]; data[k].push(v); } else data[k] = v;
-    });
-    Array.from(form.querySelectorAll("select[multiple]")).forEach(function (s) {
-      data[s.name] = Array.from(s.selectedOptions).map(function (o) { return o.value; });
-    });
-    Array.from(form.querySelectorAll("input[type=checkbox]")).forEach(function (c) {
-      if (!(c.name in data)) data[c.name] = [];
-      else if (!Array.isArray(data[c.name])) data[c.name] = [data[c.name]];
-    });
-    return data;
-  }
-  function wireConsoleForm(form, onSuccess) {
-    const status = form.querySelector("#form-status") || document.getElementById("form-status");
-    form.addEventListener("submit", function (ev) {
-      ev.preventDefault();
-      const data = formJSON(form);
-      if (ev.submitter && ev.submitter.name) data[ev.submitter.name] = ev.submitter.value;
-      if (status) status.textContent = "starting…";
-      fetch(form.dataset.endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) })
-        .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
-        .then(function (res) {
-          const j = res.body || {};
-          if (status) status.textContent = "";
-          if (res.status === 200 && j.ok) { onSuccess(j, form); return; }
-          if (res.status === 400) showBanner("warn", j.error || "Please fix the form", j.errors || (j.reasons ? ["gates: " + j.reasons.join("; ")] : []), j.cli);
-          else if (res.status === 409) showBanner("warn", j.error || "Refused", j.current_spec_hash ? ["spec hash on disk: " + j.current_spec_hash] : [], null);
-          else showBanner("error", j.error || ("request failed (" + res.status + ")"), [], j.cli);
-        })
-        .catch(function (e) { if (status) status.textContent = ""; showBanner("error", "request failed: " + e, [], null); });
-    });
-  }
-  if (page === "console") {
-    const form = document.querySelector("form.console");
-    if (form) {
-      Array.from(form.querySelectorAll("input[name=source]")).forEach(function (r) {
-        r.addEventListener("change", function () {
-          Array.from(form.querySelectorAll("[data-source]")).forEach(function (d) { d.classList.toggle("hidden", d.dataset.source !== r.value); });
-        });
-      });
-      wireConsoleForm(form, function (j) {
-        const ids = j.workflow_ids || [];
-        showBanner("ok", "Started " + ids.length + " workflow" + (ids.length === 1 ? "" : "s") + " via " + (j.via || "Temporal"), [],
-          j.cli, ids.map(function (id) { return { text: id, href: (form.dataset.jobs || "/jobs/") + encodeURIComponent(id) }; }));
-      });
-    }
-  }
-  if (page === "jobs") {
-    function fillJob(row, j) {
-      setText(row, "type", j.type);
-      setChip(row.querySelector('[data-f="status"]'), j.status, statusClass(j.status));
-      setText(row, "started", j.started_at);
-      setText(row, "summary", j.summary);
-    }
-    function refreshJobs() {
-      return fetch("/api/jobs", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
-        if (!j.ok) throw new Error("jobs unavailable: " + (j.error || ""));
-        patchTable("jobs-body", "job-row", j.jobs || [], "workflow_id", fillJob, "/jobs/");
+  /* nav counts: every page, every 10 s */
+  poll(10000, async () => { const c = await getJSON("/api/counts"); patchCounts(c); });
+  /* page data: body[data-source] is a JSON endpoint whose keys match [data-tile] keys and [data-table] ids */
+  if (body.dataset.source) {
+    const ms = parseInt(body.dataset.pollMs || "5000", 10);
+    poll(ms, async () => {
+      main.classList.add("refetching");
+      try {
+        const data = await getJSON(body.dataset.source);
+        if (data.tiles) patchTiles(data.tiles);
+        document.querySelectorAll("[data-table]").forEach((t) => { const items = data[t.dataset.table]; if (Array.isArray(items)) setRows(t, items); else if (items && Array.isArray(items.items)) setRows(t, items.items); });
         lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
-      });
-    }
-    if (document.getElementById("live")) { lastUpdate = Date.now(); poll(parseInt(body.dataset.pollMs || "5000", 10), refreshJobs); }
-  }
-  if (page === "job") {
-    const btn = document.getElementById("cancel-job");
-    if (btn) btn.addEventListener("click", function () {
-      const wid = body.dataset.job;
-      if (!window.confirm("Cancel workflow " + wid + "? Running Harbor units are not killed; the workflow stops after its current step.")) return;
-      const out = document.getElementById("cancel-status");
-      fetch(btn.dataset.endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true }) })
-        .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
-        .then(function (res) {
-          if (res.status === 200 && res.body.ok) { out.textContent = "cancelled"; setTimeout(function () { location.reload(); }, 800); }
-          else showBanner("error", res.body.error || "cancel failed", [], res.body.cli);
-        }).catch(function (e) { showBanner("error", "cancel failed: " + e, [], null); });
+      } finally { main.classList.remove("refetching"); }
     });
   }
-  if (page === "review-item") {
-    const form = document.getElementById("review-form");
-    if (form) wireConsoleForm(form, function (j) {
-      showBanner("ok", (j.decision === "approve" ? "Approved" : "Rejected") + " " + j.scenario_id + " via " + (j.via || ""), [], null);
-      setTimeout(function () { location.reload(); }, 800);
+  /* tables with their own source (no page source) */
+  document.querySelectorAll("[data-table][data-source]").forEach((t) => {
+    poll(parseInt(body.dataset.pollMs || "8000", 10), async () => {
+      const data = await getJSON(t.dataset.source);
+      const items = Array.isArray(data) ? data : (data.items || data[t.dataset.table] || []);
+      setRows(t, items); lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
     });
-  }
+  });
 
-  /* ---------------------------------------------------------------- runs filters */
-  if (page === "runs") {
-    const selects = Array.from(document.querySelectorAll(".toolbar select[data-filter]"));
-    const rows = Array.from(document.querySelectorAll("#trials-body tr[data-id]"));
-    const count = document.getElementById("filter-count");
-    function apply() {
-      let shown = 0;
-      rows.forEach(function (r) {
-        const ok = selects.every(function (s) { return !s.value || (r.dataset[s.dataset.filter] || "") === s.value; });
-        r.classList.toggle("hidden", !ok); if (ok) shown++;
-      });
-      if (count) count.textContent = shown + " of " + rows.length + " attempts";
-    }
-    selects.forEach(function (s) { s.addEventListener("change", apply); });
-    const reset = document.getElementById("filter-reset");
-    if (reset) reset.addEventListener("click", function () { selects.forEach(function (s) { s.value = ""; }); apply(); });
-    apply();
+  /* ------------------------------------------------------------ actions: preview -> confirm -> execute */
+  const dialog = document.getElementById("confirm");
+  function serialize(form) {
+    const out = {};
+    new FormData(form).forEach((v, k) => { if (k in out) { if (!Array.isArray(out[k])) out[k] = [out[k]]; out[k].push(v); } else out[k] = v; });
+    form.querySelectorAll("input[type=checkbox]").forEach((c) => { if (!(c.name in out)) out[c.name] = []; else if (c.type === "checkbox" && !Array.isArray(out[c.name])) out[c.name] = [out[c.name]]; });
+    form.querySelectorAll("select[multiple]").forEach((s) => { out[s.name] = Array.from(s.selectedOptions).map((o) => o.value); });
+    return out;
   }
-
-  /* ---------------------------------------------------------------- episode */
-  if (page === "episode") {
-    const tid = body.dataset.trial;
-    Array.from(document.querySelectorAll(".tabs button")).forEach(function (b) {
-      b.addEventListener("click", function () {
-        Array.from(document.querySelectorAll(".tabs button")).forEach(function (x) { x.setAttribute("aria-selected", x === b ? "true" : "false"); });
-        Array.from(document.querySelectorAll("[data-tab-panel]")).forEach(function (p) { p.classList.toggle("hidden", p.dataset.tabPanel !== b.dataset.tab); });
-      });
+  async function postJSON(url, payload) {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(payload) });
+    let data; try { data = await r.json(); } catch (e) { data = { ok: false, error: "HTTP " + r.status }; }
+    data.__status = r.status; return data;
+  }
+  function showBanner(target, kind, text, cli, links) {
+    const slot = target || document.getElementById("banner"); if (!slot) return;
+    slot.className = "banner " + kind; slot.replaceChildren();
+    slot.appendChild(el("div", null, text));
+    if (links && links.length) { const p = el("div"); links.forEach((l) => { const a = el("a", "mono", l.text); a.href = l.href; p.appendChild(a); p.appendChild(document.createTextNode(" ")); }); slot.appendChild(p); }
+    if (cli) { slot.appendChild(el("div", "muted small", "Equivalent command:")); slot.appendChild(el("pre", "code", cli)); }
+    slot.classList.remove("hidden");
+  }
+  function confirmWith(preview) {
+    return new Promise((resolve) => {
+      if (!dialog || typeof dialog.showModal !== "function") { resolve(window.confirm("Run?\n\n" + preview.cli)); return; }
+      dialog.querySelector('[data-confirm="what"]').textContent = preview.what || "";
+      dialog.querySelector('[data-confirm="cli"]').textContent = preview.cli || "";
+      const dl = dialog.querySelector('[data-confirm="params"]'); dl.replaceChildren();
+      Object.keys(preview.params || {}).forEach((k) => { dl.appendChild(el("dt", null, k)); const v = preview.params[k]; dl.appendChild(el("dd", "mono", Array.isArray(v) ? v.join(", ") : (typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)))); });
+      dialog.querySelector('[data-confirm="expiry"]').textContent = preview.expires_at ? "This confirmation token expires at " + preview.expires_at + " (UTC)." : "";
+      const ok = dialog.querySelector('[data-confirm="ok"]'), cancel = dialog.querySelector('[data-confirm="cancel"]');
+      const done = (v) => { ok.onclick = cancel.onclick = null; dialog.onclose = null; dialog.close(); resolve(v); };
+      ok.onclick = () => done(true); cancel.onclick = () => done(false); dialog.onclose = () => resolve(false);
+      dialog.showModal(); ok.focus();
     });
-    const form = document.getElementById("labelform");
-    if (form) {
-      form.addEventListener("submit", function (ev) {
-        ev.preventDefault();
-        const out = document.getElementById("labelresult");
-        const data = { label: form.label.value, note: form.note.value };
-        if (!data.label) { out.textContent = "choose a label"; return; }
-        fetch("/trial/" + encodeURIComponent(tid) + "/label", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) })
-          .then(function (r) { out.textContent = r.ok ? "saved" : "error " + r.status; })
-          .catch(function (e) { out.textContent = "error " + e; });
-      });
-    }
-    function bubble(r) {
-      const m = r.meta || {};
-      const isReview = r.kind === "review";
-      const refusal = r.actor === "stakeholder" && (m.tier === "refused" || /^I have to step away now/.test(r.text || ""));
-      const b = el("div", "bubble " + r.actor + (isReview ? " review" : "") + (refusal ? " refusal" : ""));
-      const who = el("div", "who");
-      who.appendChild(el("span", "badge " + r.actor, r.actor === "agent" ? "agent" : "stakeholder"));
-      who.appendChild(el("span", "", refusal ? "refusal" : isReview ? (r.actor === "agent" ? "review request" : "review") : (r.actor === "agent" ? "question" : "reply")));
-      const t = el("time", "", r.ts_iso ? r.ts_iso.slice(11, 19) : "no timestamp"); if (r.ts_iso) t.dateTime = r.ts_iso; who.appendChild(t);
-      b.appendChild(who);
-      b.appendChild(el("div", "text", r.text));
-      if (body.dataset.evaluator === "1" && r.actor === "stakeholder" && (m.disclosed_fact_ids || m.tier !== undefined)) {
-        b.appendChild(el("div", "audit", "audit (evaluator-only): tier " + (m.tier || "—") + " · patience remaining " + (m.patience_remaining === undefined ? "—" : m.patience_remaining) + " · disclosed fact ids: " + ((m.disclosed_fact_ids || []).join(", ") || "none")));
+  }
+  async function runAction(action, params, statusEl, bannerEl) {
+    const setStatus = (t) => { if (statusEl) statusEl.textContent = t; };
+    setStatus("previewing…");
+    const preview = await postJSON("/api/" + action + "/preview", params);
+    if (!preview.ok) { setStatus(""); showBanner(bannerEl, "error", (preview.errors || [preview.error || "rejected"]).join("; "), preview.cli); return preview; }
+    setStatus("awaiting confirmation");
+    const yes = await confirmWith(preview);
+    if (!yes) { setStatus("cancelled"); return { ok: false, cancelled: true }; }
+    setStatus("running…");
+    const result = await postJSON("/api/" + action, { token: preview.token, params: preview.params });
+    setStatus("");
+    if (result.ok) {
+      const links = (result.workflow_ids || []).map((w) => ({ text: w, href: "/workflows/" + encodeURIComponent(w) }));
+      if (result.workflow_id && !links.length) links.push({ text: result.workflow_id, href: "/workflows/" + encodeURIComponent(result.workflow_id) });
+      showBanner(bannerEl, "ok", result.message || ("Accepted" + (result.via ? " via " + result.via : "") + "."), result.cli, links);
+    } else showBanner(bannerEl, result.__status === 502 ? "warn" : "error", result.error || (result.errors || []).join("; ") || "failed", result.cli);
+    return result;
+  }
+  document.querySelectorAll("form[data-action]").forEach((form) => {
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      const params = serialize(form);
+      if (ev.submitter && ev.submitter.name) params[ev.submitter.name] = ev.submitter.value;
+      runAction(form.dataset.action, params, form.querySelector("[data-status]"), document.getElementById("banner"));
+    });
+  });
+  document.querySelectorAll("button[data-action]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      let params = {}; try { params = JSON.parse(btn.dataset.params || "{}"); } catch (e) { params = {}; }
+      const reasonSel = btn.dataset.reasonFrom; if (reasonSel) { const r = document.querySelector(reasonSel); if (r) params.reason = r.value; }
+      runAction(btn.dataset.action, params, document.querySelector(btn.dataset.status || "#action-status"), document.getElementById("banner"));
+    });
+  });
+  /* create form: source radio shows one block */
+  document.querySelectorAll("input[name=source]").forEach((r) => r.addEventListener("change", () => {
+    document.querySelectorAll("[data-source-block]").forEach((b) => b.classList.toggle("hidden", b.dataset.sourceBlock !== r.value));
+  }));
+
+  /* ------------------------------------------------------------ chart table-view toggle, tabs, evaluator toggle */
+  document.querySelectorAll("[data-chart-tabs]").forEach((tabs) => {
+    tabs.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
+      tabs.querySelectorAll("button").forEach((x) => x.setAttribute("aria-selected", x === b ? "true" : "false"));
+      const fig = tabs.parentElement;
+      fig.querySelectorAll("[data-view]").forEach((v) => v.classList.toggle("hidden", v.dataset.view !== b.dataset.view));
+    }));
+  });
+  document.querySelectorAll("[role=tablist] [role=tab]").forEach((tab) => tab.addEventListener("click", () => {
+    const list = tab.closest("[role=tablist]");
+    list.querySelectorAll("[role=tab]").forEach((t) => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
+    document.querySelectorAll("[data-tab-panel]").forEach((p) => p.classList.toggle("hidden", p.dataset.tabPanel !== tab.dataset.tab));
+  }));
+  document.querySelectorAll("[data-evaluator-toggle]").forEach((sw) => sw.addEventListener("click", () => {
+    const on = sw.getAttribute("aria-checked") !== "true";
+    sw.setAttribute("aria-checked", on ? "true" : "false"); sw.classList.toggle("on", on);
+    document.querySelectorAll("[data-evaluator-only]").forEach((n) => n.classList.toggle("hidden", !on));
+    sw.textContent = ""; const i = el("i"); sw.appendChild(i); sw.appendChild(document.createTextNode("evaluator-only: " + (sw.dataset.label || "material") + (on ? " shown" : " hidden")));
+  }));
+
+  /* ------------------------------------------------------------ episode: live transcript */
+  if (body.dataset.page === "episode" && body.dataset.trial && body.dataset.live === "true") {
+    const url = "/api/trial/" + encodeURIComponent(body.dataset.trial) + "/timeline";
+    poll(parseInt(body.dataset.pollMs || "3000", 10), async () => {
+      const t = await getJSON(url);
+      const chat = document.getElementById("chat");
+      if (chat && Array.isArray(t.timeline)) {
+        chat.replaceChildren();
+        t.timeline.filter((r) => r.actor === "agent" || r.actor === "stakeholder").filter((r) => r.kind !== "agent-step" && r.kind !== "tool_call").forEach((r) => {
+          const b = el("div", "bubble " + r.actor + " " + (r.kind || ""));
+          const who = el("div", "who"); who.appendChild(el("span", "badge " + r.actor, r.actor)); who.appendChild(el("span", "xtype", r.kind));
+          if (r.ts_iso) { const tm = el("time", null, r.ts_iso.slice(11, 19)); tm.dateTime = r.ts_iso; who.appendChild(tm); } else who.appendChild(el("span", "flag", "no timestamp"));
+          if (r.meta && r.meta.patience_remaining !== undefined && r.meta.patience_remaining !== null) who.appendChild(el("span", "muted", "patience " + r.meta.patience_remaining));
+          b.appendChild(who); b.appendChild(el("div", "text", r.text || "")); chat.appendChild(b);
+        });
+        if (t.live) { const w = el("div", "working"); const d = el("span", "dots"); d.appendChild(el("i")); d.appendChild(el("i")); d.appendChild(el("i")); w.appendChild(d); w.appendChild(el("span", null, "agent is working…")); chat.appendChild(w); }
+        const emptyNote = document.getElementById("chat-empty"); if (emptyNote) emptyNote.classList.toggle("hidden", chat.children.length > 0);
       }
-      return b;
-    }
-    function updateMeter(p) {
-      const m = document.getElementById("patience");
-      if (!m || !p || p.start === null || p.start === undefined) return;
-      const end = p.end === null || p.end === undefined ? p.start : p.end;
-      m.querySelector(".pt").textContent = end + " / " + p.start + " remaining";
-      const bar = m.querySelector(".meter"); if (bar) { bar.className = "meter" + (end <= 0 ? " out" : end * 3 <= p.start ? " low" : ""); bar.querySelector("i").style.width = Math.max(0, Math.min(100, Math.round(100 * end / p.start))) + "%"; }
-      m.querySelector(".pq").textContent = "questions " + (p.questions ?? 0) + " · reviews " + (p.reviews ?? 0);
-    }
-    function refreshEpisode() {
-      const url = "/api/trial/" + encodeURIComponent(tid) + "/timeline" + (body.dataset.evaluator === "1" ? "?evaluator=1" : "");
-      return fetch(url, { cache: "no-store" }).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }).then(function (data) {
-        if (data.status && data.status.status !== "running") { location.reload(); return; }
-        const chat = document.getElementById("chat");
-        if (chat) {
-          const rows = (data.timeline || []).filter(function (r) { return (r.actor === "agent" || r.actor === "stakeholder") && r.kind !== "agent-step" && r.kind !== "tool_call"; });
-          const nodes = rows.map(bubble);
-          const working = el("div", "working"); working.appendChild(el("span", "dots")); working.querySelector(".dots").append(el("i"), el("i"), el("i")); working.appendChild(el("span", "", "agent is working…"));
-          nodes.push(working);
-          chat.replaceChildren.apply(chat, nodes);
-          const empty = document.getElementById("chat-empty"); if (empty) empty.classList.toggle("hidden", rows.length > 0);
-        }
-        updateMeter(data.patience);
-        lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago" + (data.live_transcript_error ? " · transcript unavailable: " + data.live_transcript_error : ""));
-      });
-    }
-    if (body.dataset.live === "true") {
-      lastUpdate = Date.now();
-      poll(parseInt(body.dataset.pollMs || "3000", 10), refreshEpisode);
-    }
+      const pat = document.getElementById("patience-live");
+      if (pat && t.patience) pat.textContent = (t.patience.end === null || t.patience.end === undefined ? "—" : t.patience.end) + " / " + (t.patience.start === null || t.patience.start === undefined ? "—" : t.patience.start) + " remaining";
+      lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
+      if (!t.live) window.location.reload();
+    });
   }
 })();

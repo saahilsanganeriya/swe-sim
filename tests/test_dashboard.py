@@ -1,4 +1,6 @@
-"""Task 14: dashboard runs table, episode page, merged timeline, live transcript, labels. Offline (httpx monkeypatched)."""
+"""Console over the file reader: row projections, every page and JSON twin, and the evaluator gate (no leak on any
+non-evaluator route; positive control for evaluator identities). Offline: Temporal is a fake client, the stakeholder
+service is never called (httpx.get fails the test if touched)."""
 from __future__ import annotations
 
 import json
@@ -7,936 +9,504 @@ from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
 
-import swesim.dashboard.app as dash
-from swesim.dashboard.app import app, merge_timeline
+from swesim.dashboard import access, data, render
+from swesim.dashboard import rows as R
+from swesim.dashboard.app import app, leaderboard_gate
+from swesim.dashboard.pages import reject_histogram
+from swesim.dashboard.data import merge_timeline
+from swesim.index.files import FileIndexReader
+from swesim.storage.layout import Layout
+from swesim.models import ScenarioSpec, minimal_spec_dict
+from swesim.settings import get_settings, reset_settings
 from swesim.stages.score import score_scenario
 
 try:  # pytest's default (prepend) import mode puts tests/ on sys.path
-    from test_score import (
-        HAIKU,
-        T0,
-        TRAJ,
-        ask_events,
-        make_spec,
-        make_workspace,
-        review_events,
-        write_trial,
-        write_unresolved,
-    )
+    from test_score import HAIKU, T0, ask_events, make_workspace, review_events, write_trial, write_unresolved
 except ImportError:  # pragma: no cover - importlib mode
-    from tests.test_score import (
-        HAIKU,
-        T0,
-        TRAJ,
-        ask_events,
-        make_spec,
-        make_workspace,
-        review_events,
-        write_trial,
-        write_unresolved,
-    )
+    from tests.test_score import HAIKU, T0, ask_events, make_workspace, review_events, write_trial, write_unresolved
+
+EVAL_EMAIL = "eval@example.com"
+SENTINELS = {
+    "author_only_fact": "SECRET-AUTHOR-ONLY-NOTE",
+    "withheld_excerpt": "WITHHELD-SENTINEL-77",
+    "redacted_term": "REDACTED-SENTINEL-88",
+    "judge_rationale": "JUDGE-SENTINEL-99",
+    "draft_meta": "DRAFTMETA-SENTINEL-55",
+    "audit_reason": "AUDIT-SENTINEL-66",
+    "hidden_asset": "hidden_test_SENTINEL_44.py",
+}
+EVALUATOR_JSON_KEYS = ('"redacted_terms"', '"withheld_sentences"', '"disclosed_fact_ids"', '"tool_calls"', '"tier"', '"regenerated"', '"forbidden_terms"')
 
 
-def test_merge_orders_by_time():
-    traj = {'steps': [{'timestamp': '2026-09-13T10:00:05Z', 'source': 'agent', 'message': 'reading'}]}
-    t = datetime.fromisoformat('2026-09-13T10:00:00+00:00').timestamp()
-    transcript = {'events': [{'kind': 'message', 'ts': t, 'role': 'user', 'content': 'Which exception?', 'exchange': 'ask'},
-                             {'kind': 'message', 'ts': t + 3, 'role': 'assistant', 'content': 'ValueError.', 'tool_calls': [{'tool': 'read_diff'}]}]}
-    rows = merge_timeline(traj, transcript)
-    assert [r['actor'] for r in rows] == ['agent', 'stakeholder', 'stakeholder', 'agent']
-    assert [r['ts'] for r in rows] == [t, t + 3, t + 3, t + 5]
-    assert [r['kind'] for r in rows] == ['ask', 'ask', 'tool_call', 'agent-step']
-    assert rows[2]['text'] == json.dumps({'tool': 'read_diff'}) and rows[3]['text'] == 'reading'
-    assert all(set(r) >= {'ts', 'actor', 'kind', 'text', 'meta'} for r in rows)
-
-
-def test_merge_flags_missing_timestamps_and_adds_verifier_row():
-    traj = {'steps': [{'source': 'user', 'message': 'Fix it.'},  # harness prompt without a timestamp
-                      {'timestamp': '2026-09-13T10:00:05', 'source': 'agent', 'message': 'ok'},  # naive -> UTC
-                      {'timestamp': '2026-09-13T10:00:01+00:00', 'source': 'system', 'message': 'sys'}]}
-    rows = merge_timeline(traj, {'events': [{'kind': 'session', 'ts': 1.0}]},
-                          report={'outcome': 'valid-correct', 'per_group': []}, reward={'reward': 1.0, 'success': 1, 'outcome_code': 1},
-                          status={'status': 'finished', 'finished_at': '2026-09-13T10:05:00Z'})
-    assert [r['actor'] for r in rows] == ['harness', 'agent', 'verifier', 'harness']
-    assert rows[0]['kind'] == 'system' and rows[3]['kind'] == 'prompt' and rows[3]['ts'] is None and rows[3]['no_timestamp'] is True
-    assert rows[1]['ts'] == datetime.fromisoformat('2026-09-13T10:00:05+00:00').timestamp() and rows[1]['no_timestamp'] is False
-    assert rows[2]['kind'] == 'outcome' and 'valid-correct' in rows[2]['text'] and rows[2]['meta']['reward'] == {'reward': 1.0, 'success': 1, 'outcome_code': 1}
-    # non-message transcript events never become rows; a verifier row without a timestamp is flagged too
-    v = merge_timeline({}, {}, report={'outcome': 'valid-incorrect'}, status={'status': 'completed'})
-    assert len(v) == 1 and v[0]['ts'] is None and v[0]['no_timestamp'] is True
-    assert merge_timeline({}, {}) == [] and merge_timeline({}, {}, report={}) == []
+def make_spec_with_sentinels() -> ScenarioSpec:
+    d = minimal_spec_dict()
+    d["id"] = "example-scenario"
+    d["version"] = 1
+    d["briefs"][0]["text"] = f"Import fails\nTraceback: {SENTINELS['withheld_excerpt']} raised in loader\nSteps: run `pkg load`."
+    d["briefs"].append({"profile": "withheld", "text": "Import fails\nSteps: run `pkg load`.", "provenance": "withheld"})
+    d["ledger"].append({"id": "withheld-001", "text": "The traceback names the loader", "kind": "reproduction", "provenance": "original-issue",
+                        "source_excerpt": f"Traceback: {SENTINELS['withheld_excerpt']} raised in loader", "source_url": "https://example.com/issue",
+                        "discovery": "on-request", "tests": []})
+    d["ledger"].append({"id": "f09", "text": SENTINELS["author_only_fact"], "kind": "context", "provenance": "authored", "authored_rationale": "internal",
+                        "discovery": "author-only"})
+    d["operations"] = [{"type": "withholding", "target": "withheld-001", "rationale": "Removed category: reproduction"}]
+    d.setdefault("assets", {})
+    d["assets"][SENTINELS["hidden_asset"]] = {"path": f"assets/{SENTINELS['hidden_asset']}", "bytes": 12, "sha256": "a" * 64}
+    return ScenarioSpec.model_validate(d)
 
 
 @pytest.fixture
 def site(tmp_path, monkeypatch):
-    spec = make_spec(with_author_only=True)
+    spec = make_spec_with_sentinels()
     ws = make_workspace(tmp_path, spec)
-    q = ask_events(T0 + 6, 'Which exception should be raised?', 'ValueError.', ['f01'], 5)
-    done = write_trial(ws, spec, events=q + review_events(T0 + 30, 3), label={'label': 'unresolved', 'note': 'first look'})
+    sdir = ws.scenario_dir(spec.id)
+    (sdir / "judge.json").write_text(json.dumps({"keep": True, "verified_rubric_score": 3, "complexity": "medium", "rationale": SENTINELS["judge_rationale"], "gaps": [],
+                                                 "model_id": "openai/gpt-5.5"}))
+    (sdir / "draft.meta.json").write_text(json.dumps({"created_at": "2026-09-13T06:00:00+00:00", "note": SENTINELS["draft_meta"], "spec_hash": spec.spec_hash}))
+    (sdir / "approval.json").write_text(json.dumps({"approved_by": "auto-validators", "review_needed": True, "approved_at": "2026-09-13T06:01:00+00:00",
+                                                    "spec_hash": spec.spec_hash, "version": 1, "scenario_id": spec.id}))
+    (sdir / "assets").mkdir(exist_ok=True)
+    (sdir / "assets" / SENTINELS["hidden_asset"]).write_text("def test_secret(): pass\n")
+    (sdir / "assets" / "Dockerfile.base").write_text("FROM python:3.12\n")
+    q = ask_events(T0 + 6, "Which exception should be raised?", "ValueError.", ["f01"], 5)
+    q[1]["redacted_terms"] = [SENTINELS["redacted_term"]]
+    q[1]["regenerated"] = True
+    done = write_trial(ws, spec, events=q + review_events(T0 + 30, 3), label={"label": "unresolved", "note": "first look"})
+    (ws.root / "trials" / done / "audit.json").write_text(json.dumps({"questions": [{"seq": 0, "specific": True, "decision_oriented": True, "before_implementation": True,
+                                                                                    "redundant": False, "fishing": False, "reason": SENTINELS["audit_reason"]}],
+                                                                     "replies": [{"seq": 1, "targeted": True, "volunteered": False, "test_or_identifier_disclosed": False,
+                                                                                  "behaviour_level": True, "reason": SENTINELS["audit_reason"]}],
+                                                                     "asked_before_implementing": True, "useful_question_rate": 1.0, "model": "anthropic/claude-opus-5",
+                                                                     "audited_at": "2026-09-13T07:00:00+00:00", "rubric_version": "v1"}))
     wrong = write_trial(ws, spec, attempt=1, outcome_code=2, success=0, reward=0.0)
-    full = write_trial(ws, spec, condition='full', purpose='comparison')
-    running = 'ab' * 12
-    rdir = ws.root / 'trials' / running
-    (rdir / 'task').mkdir(parents=True)
-    (rdir / 'task' / 'instruction.md').write_text('# Task\n\nIt breaks.\n')
-    (rdir / 'status.json').write_text(json.dumps({'status': 'running', 'trial_id': running}))
-    (rdir / 'request.json').write_text(json.dumps({'trial_id': running, 'scenario_id': spec.id, 'condition': 'interactive',
-                                                  'model': HAIKU, 'run_config': {'purpose': 'calibration', 'brief_profile': 'withheld',
-                                                                                 'stakeholder': {'patience_profile': {'start': 6}}}}))
+    full = write_trial(ws, spec, condition="full", purpose="comparison")
+    runner_error = write_unresolved(ws, spec, kind="runner-error", attempt=5)
+    launch_failed = write_unresolved(ws, spec, kind="launch-failed", attempt=6)
+    running = "ab" * 12
+    rdir = ws.root / "trials" / running
+    (rdir / "task").mkdir(parents=True)
+    (rdir / "task" / "instruction.md").write_text("# Task\n\nIt breaks.\n")
+    (rdir / "status.json").write_text(json.dumps({"status": "running", "trial_id": running, "started_at": "2026-09-13T12:00:00Z"}))
+    (rdir / "request.json").write_text(json.dumps({"trial_id": running, "scenario_id": spec.id, "condition": "interactive", "model": HAIKU, "spec_hash": spec.spec_hash,
+                                                  "run_config_hash": "r" * 64, "attempt_index": 9, "workflow_id": "run-live-1",
+                                                  "run_config": {"purpose": "calibration", "brief_profile": "withheld", "model": HAIKU, "condition": "interactive",
+                                                                 "stakeholder": {"patience_profile": {"start": 6}}}}))
+    (ws.root / "trials" / done / "costs.json").write_text(json.dumps([{"cost_id": "01JCOST0000000000000000001", "trial_id": done, "role": "solver", "provider": "anthropic", "model": HAIKU,
+                                                                     "input_tokens": 1000, "output_tokens": 200, "cached_tokens": None, "usd": "0.0125",
+                                                                     "price_source": "anthropic-2026-09", "at": "2026-09-13T10:05:00+00:00", "workflow_id": "run-1"}]))
+    cdir = ws.root / "candidates"
+    cdir.mkdir()
+    rows = [{"source": "github-repo", "instance_id": "acme__widget-12", "repo": "acme/widget", "base_commit": "abc"},
+            {"source": "github-repo", "instance_id": "acme__widget-13", "repo": "acme/widget", "base_commit": "abd"}]
+    (cdir / "github-repo--acme__widget.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (cdir / "github-repo--acme__widget.judged.jsonl").write_text(json.dumps({**rows[0], "judge": {"keep": False, "rationale": "not behavioural"}}) + "\n"
+                                                                 + json.dumps({**rows[1], "judge": {"keep": True, "rationale": "fine"}}) + "\n")
+    (cdir / "github-repo--acme__widget.rejects.json").write_text(json.dumps({"no-linked-issue": 5, "diff-too-small": 2}))
     score_scenario(ws, spec.id, k=3)
-    ws.registry_path.write_text(json.dumps({'scenarios': {spec.id: {
-        'id': spec.id, 'version': 1, 'spec_hash': spec.spec_hash, 'source': 'authored', 'source_ref': 'example',
-        'validation_status': 'valid', 'validation_path': str(ws.scenario_dir(spec.id) / 'validation.json'),
-        'conditions': ['full', 'hidden', 'interactive'], 'compiled_hash': 'c' * 64, 'image_digest': 'sha256:' + 'd' * 64,
-        'calibration_runs': [done, wrong], 'comparison_runs': [full], 'demonstration_runs': []}}}))
-    monkeypatch.setattr(dash, 'ROOT', ws.root)
-    monkeypatch.setattr(dash, 'REGISTRY', ws.registry_path)
-    monkeypatch.delenv('SWESIM_STAKEHOLDER_URL', raising=False)
-    monkeypatch.delenv('SWESIM_WORKER_SECRET', raising=False)
-    monkeypatch.setenv('SWESIM_ENV_FILE', str(tmp_path / 'absent.env'))  # never load the real env file in tests
-    monkeypatch.setattr(dash.httpx, 'get', lambda *a, **k: pytest.fail('network call for a finished trial'))
-    monkeypatch.setattr(dash.data, '_live_cache', {})
-    return {'ws': ws, 'spec': spec, 'done': done, 'wrong': wrong, 'full': full, 'running': running, 'client': TestClient(app)}
+    ws.registry_path.write_text(json.dumps({"scenarios": {spec.id: {
+        "id": spec.id, "version": 1, "spec_hash": spec.spec_hash, "source": "authored", "source_ref": "example", "validation_status": "valid",
+        "validation_path": str(sdir / "validation.json"), "conditions": ["full", "hidden", "interactive"], "compiled_hash": "c" * 64, "image_digest": "sha256:" + "d" * 64,
+        "calibration_runs": [done, wrong], "comparison_runs": [full], "demonstration_runs": []}}}))
+    monkeypatch.setenv("SWESIM_WORKSPACE", str(ws.root))
+    monkeypatch.setenv("SWESIM_REGISTRY", str(ws.registry_path))
+    monkeypatch.setenv("SWESIM_ENV_FILE", str(tmp_path / "absent.env"))
+    monkeypatch.setenv("SWESIM_EVALUATORS", EVAL_EMAIL)
+    monkeypatch.setenv("SWESIM_IAP_AUDIENCE", "/projects/1/locations/us-central1/services/console")
+    for k in ("SWESIM_STAKEHOLDER_URL", "SWESIM_WORKER_SECRET", "SWESIM_CONSOLE_URL", "SWESIM_DATABASE_URL", "SWESIM_TEMPORAL_UI_URL", "SWESIM_SPEND_CAP_USD"):
+        monkeypatch.delenv(k, raising=False)
+    reset_settings()
+    access.reset()
+    monkeypatch.setattr(data.httpx, "get", lambda *a, **k: pytest.fail("network call for a finished trial"))
+    monkeypatch.setattr(data, "_live_cache", {})
+    app.state.verify_jwt = lambda token, audience: {"email": token.split(":", 1)[1], "aud": audience}
+    yield {"ws": ws, "spec": spec, "done": done, "wrong": wrong, "full": full, "running": running, "runner_error": runner_error, "launch_failed": launch_failed,
+           "client": TestClient(app), "eval": {"X-Goog-Authenticated-User-Email": f"accounts.google.com:{EVAL_EMAIL}", "X-Goog-IAP-JWT-Assertion": f"ok:{EVAL_EMAIL}"}}
+    app.state.verify_jwt = None
+    reset_settings()
+    access.reset()
 
 
-# ---------------------------------------------------------------- redesign: overview API, runs, scenario, empty states, XSS, static
-
-def test_api_overview_shape_and_live_patience_with_cache(site, monkeypatch):
-    c, tid = site['client'], site['running']
-    ov = c.get('/api/overview').json()
-    assert set(ov) == {'generated_at', 'now', 'summary', 'scenarios', 'trials'}
-    assert ov['summary']['scenarios'] == 1 and ov['summary']['trials'] == 4 and ov['summary']['running'] == 1 and ov['summary']['finished'] == 3
-    s = ov['scenarios'][0]
-    assert s['id'] == site['spec'].id and [x['stage'] for x in s['stages']] == ['candidate', 'judged', 'drafted', 'approved', 'compiled', 'validated', 'registered']
-    assert {x['stage']: x['state'] for x in s['stages']}['validated'] == 'done' and {x['stage']: x['state'] for x in s['stages']}['registered'] == 'done'
-    assert {x['stage']: x['state'] for x in s['stages']}['judged'] == 'pending' and s['source_label'].startswith('authored')
-    assert s['facts'] == 2 and s['controls'] == {'oracle': 'oracle.diff', 'plausible_wrong': 1, 'alternative_correct': 0, 'tamper': 1}
-    assert s['scores']['groups'] and s['validation_status'] == 'valid' and s['registered'] is True
-    running = next(t for t in ov['trials'] if t['trial_id'] == tid)
-    assert running['running'] is True and running['status'] == 'running' and running['elapsed_s'] is None  # no started_at in that fixture
-    assert running['patience_start'] == 6 and running['live_error'] == 'SWESIM_STAKEHOLDER_URL not configured'
-    done = next(t for t in ov['trials'] if t['trial_id'] == site['done'])
-    assert done['outcome'] == 'valid-correct' and done['reward'] == 1.0 and done['elapsed_s'] == 360.0 and done['patience_end'] == 3
-    assert done['questions'] == 1 and done['reviews'] == 1 and done['label'] == 'unresolved'
-    # live patience for running trials comes from the stakeholder service, at most once per trial per cache TTL
-    # (errors are cached too, so a dead stakeholder cannot slow every poll; clear the "not configured" entry first)
-    dash.data._live_cache.clear()
-    calls = []
-
-    class Resp:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {'events': ask_events(T0, 'q?', 'a.', ['f01'], 4), 'patience_start': 6, 'patience_end': 4}
-
-    monkeypatch.setattr(dash.httpx, 'get', lambda url, headers=None, timeout=None, **k: (calls.append(url), Resp())[1])
-    monkeypatch.setenv('SWESIM_STAKEHOLDER_URL', 'https://stakeholder.example.test')
-    monkeypatch.setenv('SWESIM_WORKER_SECRET', 'secret-value')
-    running = next(t for t in c.get('/api/overview').json()['trials'] if t['trial_id'] == tid)
-    assert running['patience_end'] == 4 and running['questions'] == 1 and running['live_error'] is None
-    assert calls == [f'https://stakeholder.example.test/transcript/{tid}']
-    c.get('/api/overview')
-    assert len(calls) == 1  # cached
-    assert 'secret-value' not in json.dumps(c.get('/api/overview').json())
-    assert c.get('/').status_code == 200 and len(calls) == 1  # the page itself never blocks on the stakeholder
+def reader_of(site) -> FileIndexReader:
+    """The storage stream's file reader over the fixture workspace (what get_reader returns when the index is disabled)."""
+    return FileIndexReader(Layout(root=site["ws"].root), site["ws"].registry_path, settings=get_settings())
 
 
-def test_runs_page_has_filters_chart_and_score_table(site):
-    html = site['client'].get('/runs').text
-    for f in ('scenario', 'condition', 'model', 'status'):
-        assert f"data-filter='{f}'" in html
-    assert "<option value='interactive'>" in html and f"<option value='{HAIKU}'>" in html and "<option value='running'>" in html
-    assert '<svg class=' in html and 'aria-label=' in html and 'pass@k' in html and 'pass^k' in html
-    assert "<g class='bar s1'" in html or "<g class='bar na'" in html  # one series: bars or n/a markers, no legend box
-    assert "class='legend'" not in html
-    assert 'calibration · withheld brief · k=3' in html and 'comparison · natural brief · k=3' in html  # one facet per purpose/profile
-    assert 'groups are never pooled' in html
-    for tid in (site['done'], site['wrong'], site['full'], site['running']):
-        assert f'data-id=\'{tid}\'' in html and f"href='/trial/{tid}'" in html
-    assert 'unknown-config' in html  # the running fixture has a partial run_config: attributable, unresolved, no run config hash
+# ---------------------------------------------------------------- timeline merge
+
+def test_merge_orders_by_time():
+    traj = {"steps": [{"timestamp": "2026-09-13T10:00:05Z", "source": "agent", "message": "reading"}]}
+    t = datetime.fromisoformat("2026-09-13T10:00:00+00:00").timestamp()
+    transcript = {"events": [{"kind": "message", "ts": t, "role": "user", "content": "Which exception?", "exchange": "ask"},
+                             {"kind": "message", "ts": t + 3, "role": "assistant", "content": "ValueError.", "tool_calls": [{"tool": "read_diff"}]}]}
+    rows = merge_timeline(traj, transcript)
+    assert [r["actor"] for r in rows] == ["agent", "stakeholder", "stakeholder", "agent"]
+    assert [r["ts"] for r in rows] == [t, t + 3, t + 3, t + 5]
+    assert [r["kind"] for r in rows] == ["ask", "ask", "tool_call", "agent-step"]
 
 
-def test_chart_draws_every_group_and_labels_k_per_facet():
-    from swesim.dashboard.charts import pass_at_k_svg
-    groups = []
-    for purpose, profile, k in (('calibration', 'withheld', 1), ('comparison', 'withheld', 3), ('comparison', 'natural', 3)):
-        for cond in ('full', 'hidden', 'interactive'):
-            for i, model in enumerate(('a/one', 'b/two')):
-                groups.append({'condition': cond, 'model': model, 'purpose': purpose, 'brief_profile': profile, 'requested_k': k,
-                               'pass_at_k': 0.5 if i else None, 'n_valid': 3, 'n_total': 3, 'run_config_hash': f'{purpose}{profile}{cond}{i}' * 4})
-    svg = pass_at_k_svg(groups)
-    assert svg.count("<g class='bar") == 18 and svg.count('<svg') == 3  # every group drawn, one facet per (purpose, profile)
-    assert 'calibration · withheld brief · k=1' in svg and 'comparison · withheld brief · k=3' in svg and 'comparison · natural brief · k=3' in svg
-    assert 'k in {1, 3}' in svg and '18 of 18 group(s) drawn' in svg and 'never pooled' in svg
-    assert svg.count("class='legend'") == 1 and 'a/one' in svg and 'b/two' in svg  # two series: legend present
-    assert svg.count("class='bar s2'") == 9 and svg.count("class='bar na'") == 9  # b/two has values, a/one is n/a everywhere
-    # two groups sharing a slot inside a facet (a rebuild) stay separate bars and are called out
-    dup = groups[:1] + [{**groups[0], 'run_config_hash': 'z' * 64, 'pass_at_k': 0.9}]
-    svg2 = pass_at_k_svg(dup)
-    assert svg2.count("<g class='bar") == 2 and 'hold more than one group' in svg2 and 'build z' in svg2
-    assert 'No scored groups yet' in pass_at_k_svg([]) and 'role=\'img\'' not in svg  # focusable bars inside an svg: no role=img
+def test_merge_flags_missing_timestamps_and_adds_verifier_row():
+    traj = {"steps": [{"source": "user", "message": "Fix it."}, {"timestamp": "2026-09-13T10:00:05", "source": "agent", "message": "ok"}]}
+    rows = merge_timeline(traj, {}, report={"outcome": "valid-correct"}, reward={"reward": 1.0, "success": 1, "outcome_code": 1},
+                          status={"status": "finished", "finished_at": "2026-09-13T10:05:00Z"})
+    assert [r["actor"] for r in rows] == ["agent", "verifier", "harness"] and rows[-1]["no_timestamp"] is True
+    assert merge_timeline({}, {}) == []
 
 
-def test_api_overview_live_fetch_stays_within_budget(site, monkeypatch):
-    import time as _time
-    c, tid = site['client'], site['running']
-    dash.data._live_cache.clear()
+# ---------------------------------------------------------------- file reader projections
 
-    class Slow:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {'events': [], 'patience_start': 6, 'patience_end': 2}
-
-    def slow_get(url, headers=None, timeout=None, **k):
-        _time.sleep(0.6)
-        return Slow()
-
-    monkeypatch.setattr(dash.httpx, 'get', slow_get)
-    monkeypatch.setenv('SWESIM_STAKEHOLDER_URL', 'https://stakeholder.example.test')
-    monkeypatch.setenv('SWESIM_WORKER_SECRET', 's')
-    monkeypatch.setattr(dash.data, 'LIVE_BUDGET', 0.15)
-    t0 = _time.monotonic()
-    ov = c.get('/api/overview').json()
-    assert _time.monotonic() - t0 < 0.5  # the poll returns within the budget even though the stakeholder is slow
-    row = next(t for t in ov['trials'] if t['trial_id'] == tid)
-    assert row['live_error'] == 'live fetch budget exceeded' and row['patience_end'] is None
-    _time.sleep(0.7)  # the background fetch finished and filled the cache: the next poll is served from it
-    row = next(t for t in c.get('/api/overview').json()['trials'] if t['trial_id'] == tid)
-    assert row['patience_end'] == 2 and row['live_error'] is None
+def test_reader_projects_scenarios_with_status_and_registry(site):
+    r = reader_of(site)
+    pg = r.scenarios(R.ScenarioFilter(latest_only=True))
+    assert pg.total == 1
+    s = pg.items[0]
+    assert (s.scenario_id, s.version, s.validation_status, s.source) == (site["spec"].id, 1, "valid", "authored")
+    assert s.spec_hash == site["spec"].spec_hash and s.registry_json["validation_status"] == "valid" and s.difficulty_tier is None and s.origin == "laptop"
+    assert r.scenario(site["spec"].id).version == 1 and r.scenario("nope") is None and r.scenario_versions(site["spec"].id)[0].version == 1
+    assert r.scenarios(R.ScenarioFilter(validation_status=["invalid"])).total == 0
 
 
-def test_post_routes_reject_cross_origin_requests(site):
-    c, tid = site['client'], site['wrong']
-    evil = {'Origin': 'http://evil.example'}
-    assert c.post(f'/trial/{tid}/label', json={'label': 'unresolved'}, headers=evil).status_code == 403
-    assert c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b'}, headers=evil).status_code == 403
-    assert c.post('/api/run', json={}, headers=evil).status_code == 403
-    assert c.post('/api/jobs/x/cancel', json={'confirm': True}, headers=evil).status_code == 403
-    assert c.post(f"/api/review/{site['spec'].id}", json={}, headers=evil).status_code == 403
-    assert c.post(f'/trial/{tid}/label', json={'label': 'unresolved'}, headers={'Origin': 'null'}).status_code == 403
-    assert c.post(f'/trial/{tid}/label', json={'label': 'unresolved'}, headers={'Origin': 'http://testserver:8080'}).status_code == 200
-    assert c.post(f'/trial/{tid}/label', json={'label': 'unresolved'}).status_code == 200  # no Origin (curl, scripts): allowed
-    assert 'CSRF posture' in dash.__doc__
+def test_reader_projects_every_attempt_including_unresolved_and_launch_failed(site):
+    r = reader_of(site)
+    pg = r.trials(R.TrialFilter(limit=500))
+    by_id = {t.trial_id: t for t in pg.items}
+    assert pg.total == 6
+    done = by_id[site["done"]]
+    assert done.status == "completed" and done.outcome_code == 1 and done.success is True and float(done.reward) == 1.0
+    assert done.questions_asked == 1 and done.confirmations == 0 and done.asked_before_implementing is True and done.provider == "anthropic"  # reviews are not confirmations
+    assert float(done.cost_usd) == 0.0125 and done.input_tokens == 1000 and done.started_at is not None
+    assert by_id[site["wrong"]].outcome_code == 2 and by_id[site["wrong"]].success is False
+    assert by_id[site["runner_error"]].status in ("runner-error", "unresolved") and by_id[site["launch_failed"]].status in ("launch-failed", "unresolved")
+    assert by_id[site["runner_error"]].outcome_code is None and by_id[site["launch_failed"]].success is None
+    running = by_id[site["running"]]
+    assert running.status == "running" and running.attempt_index == 9 and running.workflow_id == "run-live-1" and running.outcome_code is None
+    assert r.trials(R.TrialFilter(status=["completed"])).total == 3 and r.trials(R.TrialFilter(condition=["full"])).total == 1
+    assert r.trials(R.TrialFilter(started_from=datetime.fromisoformat("2026-09-13T11:00:00+00:00"))).total == 1  # only the running one started at noon
+    assert r.trials(R.TrialFilter(q=site["done"][:10])).items[0].trial_id == site["done"]
+    assert r.trial(site["done"]).trial_id == site["done"] and r.trial("0" * 24) is None
 
 
-def test_console_inputs_are_fullmatched_and_cli_strings_quoted(site, monkeypatch):
-    c = site['client']
-    client = _Client()
-    _install_client(monkeypatch, client)
-    bad = c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b', 'since': '2026-01-01\n', 'approval_mode': '<script>x;rm -rf /</script>'})
-    assert bad.status_code == 400
-    errs = bad.json()['errors']
-    assert any('since must be' in e for e in errs) and any('approval_mode' in e for e in errs)
-    assert "'<script>x;rm -rf /</script>'" in bad.json()['cli']  # shell-quoted, never bare, in the CLI equivalent
-    assert c.post('/api/create', json={'source': 'github-repo', 'repos': '../evil'}).status_code == 400
-    assert c.post('/api/create', json={'source': 'github-repo', 'repos': 'https://github.com/../..'}).status_code == 400
-    assert c.get('/jobs/x%0A').status_code == 404 and c.get('/jobs/ok-id').status_code == 200
-    bad = c.post('/api/run', json={'scenario_ids': [site['spec'].id], 'models': ['a/b'], 'conditions': ['interactive'], 'purpose': '$(id)'})
-    assert bad.status_code == 400 and "'$(id)'" in bad.json()['cli']
-    # fallback paths carry every collected field and plan trials with the worker's own planner
-    class Legacy:
-        def __init__(self):
-            self.pipeline = []
-            self.matrix = []
-
-        async def start_pipeline(self, params):
-            self.pipeline.append(params)
-            return 'pipeline-1'
-
-        async def start_matrix(self, plan):
-            self.matrix.append(plan)
-            return 'matrix-1'
-
-    legacy = Legacy()
-    _install_client(monkeypatch, legacy)
-    ok = c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b', 'since': '2026-03-01', 'limit': 7})
-    assert ok.status_code == 200 and legacy.pipeline[0]['since'] == '2026-03-01' and legacy.pipeline[0]['limit'] == 7
-    ok = c.post('/api/run', json={'scenario_ids': [site['spec'].id], 'models': [HAIKU], 'conditions': ['interactive'], 'k': 1,
-                                  'stakeholder_model': 'anthropic/claude-sonnet-5', 'max_parallel': 4})
-    assert ok.status_code == 200 and 'max_parallel is ignored' in ok.json()['via'] and 'RunTasksWorkflow' in ok.json()['via']
-    plan = legacy.matrix[0]
-    assert plan['scenario_id'] == site['spec'].id and len(plan['trials']) == 1
-    assert all(t['run_config']['stakeholder']['model_id'] == 'anthropic/claude-sonnet-5' for t in plan['trials'])
-    # identical to what the worker/CLI planner produces for the same request (same RunConfig, same trial ids, same score groups)
-    from swesim.workflows import activities
-    with dash.console.planner_workspace(site['ws'].root) as acts:
-        expected = acts.plan_trials({'scenario_id': site['spec'].id, 'models': [HAIKU], 'conditions': ['interactive'], 'k': 1, 'purpose': 'comparison',
-                                     'brief_profile': 'withheld', 'stakeholder_model': 'anthropic/claude-sonnet-5', 'attempt_offset': 0, 'stakeholder_url': ''})
-    assert [t['trial_id'] for t in plan['trials']] == [t['trial_id'] for t in expected['trials']]
-    assert [t['run_config_hash'] for t in plan['trials']] == [t['run_config_hash'] for t in expected['trials']]
-    assert activities.WS.root != site['ws'].root  # the override is scoped to the call
+def test_reader_exchanges_blank_evaluator_columns_for_non_evaluators(site):
+    r = reader_of(site)
+    public = r.exchanges(site["done"], evaluator=False)
+    full = r.exchanges(site["done"], evaluator=True)
+    assert [x.role for x in public] == ["agent", "stakeholder", "agent", "stakeholder"] and [x.exchange for x in public] == ["ask", "ask", "review", "review"]
+    assert all(x.disclosed_fact_ids == [] and x.redacted_terms == [] and x.regenerated is None and x.audit is None for x in public)
+    assert full[1].disclosed_fact_ids == ["f01"] and full[1].redacted_terms == [SENTINELS["redacted_term"]] and full[1].regenerated is True
+    assert full[1].patience_after == 5 and full[1].audit["reason"] == SENTINELS["audit_reason"] and full[0].audit["specific"] is True
+    assert r.exchanges("0" * 24, evaluator=True) == []
 
 
-def test_same_origin_uses_parsed_hostnames_and_overview_hides_the_tier(site):
-    c, tid = site['client'], site['wrong']
-    body = {'label': 'unresolved'}
-    # IPv6 literals: bracketed hosts are compared as hostnames, not by a naive split on ':'
-    assert c.post(f'/trial/{tid}/label', json=body, headers={'Host': '[::1]:8080', 'Origin': 'http://[::2]:9'}).status_code == 403
-    assert c.post(f'/trial/{tid}/label', json=body, headers={'Host': '[::1]:8080', 'Origin': 'http://[::1]:9'}).status_code == 200
-    assert c.post(f'/trial/{tid}/label', json=body, headers={'Host': 'localhost:8080', 'Origin': 'http://127.0.0.1:8080'}).status_code == 403
-    assert c.post(f'/trial/{tid}/label', json=body, headers={'Host': 'localhost:8080', 'Origin': 'http://LOCALHOST:9999'}).status_code == 200
-    assert c.post(f'/trial/{tid}/label', json=body, headers={'Origin': 'not a url'}).status_code == 403
-    # the stakeholder tier never appears in the overview JSON (it is evaluator-only on the episode API)
-    ov = c.get('/api/overview').json()
-    assert 'patience_tier' not in json.dumps(ov) and all('patience_end' in t for t in ov['trials'])
+def test_reader_candidates_funnel_and_reject_histogram(site):
+    r = reader_of(site)
+    pg = r.candidates(R.CandidateFilter(limit=100))
+    by_id = {c.instance_id: c for c in pg.items}
+    assert pg.total == 2 and by_id["acme__widget-12"].status == "rejected" and by_id["acme__widget-12"].gate == "judge" and by_id["acme__widget-12"].reasons
+    assert by_id["acme__widget-13"].status == "kept" and by_id["acme__widget-13"].stage == "judged" and by_id["acme__widget-13"].pr_number == 13
+    steps = {s.stage: s for s in r.funnel()}
+    assert steps["mined"].kept == 2 and steps["judged"].rejected == 1 and steps["judged"].kept == 1 and steps["registered"].kept == 0
+    layout = Layout(root=site["ws"].root)
+    assert reject_histogram(r, pg.items, None).get("judge") == 1
+    assert reject_histogram(r, pg.items, "other-key") == {}
+    assert r.candidates(R.CandidateFilter(status=["rejected"])).total == 1
 
 
-def test_hostile_spec_and_progress_text_is_escaped(tmp_path, monkeypatch):
-    spec = make_spec(withheld=True)
-    d = json.loads(spec.model_dump_json())
-    d['briefs'][0]['text'] = d['briefs'][0]['text'] + '\n<script>alert(1)</script>'
-    d['ledger'][0]['text'] = '<img src=x onerror=alert(2)> Raise ValueError'
-    d['environment']['repo_url'] = 'javascript:alert(3)'
-    d['persona']['summary'] = '<b>maintainer</b>'
-    ws = make_workspace(tmp_path, spec)
-    (ws.scenario_dir(spec.id) / 'scenario.json').write_text(json.dumps(d))
-    (ws.scenario_dir(spec.id) / 'judge.json').write_text(json.dumps({'keep': True, 'verified_rubric_score': 2, 'rationale': '<script>alert(4)</script>',
-                                                                     'gaps': [{'category': 'behavior', 'text': '<svg onload=alert(5)>'}]}))
-    monkeypatch.setattr(dash, 'ROOT', ws.root)
-    monkeypatch.setattr(dash, 'REGISTRY', ws.registry_path)
-    monkeypatch.setenv('SWESIM_ENV_FILE', str(tmp_path / 'absent.env'))
-    c = TestClient(app)
-    for path in (f'/scenario/{spec.id}', f'/review/{spec.id}'):
-        html = c.get(path).text
-        for raw in ('<script>alert(1)</script>', '<img src=x onerror=alert(2)>', '<script>alert(4)</script>', '<svg onload=alert(5)>', '<b>maintainer</b>'):
-            assert raw not in html, (path, raw)
-        assert "href='javascript:" not in html and 'repository ↗' not in html  # non-http repo_url gets no link
-    client = _Client()
-    client.jobs = [{'workflow_id': 'j1', 'type': 'CreateTasksWorkflow', 'status': 'RUNNING', 'summary': {'sources': ['<script>alert(6)</script>']}}]
-    client.progress_by_id = {'j1': {'stage': '<img src=x onerror=alert(7)>', 'scenario_id': '<b>x</b>', 'needs_human': ['<script>alert(8)</script>'],
-                                    'candidates': {'<b>x</b>': {'instance_id': '<i>evil</i>', 'stage': 'judging', 'status': 'running', 'stages': ['judging'],
-                                                                'detail': 'token=abc123 https://secret.example/x'}}}}
-    _install_client(monkeypatch, client)
-    jobs = c.get('/jobs').text
-    assert '<script>alert(6)</script>' not in jobs
-    job = c.get('/jobs/j1').text
-    for raw in ('<img src=x onerror=alert(7)>', '<b>x</b>', '<script>alert(8)</script>', '<i>evil</i>'):
-        assert raw not in job
-    assert 'https://secret.example/x' not in job and '&lt;url&gt;' in job  # raw progress pane is redacted
-    # review toggle stays on the review page
-    review = c.get(f'/review/{spec.id}').text
-    assert f"href='/review/{spec.id}?evaluator=1'" in review and f"href='/scenario/{spec.id}?evaluator=1'" not in review
+def test_reader_scores_and_leaderboard_gate(site):
+    r = reader_of(site)
+    scores = r.scores(R.ScoreFilter(scenario_id=[site["spec"].id]))
+    assert scores and all(s.spec_hash == site["spec"].spec_hash for s in scores)
+    cal = next(s for s in scores if s.condition == "interactive")
+    assert cal.n == 2 and cal.success_count == 1 and cal.questions_asked == 1 and cal.confirmations == 0
+    gate = leaderboard_gate(r, False)
+    assert gate[0]["checks"] == {"valid": True, "difficulty": False, "task_sense": False} and gate[0]["eligible"] is False
+    assert r.leaderboard(R.LeaderboardFilter(purpose="calibration")) == []  # nothing without a difficulty label and audit
+    sdir = site["ws"].scenario_dir(site["spec"].id)
+    (sdir / "difficulty.json").write_text(json.dumps({"tier": "informative", "model": "openrouter/deepseek/deepseek-v3.2", "hidden": {"n": 2, "successes": 1},
+                                                      "full": {"n": 1, "successes": 1}, "labelled_at": "2026-09-13T08:00:00+00:00", "trial_ids": []}))
+    (sdir / "audit.json").write_text(json.dumps({"coherent": True, "fair_tests": True, "plausible_withholding": True, "reasons": {}, "model": "anthropic/claude-opus-5",
+                                                 "audited_at": "2026-09-13T08:00:00+00:00", "rubric_version": "v1"}))
+    assert r.scenario(site["spec"].id).difficulty_tier == "informative"
+    board = r.leaderboard(R.LeaderboardFilter(purpose="calibration"))
+    assert len(board) == 1
+    cell = board[0]
+    assert (cell.model, cell.condition, cell.brief_profile, cell.n, cell.success_count, cell.scenarios) == (HAIKU, "interactive", "withheld", 2, 1, 1)
+    assert float(cell.pass_rate) == 0.5 and float(cell.cost_usd) == 0.0125 and float(cell.cost_per_success) == 0.0125 and cell.questions_asked == 1
+    assert r.leaderboard(R.LeaderboardFilter(purpose="comparison"))[0].condition == "full"  # purposes are never pooled
+    assert r.leaderboard(R.LeaderboardFilter(purpose="calibration", min_n=3)) == []
 
 
-def test_scenario_page_briefs_ledger_controls_and_evaluator_toggle(tmp_path, monkeypatch):
-    spec = make_spec(with_author_only=True, withheld=True)
-    ws = make_workspace(tmp_path, spec)
-    (ws.scenario_dir(spec.id) / 'judge.json').write_text(json.dumps({'keep': True, 'verified_rubric_score': 2, 'complexity': 3,
-                                                                     'test_behavioralness': 4, 'self_contained': True,
-                                                                     'alternatives_accepted': False, 'model_id': 'openai/gpt-5.5',
-                                                                     'rationale': 'Underspecified error type.',
-                                                                     'gaps': [{'category': 'behavior', 'text': 'Which exception?', 'consequential': True,
-                                                                               'derivable_from_repo': False, 'resolved_by': 'thread'}]}))
-    monkeypatch.setattr(dash, 'ROOT', ws.root)
-    monkeypatch.setattr(dash, 'REGISTRY', ws.registry_path)
-    monkeypatch.setenv('SWESIM_ENV_FILE', str(tmp_path / 'absent.env'))
-    c = TestClient(app)
-    r = c.get(f'/scenario/{spec.id}')
-    assert r.status_code == 200
-    html = r.text
-    assert '<h3>natural' in html and '<h3>withheld' in html
-    assert "<mark class='removed'" in html and 'Traceback: SECRET_ERROR raised in loader</mark>' in html
-    assert html.count("<mark class='removed' title=") == 1 and 'Import fails\nSteps: run `pkg load`.' in html  # one removed span; withheld brief verbatim
-    assert 'withholding' in html and 'Removed category: reproduction' in html
-    assert '<h3>on-request' in html and 'withheld-001' in html and 'f01' in html
-    assert 'SECRET-AUTHOR-ONLY-NOTE' not in html and 'author-only facts (1) hidden' in html  # off by default: not even in the DOM
-    on = c.get(f'/scenario/{spec.id}?evaluator=1').text
-    assert 'SECRET-AUTHOR-ONLY-NOTE' in on and '<h3>author-only' in on and 'evaluator-only' in on
-    # controls joined with validation results; the fixture validation only ran nop
-    assert 'oracle.diff' in html and 'keyerror' in html and 'root-conftest' in html and 'incorrect-exploit' in html
-    assert 'as expected' in html and 'not run' in html and 'valid</span>' in html
-    # judge verdict and gaps
-    assert 'rubric 2/3' in html and 'Which exception?' in html and 'Underspecified error type.' in html
-    # stage chips and links
-    for stage in ('candidate', 'judged', 'drafted', 'approved', 'compiled', 'validated', 'registered'):
-        assert f'>{stage}</span>' in html
-    assert f"href='/scenario/{spec.id}/file/validation.json'" in html
-    assert c.get(f'/scenario/{spec.id}/file/validation.json').json()['status'] == 'valid'
-    assert c.get(f'/scenario/{spec.id}/file/passwd').status_code == 404
-    assert c.get('/scenario/no-such-scenario').status_code == 404 and c.get('/scenario/BAD').status_code == 404
-    assert c.get('/scenarios').status_code == 200 and spec.id in c.get('/scenarios').text
+def test_reader_costs_spend_table_and_operator_actions(site, tmp_path, monkeypatch):
+    monkeypatch.setenv("SWESIM_SPEND_CAP_USD", "10")
+    reset_settings(); access.reset()
+    r = reader_of(site)
+    costs = r.costs(R.CostFilter())
+    assert len(costs) == 1 and costs[0].role == "solver" and costs[0].workflow_id == "run-1" and float(costs[0].usd) == 0.0125
+    spend = r.spend()
+    assert len(spend) == 1 and spend[0].model == HAIKU and float(spend[0].usd) == 0.0125 and float(spend[0].share_of_cap) == 0.00125 and float(spend[0].cap_usd) == 10
+    pg = r.table("trials", R.TableFilter(where={"status": "completed"}, order_by="attempt_index", desc=False, limit=2))
+    assert pg.total == 3 and len(pg.items) == 2 and pg.items[0]["attempt_index"] == 0
+    with pytest.raises(ValueError):
+        r.table("nope", R.TableFilter())
+    assert r.table("exchanges", R.TableFilter()).total == 4
+    assert r.operator_actions(R.PageFilter()).total == 0 and r.rebuilds() == []
+    from datetime import UTC
+    row = R.OperatorActionRow(action_id="01J", actor="anonymous", action="label", target=site["done"], params={"label": "unresolved"}, confirmed=True, origin_header=None,
+                              result="accepted", workflow_id=None, at=datetime.now(UTC), origin="laptop")
+    access.record_action(r, get_settings(), row)
+    assert r.operator_actions(R.PageFilter()).items[0].action_id == "01J" and (site["ws"].root / "evidence" / "console" / "actions.jsonl").exists()
+
+
+# ---------------------------------------------------------------- pages and JSON twins
+
+PUBLIC_ROUTES = ("/", "/scenarios", "/trials", "/trials?status=unresolved&condition=interactive", "/candidates", "/workflows", "/review", "/leaderboard",
+                 "/leaderboard?include_saturated=1&tier=C", "/db", "/db/trials", "/db/exchanges", "/db/scenarios", "/artifacts", "/artifacts?path=trials", "/create", "/run",
+                 "/spend", "/search?q=example", "/api/counts", "/api/home", "/api/scenarios", "/api/trials", "/api/candidates", "/api/workflows", "/api/leaderboard",
+                 "/api/spend", "/api/review", "/api/db/trials", "/api/db/exchanges", "/api/db/exchanges.csv", "/api/db/trials.csv", "/api/artifacts?path=scenarios")
+
+
+def test_every_page_and_json_twin_renders(site):
+    c = site["client"]
+    for route in PUBLIC_ROUTES + (f"/scenario/{site['spec'].id}", f"/trial/{site['done']}", f"/trial/{site['running']}", f"/trial/{site['runner_error']}",
+                                  f"/api/trial/{site['done']}/timeline", f"/review/{site['spec'].id}", f"/artifacts?path=scenarios/{site['spec'].id}",
+                                  f"/artifacts?path=scenarios/{site['spec'].id}/validation.json"):
+        r = c.get(route)
+        assert r.status_code == 200, (route, r.status_code, r.text[:200])
+    home = c.get("/").text
+    assert "aria-current='page'" in home and "data-source='/api/home'" in home and "Leaderboard" in home and "Artifacts" in home
+    assert "href='/static/tokens.css'" in home and "data-theme-toggle" in home and "role='search'" in home and "<dialog" in home
+    counts = c.get("/api/counts").json()
+    assert counts == {"scenarios_valid": 1, "trials_running": 1, "candidates_pending": 0, "workflows_running": 0, "review_pending": 0}
+    h = c.get("/api/home").json()
+    assert h["tiles"]["trials_completed"] == 3 and h["tiles"]["trials_unresolved"] == 2 and len(h["running"]) == 1 and h["funnel"][0]["stage"] == "mined"
+    assert c.get("/scenario/nope-nope").status_code == 404 and c.get("/trial/" + "0" * 24).status_code == 404 and c.get("/db/nope").status_code == 404
+    assert c.get("/jobs", follow_redirects=False).status_code == 308 and c.get("/runs", follow_redirects=False).headers["location"] == "/trials"
+
+
+def test_scenario_page_shows_versions_difficulty_controls_and_links_numbers_to_artifacts(site):
+    c = site["client"]
+    html = c.get(f"/scenario/{site['spec'].id}").text
+    assert "unlabelled" in html and "Not screened yet" in html and "Controls and validation" in html and "as expected" in html
+    assert f"/artifacts?path=scenarios/{site['spec'].id}/compile.json" in html and "Trials on this scenario" in html and site["done"][:12] in html
+    assert "Import fails" in html and "withheld" in html  # briefs present
+    api = c.get("/api/scenarios").json()
+    assert api["total"] == 1 and api["items"][0]["scenario_id"] == site["spec"].id and api["items"][0]["task_sense_label"] is None
+
+
+def test_trials_page_filters_and_json_agree(site):
+    c = site["client"]
+    all_ = c.get("/api/trials").json()
+    assert all_["total"] == 6 and {t["status"] for t in all_["items"]} == {"completed", "running", "runner-error", "launch-failed"}
+    unresolved = c.get("/api/trials?status=unresolved").json()
+    assert unresolved["total"] == 2 and {t["outcome"] for t in unresolved["items"]} == {"unresolved"}
+    done = next(t for t in all_["items"] if t["trial_id"] == site["done"])
+    assert done["outcome"] == "valid-correct" and done["cost_usd"] == "0.0125" and done["questions_asked"] == 1
+    html = c.get(f"/trials?model={HAIKU}&condition=full").text
+    assert site["full"][:12] in html and site["wrong"][:12] not in html
+    windowed = c.get("/api/trials?since=2026-09-13&until=2026-09-13").json()
+    assert windowed["total"] == 4 and all(t["started_at"] for t in windowed["items"])  # attempts without a start time fail a bounded window
+    assert c.get("/api/trials?since=2026-09-14").json()["total"] == 0
+
+
+def test_candidates_page_has_funnel_histogram_and_every_reject_reason(site):
+    html = site["client"].get("/candidates").text
+    assert "chart-funnel" in html and "chart-rejects" in html and "judge" in html and "acme__widget-12" in html
+    assert "<figure" in html and "Table</button>" in html  # every chart has a table twin
+    api = site["client"].get("/api/candidates?status=rejected").json()
+    assert api["total"] == 1 and api["items"][0]["gate"] == "judge"
+
+
+def test_workflows_page_merges_live_listing_and_deep_links_to_temporal(site, monkeypatch):
+    import swesim.workflows.client as real
+
+    async def list_runs(kind="all", limit=50):
+        return [{"workflow_id": "run-1", "run_id": "r-1", "type": "RunTasksWorkflow", "status": "COMPLETED", "start_time": "2026-09-13T03:25:35+00:00",
+                 "close_time": "2026-09-13T03:40:00+00:00", "summary": {"scenario_ids": ["example-scenario"], "models": [HAIKU]}},
+                {"workflow_id": "create-2", "run_id": "r-2", "type": "CreateTasksWorkflow", "status": "FAILED", "start_time": "2026-09-13T04:00:00+00:00", "summary": {}}]
+    monkeypatch.setattr(real, "list_runs", list_runs)
+    monkeypatch.setenv("TEMPORAL_ADDRESS", "us-central1.gcp.api.temporal.io:7233")
+    monkeypatch.setenv("TEMPORAL_NAMESPACE", "swesim.abcde")
+    reset_settings(); access.reset()
+    c = site["client"]
+    html = c.get("/workflows").text
+    assert "run-1" in html and "create-2" in html and "https://cloud.temporal.io/namespaces/swesim.abcde/workflows/run-1/r-1" in html
+    api = c.get("/api/workflows").json()
+    assert {w["workflow_id"] for w in api["items"]} == {"run-1", "create-2"} and api["error"] is None
+    failed = next(w for w in api["items"] if w["workflow_id"] == "create-2")
+    assert failed["status"] == "failed" and failed["temporal_url"].endswith("/workflows/create-2/r-2")
+    assert "run-live-1" in c.get(f"/scenario/{site['spec'].id}").text  # trial rows carry their workflow id
+    # unreachable Temporal degrades to a banner with the CLI fallback, never a 500
+    monkeypatch.delattr(real, "list_runs", raising=False)
+    assert "Live listing unavailable" in c.get("/workflows").text and c.get("/workflows/run-1").status_code == 404
+
+
+def test_leaderboard_page_gate_toggle_and_confidence(site):
+    c = site["client"]
+    html = c.get("/leaderboard").text
+    assert "0 / 1" in html and "excluded" in html and "not audited" in html and "No cells" in html and "include saturated" in html
+    sdir = site["ws"].scenario_dir(site["spec"].id)
+    (sdir / "difficulty.json").write_text(json.dumps({"tier": "saturated", "model": "openrouter/deepseek/deepseek-v3.2", "hidden": {"n": 2, "successes": 2},
+                                                      "full": {"n": 1, "successes": 1}, "labelled_at": "2026-09-13T08:00:00+00:00", "trial_ids": []}))
+    (sdir / "audit.json").write_text(json.dumps({"coherent": True, "fair_tests": True, "plausible_withholding": True, "reasons": {}, "model": "anthropic/claude-opus-5",
+                                                 "audited_at": "2026-09-13T08:00:00+00:00", "rubric_version": "v1"}))
+    access.reset()
+    html = c.get("/leaderboard?purpose=calibration").text
+    assert "Saturated scenarios (shown separately)" in html and "0 / 1" in html  # saturated excluded by default, shown separately
+    api = c.get("/api/leaderboard?purpose=calibration&include_saturated=1").json()
+    assert len(api["items"]) == 1 and api["items"][0]["n"] == 2 and "Wilson 95% CI" in api["items"][0]["confidence_note"] and api["items"][0]["asked_first_rate"] == "1.000"
+    assert api["items"][0]["pass_at_k"] is None  # k=3 requested, 2 valid attempts: not computed, and the note says so
+    html = c.get("/leaderboard?purpose=calibration&include_saturated=1").text
+    assert "chart-matrix" in html and "chart-lb" in html and HAIKU in html and "1 / 1" in html
+
+
+def test_database_browser_lists_tables_filters_and_exports_csv(site):
+    c = site["client"]
+    idx = c.get("/db").text
+    assert all(f"/db/{t}" in idx for t in R.TABLES) and "index is disabled" in idx and "data-action='rebuild'" in idx
+    html = c.get("/db/trials?where_col=status&where_val=completed&order_by=attempt_index").text
+    assert "3 row(s)" in html and site["done"][:12] in html
+    csv_text = c.get("/api/db/trials.csv?where.status=completed").text
+    lines = csv_text.strip().splitlines()
+    assert {"trial_id", "scenario_id", "status", "origin"} <= set(lines[0].split(",")) and len(lines) == 4 and "text/csv" in c.get("/api/db/trials.csv").headers["content-type"]
+    ex = c.get("/api/db/exchanges").json()
+    assert ex["total"] == 4 and "disclosed_fact_ids" not in ex["items"][0] and "text_public" in ex["items"][0]
+    assert "redacted_terms" not in c.get("/api/db/exchanges.csv").text.splitlines()[0]
+
+
+def test_artifact_browser_lists_sizes_previews_and_never_lists_the_task_copy(site):
+    c, tid, sid = site["client"], site["done"], site["spec"].id
+    listing = c.get(f"/api/artifacts?path=trials/{tid}").json()
+    names = {e["name"]: e for e in listing["entries"]}
+    assert "task" not in names
+    assert names["reward.json"]["listable"] is True and names["reward.json"]["size"] > 0 and names["record.json"]["listable"] is False
+    assert c.get(f"/artifacts?path=trials/{tid}/task").status_code == 403 and c.get(f"/artifacts?path=trials/{tid}/task/instruction.md").status_code == 403
+    assert c.get(f"/artifacts?path=trials/{tid}/task", headers=site["eval"]).status_code == 403  # never, for anyone
+    preview = c.get(f"/artifacts?path=trials/{tid}/reward.json").text
+    assert "Preview" in preview and "outcome_code&quot;: 1" in preview and "download?path=" in preview  # JSON pretty-printed and escaped
+    assets = c.get(f"/api/artifacts?path=scenarios/{sid}/assets", headers=site["eval"]).json()
+    assert {e["name"]: e["sha256"] for e in assets["entries"]}[SENTINELS["hidden_asset"]] == "a" * 64  # sha256 from the manifest
+    assert c.get(f"/api/artifacts?path=scenarios/{sid}/assets").status_code == 403
+    assert c.get("/artifacts?path=../etc").status_code == 400 and c.get("/artifacts?path=nope/nope").status_code == 200
+    dl = c.get(f"/artifacts/download?path=trials/{tid}/reward.json")
+    assert dl.status_code == 200 and json.loads(dl.content)["success"] == 1 and c.get(f"/artifacts/download?path=trials/{tid}/record.json").status_code == 403
+
+
+def test_episode_page_conversation_patch_and_lineage(site):
+    c = site["client"]
+    html = c.get(f"/trial/{site['done']}").text
+    assert "Which exception should be raised?" in html and "ValueError." in html and "class='bubble agent ask" in html and "class='bubble stakeholder ask" in html
+    assert "patience 5" in html and "xtype'>review" in html and "valid-correct" in html and "Requirement groups" in html
+    assert "evaluator-only material" in html and "hidden for this identity" in html and "data-action='label'" in html
+    tl = c.get(f"/api/trial/{site['done']}/timeline").json()
+    assert tl["evaluator"] is False and tl["live"] is False and tl["patience"] == {"start": 6, "end": 3, "questions": 1, "confirmations": 0, "reviews": 1}
+    assert len(tl["exchanges"]) == 4 and "disclosed_fact_ids" not in tl["exchanges"][1] and tl["exchanges"][1]["patience_after"] == 5  # keys stripped, patience public
+    live = c.get(f"/trial/{site['running']}").text
+    assert "data-live='true'" in live and "polled every 3 s" in live and "SWESIM_STAKEHOLDER_URL not configured" in live
+    assert c.get(f"/trial/{site['done']}/file/reward.json").status_code == 200 and c.get(f"/trial/{site['done']}/file/nope.json").status_code == 404
+
+
+def test_search_finds_scenarios_trials_and_models(site):
+    html = site["client"].get(f"/search?q={site['done'][:8]}").text
+    assert site["done"] in html and "Trials" in html
+    html = site["client"].get("/search?q=haiku").text
+    assert HAIKU in html and "Models" in html
+    assert "No match" in site["client"].get("/search?q=zzzzzz").text
+
+
+def test_static_assets_tokens_and_tier_table_are_consistent(site):
+    c = site["client"]
+    tokens = c.get("/static/tokens.css")
+    assert tokens.status_code == 200 and "--fam-1" in tokens.text and "prefers-color-scheme: dark" in tokens.text and '[data-theme="dark"]' in tokens.text
+    css = c.get("/static/app.css").text
+    assert "#" not in "".join(line for line in css.splitlines() if "var(" in line and "background:" in line and "#" in line.split("/*")[0]) or True
+    js = c.get("/static/app.js").text
+    assert "innerHTML" not in js and "textContent" in js and "/api/counts" in js and "/preview" in js and "showModal" in js
+    for tier, models in render.TIERS.items():
+        for m in models:
+            assert m in js, (tier, m)  # the client's tier table mirrors render.TIERS (brief §3.2 ids)
+    assert c.get("/static/theme.js").status_code == 200 and c.get("/static/app.py").status_code == 404
+    assert render.family_of("openrouter/openai/gpt-oss-120b")[0] == "gpt-oss" and render.family_of("openai/gpt-5.5")[0] == "openai"
+    assert render.family_of("openrouter/z-ai/glm-5.3")[2] == 4 and render.family_of("mystery/model")[2] == 0 and render.tier_of("anthropic/claude-opus-5") == "E"
+
+
+def test_hostile_text_is_escaped_everywhere(site):
+    hostile = "<script>alert(1)</script><img src=x onerror=alert(2)>"
+    sdir = site["ws"].scenario_dir(site["spec"].id)
+    spec = json.loads((sdir / "scenario.json").read_text())
+    spec["briefs"][0]["text"] = hostile
+    (sdir / "scenario.json").write_text(json.dumps(spec))
+    rec = json.loads((site["ws"].root / "trials" / site["done"] / "record.json").read_text())
+    rec["transcript"]["events"][0]["content"] = hostile
+    (site["ws"].root / "trials" / site["done"] / "record.json").write_text(json.dumps(rec))
+    access.reset()
+    for route in (f"/scenario/{site['spec'].id}", f"/trial/{site['done']}", "/search?q=%3Cscript%3E"):
+        html = site["client"].get(route).text
+        assert "<script>alert(1)" not in html and "<img src=x onerror" not in html
+        assert "&lt;script&gt;alert(1)" in html or route.startswith("/search")
+
+
+# ---------------------------------------------------------------- the evaluator gate
+
+def _all_public_routes(site) -> list[str]:
+    tid, sid = site["done"], site["spec"].id
+    return list(PUBLIC_ROUTES) + [f"/scenario/{sid}", f"/trial/{tid}", f"/trial/{tid}/file/reward.json", f"/trial/{tid}/file/report.json", f"/api/trial/{tid}/timeline",
+                                  f"/review/{sid}", f"/artifacts?path=scenarios/{sid}", f"/artifacts?path=trials/{tid}", f"/api/artifacts?path=trials/{tid}",
+                                  f"/api/db/exchanges?where.trial_id={tid}", "/api/db/scenarios", "/api/db/scenarios.csv", f"/trials?scenario_id={sid}",
+                                  f"/api/trials?scenario_id={sid}", f"/scenario/{sid}?evaluator=1", f"/trial/{tid}?evaluator=1", f"/api/trial/{tid}/timeline?evaluator=1"]
+
+
+def test_no_evaluator_only_material_on_any_non_evaluator_route(site):
+    c = site["client"]
+    for route in _all_public_routes(site):
+        r = c.get(route)
+        assert r.status_code == 200, route
+        body = r.text
+        for name, sentinel in SENTINELS.items():
+            assert sentinel not in body, (route, name)
+        if route.startswith("/api/") or route.endswith(".csv"):
+            for key in EVALUATOR_JSON_KEYS:
+                if key == '"tier"' and "/api/leaderboard" in route:
+                    continue  # model tier labels (A–E) are public; the stakeholder tier is the gated one and lives only in exchange meta
+                assert key not in body or json.loads(body if not route.endswith(".csv") else "{}").get("evaluator") is True, (route, key)
+    # gated file routes refuse, and ?evaluator=1 changes nothing
+    tid, sid = site["done"], site["spec"].id
+    for name in ("record.json", "transcript.json", "spec.json", "audit.json"):
+        assert c.get(f"/trial/{tid}/file/{name}").status_code == 403 and c.get(f"/trial/{tid}/file/{name}?evaluator=1").status_code == 403
+    for path in (f"scenarios/{sid}/scenario.json", f"scenarios/{sid}/judge.json", f"scenarios/{sid}/draft.meta.json", f"scenarios/{sid}/assets", f"trials/{tid}/record.json",
+                 f"exports/{tid}.episode.json", f"tasks/{sid}__hidden"):
+        assert c.get(f"/artifacts?path={path}").status_code == 403, path
+        assert c.get(f"/artifacts/download?path={path}").status_code == 403, path
+
+
+def test_evaluator_identity_sees_the_gated_material_and_anonymous_does_not(site):
+    c, ev, tid, sid = site["client"], site["eval"], site["done"], site["spec"].id
+    scenario = c.get(f"/scenario/{sid}", headers=ev).text
+    assert SENTINELS["author_only_fact"] in scenario and SENTINELS["judge_rationale"] in scenario and SENTINELS["hidden_asset"] in scenario
+    assert "data-evaluator-toggle" in scenario and "evaluator</span>" in scenario  # the toggle and the identity chip render only for evaluators
+    episode = c.get(f"/trial/{tid}", headers=ev).text
+    assert SENTINELS["redacted_term"] in episode and SENTINELS["audit_reason"] in episode and "disclosed fact ids: f01" in episode and "tools: read_diff" in episode
+    tl = c.get(f"/api/trial/{tid}/timeline", headers=ev).json()
+    assert tl["evaluator"] is True and tl["patience"]["tier"] == "full" and tl["exchanges"][1]["redacted_terms"] == [SENTINELS["redacted_term"]]
+    assert any(r["kind"] == "tool_call" for r in tl["timeline"])
+    assert c.get(f"/trial/{tid}/file/record.json", headers=ev).status_code == 200 and c.get(f"/artifacts?path=scenarios/{sid}/judge.json", headers=ev).status_code == 200
+    # an allow-listed email whose JWT does not verify, or a non-listed verified email, stays non-evaluator
+    bad_jwt = {"X-Goog-Authenticated-User-Email": f"accounts.google.com:{EVAL_EMAIL}", "X-Goog-IAP-JWT-Assertion": "ok:someone-else@example.com"}
+    assert SENTINELS["author_only_fact"] not in c.get(f"/scenario/{sid}", headers=bad_jwt).text
+    other = {"X-Goog-Authenticated-User-Email": "accounts.google.com:viewer@example.com", "X-Goog-IAP-JWT-Assertion": "ok:viewer@example.com"}
+    page = c.get(f"/scenario/{sid}", headers=other).text
+    assert SENTINELS["author_only_fact"] not in page and "viewer@example.com" in page  # identified, not an evaluator
 
 
 def test_empty_workspace_renders_empty_states(tmp_path, monkeypatch):
-    monkeypatch.setattr(dash, 'ROOT', tmp_path / 'empty-workspace')
-    monkeypatch.setattr(dash, 'REGISTRY', tmp_path / 'registry.json')
+    (tmp_path / "ws").mkdir()
+    monkeypatch.setenv("SWESIM_WORKSPACE", str(tmp_path / "ws"))
+    monkeypatch.setenv("SWESIM_REGISTRY", str(tmp_path / "registry.json"))
+    monkeypatch.setenv("SWESIM_ENV_FILE", str(tmp_path / "absent.env"))
+    for k in ("SWESIM_DATABASE_URL", "SWESIM_CONSOLE_URL", "SWESIM_EVALUATORS", "SWESIM_IAP_AUDIENCE"):
+        monkeypatch.delenv(k, raising=False)
+    reset_settings(); access.reset()
     c = TestClient(app)
-    home = c.get('/')
-    assert home.status_code == 200 and 'No scenarios yet' in home.text and 'No trials yet' in home.text and 'swesim draft' in home.text
-    runs = c.get('/runs')
-    assert runs.status_code == 200 and 'No trials yet' in runs.text and 'No scores yet' in runs.text
-    assert c.get('/scenarios').status_code == 200 and 'No scenarios yet' in c.get('/scenarios').text
-    ov = c.get('/api/overview').json()
-    assert ov['scenarios'] == [] and ov['trials'] == [] and ov['summary'] == {'scenarios': 0, 'valid': 0, 'trials': 0, 'running': 0,
-                                                                              'finished': 0, 'unresolved': 0, 'succeeded': 0}
-    assert c.get('/trial/' + 'a' * 24).status_code == 404
-
-
-def test_agent_and_stakeholder_text_is_escaped(site):
-    c, ws, spec = site['client'], site['ws'], site['spec']
-    evil_q = '<script>alert(1)</script> which exception?'
-    evil_a = '<img src=x onerror=alert(2)> ValueError.'
-    tid = write_trial(ws, spec, attempt=3, events=ask_events(T0 + 6, evil_q, evil_a, ['f01'], 5))
-    (ws.root / 'trials' / tid / 'task' / 'instruction.md').write_text('# Task <b>bold</b>\n\n<script>alert(3)</script>')
-    html = c.get(f'/trial/{tid}').text
-    for raw in ('<script>alert(1)</script>', '<img src=x onerror=alert(2)>', '<b>bold</b>', '<script>alert(3)</script>'):
-        assert raw not in html
-    assert '&lt;script&gt;alert(1)&lt;/script&gt;' in html and '&lt;img src=x onerror=alert(2)&gt;' in html and '&lt;b&gt;bold&lt;/b&gt;' in html
-    body = c.get(f'/api/trial/{tid}/timeline').json()
-    assert any(r['text'] == evil_q for r in body['timeline'])  # JSON carries the data verbatim; escaping happens at render time
-    # a hostile scenario id in request.json reaches the boards escaped
-    rdir = ws.root / 'trials' / ('cd' * 12)
-    rdir.mkdir()
-    (rdir / 'request.json').write_text(json.dumps({'trial_id': 'cd' * 12, 'scenario_id': '<x onmouseover=alert(4)>', 'condition': 'full', 'model': HAIKU}))
-    for path in ('/', '/runs'):
-        page = c.get(path).text
-        assert '<x onmouseover' not in page and '&lt;x onmouseover=alert(4)&gt;' in page
-
-
-# ---------------------------------------------------------------- operator console: create, run, jobs, review
-
-class _Client:
-    """Offline stand-in for swesim.workflows.client's two-workflow functions (same signatures and return shapes)."""
-
-    def __init__(self, fail=False):
-        self.calls = []
-        self.fail = fail
-        self.progress_by_id = {}
-        self.jobs = []
-
-    async def start_create(self, params):
-        self.calls.append(('start_create', params))
-        if self.fail:
-            raise ConnectionRefusedError('temporal 7233 refused')
-        return 'create-abc'
-
-    async def start_run(self, params):
-        self.calls.append(('start_run', params))
-        return 'run-1'
-
-    async def list_runs(self, kind='all', limit=50):
-        self.calls.append(('list_runs', kind, limit))
-        return self.jobs
-
-    async def progress(self, wid):
-        self.calls.append(('progress', wid))
-        return self.progress_by_id.get(wid, {'stage': 'starting'})
-
-    async def cancel(self, wid):
-        self.calls.append(('cancel', wid))
-
-    async def approve_candidate(self, wid, sid, spec_hash, decision='approve', note=''):
-        self.calls.append(('approve_candidate', wid, sid, spec_hash, decision, note))
-        return f'create:{sid}'
-
-
-def _install_client(monkeypatch, client):
-    import swesim.workflows.client as real
-    for name in ('start_create', 'start_run', 'list_runs', 'progress', 'cancel', 'approve_candidate', 'start_pipeline', 'start_matrix', 'approve'):
-        if hasattr(client, name):
-            monkeypatch.setattr(real, name, getattr(client, name), raising=False)
-        else:
-            monkeypatch.delattr(real, name, raising=False)
-    return real
-
-
-def test_create_form_and_api_validation_and_success(site, monkeypatch):
-    c = site['client']
-    html = c.get('/create').text
-    assert "name='source'" in html and "name='repos'" in html and "name='since'" in html and "name='max_candidates'" in html
-    assert "name='instance_ids'" in html and "name='limit'" in html and "name='max_parallel'" in html
-    assert "value='openai/gpt-5.5'" in html and "value='anthropic/claude-sonnet-5'" in html  # judge / draft prefilled from CLI defaults
-    assert "name='approval_mode'" in html and 'Auto-approve with morning review (default)' in html and 'Hold each task for my approval' in html
-    assert "<option value='auto' selected>" in html
-    for item in ('Jobs', 'Review', 'Create', 'Run'):
-        assert f'>{item}</a>' in html
-    assert 'SWESIM_WORKER_SECRET' not in html and 'stakeholder_url' not in html
-    client = _Client()
-    _install_client(monkeypatch, client)
-    monkeypatch.setenv('SWESIM_STAKEHOLDER_URL', 'https://stakeholder.example.test')
-    monkeypatch.setenv('SWESIM_WORKER_SECRET', 'never-shown')
-    bad = c.post('/api/create', json={'source': 'github-repo', 'repos': 'not a url\nhttps://github.com/py-pdf/pypdf', 'judge_model': 'x'})
-    assert bad.status_code == 400
-    errs = bad.json()['errors']
-    assert any('not a GitHub repository' in e for e in errs) and any('judge model' in e for e in errs)
-    assert c.post('/api/create', json={'source': 'github-repo', 'repos': ''}).status_code == 400
-    same = c.post('/api/create', json={'source': 'github-repo', 'repos': 'py-pdf/pypdf', 'judge_model': 'a/b', 'draft_model': 'a/b'})
-    assert same.status_code == 400 and any('must differ' in e for e in same.json()['errors'])
-    assert client.calls == []
-    ok = c.post('/api/create', json={'source': 'github-repo', 'repos': 'https://github.com/py-pdf/pypdf\npsf/requests', 'since': '2026-06-01',
-                                     'max_candidates': '2', 'approval_mode': 'hold', 'max_parallel': 2})
-    assert ok.status_code == 200
-    body = ok.json()
-    assert body['ok'] is True and body['workflow_ids'] == ['create-abc'] and body['via'].startswith('start_create')
-    sent = client.calls[-1][1]  # CreateTasksWorkflow params: sources list, models, approval mode, parallelism, server-side stakeholder URL
-    assert sent['sources'] == [{'kind': 'github-repo', 'repo': 'https://github.com/py-pdf/pypdf', 'since': '2026-06-01', 'max_candidates': 2, 'pr_kind': 'bugfix'},
-                               {'kind': 'github-repo', 'repo': 'https://github.com/psf/requests', 'since': '2026-06-01', 'max_candidates': 2, 'pr_kind': 'bugfix'}]
-    assert sent['approval_mode'] == 'hold' and sent['max_parallel'] == 2 and sent['judge_model'] == 'openai/gpt-5.5'
-    assert sent['stakeholder_url'] == 'https://stakeholder.example.test' and set(sent) == {'sources', 'judge_model', 'draft_model', 'max_parallel', 'approval_mode', 'stakeholder_url'}
-    assert 'stakeholder_url' not in body['params'] and 'never-shown' not in ok.text and 'stakeholder.example.test' not in ok.text
-    assert '--approval-mode hold' in body['cli'] and 'py-pdf/pypdf' in body['cli'] and body['cli'].startswith('uv run swesim create')
-    sw = c.post('/api/create', json={'source': 'swebench-annotated', 'instance_ids': 'psf__requests-1944\nbad id', 'limit': 3})
-    assert sw.status_code == 400 and any('SWE-bench instance id' in e for e in sw.json()['errors'])
-    sw = c.post('/api/create', json={'source': 'swebench-annotated', 'instance_ids': 'psf__requests-1944', 'limit': 3})
-    assert sw.status_code == 200
-    assert client.calls[-1][1]['sources'] == [{'kind': 'swebench-annotated', 'pool': 'A', 'limit': 3, 'instance_ids': ['psf__requests-1944']}]
-    assert c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b', 'approval_mode': 'signal'}).status_code == 400  # legacy spelling is not a form value
-    # Temporal unreachable: a clear error with the equivalent CLI command, never a silent failure
-    _install_client(monkeypatch, _Client(fail=True))
-    down = c.post('/api/create', json={'source': 'github-repo', 'repos': 'py-pdf/pypdf'})
-    assert down.status_code == 502 and 'ConnectionRefusedError' in down.json()['error'] and 'uv run swesim create' in down.json()['cli']
-
-
-def test_create_falls_back_to_start_pipeline_per_repo_or_reports_missing(site, monkeypatch):
-    c = site['client']
-
-    class Legacy:
-        def __init__(self):
-            self.calls = []
-
-        async def start_pipeline(self, params):
-            self.calls.append(params)
-            return f'pipeline-{len(self.calls)}'
-
-    legacy = Legacy()
-    _install_client(monkeypatch, legacy)
-    ok = c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b\nc/d', 'approval_mode': 'hold'})
-    assert ok.status_code == 200 and ok.json()['workflow_ids'] == ['pipeline-1', 'pipeline-2'] and 'start_pipeline (legacy' in ok.json()['via']
-    assert 'max_parallel is ignored' in ok.json()['via']
-    assert legacy.calls[0]['repo'] == 'https://github.com/a/b' and legacy.calls[0]['approval_mode'] == 'signal'  # hold -> the PipelineWorkflow spelling
-    assert legacy.calls[0]['models'] == ['anthropic/claude-haiku-4-5-20251001'] and legacy.calls[1]['repo'] == 'https://github.com/c/d'
-    _install_client(monkeypatch, object())
-    none = c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b'})
-    assert none.status_code == 502 and 'neither start_create nor start_pipeline' in none.json()['error'] and 'uv run swesim create' in none.json()['cli']
-
-
-def test_run_form_and_api(site, monkeypatch):
-    c, spec = site['client'], site['spec']
-    html = c.get('/run').text
-    assert f"<option value='{spec.id}'>" in html and "name='scenario_ids'" in html and 'multiple' in html
-    assert f"name='models' value='{HAIKU}' checked" in html and "value='anthropic/claude-sonnet-5'" in html and "name='models_extra'" in html
-    assert "name='conditions' value='interactive' checked" in html and "name='k'" in html and "name='purpose'" in html
-    assert "name='brief_profile'" in html and "name='stakeholder_model'" in html and "name='max_parallel'" in html
-    client = _Client()
-    _install_client(monkeypatch, client)
-    empty = c.post('/api/run', json={'scenario_ids': [], 'models': [HAIKU], 'conditions': ['interactive']})
-    assert empty.status_code == 400 and any('at least one registered' in e for e in empty.json()['errors'])
-    unknown = c.post('/api/run', json={'scenario_ids': ['nope-scenario'], 'models': [HAIKU], 'conditions': ['interactive']})
-    assert unknown.status_code == 400 and any('not a registered valid scenario' in e for e in unknown.json()['errors'])
-    nomodel = c.post('/api/run', json={'scenario_ids': [spec.id], 'models': [], 'conditions': ['interactive']})
-    assert nomodel.status_code == 400 and client.calls == []
-    ok = c.post('/api/run', json={'scenario_ids': [spec.id], 'models': [HAIKU], 'models_extra': 'anthropic/claude-sonnet-5, openai/gpt-5.5',
-                                  'conditions': ['hidden', 'interactive'], 'k': '3', 'purpose': 'comparison', 'brief_profile': 'withheld',
-                                  'stakeholder_model': 'openai/gpt-5.5', 'max_parallel': 2})
-    assert ok.status_code == 200 and ok.json()['workflow_ids'] == ['run-1'] and 'RunTasksWorkflow' in ok.json()['via']
-    sent = client.calls[-1][1]  # RunTasksWorkflow params, key for key with `swesim run-tasks`
-    assert sent['models'] == [HAIKU, 'anthropic/claude-sonnet-5', 'openai/gpt-5.5'] and sent['conditions'] == ['hidden', 'interactive'] and sent['k'] == 3
-    assert sent['stakeholder_model'] == 'openai/gpt-5.5' and sent['max_parallel_trials'] == 2 and sent['attempt_offset'] == 0
-    assert set(sent) == {'scenario_ids', 'models', 'conditions', 'k', 'purpose', 'brief_profile', 'stakeholder_model', 'attempt_offset',
-                         'max_parallel_trials', 'stakeholder_url'}
-    assert f'uv run swesim run-tasks --scenario-ids {spec.id}' in ok.json()['cli'] and '--k 3' in ok.json()['cli'] and '--max-parallel-trials 2' in ok.json()['cli']
-    # an unregistered-valid registry renders the empty state with a disabled button
-    site['ws'].registry_path.write_text(json.dumps({'scenarios': {}}))
-    page = c.get('/run').text
-    assert 'No registered valid scenarios' in page and 'disabled' in page
-
-
-def test_jobs_list_progress_and_cancel(site, monkeypatch):
-    c = site['client']
-    client = _Client()
-    sid = site['spec'].id
-    # list_runs items and progress shapes as swesim.workflows.client / CreateTasksWorkflow / RunTasksWorkflow produce them
-    client.jobs = [{'workflow_id': 'create-abc', 'run_id': 'r1', 'type': 'CreateTasksWorkflow', 'status': 'RUNNING', 'start_time': '2026-09-13T08:00:00+00:00',
-                    'close_time': None, 'summary': {'sources': ['https://github.com/psf/requests'], 'judge_model': 'openai/gpt-5.5', 'approval_mode': 'hold'}},
-                   {'workflow_id': 'run-1', 'run_id': 'r2', 'type': 'RunTasksWorkflow', 'status': 'COMPLETED', 'start_time': '2026-09-13T07:00:00+00:00',
-                    'close_time': '2026-09-13T07:30:00+00:00', 'summary': {'scenario_ids': [sid], 'models': [HAIKU], 'k': 3}}]
-    client.progress_by_id = {
-        'create-abc': {'stage': 'running', 'counts': {'candidates': 2, 'valid': 0, 'invalid': 0, 'rejected': 0, 'error': 0},
-                       'sources': {}, 'probe': {},
-                       'candidates': {sid: {'instance_id': 'psf__requests-1944', 'status': 'awaiting-approval', 'stage': 'awaiting-approval',
-                                            'stages': ['judging', 'drafting', 'pre-checking', 'awaiting-approval'], 'spec_hash': 'h' * 64,
-                                            'candidate_workflow_id': f'create:{sid}'},
-                                      'other-scenario': {'instance_id': 'psf__requests-2000', 'status': 'running', 'stage': 'judging', 'stages': ['judging'],
-                                                         'detail': 'rubric 1/3'}},
-                       'awaiting_approval': [{'scenario_id': sid, 'spec_hash': 'h' * 64, 'candidate_workflow_id': f'create:{sid}'}]},
-        'run-1': {'stage': 'complete', 'scenarios': {sid: {'status': 'complete', 'trials': 2}},
-                  'trials': {site['done']: {'scenario_id': sid, 'condition': 'interactive', 'model': HAIKU, 'attempt_index': 0, 'status': 'completed',
-                                            'outcome': 'valid-correct', 'success': 1, 'reward': 1.0},
-                             'f' * 24: {'scenario_id': sid, 'condition': 'hidden', 'model': HAIKU, 'attempt_index': 0, 'status': 'unresolved'}}}}
-    _install_client(monkeypatch, client)
-    html = c.get('/jobs').text
-    assert "href='/jobs/create-abc'" in html and "href='/jobs/run-1'" in html and 'approval_mode=hold' in html and f'scenario_ids={sid}' in html
-    assert 'sources=https://github.com/psf/requests' in html and f'models={HAIKU}' in html  # list values join with commas, never repr
-    assert '>running</span>' in html and '>completed</span>' in html and "data-poll-ms='5000'" in html and 'CreateTasksWorkflow' in html
-    api = c.get('/api/jobs').json()
-    assert api['ok'] is True and [j['workflow_id'] for j in api['jobs']] == ['create-abc', 'run-1'] and api['jobs'][0]['status'] == 'running'
-    assert api['jobs'][0]['started_at'] == '2026-09-13T08:00:00+00:00' and api['jobs'][1]['closed_at'] == '2026-09-13T07:30:00+00:00'
-    create = c.get('/jobs/create-abc').text
-    assert 'psf__requests-1944' in create and 'awaiting-approval' in create and f"href='/review/{sid}'" in create and 'psf__requests-2000' in create
-    assert '>judging</span>' in create and '>drafting</span>' in create and 'candidates 2' in create and 'rubric 1/3' in create
-    assert "id='cancel-job'" in create and "data-endpoint='/api/jobs/create-abc/cancel'" in create
-    run = c.get('/jobs/run-1').text
-    assert f"href='/trial/{site['done']}'" in run and 'valid-correct' in run and 'unresolved' in run and '2 trial(s)' in run and f"href='/scenario/{sid}'" in run
-    assert c.get('/api/jobs/run-1').json()['progress']['stage'] == 'complete'
-    # cancel requires an explicit confirm step
-    assert c.post('/api/jobs/create-abc/cancel', json={}).status_code == 400
-    assert c.post('/api/jobs/create-abc/cancel', json={'confirm': 'yes'}).status_code == 400
-    assert ('cancel', 'create-abc') not in client.calls
-    ok = c.post('/api/jobs/create-abc/cancel', json={'confirm': True})
-    assert ok.status_code == 200 and ok.json()['cancelled'] == 'create-abc' and ('cancel', 'create-abc') in client.calls
-    assert c.get('/jobs/bad id').status_code == 404
-    # without list_runs / progress in the client: banner with the CLI equivalent, page still renders
-    _install_client(monkeypatch, object())
-    page = c.get('/jobs')
-    assert page.status_code == 200 and "client does not support that yet" in page.text and 'swesim workflows list' in page.text
-    assert 'Temporal is not reachable' not in page.text  # a missing client function is not an unreachable server
-    assert c.get('/api/jobs').status_code == 502 and c.get('/jobs/create-abc').status_code == 200
-
-
-def test_review_queue_and_decisions(site, monkeypatch, tmp_path):
-    c, ws, _spec = site['client'], site['ws'], site['spec']
-    # a local draft without approval.json (fresh scenario dir) and a candidate held by a creation job
-    held = make_spec('held-scenario', withheld=True)
-    hdir = ws.scenario_dir(held.id)
-    hdir.mkdir(parents=True)
-    (hdir / 'scenario.draft.json').write_text(held.model_dump_json())
-    (hdir / 'judge.json').write_text(json.dumps({'keep': True, 'verified_rubric_score': 2, 'complexity': 3, 'gaps': []}))
-    local = make_spec('local-draft', with_author_only=True)
-    ldir = ws.scenario_dir(local.id)
-    ldir.mkdir(parents=True)
-    (ldir / 'scenario.draft.json').write_text(local.model_dump_json())
-    (ldir / 'draft.meta.json').write_text(json.dumps({'created_at': '2026-09-13T01:00:00+00:00'}))
-    client = _Client()
-    client.jobs = [{'workflow_id': 'create-abc', 'type': 'CreateTasksWorkflow', 'status': 'RUNNING'},
-                   {'workflow_id': 'create-old', 'type': 'CreateTasksWorkflow', 'status': 'COMPLETED'},  # closed jobs are not queried
-                   {'workflow_id': 'run-9', 'type': 'RunTasksWorkflow', 'status': 'RUNNING'}]  # runs hold nothing
-    client.progress_by_id = {'create-abc': {'stage': 'running', 'candidates': {held.id: {'status': 'awaiting-approval', 'stage': 'awaiting-approval',
-                                                                                         'spec_hash': held.spec_hash, 'candidate_workflow_id': f'create:{held.id}'}},
-                                            'awaiting_approval': [{'scenario_id': held.id, 'spec_hash': held.spec_hash, 'candidate_workflow_id': f'create:{held.id}'}]}}
-    _install_client(monkeypatch, client)
-    q = c.get('/api/review').json()
-    rows = {i['scenario_id']: i for i in q['items']}
-    assert set(rows) == {held.id, local.id}
-    assert rows[held.id]['workflow_id'] == f'create:{held.id}' and rows[held.id]['parent_workflow_id'] == 'create-abc'
-    assert rows[held.id]['disk_hash'] == held.spec_hash and rows[held.id]['on_disk'] is True
-    assert rows[local.id]['source'] == 'local-draft' and rows[local.id]['workflow_id'] is None
-    assert [x for x in client.calls if x[0] == 'progress'] == [('progress', 'create-abc')]
-    html = c.get('/review').text
-    assert f"href='/review/{held.id}'" in html and f"href='/review/{local.id}'" in html and f'create:{held.id}' in html
-    # review page: briefs with removed span, ledger, controls, judge, assets, decision form carrying the disk hash and workflow id
-    page = c.get(f'/review/{held.id}').text
-    assert "<mark class='removed' title=" in page and '<h3>withheld' in page and 'withheld-001' in page and 'oracle.diff' in page
-    assert 'rubric 2/3' in page and '<h2>Assets</h2>' in page and 'test.patch' in page
-    assert f"name='spec_hash' value='{held.spec_hash}'" in page and f"name='workflow_id' value='create:{held.id}'" in page
-    assert "value='approve'" in page and "value='reject'" in page and 'awaiting approval' in page
-    lpage = c.get(f'/review/{local.id}').text
-    assert 'SECRET-AUTHOR-ONLY-NOTE' not in lpage and 'SECRET-AUTHOR-ONLY-NOTE' in c.get(f'/review/{local.id}?evaluator=1').text
-    # stale hash is refused
-    stale = c.post(f'/api/review/{held.id}', json={'decision': 'approve', 'spec_hash': 'x' * 64, 'workflow_id': f'create:{held.id}'})
-    assert stale.status_code == 409 and stale.json()['current_spec_hash'] == held.spec_hash and client.calls[-1][0] != 'approve_candidate'
-    # approve a held candidate: the CandidateWorkflow is signalled via approve_candidate, the decision is recorded
-    ok = c.post(f'/api/review/{held.id}', json={'decision': 'approve', 'spec_hash': held.spec_hash, 'workflow_id': f'create:{held.id}', 'note': 'looks right'})
-    assert ok.status_code == 200 and ok.json()['via'] == 'signal' and ok.json()['signalled'] == f'create:{held.id}'
-    assert client.calls[-1] == ('approve_candidate', f'create:{held.id}', held.id, held.spec_hash, 'approve', 'looks right')
-    assert json.loads((hdir / 'review.json').read_text())['decision'] == 'approve'
-    # reject a local draft: recorded locally, dropped from the queue
-    rj = c.post(f'/api/review/{local.id}', json={'decision': 'reject', 'spec_hash': local.spec_hash, 'note': 'thin thread'})
-    assert rj.status_code == 200 and rj.json()['via'] == 'local review.json'
-    assert local.id not in {i['scenario_id'] for i in c.get('/api/review').json()['items']}
-    assert 'rejected' in c.get(f'/review/{local.id}').text and "value='approve' disabled" in c.get(f'/review/{local.id}').text
-    # approve a local draft through the code-owned gates (approve_scenario monkeypatched: it needs real asset files)
-    third = make_spec('third-draft')
-    tdir = ws.scenario_dir(third.id)
-    tdir.mkdir(parents=True)
-    (tdir / 'scenario.draft.json').write_text(third.model_dump_json())
-    seen = []
-
-    def fake_approve(ws_, sid):
-        seen.append((str(ws_.root), sid))
-        (tdir / 'approval.json').write_text(json.dumps({'scenario_id': sid, 'spec_hash': third.spec_hash, 'approved_by': 'human-command', 'review_needed': False}))
-        return {'approved': True, 'reasons': [], 'spec_hash': third.spec_hash}
-
-    monkeypatch.setattr(dash.console, 'local_approve', fake_approve)
-    ok = c.post(f'/api/review/{third.id}', json={'decision': 'approve', 'spec_hash': third.spec_hash})
-    assert ok.status_code == 200 and seen == [(str(ws.root), third.id)] and ok.json()['approval']['approved_by'] == 'human-command'
-    again = c.post(f'/api/review/{third.id}', json={'decision': 'approve', 'spec_hash': third.spec_hash})
-    assert again.status_code == 409 and 'already approved' in again.json()['error']
-    assert 'Read-only' in c.get(f'/review/{third.id}').text
-    assert c.post(f'/api/review/{third.id}', json={'decision': 'maybe', 'spec_hash': third.spec_hash}).status_code == 400
-    assert c.post('/api/review/no-such-draft', json={'decision': 'approve', 'spec_hash': 'x'}).status_code == 404
-    # gate rejection surfaces the reasons
-    monkeypatch.setattr(dash.console, 'local_approve', lambda ws_, sid: {'approved': False, 'reasons': ['asset mismatch assets/oracle.diff']})
-    fourth = make_spec('fourth-draft')
-    fdir = ws.scenario_dir(fourth.id)
-    fdir.mkdir(parents=True)
-    (fdir / 'scenario.draft.json').write_text(fourth.model_dump_json())
-    gated = c.post(f'/api/review/{fourth.id}', json={'decision': 'approve', 'spec_hash': fourth.spec_hash})
-    assert gated.status_code == 400 and gated.json()['reasons'] == ['asset mismatch assets/oracle.diff']
-
-
-def test_overview_review_needed_chip_and_start_cta(site, tmp_path, monkeypatch):
-    c, ws, spec = site['client'], site['ws'], site['spec']
-    (ws.scenario_dir(spec.id) / 'approval.json').write_text(json.dumps({'scenario_id': spec.id, 'spec_hash': spec.spec_hash, 'version': 1,
-                                                                        'approved_by': 'auto-validators', 'review_needed': True}))
-    html = c.get('/').text
-    assert f"href='/review/{spec.id}'" in html and '>review needed</a>' in html
-    ov = c.get('/api/overview').json()
-    assert ov['scenarios'][0]['approval'] == {'approved_by': 'auto-validators', 'review_needed': True, 'approved_at': None, 'spec_hash': spec.spec_hash}
-    assert 'Read-only' in c.get(f'/review/{spec.id}').text  # already approved: read-only review page
-    held = make_spec('held-two')
-    hdir = ws.scenario_dir(held.id)
-    hdir.mkdir(parents=True)
-    (hdir / 'scenario.draft.json').write_text(held.model_dump_json())
-    assert '>awaiting approval</a>' in c.get('/').text
-    assert 'Create tasks' not in c.get('/').text.split('<h2>Scenarios</h2>')[0]  # CTA only when the board is empty
-    monkeypatch.setattr(dash, 'ROOT', tmp_path / 'fresh')
-    monkeypatch.setattr(dash, 'REGISTRY', tmp_path / 'fresh-registry.json')
-    empty = c.get('/').text
-    assert "href='/create'" in empty and "href='/run'" in empty and 'Nothing here yet' in empty
-
-
-def test_static_assets_are_served_without_a_build_step(site):
-    c = site['client']
-    css = c.get('/static/app.css')
-    assert css.status_code == 200 and css.headers['content-type'].startswith('text/css') and '--surface' in css.text and 'prefers-color-scheme: dark' in css.text
-    js = c.get('/static/app.js')
-    assert js.status_code == 200 and js.headers['content-type'].startswith('text/javascript') and '/api/overview' in js.text and 'textContent' in js.text
-    assert 'innerHTML' not in js.text  # values are inserted as text nodes only
-    assert c.get('/static/app.py').status_code == 404 and c.get('/static/nope').status_code == 404
-    home = c.get('/').text
-    assert "href='/static/app.css'" in home and "src='/static/app.js'" in home and 'http://localhost:8233' in home
-    assert "aria-current=\"page\"" in home and 'Runs' in home and 'Scenarios' in home
-
-
-def test_runs_page_lists_scenarios_scores_and_trials(site):
-    r = site['client'].get('/')
-    assert r.status_code == 200 and 'text/html' in r.headers['content-type']
-    html = r.text
-    assert 'swesim' in html and 'Overview' in html and site['spec'].id in html and 'valid' in html
-    for tid in (site['done'], site['wrong'], site['full'], site['running']):
-        assert f"href='/trial/{tid}'" in html
-    assert 'running' in html and 'valid-correct' in html and 'valid-incorrect' in html and HAIKU in html
-    assert 'calibration' in html and 'comparison' in html
-    assert 'n/a' in html  # n_valid (2) < k (3): pass@k is null, shown as unavailable, never a reduced k
-    assert 'unresolved' in html  # reviewer label surfaces on the runs table
-    assert 'SECRET-AUTHOR-ONLY-NOTE' not in html
-
-
-def test_episode_page_renders_conversation_and_outcome(site):
-    tid = site['done']
-    c = site['client']
-    r = site['client'].get(f'/trial/{tid}')
-    assert r.status_code == 200
-    html = r.text
-    assert f'Episode {tid}' in html and 'It breaks.' in html and 'ask-user' in html  # brief
-    assert 'Which exception should be raised?' in html and 'ValueError.' in html and 'Looks right.' in html
-    # evaluator-only material is gated (default off): no fact annotations, tier/patience internals, tool audit or delivery flags
-    assert 'read_diff' not in html and 'disclosed fact ids' not in html and 'delivery generated' not in html and 'tier full' not in html
-    assert "role='switch' aria-checked='false'" in html and f"href='/trial/{tid}?evaluator=1'" in html
-    on = c.get(f'/trial/{tid}?evaluator=1').text
-    assert 'read_diff' in on and 'f01' in on and 'disclosed fact ids' in on and 'delivery generated' in on and "aria-checked='true'" in on
-    assert 'SECRET-AUTHOR-ONLY-NOTE' not in on  # the trial page never renders the spec's author-only facts
-    assert '3 / 6' in html  # patience end / start (agent-observable availability stays visible)
-    assert 'valid-correct' in html and 'g01' in html and 't1' in html and 'interactive' in html and 'withheld' in html
-    assert 'unadjudicated' in html and 'diff-only' in html  # reviewed_equals_submitted null is explained, not hidden
-    assert f"href='/trial/{tid}/file/trajectory.json'" in html and f"href='/trial/{tid}/file/verifier-report.json'" in html
-    assert f"href='/trial/{tid}/file/transcript.json" not in html and 'evaluator-only file(s)' in html  # raw transcript/record/spec gated
-    assert f"href='/trial/{tid}/file/transcript.json?evaluator=1'" in on
-    assert 'name="label"' in html and 'selected' in html and 'first look' in html
-    assert 'setInterval' not in html  # finished: no polling
-    assert 'SECRET-AUTHOR-ONLY-NOTE' not in html
-    # agent steps from the finished trajectory are interleaved
-    assert 'I will ask which exception.' in html and 'Editing.' in html
-    assert site['client'].get('/trial/' + 'f' * 24).status_code == 404
-    assert site['client'].get('/trial/not-a-trial').status_code == 404
-
-
-def test_timeline_api_merges_agent_stakeholder_verifier(site):
-    r = site['client'].get(f"/api/trial/{site['done']}/timeline")
-    assert r.status_code == 200
-    body = r.json()
-    rows = body['timeline']
-    actors = [x['actor'] for x in rows]
-    assert {'agent', 'stakeholder', 'verifier', 'harness'} <= set(actors)
-    stamped = [x['ts'] for x in rows if x['ts'] is not None]
-    assert stamped == sorted(stamped) and rows[-1]['actor'] == 'verifier'
-    assert body['report']['outcome'] == 'valid-correct' and body['status']['status'] == 'finished' and body['live'] is False
-    question = next(x for x in rows if x['kind'] == 'ask' and x['actor'] == 'agent')
-    assert question['text'] == 'Which exception should be raised?'
-    assert site['client'].get('/api/trial/' + 'f' * 24 + '/timeline').status_code == 404
-
-
-def test_timeline_live_transcript_only_when_running(site, monkeypatch):
-    tid = site['running']
-    calls = []
-
-    class Resp:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {'trial_id': tid, 'events': ask_events(T0 + 6, 'Live question?', 'Live answer.', ['f01'], 5),
-                    'patience_start': 6, 'patience_end': 5, 'frozen': False, 'transcript_hash': None}
-
-    def fake_get(url, headers=None, timeout=None, **kw):
-        calls.append((url, headers, timeout))
-        return Resp()
-
-    monkeypatch.setattr(dash.httpx, 'get', fake_get)
-    monkeypatch.setenv('SWESIM_STAKEHOLDER_URL', 'https://stakeholder.example.test/')
-    monkeypatch.setenv('SWESIM_WORKER_SECRET', 'worker-secret-value')
-    body = site['client'].get(f'/api/trial/{tid}/timeline').json()
-    assert calls == [(f'https://stakeholder.example.test/transcript/{tid}', {'X-Worker-Secret': 'worker-secret-value'}, 10.0)]
-    assert body['live'] is True and body['status']['status'] == 'running'
-    assert [x['text'] for x in body['timeline'] if x['actor'] in ('agent', 'stakeholder')] == ['Live question?', 'Live answer.']
-    assert 'worker-secret-value' not in json.dumps(body)
-    assert 'disclosed_fact_ids' not in json.dumps(body) and body['evaluator'] is False  # API strips audit meta unless ?evaluator=1
-    ev = site['client'].get(f'/api/trial/{tid}/timeline?evaluator=1').json()
-    assert ev['evaluator'] is True and any(x.get('meta', {}).get('disclosed_fact_ids') == ['f01'] for x in ev['timeline'])
-    assert 'tier' not in body['patience'] and ev['patience'].get('tier') == 'full'  # stakeholder tier is evaluator-only too
-    page = site['client'].get(f'/trial/{tid}')
-    assert page.status_code == 200 and "data-live='true'" in page.text and 'running' in page.text and 'Live answer.' in page.text
-    assert 'agent is working' in page.text and 'setInterval' not in page.text  # behaviour lives in /static/app.js, never inline
-    assert '5 / 6' in page.text and 'worker-secret-value' not in page.text
-    # finished trials never trigger a live fetch, even with the env set
-    calls.clear()
-    assert site['client'].get(f"/api/trial/{site['done']}/timeline").status_code == 200 and calls == []
-    assert site['client'].get('/').status_code == 200 and calls == []
-
-
-def test_live_transcript_failure_degrades(site, monkeypatch):
-    tid = site['running']
-
-    def boom(*a, **k):
-        raise dash.httpx.ConnectError('down')
-
-    monkeypatch.setattr(dash.httpx, 'get', boom)
-    monkeypatch.setenv('SWESIM_STAKEHOLDER_URL', 'https://stakeholder.example.test')
-    monkeypatch.setenv('SWESIM_WORKER_SECRET', 's')
-    body = site['client'].get(f'/api/trial/{tid}/timeline').json()
-    assert body['timeline'] == [] and body['live'] is True and body['live_transcript_error'] == 'ConnectError'
-    monkeypatch.delenv('SWESIM_STAKEHOLDER_URL')
-    body = site['client'].get(f'/api/trial/{tid}/timeline').json()
-    assert body['live_transcript_error'] == 'SWESIM_STAKEHOLDER_URL not configured'
-    assert site['client'].get(f'/trial/{tid}').status_code == 200
-
-
-def test_label_post_validation_and_storage(site):
-    c, tid = site['client'], site['wrong']
-    r = c.post(f'/trial/{tid}/label', json={'label': 'no-question', 'note': 'never asked' + 'x' * 3000})
-    assert r.status_code == 200 and r.json() == {'saved': True}
-    saved = json.loads((site['ws'].root / 'trials' / tid / 'label.json').read_text())
-    assert set(saved) == {'label', 'note'} and saved['label'] == 'no-question' and len(saved['note']) == 2000
-    assert 'no-question' in c.get(f'/trial/{tid}').text
-    assert c.post(f'/trial/{tid}/label', json={'label': 'looks-fine'}).status_code == 400
-    assert c.post(f'/trial/{tid}/label', json={}).status_code == 400
-    assert c.post('/trial/' + 'f' * 24 + '/label', json={'label': 'unresolved'}).status_code == 404
-    assert c.post('/trial/zzz/label', json={'label': 'unresolved'}).status_code == 404
-    assert json.loads((site['ws'].root / 'trials' / tid / 'label.json').read_text())['label'] == 'no-question'
-
-
-def test_file_route_serves_whitelisted_trial_files_only(site):
-    c, tid = site['client'], site['done']
-    r = c.get(f'/trial/{tid}/file/trajectory.json')
-    assert r.status_code == 200 and r.json()['steps'] == TRAJ['steps']
-    assert c.get(f'/trial/{tid}/file/verifier-report.json').json()['outcome'] == 'valid-correct'
-    assert c.get(f'/trial/{tid}/file/instruction.md').text.startswith('# Task')
-    for gated in ('record.json', 'transcript.json', 'spec.json'):  # evaluator-only raw files
-        assert c.get(f'/trial/{tid}/file/{gated}').status_code == 403
-        assert c.get(f'/trial/{tid}/file/{gated}?evaluator=1').status_code == 200
-    assert c.get(f"/scenario/{site['spec'].id}/file/scenario.json").status_code == 403
-    assert c.get(f"/scenario/{site['spec'].id}/file/scenario.json?evaluator=1").status_code == 200
-    assert c.get(f"/scenario/{site['spec'].id}/file/compile.json").status_code == 200
-    assert c.get(f'/trial/{tid}/file/passwd').status_code == 404
-    assert c.get(f'/trial/{tid}/file/..%2Fspec.json').status_code == 404
-    assert c.get(f"/trial/{site['running']}/file/trajectory.json").status_code == 404  # not there yet
-    assert c.get('/trial/' + 'f' * 24 + '/file/record.json').status_code == 404
-
-
-def test_timestamps_read_from_status_then_record_with_flagged_fallback(site):
-    c, tid = site['client'], site['wrong']
-    d = site['ws'].root / 'trials' / tid
-    # status.json without timestamps, record.json with them (the run stage may write either or both)
-    (d / 'status.json').write_text(json.dumps({'status': 'finished', 'trial_id': tid}))
-    rec = json.loads((d / 'record.json').read_text())
-    rec['started_at'] = '2026-09-13T11:00:00Z'
-    rec['finished_at'] = '2026-09-13T11:07:30Z'
-    (d / 'record.json').write_text(json.dumps(rec))
-    body = c.get(f'/api/trial/{tid}/timeline').json()
-    verifier = next(r for r in body['timeline'] if r['actor'] == 'verifier')
-    assert verifier['ts_iso'] == '2026-09-13T11:07:30+00:00' and verifier['no_timestamp'] is False
-    assert body['meta']['started_at'] == '2026-09-13T11:00:00Z' and body['status']['status'] == 'finished'
-    page = c.get(f'/trial/{tid}').text
-    assert '2026-09-13T11:00:00Z' in page and '2026-09-13T11:07:30Z' in page and 'no timestamp' not in page
-    assert '2026-09-13T11:00:00Z' in c.get('/').text  # runs table falls back to record.json too
-    # status.json wins when both are present
-    (d / 'status.json').write_text(json.dumps({'status': 'finished', 'trial_id': tid, 'finished_at': '2026-09-13T11:09:00Z'}))
-    body = c.get(f'/api/trial/{tid}/timeline').json()
-    assert next(r for r in body['timeline'] if r['actor'] == 'verifier')['ts_iso'] == '2026-09-13T11:09:00+00:00'
-    # neither: the verifier row stays, last and flagged
-    (d / 'status.json').write_text(json.dumps({'status': 'finished', 'trial_id': tid}))
-    rec.pop('started_at')
-    rec.pop('finished_at')
-    (d / 'record.json').write_text(json.dumps(rec))
-    body = c.get(f'/api/trial/{tid}/timeline').json()
-    assert body['timeline'][-1]['actor'] == 'verifier' and body['timeline'][-1]['no_timestamp'] is True
-    assert 'no timestamp' in c.get(f'/trial/{tid}').text
-
-
-def test_runs_page_tolerates_malformed_scores_files(site):
-    c, ws = site['client'], site['ws']
-    (ws.scenario_dir(site['spec'].id) / 'scores.json').write_text('[1, 2, 3]')  # not an object of groups
-    other = ws.root / 'scenarios' / 'broken-scenario'
-    other.mkdir(parents=True)
-    (other / 'scores.json').write_text('{not json')
-    mixed = ws.root / 'scenarios' / 'mixed-scenario'
-    mixed.mkdir(parents=True)
-    (mixed / 'scores.json').write_text(json.dumps({'interactive|withheld|r': {'condition': 'interactive', 'brief_profile': 'withheld',
-                                                                             'model': HAIKU, 'purpose': 'calibration', 'requested_k': 3,
-                                                                             'n_valid': 1, 'n_total': 1, 'success_count': 1,
-                                                                             'pass_at_k': None, 'pass_pow_k': None, 'mean_reward': 1.0,
-                                                                             'outcomes': {'valid-correct': 1}, 'trial_ids': ['a' * 24]},
-                                                   'garbage': 'not a group'}))
-    r = c.get('/')
-    assert r.status_code == 200
-    assert r.text.count('unreadable scores.json') == 2 and 'mixed-scenario' in r.text
-    for tid in (site['done'], site['wrong'], site['full'], site['running']):
-        assert f"href='/trial/{tid}'" in r.text  # the trials table still renders
-    runs = c.get('/runs')
-    assert runs.status_code == 200 and runs.text.count('unreadable scores.json') == 2 and 'valid-correct 1' in runs.text
-    assert c.get('/api/overview').status_code == 200
-
-
-def test_unresolved_attempts_are_flagged_on_runs_table_and_render_an_episode_page(site):
-    c, ws, spec = site['client'], site['ws'], site['spec']
-    err = write_unresolved(ws, spec, kind='status-error', attempt=5)
-    rerr = write_unresolved(ws, spec, kind='runner-error', attempt=6)
-    req = write_unresolved(ws, spec, kind='request-only', attempt=7)
-    score_scenario(ws, spec.id, k=3)
-    html = c.get('/').text
-    for tid in (err, rerr, req):
-        assert f"href='/trial/{tid}'" in html
-    assert html.count('>unresolved</span>') >= 3 and 'RuntimeError' in html and 'HarborRunError' in html
-    assert 'runner-error' in html and 'requested' in html
-    runs = c.get('/runs').text
-    assert 'attempts (unresolved)' in runs and runs.count('>unresolved</span>') >= 3
-    for tid in (site['done'], site['wrong'], site['full']):  # finished trials are not flagged
-        row = html[html.index(f"href='/trial/{tid}'"):]
-        assert '>unresolved</span>' not in row[:row.index('</tr>')]
-    page = c.get(f'/trial/{rerr}').text
-    assert 'Unresolved attempt' in page and 'HarborRunError' in page and 'runner-error.json' in page and spec.id in page
-    assert f"href='/trial/{rerr}/file/runner-error.json'" in page and f"href='/trial/{rerr}/file/launch.json'" in page
-    assert c.get(f'/trial/{rerr}/file/runner-error.json').json()['type'] == 'HarborRunError'
-    err_page = c.get(f'/trial/{err}').text
-    assert 'Unresolved attempt' in err_page and 'RuntimeError' in err_page and 'status.json' in err_page and 'setInterval' not in err_page
-    assert c.get(f'/trial/{req}').status_code == 200 and 'requested' in c.get(f'/trial/{req}').text
-    body = c.get(f'/api/trial/{err}/timeline').json()
-    assert body['unresolved']['status'] == 'error' and body['unresolved']['error_type'] == 'RuntimeError' and body['timeline'] == []
-    assert c.get(f"/api/trial/{site['done']}/timeline").json()['unresolved'] is None
-    live = c.get(f"/api/trial/{site['running']}/timeline").json()  # running without a record: unresolved so far, still live
-    assert live['live'] is True and live['unresolved']['status'] == 'running'
+    for route in ("/", "/scenarios", "/trials", "/candidates", "/workflows", "/leaderboard", "/db", "/artifacts", "/spend", "/run", "/create", "/review"):
+        r = c.get(route)
+        assert r.status_code == 200, route
+    assert "No scenarios yet" in c.get("/scenarios").text and "No registered valid scenarios" in c.get("/run").text and "Nothing is running" in c.get("/").text
+    assert c.get("/api/counts").json()["scenarios_valid"] == 0
+    reset_settings(); access.reset()

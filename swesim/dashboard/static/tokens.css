@@ -1,0 +1,63 @@
+/* swesim console design tokens. The ONLY file with colour literals; app.css and the SVG charts reference these.
+   Values and their validation: docs/superpowers/specs/2026-09-13-console-design.md §2–§3 and
+   workspace/evidence/console/palette-validation.txt (dataviz validate_palette.js, both modes). */
+:root {
+  /* type scale (px) and fonts */
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --fs-0: 12px; --fs-1: 13px; --fs-2: 14px; --fs-3: 16px; --fs-4: 20px; --fs-5: 26px; --fs-6: 40px;
+  /* 8-px grid */
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 24px; --s-6: 32px; --s-7: 48px;
+  --r-1: 4px; --r-2: 8px; --r-3: 14px;
+  --measure: 72ch; --nav-w: 216px;
+  /* surfaces: page, card, inset, overlay; hairlines */
+  --page: #f9f9f7; --surface: #fcfcfb; --inset: #f3f2ee; --overlay: #ffffff;
+  --line: #e1e0d9; --line-2: #c3c2b7;
+  /* ink: primary, secondary, muted (all >= 4.5:1 on every surface, measured) */
+  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #6f6e69;
+  /* accent: interactive elements only */
+  --accent: #2a78d6; --accent-ink: #1c5cab; --accent-wash: #e9f1fb; --focus: #2a78d6;
+  /* status (fixed, never themed; icon + label always) */
+  --good: #0ca30c; --good-ink: #0a7a0a; --good-wash: #e6f5e6;
+  --warn: #fab219; --warn-ink: #7a5300; --warn-wash: #fff4dc;
+  --serious: #ec835a; --serious-ink: #9a3f1c; --serious-wash: #fdeee6;
+  --critical: #d03b3b; --critical-ink: #a32b2b; --critical-wash: #fbe6e6;
+  --neutral: #898781;
+  /* categorical: model families, fixed order (1 Anthropic, 2 OpenAI, 3 DeepSeek, 4 GLM/Z.ai, 5 Qwen, 6 Kimi, 7 MiniMax, 8 gpt-oss) */
+  --fam-1: #2a78d6; --fam-2: #eb6834; --fam-3: #1baf7a; --fam-4: #eda100; --fam-5: #e87ba4; --fam-6: #008300; --fam-7: #4a3aa7; --fam-8: #e34948;
+  --fam-other: #898781;
+  /* sequential (magnitudes): blue 100..700 */
+  --seq-100: #cde2fb; --seq-200: #9ec5f4; --seq-300: #6da7ec; --seq-400: #3987e5; --seq-500: #256abf; --seq-600: #184f95; --seq-700: #0d366b;
+  --seq-ink-on-dark-step: #ffffff; --seq-ink-on-light-step: #0b0b0b;
+  /* roles in the transcript */
+  --agent: #1c5cab; --stakeholder: #b8471a; --verifier: #0b7a56; --harness: #898781;
+  --agent-wash: #e9f1fb; --stakeholder-wash: #fdeee6; --audit-wash: #fff4e8; --mark-wash: #fde9d9;
+  --diff-add-wash: #e6f5e6; --diff-del-wash: #fbe6e6;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0d0d0d; --surface: #1a1a19; --inset: #2c2c2a; --overlay: #232322;
+    --line: #2c2c2a; --line-2: #383835;
+    --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #9d9c93;
+    --accent: #3987e5; --accent-ink: #86b6ef; --accent-wash: #1d2a3b; --focus: #86b6ef;
+    --good-ink: #5ed35e; --good-wash: #16301a; --warn-ink: #f2c65a; --warn-wash: #33281a;
+    --serious-ink: #f5a884; --serious-wash: #3a2519; --critical-ink: #ef8a8a; --critical-wash: #3d1d1d;
+    --fam-1: #3987e5; --fam-2: #d95926; --fam-3: #199e70; --fam-4: #c98500; --fam-5: #d55181; --fam-6: #008300; --fam-7: #9085e9; --fam-8: #e66767;
+    --agent-wash: #1d2a3b; --stakeholder-wash: #3a2519; --audit-wash: #33281a; --mark-wash: #4a2a15;
+    --diff-add-wash: #16301a; --diff-del-wash: #3d1d1d;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --page: #0d0d0d; --surface: #1a1a19; --inset: #2c2c2a; --overlay: #232322;
+  --line: #2c2c2a; --line-2: #383835;
+  --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #9d9c93;
+  --accent: #3987e5; --accent-ink: #86b6ef; --accent-wash: #1d2a3b; --focus: #86b6ef;
+  --good-ink: #5ed35e; --good-wash: #16301a; --warn-ink: #f2c65a; --warn-wash: #33281a;
+  --serious-ink: #f5a884; --serious-wash: #3a2519; --critical-ink: #ef8a8a; --critical-wash: #3d1d1d;
+  --fam-1: #3987e5; --fam-2: #d95926; --fam-3: #199e70; --fam-4: #c98500; --fam-5: #d55181; --fam-6: #008300; --fam-7: #9085e9; --fam-8: #e66767;
+  --agent-wash: #1d2a3b; --stakeholder-wash: #3a2519; --audit-wash: #33281a; --mark-wash: #4a2a15;
+  --diff-add-wash: #16301a; --diff-del-wash: #3d1d1d;
+  color-scheme: dark;
+}

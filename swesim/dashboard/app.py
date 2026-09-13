@@ -1,263 +1,821 @@
-"""swesim dashboard: FastAPI routes over the workspace files (server-rendered HTML + vanilla JS, no build step).
+"""swesim console: the operator surface for the whole record (FastAPI, server-rendered HTML + vanilla JS, no build step).
 
-Pages: ``/`` overview (live board, polls ``/api/overview``), ``/runs`` (filterable attempts, pass@k chart + table),
-``/scenarios`` and ``/scenario/{id}`` (briefs with removed spans, ledger by discovery, controls vs validation), and
-``/trial/{id}`` (chat + verifier panel; polls the live transcript while running; Timeline tab after completion).
-JSON: ``/api/overview``, ``/api/trial/{id}/timeline``. Writes: only ``POST /trial/{id}/label``.
+Pages answer one question each (design spec §1): Home (what is running and what changed), Scenarios, Trials/Episode,
+Candidates, Workflows, Review, Leaderboard, Database, Artifacts, Create/Run, Spend, Search. Every list, filter, funnel
+and score comes from the ``IndexReader`` (``access.reader_for``); the artifact browser is the one page that walks the
+filesystem through ``Layout``. Live updates poll the ``/api/*`` JSON twins of each page.
 
-Honesty rules baked in: rows without timestamps are flagged and never ordered as facts; stakeholder fact annotations and
-tool audit are marked evaluator-only; null metrics (n < k) read "n/a"; ``reviewed_equals_submitted`` null is explained as
-the diff-only pilot; author-only facts, stakeholder fact annotations, tool audit and the raw record/transcript/spec files are
-rendered only with ``?evaluator=1``. Reviewer tool: reached over an SSH forward, never exposed to agents. Secrets are read
-from the server environment only and never rendered.
+Identity: IAP headers verified by ``identity.identity_from_headers`` (evaluator = allow-listed email); anonymous otherwise.
+Evaluator-only material (facts, redactions, tool audit, judge/draft metadata, hidden assets, raw record/transcript/spec)
+is never in a non-evaluator response; ``?evaluator=1`` does not exist.
 
-CSRF posture: every mutating route takes a JSON body only (an HTML form cannot produce one cross-site without a CORS
-preflight, and no CORS middleware is installed) and additionally rejects a request whose ``Origin`` host differs from
-its ``Host`` (``same_origin``). Residual: DNS rebinding against the SSH-forwarded localhost port, accepted for this tool.
+Mutations (``/api/<action>/preview`` then ``/api/<action>``): strict Origin check (scheme+host+port), signed confirmation
+token bound to the params and actor, an ``OperatorActionRow`` for every attempt, and the CLI equivalent in every reply.
+Temporal is reached only through ``console.py`` (``ConsoleUnavailable`` becomes a 502 carrying the CLI fallback).
+Configuration comes from ``swesim.settings.Settings``; secrets are read at the point of use and never rendered.
+
+File convention this consumer depends on (tests/test_contracts.py): the episode page reads ``trials/<tid>/record.json``,
+``reward.json``, ``report.json``, ``transcript.json``, ``status.json``, ``run_config.json`` and ``spec.json`` exactly as
+``swesim/stages/run.py`` writes them (through ``data.load_trial``); ``merge_timeline`` is re-exported from ``data``.
 """
 from __future__ import annotations
 
+import asyncio
+import csv
+import io
 import json
-import os
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
-from urllib.parse import urlsplit
+from typing import Any
 
-import httpx  # noqa: F401 - re-exported so tests can monkeypatch ``app.httpx.get`` (the module object is shared with data.py)
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 
-from swesim.dashboard import console, data, render, render_console
-from swesim.dashboard.data import (
-    SCENARIO_FILES,
-    TRIAL_RE,
-    clock,
-    fetch_live_transcript,
-    iso,
-    patience_of,
-    read_json,
-    to_ts,
-)
+from swesim.dashboard import access, actions, console, data, pages, render, render_console, render_episode, render_scenario
+from swesim.dashboard import rows as R
+from swesim.dashboard.data import merge_timeline  # noqa: F401 - contract re-export (tests/test_contracts.py)
+from swesim.dashboard.identity import Identity, identity_from_headers
+from swesim.dashboard.public import PRIVATE_KEYS, project
+from swesim.dashboard.access import all_rows
 from swesim.paths import atomic_json
-from swesim.stages.score import OUTCOME_NAMES, normalize_record, outcome_code, unresolved_attempt
+from swesim.settings import Settings, get_settings
 
-app = FastAPI(title="swesim dashboard", docs_url=None, redoc_url=None)
-ROOT = Path(os.environ.get("SWESIM_WORKSPACE", "workspace")).resolve()
-REGISTRY = Path(os.environ.get("SWESIM_REGISTRY", "registry.json")).resolve()
-LABELS = render.LABELS
-LIVE_TIMEOUT = data.LIVE_TIMEOUT
-POLL_MS = 5000
+app = FastAPI(title="swesim console", docs_url=None, redoc_url=None)
+app.state.verify_jwt = None  # tests inject a verifier; None means google.auth
 STATIC = Path(__file__).resolve().parent / "static"
-STATIC_TYPES = {"app.css": "text/css; charset=utf-8", "app.js": "text/javascript; charset=utf-8"}
-# Files a reviewer may open from the episode page. Fixed names only; nothing else under the trial dir is served.
-TRIAL_FILES = {
-    "record.json": ("trial", "record.json"), "reward.json": ("trial", "reward.json"), "report.json": ("trial", "report.json"),
-    "transcript.json": ("trial", "transcript.json"), "run_config.json": ("trial", "run_config.json"),
-    "spec.json": ("trial", "spec.json"), "status.json": ("trial", "status.json"), "label.json": ("trial", "label.json"),
-    "request.json": ("trial", "request.json"), "runner-error.json": ("trial", "runner-error.json"),
-    "launch.json": ("trial", "launch.json"), "instruction.md": ("trial", "task/instruction.md"),
-    "harbor-result.json": ("harbor", "result.json"), "trajectory.json": ("harbor", "agent/trajectory.json"),
-    "verifier-reward.json": ("harbor", "verifier/reward.json"), "verifier-report.json": ("harbor", "verifier/report.json"),
-}
+STATIC_TYPES = {"tokens.css": "text/css; charset=utf-8", "app.css": "text/css; charset=utf-8", "app.js": "text/javascript; charset=utf-8",
+                "theme.js": "text/javascript; charset=utf-8"}
+LIVE_LIST_TIMEOUT = 5.0
+LABELS = render_episode.LABELS
 
-__all__ = ["app", "clock", "fetch_live_transcript", "iso", "load_trial", "merge_timeline", "read_json", "to_ts", "trial_path"]
+__all__ = ["app", "merge_timeline", "settings_dep", "reader_dep", "identity_dep"]
 
 
-def trial_path(tid: str) -> Path:
-    if not TRIAL_RE.fullmatch(tid):
-        raise HTTPException(404)
-    return ROOT / "trials" / tid
+@app.exception_handler(ValueError)
+async def invalid_input(_request: Request, error: ValueError) -> JSONResponse:
+    return _json(400, {"error": str(error)})
 
 
-def same_origin(request: Request) -> None:
-    """POST guard: when the browser sends an Origin, its host must be our Host (scheme/port aside). No Origin (curl, tests) passes."""
-    origin = request.headers.get("origin")
-    if not origin:
-        return
-    if origin == "null":
-        raise HTTPException(403, detail="cross-site request rejected (null origin)")
-    host = (request.url.hostname or "").lower()  # parsed from the Host header; IPv6 literals come back without brackets
-    origin_host = (urlsplit(origin).hostname or "").lower()
-    if not host or not origin_host or origin_host != host:
-        raise HTTPException(403, detail="cross-site request rejected (origin does not match host)")
+@app.exception_handler(PermissionError)
+async def denied_artifact(_request: Request, error: PermissionError) -> JSONResponse:
+    return _json(403, {"error": str(error)})
 
 
-EVALUATOR_TRIAL_FILES = set(render.EVALUATOR_FILES)
-EVALUATOR_SCENARIO_FILES = set(render.SCENARIO_EVALUATOR_FILES)
-AUDIT_META = ("disclosed_fact_ids", "tier", "patience_remaining", "tool_calls", "delivery")
+# ----------------------------------------------------------------------------- dependencies
+
+def settings_dep() -> Settings:
+    return get_settings()
 
 
-def _public_rows(rows: list[dict]) -> list[dict]:
-    """Timeline rows without evaluator-only material: no stakeholder tool-call rows, no audit fields in stakeholder meta."""
-    out = []
-    for r in rows:
-        if r.get("kind") == "tool_call":
-            continue
-        if r.get("actor") == "stakeholder" and isinstance(r.get("meta"), dict):
-            r = {**r, "meta": {k: v for k, v in r["meta"].items() if k not in AUDIT_META}}
-        out.append(r)
+def reader_dep(settings: Settings = Depends(settings_dep)):
+    return access.reader_for(settings)
+
+
+def layout_dep(settings: Settings = Depends(settings_dep)):
+    return access.layout_for(settings)
+
+
+def identity_dep(request: Request, settings: Settings = Depends(settings_dep)) -> Identity:
+    return identity_from_headers(request.headers, settings, verify=app.state.verify_jwt)
+
+
+def origin_dep(request: Request, settings: Settings = Depends(settings_dep)) -> None:
+    try:
+        actions.check_origin(request.headers, settings, str(request.url))
+    except actions.OriginError as e:
+        raise HTTPException(403, detail=str(e)) from e
+
+
+def _json(status: int, body: dict) -> JSONResponse:
+    return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
+
+
+def _dump(obj) -> Any:
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(mode="json")
+    return obj
+
+
+def _lists(request: Request, *keys: str) -> dict[str, list[str] | None]:
+    out: dict[str, list[str] | None] = {}
+    for k in keys:
+        vals = [v for v in request.query_params.getlist(k) if v]
+        out[k] = vals or None
     return out
 
 
-# ----------------------------------------------------------------------------- timeline
-
-def _row(ts, seq, actor, kind, text, meta) -> dict:
-    return {"ts": ts, "ts_iso": iso(ts), "no_timestamp": ts is None, "seq": seq, "actor": actor, "kind": kind,
-            "text": text, "meta": meta}
-
-
-def merge_timeline(traj: dict, transcript: dict, report: dict | None = None, reward: dict | None = None,
-                   status: dict | None = None) -> list[dict]:
-    """Interleave ATIF agent steps (``timestamp``), stakeholder transcript messages (``ts``; each stakeholder
-    ``tool_calls`` entry is its own row) and, when a report exists, one verifier outcome row. Sorted by time;
-    rows without a timestamp sort last and carry ``no_timestamp: True``."""
-    rows: list[dict] = []
-    for i, s in enumerate((traj or {}).get("steps") or []):
-        if not isinstance(s, dict):
+def _ints(vals: list[str] | None) -> list[int] | None:
+    if not vals:
+        return None
+    out = []
+    for v in vals:
+        try:
+            out.append(int(v))
+        except ValueError:
             continue
-        source = s.get("source", "agent")
-        actor = "agent" if source == "agent" else "harness"
-        kind = "agent-step" if source == "agent" else ("prompt" if source == "user" else "system")
-        rows.append(_row(to_ts(s.get("timestamp")), i, actor, kind, str(s.get("message") or ""), s))
-    last_exchange = None
-    for i, e in enumerate((transcript or {}).get("events") or []):
-        if not isinstance(e, dict) or e.get("kind") != "message":
+    return out or None
+
+
+def _date(v: str | None, end: bool = False) -> datetime | None:
+    if not v:
+        return None
+    try:
+        d = date.fromisoformat(v)
+    except ValueError:
+        return None
+    return datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=UTC) if end else datetime(d.year, d.month, d.day, tzinfo=UTC)
+
+
+def _paging(request: Request, default_limit: int = 100) -> tuple[int, int]:
+    try:
+        offset = max(0, int(request.query_params.get("offset", 0)))
+        limit = min(500, max(1, int(request.query_params.get("limit", default_limit))))
+    except ValueError:
+        offset, limit = 0, default_limit
+    return offset, limit
+
+
+def page(p: render.Page, body: str, reader, identity: Identity, settings: Settings) -> HTMLResponse:
+    return HTMLResponse(render.layout(p, body, counts=counts(reader, settings), identity=identity, temporal_url=settings.workflow_url("").rsplit("/workflows/", 1)[0] if settings.workflow_url("") else None))
+
+
+# ----------------------------------------------------------------------------- counts and home data
+
+def counts(reader, settings: Settings) -> dict:
+    scen = reader.scenarios(R.ScenarioFilter(validation_status=["valid"], latest_only=True, limit=1))
+    running = reader.trials(R.TrialFilter(status=["running", "launched"], limit=1))
+    pending = reader.candidates(R.CandidateFilter(status=["pending"], limit=1))
+    wf = reader.workflows(R.WorkflowFilter(status=["running"], limit=1))
+    review = reader.scenarios(R.ScenarioFilter(validation_status=["drafting"], latest_only=True, limit=1)).total
+    return {"scenarios_valid": scen.total, "trials_running": running.total, "candidates_pending": pending.total, "workflows_running": wf.total, "review_pending": review}
+
+
+async def live_jobs(settings: Settings | None = None) -> tuple[list[dict], str | None]:
+    """The Temporal listing through console.py, bounded in time; (jobs, error)."""
+    if settings is not None and settings.index_enabled:
+        return [], None
+    try:
+        return await asyncio.wait_for(console.list_jobs(), LIVE_LIST_TIMEOUT), None
+    except console.ConsoleUnavailable as e:
+        return [], f"{e} · {e.cli}"
+    except asyncio.TimeoutError:
+        return [], "Temporal listing timed out"
+
+
+def workflow_views(reader, live: list[dict], settings: Settings, f: R.WorkflowFilter) -> tuple[list[dict], int]:
+    indexed = reader.workflows(f)
+    if not live:
+        return [pages.workflow_view(project(_dump(w)), settings) for w in indexed.items], indexed.total
+    by_id: dict[tuple[str, str], dict] = {}
+    for w in all_rows(reader.workflows, f):
+        d = project(_dump(w))
+        by_id[d["workflow_id"], d["run_id"]] = d
+    for j in live:
+        j = project(j)
+        if any(getattr(f, field) and j.get(field) not in getattr(f, field) for field in ("workflow_id", "run_id", "status", "type", "parent_workflow_id", "task_queue")):
             continue
-        ts = to_ts(e.get("ts"))
-        if e.get("role") == "user":
-            actor, last_exchange = "agent", e.get("exchange") or last_exchange or "ask"
-            kind = last_exchange
-        else:
-            actor, kind = "stakeholder", e.get("exchange") or last_exchange or "reply"
-        rows.append(_row(ts, i, actor, kind, str(e.get("content") or ""), e))
-        for tool in e.get("tool_calls") or []:
-            rows.append(_row(ts, i, "stakeholder", "tool_call", json.dumps(tool), tool))
-    report, reward, status = report or {}, reward or {}, status or {}
-    if report.get("outcome") or reward.get("outcome_code") is not None:
-        name = report.get("outcome") or OUTCOME_NAMES[outcome_code({"reward": reward})]
-        text = name if not reward else f"{name}: reward={reward.get('reward')} success={reward.get('success')}"
-        ts = next((to_ts(status.get(k)) for k in ("finished_at", "completed_at", "ended_at", "updated_at") if status.get(k)), None)
-        ts = ts if ts is not None else to_ts(report.get("finished_at"))
-        rows.append(_row(ts, 1 << 30, "verifier", "outcome", text, {"report": report, "reward": reward, "status": status}))
-    return sorted(rows, key=lambda r: (r["ts"] is None, r["ts"] or 0.0, r["seq"]))
+        if f.q and f.q.lower() not in json.dumps(j).lower():
+            continue
+        key = j["workflow_id"], j.get("run_id", "")
+        cur = by_id.get(key, {})
+        merged = {**cur, **{k: v for k, v in j.items() if v not in (None, "", {}) or k not in cur}}
+        merged.setdefault("params_summary", j.get("params_summary") or {})
+        by_id[key] = merged
+    views = [pages.workflow_view(w, settings) for w in by_id.values()]
+    views.sort(key=lambda w: str(w.get("started_at") or ""), reverse=True)
+    return views[f.offset:f.offset + f.limit], len(views)
 
 
-# ----------------------------------------------------------------------------- trial loading
-
-def _trajectory(tid: str, record: dict) -> dict:
-    if record.get("trial_dir"):
-        traj = read_json(Path(record["trial_dir"]) / "agent" / "trajectory.json")
-        if traj:
-            return traj
-    found = sorted((ROOT / "jobs" / "runs" / tid).glob("*/agent/trajectory.json"))
-    return read_json(found[0]) if len(found) == 1 else {}
-
-
-def load_trial(tid: str) -> dict:
-    d = trial_path(tid)
-    if not d.is_dir():
-        raise HTTPException(404)
-    status = read_json(d / "status.json")
-    raw = read_json(d / "record.json") if (d / "record.json").exists() else {}
-    has_record = bool(raw)
-    record = normalize_record(raw, d) if has_record else {}
-    unresolved = None if has_record else unresolved_attempt(d)  # no record: describe whatever files exist
-    request = read_json(d / "request.json")
-    rc = record.get("run_config") or request.get("run_config") or (unresolved or {}).get("run_config") or {}
-    live = status.get("status") == "running" and not has_record
-    live_error = None
-    if live:
-        transcript, live_error = fetch_live_transcript(tid)
-    else:
-        transcript = record.get("transcript") or read_json(d / "transcript.json")
-    report = record.get("report") or read_json(d / "report.json")
-    reward = record.get("reward") or read_json(d / "reward.json")
-    traj = _trajectory(tid, record)
-    ins = next((p for p in (d / "task" / "instruction.md",
-                            Path(record["task_dir"]) / "instruction.md" if record.get("task_dir") else None)
-                if p is not None and p.exists()), None)
-    u = unresolved or {}
-    meta = {
-        "scenario_id": record.get("scenario_id") or request.get("scenario_id") or u.get("scenario_id"),
-        "condition": record.get("condition") or request.get("condition") or u.get("condition"),
-        "brief_profile": record.get("brief_profile") or rc.get("brief_profile") or u.get("brief_profile"),
-        "model": record.get("model") or request.get("model") or rc.get("model") or u.get("model"),
-        "purpose": record.get("purpose") or rc.get("purpose") or u.get("purpose"),
-        "attempt_index": record.get("attempt_index", request.get("attempt_index")),
-        "spec_hash": record.get("spec_hash") or request.get("spec_hash"),
-        "run_config_hash": record.get("run_config_hash") or request.get("run_config_hash") or u.get("run_config_hash"),
-        "compiled_hash": record.get("compiled_hash") or rc.get("compiled_hash") or u.get("compiled_hash"),
-        "image_digest": (report or {}).get("image_digest"),
-        "trial_dir": record.get("trial_dir"),
-    }
-    # ISO-8601 timestamps: status.json first, record.json as fallback (both written by the run stage when present).
-    timestamps = {k: status.get(k) or record.get(k) for k in ("started_at", "finished_at")}
-    meta.update(timestamps)
-    status_view = {**{k: v for k, v in timestamps.items() if v}, **status}
-    return {"trial_id": tid, "dir": d, "status": status_view, "record": record, "request": request, "live": live,
-            "unresolved": unresolved, "live_transcript_error": live_error, "transcript": transcript or {},
-            "report": report or {}, "reward": reward or {}, "trajectory": traj,
-            "instruction": ins.read_text() if ins else None, "label": read_json(d / "label.json", default=None) or None,
-            "meta": meta, "patience": patience_of(transcript or {}, rc), "files": list(TRIAL_FILES)}
+async def home_data(reader, settings: Settings) -> dict:
+    c = counts(reader, settings)
+    running = reader.trials(R.TrialFilter(status=["running", "launched", "planned"], limit=100))
+    completed = reader.trials(R.TrialFilter(status=["completed"], limit=1))
+    unresolved = reader.trials(R.TrialFilter(status=["unresolved", "runner-error", "launch-failed", "unit-failed", "cancelled"], limit=1))
+    recent = reader.trials(R.TrialFilter(order_by="finished_at", desc=True, limit=15))
+    live, err = await live_jobs(settings)
+    wviews, _ = workflow_views(reader, live, settings, R.WorkflowFilter(limit=15))
+    spend = reader.spend()
+    total = sum((Decimal(str(s.usd)) for s in spend), Decimal(0))
+    tiles = {**c, "trials_completed": completed.total, "trials_unresolved": unresolved.total, "spend_usd": float(total), "spend_text": f"${total:,.2f}"}
+    return {"tiles": tiles, "running": [pages.trial_view(t) for t in running.items],
+            "recent": [pages.trial_view(t) for t in recent.items if t.status != "running"],
+            "workflows": wviews[:15], "workflow_error": err, "funnel": [_dump(s) for s in reader.funnel()],
+            "generated_at": datetime.now(UTC).isoformat(timespec="seconds")}
 
 
-def _resolve_file(t: dict, name: str) -> Path | None:
-    base, rel = TRIAL_FILES[name]
-    if base == "trial":
-        return t["dir"] / rel
-    trial_dir = t["meta"].get("trial_dir")
-    if trial_dir:
-        return Path(trial_dir) / rel
-    found = sorted((ROOT / "jobs" / "runs" / t["trial_id"]).glob(f"*/{rel}"))
-    return found[0] if len(found) == 1 else None
-
-
-def _timeline_rows(t: dict) -> list[dict]:
-    return merge_timeline(t["trajectory"], t["transcript"], report=t["report"], reward=t["reward"], status=t["status"])
-
-
-# ----------------------------------------------------------------------------- routes: pages
+# ----------------------------------------------------------------------------- pages: record
 
 @app.get("/", response_class=HTMLResponse)
-def overview() -> HTMLResponse:
-    ov = data.overview(ROOT, REGISTRY, live=False)  # the page never blocks on the stakeholder; the poll fetches live patience
-    return HTMLResponse(render.overview_page(ov, ROOT, REGISTRY))
+async def home(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    d = await home_data(reader, settings)
+    p = render.Page("Home", "home", "home", attrs={"source": "/api/home", "poll-ms": "5000"}, live="updated 0s ago")
+    return page(p, pages.home_body(d, settings), reader, identity, settings)
 
 
-@app.get("/runs", response_class=HTMLResponse)
-def runs() -> HTMLResponse:
-    return HTMLResponse(render.runs_page(data.trial_board(ROOT), data.scenario_board(ROOT, REGISTRY)))
+@app.get("/api/home")
+async def api_home(reader=Depends(reader_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    return _json(200, await home_data(reader, settings))
+
+
+@app.get("/api/counts")
+def api_counts(reader=Depends(reader_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    return _json(200, counts(reader, settings))
 
 
 @app.get("/scenarios", response_class=HTMLResponse)
-def scenarios() -> HTMLResponse:
-    return HTMLResponse(render.scenarios_page(data.scenario_board(ROOT, REGISTRY)))
+def scenarios(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    offset, limit = _paging(request, 200)
+    f = R.ScenarioFilter(**_lists(request, "validation_status", "source", "difficulty_tier"), latest_only=request.query_params.get("latest") == "1", offset=offset, limit=limit)
+    pg = reader.scenarios(f)
+    p = render.Page("Scenarios", "scenarios", "scenarios", crumbs=(("Scenarios", None),))
+    return page(p, render_scenario.scenarios_body(pg, counts(reader, settings)), reader, identity, settings)
+
+
+@app.get("/api/scenarios")
+def api_scenarios(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
+    offset, limit = _paging(request, 200)
+    pg = reader.scenarios(R.ScenarioFilter(**_lists(request, "validation_status", "source", "difficulty_tier"), offset=offset, limit=limit))
+    return _json(200, {"items": [render_scenario.scenario_row_view(r) for r in pg.items], "total": pg.total, "offset": pg.offset, "limit": pg.limit})
 
 
 @app.get("/scenario/{sid}", response_class=HTMLResponse)
-def scenario(sid: str, evaluator: int = 0) -> HTMLResponse:
-    d = data.scenario_detail(ROOT, REGISTRY, sid, evaluator=bool(evaluator))
-    if d is None:
+def scenario(sid: str, request: Request, reader=Depends(reader_dep), layout=Depends(layout_dep), identity: Identity = Depends(identity_dep),
+             settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    if not access.ID_RE.fullmatch(sid):
         raise HTTPException(404)
-    return HTMLResponse(render.scenario_page(d))
+    version = _ints([request.query_params.get("version", "")])
+    row = reader.scenario(sid, version[0] if version else None)
+    versions = reader.scenario_versions(sid)
+    archived = row is not None and row.validation_status == "archived"
+    d = data.scenario_detail(layout, sid, identity.evaluator, row.version if archived else None)
+    if d is None and row is None:
+        raise HTTPException(404)
+    if d is None:  # registered, no directory in this copy
+        d = {"scenario_id": sid, "version": row.version, "frozen": False, "spec_hash": row.spec_hash, "source": row.source, "source_ref": row.source_ref, "created_at": None,
+             "natural_segments": [("", False)], "withheld": None, "removed_excerpts": [], "operations": [], "ledger_groups": {}, "hidden_author_only": 0, "evaluator": identity.evaluator,
+             "requirements": [], "groups": [], "checks": [], "persona": {}, "environment": {}, "contract": {"fail_to_pass": 0, "pass_to_pass": 0, "protected_paths": 0},
+             "controls": [], "validation": {}, "failures": [], "probe": {}, "approval": {}, "compile": {}, "assets": {}, "hidden_assets": 0, "difficulty": {}, "audit": {}, "judge": {},
+             "draft_meta": {}, "review": {}, "files": [], "dir": None}
+    trials = reader.trials(R.TrialFilter(scenario_id=[sid], limit=500))
+    trials_html = render.table("scenario-trials", pages.TRIAL_COLUMNS, [pages.trial_view(t) for t in trials.items], key="trial_id",
+                               empty="<strong>No trials on this scenario yet.</strong> Start one on <a href='/run'>Run</a>.", export=True)
+    p = render.Page(f"Scenario {sid}", "scenarios", "scenario", crumbs=(("Scenarios", "/scenarios"), (sid, None)))
+    return page(p, render_scenario.scenario_body(d, row, versions, trials_html, identity.evaluator), reader, identity, settings)
 
 
-@app.get("/scenario/{sid}/file/{name}")
-def scenario_file(sid: str, name: str, evaluator: int = 0) -> PlainTextResponse:
-    if name not in SCENARIO_FILES or not data.ID_RE.fullmatch(sid):
+def _trial_filter(request: Request, default_limit: int = 200) -> R.TrialFilter:
+    offset, limit = _paging(request, default_limit)
+    lists = _lists(request, "scenario_id", "model", "condition", "brief_profile", "status", "purpose", "origin", "trial_id")
+    status = lists.pop("status")
+    if status and "unresolved" in status:
+        status = sorted(set(status) | {"runner-error", "launch-failed", "unit-failed", "cancelled"})
+    return R.TrialFilter(**lists, status=status, version=_ints(request.query_params.getlist("version")), outcome_code=_ints(request.query_params.getlist("outcome_code")),
+                         started_from=_date(request.query_params.get("since")), started_to=_date(request.query_params.get("until"), end=True),
+                         order_by=request.query_params.get("order_by") or None, desc=request.query_params.get("asc") != "1", offset=offset, limit=limit)
+
+
+@app.get("/trials", response_class=HTMLResponse)
+def trials(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    f = _trial_filter(request)
+    pg = reader.trials(f)
+    views = [pages.trial_view(t) for t in pg.items]
+    everything = reader.trials(R.TrialFilter(limit=500)).items
+    facets = {"scenario_id": sorted({t.scenario_id for t in everything}), "version": sorted({t.version for t in everything if t.version is not None}),
+              "model": sorted({t.model for t in everything}), "status": sorted({t.status for t in everything} | {"unresolved"}),
+              "outcome_code": sorted({t.outcome_code for t in everything if t.outcome_code is not None}), "origin": sorted({t.origin for t in everything})}
+    current = {k: request.query_params.getlist(k) for k in ("scenario_id", "version", "model", "condition", "brief_profile", "status", "outcome_code", "purpose", "origin")}
+    current.update(since=request.query_params.get("since"), until=request.query_params.get("until"))
+    p = render.Page("Trials", "trials", "trials", crumbs=(("Trials", None),))
+    return page(p, pages.trials_body(pg, views, facets, current), reader, identity, settings)
+
+
+@app.get("/api/trials")
+def api_trials(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
+    pg = reader.trials(_trial_filter(request))
+    return _json(200, {"items": [pages.trial_view(t) for t in pg.items], "total": pg.total, "offset": pg.offset, "limit": pg.limit})
+
+
+@app.get("/candidates", response_class=HTMLResponse)
+def candidates(request: Request, reader=Depends(reader_dep), layout=Depends(layout_dep), identity: Identity = Depends(identity_dep),
+               settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    offset, limit = _paging(request, 200)
+    key = request.query_params.get("source_key") or None
+    f = R.CandidateFilter(source_key=[key] if key else None, **_lists(request, "stage", "status", "gate"), offset=offset, limit=limit)
+    pg = reader.candidates(f)
+    steps = [_dump(s) for s in reader.funnel(key)]
+    everything = reader.candidates(R.CandidateFilter(limit=500)).items
+    everything = list(all_rows(reader.candidates, R.CandidateFilter()))
+    hist = pages.reject_histogram(reader, everything, key)
+    keys = sorted({r.source_key for r in everything})
+    p = render.Page("Candidates", "candidates", "candidates", crumbs=(("Candidates", None),))
+    body = pages.candidates_body(pg, [pages.candidate_view(r) for r in pg.items], steps, hist, keys, key)
+    if not callable(getattr(reader, "reject_histogram", None)):
+        body += "<p class='muted'>Discovery-time reject counts are unavailable in this reader; the histogram shows indexed candidate gates.</p>"
+    return page(p, body, reader, identity, settings)
+
+
+@app.get("/api/candidates")
+def api_candidates(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
+    offset, limit = _paging(request, 200)
+    key = request.query_params.get("source_key") or None
+    pg = reader.candidates(R.CandidateFilter(source_key=[key] if key else None, **_lists(request, "stage", "status", "gate"), offset=offset, limit=limit))
+    return _json(200, {"items": [pages.candidate_view(r) for r in pg.items], "total": pg.total, "funnel": [_dump(s) for s in reader.funnel(key)]})
+
+
+@app.get("/workflows", response_class=HTMLResponse)
+async def workflows(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    offset, limit = _paging(request, 200)
+    live, err = await live_jobs(settings)
+    views, total = workflow_views(reader, live, settings, R.WorkflowFilter(**_lists(request, "status", "type"), offset=offset, limit=limit))
+    p = render.Page("Workflows", "workflows", "workflows", crumbs=(("Workflows", None),), attrs={"poll-ms": "8000"}, live="updated 0s ago")
+    return page(p, pages.workflows_body(views, err, total, settings), reader, identity, settings)
+
+
+@app.get("/api/workflows")
+async def api_workflows(request: Request, reader=Depends(reader_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    offset, limit = _paging(request, 200)
+    live, err = await live_jobs(settings)
+    views, total = workflow_views(reader, live, settings, R.WorkflowFilter(**_lists(request, "status", "type"), offset=offset, limit=limit))
+    return _json(200, {"items": views, "total": total, "error": err})
+
+
+def _wid(wid: str) -> str:
+    if not console.WORKFLOW_ID_RE.fullmatch(wid):
         raise HTTPException(404)
-    p = ROOT / "scenarios" / sid / name
-    if not p.is_file():
+    return wid
+
+
+@app.get("/workflows/{wid}", response_class=HTMLResponse)
+async def workflow(wid: str, request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    wid = _wid(wid)
+    run_id = request.query_params.get("run_id")
+    matches = reader.workflows(R.WorkflowFilter(workflow_id=[wid], run_id=[run_id] if run_id else None, limit=1)).items
+    row = matches[0] if matches else None
+    live, _err = await live_jobs(settings)
+    job = next((j for j in live if j["workflow_id"] == wid and (not run_id or j.get("run_id") == run_id)), None)
+    progress, perr = None, None
+    try:
+        if not run_id and (row is None or row.status == "running"):
+            progress = await asyncio.wait_for(console.job_progress(wid), LIVE_LIST_TIMEOUT)
+    except console.ConsoleUnavailable as e:
+        perr = f"{e} · {e.cli}"
+    except asyncio.TimeoutError:
+        perr = "progress query timed out"
+    if row is None and job is None and progress is None:
         raise HTTPException(404)
-    if name in EVALUATOR_SCENARIO_FILES and not evaluator:
-        raise HTTPException(403, detail="evaluator-only file: add ?evaluator=1")
-    return PlainTextResponse(p.read_text(), media_type="application/json")
+    children = [pages.workflow_view(_dump(w), settings) for w in reader.workflows(R.WorkflowFilter(parent_workflow_id=[wid], limit=200)).items]
+    trials = [pages.trial_view(t) for t in reader.trials(R.TrialFilter(limit=500)).items if t.workflow_id == wid]
+    p = render.Page(f"Workflow {wid}", "workflows", "workflow", crumbs=(("Workflows", "/workflows"), (wid, None)))
+    if not identity.evaluator:
+        row = row.model_copy(update={"params_summary": project(row.params_summary)}) if row else None
+        job, progress = project(job), project(progress)
+    return page(p, pages.workflow_body(wid, row, job, progress, perr, children, trials, settings, console.redact), reader, identity, settings)
+
+
+@app.get("/api/workflows/{wid}")
+async def api_workflow(wid: str, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    wid = _wid(wid)
+    try:
+        progress = await asyncio.wait_for(console.job_progress(wid), LIVE_LIST_TIMEOUT)
+    except console.ConsoleUnavailable as e:
+        return _json(502, {"ok": False, "error": str(e), "cli": e.cli})
+    except asyncio.TimeoutError:
+        return _json(504, {"ok": False, "error": "progress query timed out"})
+    row = reader.workflow(wid)
+    result = {"ok": True, "workflow_id": wid, "progress": progress, "row": _dump(row), "temporal_url": settings.workflow_url(wid, row.run_id if row else None)}
+    return _json(200, result if identity.evaluator else project(result))
+
+
+# compatibility redirects for the previous console's paths
+@app.get("/jobs")
+def jobs_redirect() -> RedirectResponse:
+    return RedirectResponse("/workflows", status_code=308)
+
+
+@app.get("/jobs/{wid}")
+def job_redirect(wid: str) -> RedirectResponse:
+    return RedirectResponse(f"/workflows/{_wid(wid)}", status_code=308)
+
+
+@app.get("/runs")
+def runs_redirect() -> RedirectResponse:
+    return RedirectResponse("/trials", status_code=308)
+
+
+# ----------------------------------------------------------------------------- leaderboard
+
+def _lb_filter(request: Request, reader) -> tuple[R.LeaderboardFilter, dict]:
+    lists = _lists(request, "brief_profile", "source", "condition", "tier")
+    tiers = lists.pop("tier")
+    include_sat = request.query_params.get("include_saturated") == "1"
+    difficulty = request.query_params.get("difficulty_tier") or None
+    if difficulty and difficulty not in ("informative", "saturated"):
+        raise HTTPException(400, "difficulty_tier must be informative or saturated")
+    if difficulty == "saturated":
+        include_sat = True
+    purpose = request.query_params.get("purpose") or "comparison"
+    if purpose not in ("calibration", "comparison", "demonstration", "screen"):
+        purpose = "comparison"
+    models = sorted({m for t in (tiers or []) for m in render.TIERS.get(t, ())}) or None  # model tier -> the brief's verbatim ids
+    f = R.LeaderboardFilter(**lists, model=models, purpose=purpose, include_saturated=include_sat)
+    if difficulty:
+        ids = [s.scenario_id for s in all_rows(reader.scenarios, R.ScenarioFilter(difficulty_tier=[difficulty]))]
+        f = f.model_copy(update={"scenario_id": ids or ["__no_scenarios__"]})
+    current = {k: v or [] for k, v in lists.items()}
+    current.update(tier=tiers or [], include_saturated=include_sat, purpose=purpose, difficulty_tier=[difficulty] if difficulty else [])
+    return f, current
+
+
+def leaderboard_gate(reader, include_saturated: bool) -> list[dict]:
+    """Interfaces §9.1 per current scenario version, with the per-check breakdown the page explains; ``eligible`` is the
+    reader's own ``reports.gate_passes`` so the board and its explanation can never disagree."""
+    from swesim.index.reports import gate_passes
+    out = []
+    for s in all_rows(reader.scenarios, R.ScenarioFilter(latest_only=True)):
+        ts = s.task_sense if isinstance(s.task_sense, dict) else {}
+        checks = {"valid": s.validation_status == "valid",
+                  "difficulty": s.difficulty_tier == "informative" or (include_saturated and s.difficulty_tier == "saturated"),
+                  "task_sense": bool(ts.get("coherent")) and bool(ts.get("fair_tests"))}
+        out.append({"scenario_id": s.scenario_id, "version": s.version, "validation_status": s.validation_status, "difficulty_tier": s.difficulty_tier, "source": s.source,
+                    "task_sense": {k: ts.get(k) for k in ("coherent", "fair_tests", "plausible_withholding")} if ts else None, "checks": checks,
+                    "eligible": gate_passes(s, include_saturated)})
+    return out
+
+
+def _wilson(successes: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
+    if n <= 0:
+        return None
+    import math
+    p = successes / n
+    den = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / den
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def board_trials(reader, f: R.LeaderboardFilter) -> list:
+    """Completed, attributable trials admitted by the shared version-aware leaderboard gate."""
+    from swesim.index.reports import gate_passes, scenario_for_trial
+    versions = {}
+    for s in all_rows(reader.scenarios, R.ScenarioFilter(scenario_id=f.scenario_id)):
+        versions.setdefault(s.scenario_id, []).append(s)
+    selected = []
+    for t in all_rows(reader.trials, R.TrialFilter(scenario_id=f.scenario_id, purpose=[f.purpose], status=["completed"],
+                                                 condition=f.condition, brief_profile=f.brief_profile, model=f.model, outcome_code=[1, 2, 3, 4])):
+        s = scenario_for_trial(t, versions.get(t.scenario_id, []))
+        if s is not None and gate_passes(s, f.include_saturated) and (not f.source or s.source in f.source):
+            selected.append(t)
+    return selected
+
+
+def board_views(reader, rows: list, eligible: set[str], f: R.LeaderboardFilter) -> list[dict]:
+    """LeaderboardRow cells joined with what the row model does not carry: mean per-scenario pass@k / pass^k from the scores
+    table, the asked-before-implementing rate and a confidence note (Wilson 95% CI on the pass rate)."""
+    trials = [t for t in board_trials(reader, f) if t.scenario_id in eligible]
+    groups = {}
+    for t in trials:
+        key = (t.scenario_id, t.spec_hash, t.condition, t.brief_profile, t.model, t.run_config_hash)
+        groups.setdefault(key, []).append(t)
+    scores = []
+    for key, attempts in groups.items():
+        sf = R.ScoreFilter(**{name: [value] for name, value in zip(("scenario_id", "spec_hash", "condition", "brief_profile", "model", "run_config_hash"), key)})
+        scores.extend(s for s in reader.scores(sf) if s.n == len(attempts) and s.success_count == sum(bool(t.success) for t in attempts))
+    views = []
+    for r in rows:
+        d = r.model_dump(mode="json")
+        cell_scores = [s for s in scores if s.model == r.model and s.condition == r.condition and s.brief_profile == r.brief_profile and s.scenario_id in eligible]
+        pk = [s.pass_at_k for s in cell_scores if s.pass_at_k is not None]
+        ppk = [s.pass_pow_k for s in cell_scores if s.pass_pow_k is not None]
+        d["pass_at_k"] = str((sum(pk) / len(pk)).quantize(Decimal("0.001"))) if pk else None
+        d["pass_pow_k"] = str((sum(ppk) / len(ppk)).quantize(Decimal("0.001"))) if ppk else None
+        flags = [t.asked_before_implementing for t in trials if t.model == r.model and t.condition == r.condition and t.brief_profile == r.brief_profile and t.asked_before_implementing is not None]
+        d["asked_first_rate"] = f"{sum(1 for x in flags if x) / len(flags):.3f}" if flags else None
+        ci = _wilson(r.success_count, r.n)
+        d["confidence_note"] = (f"n={r.n} valid attempt(s) over {r.scenarios} scenario(s); pass rate {r.success_count}/{r.n}" + (f", Wilson 95% CI {ci[0]:.2f}–{ci[1]:.2f} (attempt independence approximation)" if ci else "")
+                                + ("; pass@k is the mean of matching per-spec/config scores (k as scored)" if pk else "; pass@k unavailable: insufficient attempts or no matching score"))
+        d["key"] = f"{r.model}|{r.condition}|{r.brief_profile}"
+        views.append(d)
+    return views
+
+
+@app.get("/leaderboard", response_class=HTMLResponse)
+def leaderboard(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    f, current = _lb_filter(request, reader)
+    rows = reader.leaderboard(f)
+    gate = leaderboard_gate(reader, f.include_saturated)
+    trials = board_trials(reader, f)
+    eligible = {t.scenario_id for t in trials}
+    saturated_views: list[dict] = []
+    if not f.include_saturated:
+        sat_ids = {g["scenario_id"] for g in leaderboard_gate(reader, True) if g["eligible"] and g["difficulty_tier"] == "saturated"}
+        if sat_ids:
+            sat_rows = reader.leaderboard(R.LeaderboardFilter(purpose=f.purpose, condition=f.condition, brief_profile=f.brief_profile, model=f.model, source=f.source,
+                                                              scenario_id=sorted(sat_ids), include_saturated=True))
+            saturated_views = board_views(reader, sat_rows, sat_ids, f.model_copy(update={"include_saturated": True, "scenario_id": sorted(sat_ids)}))
+    views = board_views(reader, rows, eligible, f)
+    for key in ("condition", "brief_profile", "model"):
+        want = getattr(f, key)
+        if want:
+            trials = [t for t in trials if getattr(t, key) in want]
+    models = sorted({t.model for t in trials}, key=lambda m: (render.family_of(m)[2] or 99, m))
+    by_cell: dict[tuple[str, str], list] = {}
+    for t in trials:
+        by_cell.setdefault((t.scenario_id, t.model), []).append(t)
+
+    def cell(sid, model):
+        ts = [t for t in by_cell.get((sid, model), []) if t.outcome_code in (1, 2, 3, 4)]
+        if not ts:
+            return None, 0, f"{sid} · {model}: no valid attempts"
+        return sum(1 for t in ts if t.success) / len(ts), len(ts), f"{sid} · {model}: {sum(1 for t in ts if t.success)}/{len(ts)} valid attempts succeeded"
+
+    matrix_html = pages.charts.matrix(sorted(eligible), models, cell, chart_id="chart-matrix", title="pass rate per scenario × model",
+                                      col_label=lambda m: m.split("/")[-1][:18]) if eligible and models else "<p class='empty'>No eligible scenario has completed trials for this purpose.</p>"
+    chart_rows = [{"model": r.model, "condition": r.condition, "pass_rate": float(r.pass_rate) if r.pass_rate is not None else None, "n": r.n} for r in rows]
+    chart_html = pages.charts.grouped_bars(chart_rows, metric="pass_rate", chart_id="chart-lb", title="pass rate per model per condition")
+    p = render.Page("Leaderboard", "leaderboard", "leaderboard", crumbs=(("Leaderboard", None),))
+    return page(p, pages.leaderboard_body(views, gate, current, matrix_html, chart_html, saturated_views), reader, identity, settings)
+
+
+@app.get("/api/leaderboard")
+def api_leaderboard(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
+    f, _ = _lb_filter(request, reader)
+    gate = leaderboard_gate(reader, f.include_saturated)
+    eligible = {t.scenario_id for t in board_trials(reader, f)}
+    return _json(200, {"items": board_views(reader, reader.leaderboard(f), eligible, f), "gate": gate})
+
+
+# ----------------------------------------------------------------------------- episode
+
+def _timeline_rows(t: dict) -> list[dict]:
+    return data.merge_timeline(t["trajectory"], t["transcript"], report=t["report"], reward=t["reward"], status=t["status"])
 
 
 @app.get("/trial/{tid}", response_class=HTMLResponse)
-def episode(tid: str, evaluator: int = 0) -> HTMLResponse:
-    t = load_trial(tid)
-    return HTMLResponse(render.episode_page(t, _timeline_rows(t), _resolve_file, evaluator=bool(evaluator)))
+def episode(tid: str, reader=Depends(reader_dep), layout=Depends(layout_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    t = data.load_trial(layout, tid, settings)
+    if t is None:
+        raise HTTPException(404)
+    if not identity.evaluator:
+        t = {**t, "report": project(t["report"]), "reward": project(t["reward"]), "status": project(t["status"])}
+    row = reader.trial(tid)
+    body = render_episode.episode_body(t, row, _timeline_rows(t), lambda tt, name: data.resolve_trial_file(layout, tt, name), identity.evaluator)
+    p = render.Page(f"Episode {tid}", "trials", "episode", crumbs=(("Trials", "/trials"), (tid, None)),
+                    attrs={"trial": tid, "live": "true" if t["live"] else "false", "poll-ms": "3000"}, live="live" if t["live"] else None)
+    return page(p, body, reader, identity, settings)
 
+
+@app.get("/api/trial/{tid}/timeline")
+def timeline(tid: str, reader=Depends(reader_dep), layout=Depends(layout_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    t = data.load_trial(layout, tid, settings)
+    if t is None:
+        raise HTTPException(404)
+    rows = _timeline_rows(t)
+    ev = identity.evaluator
+    patience = t["patience"] if ev else {k: v for k, v in t["patience"].items() if k != "tier"}
+    # the public timeline never carries the evaluator-only columns, not even blanked (brief §2.5, Codex B-P2-6)
+    exchanges = [_dump(x) if ev else {k: v for k, v in _dump(x).items() if k not in R.EVALUATOR_ONLY_KEYS} for x in reader.exchanges(tid, ev)]
+    result = {"trial_id": tid, "status": t["status"], "live": t["live"], "live_transcript_error": t["live_transcript_error"], "unresolved": t["unresolved"],
+                       "evaluator": ev, "timeline": rows if ev else render_episode.public_rows(rows), "report": t["report"], "reward": t["reward"], "label": t["label"],
+                       "patience": patience, "meta": t["meta"], "exchanges": exchanges}
+    return _json(200, result if ev else project(result))
+
+
+@app.get("/trial/{tid}/file/{name}")
+def trial_file(tid: str, name: str, layout=Depends(layout_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> PlainTextResponse:
+    if name not in data.TRIAL_FILES:
+        raise HTTPException(404)
+    t = data.load_trial(layout, tid, settings)
+    if t is None:
+        raise HTTPException(404)
+    if name in data.EVALUATOR_TRIAL_FILES and not identity.evaluator:
+        raise HTTPException(403, detail="evaluator-only file")
+    p = data.resolve_trial_file(layout, t, name)
+    if p is None or not p.is_file():
+        raise HTTPException(404)
+    media = "application/json" if name.endswith(".json") else "text/plain; charset=utf-8"
+    if media == "application/json" and not identity.evaluator:
+        return PlainTextResponse(json.dumps(project(data.read_json(p)), indent=2), media_type=media)
+    return PlainTextResponse(p.read_text(errors="replace"), media_type=media)
+
+
+# ----------------------------------------------------------------------------- review
+
+@app.get("/review", response_class=HTMLResponse)
+async def review_queue(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    q = await console.review_queue(settings.workspace, reader=reader)
+    p = render.Page("Review queue", "review", "review", crumbs=(("Review", None),))
+    return page(p, render_console.review_queue_body(q), reader, identity, settings)
+
+
+@app.get("/api/review")
+async def api_review_queue(reader=Depends(reader_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    return _json(200, {"ok": True, **(await console.review_queue(settings.workspace, reader=reader))})
+
+
+@app.get("/review/{sid}", response_class=HTMLResponse)
+async def review_item(sid: str, workflow_id: str = "", reader=Depends(reader_dep), layout=Depends(layout_dep), identity: Identity = Depends(identity_dep),
+                      settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    if not access.ID_RE.fullmatch(sid):
+        raise HTTPException(404)
+    d = data.scenario_detail(layout, sid, identity.evaluator)
+    if d is None:
+        raise HTTPException(404)
+    sdir = layout.scenario_dir(sid)
+    wid = workflow_id if workflow_id and console.WORKFLOW_ID_RE.fullmatch(workflow_id) else ""
+    if not wid:
+        try:
+            wid = next((i["workflow_id"] for i in (await console.review_queue(settings.workspace, reader=reader))["items"] if i["scenario_id"] == sid and i.get("workflow_id")), "")
+        except console.ConsoleUnavailable:
+            wid = ""
+    body = render_console.review_body(d, reader.scenario(sid), reader.scenario_versions(sid), console.draft_hash(sdir), wid or None,
+                                      data.read_json(sdir / "approval.json"), data.read_json(sdir / "review.json"), identity.evaluator)
+    p = render.Page(f"Review {sid}", "review", "review-item", crumbs=(("Review", "/review"), (sid, None)))
+    return page(p, body, reader, identity, settings)
+
+
+# ----------------------------------------------------------------------------- create / run / spend / search
+
+@app.get("/create", response_class=HTMLResponse)
+def create_form(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    repos = sorted({r.source_ref for r in reader.scenarios(R.ScenarioFilter(source=["github-repo"], latest_only=True, limit=500)).items if str(r.source_ref).startswith("http")})
+    p = render.Page("Create tasks", "create", "create", crumbs=(("Create", None),))
+    return page(p, render_console.create_body(console.defaults(), repos, settings.spend_cap_usd), reader, identity, settings)
+
+
+@app.get("/run", response_class=HTMLResponse)
+def run_form(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    valid = [r for r in reader.scenarios(R.ScenarioFilter(validation_status=["valid"], latest_only=True, limit=500)).items if r.registry_json]
+    p = render.Page("Run trials", "run", "run", crumbs=(("Run", None),))
+    return page(p, render_console.run_body(console.defaults(), valid, settings.spend_cap_usd), reader, identity, settings)
+
+
+@app.get("/spend", response_class=HTMLResponse)
+def spend(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    wid = request.query_params.get("workflow_id") or None
+    costs = reader.costs(R.CostFilter(workflow_id=[wid] if wid else None, limit=500))
+    by_run: dict[str, dict] = {}
+    for c in costs:
+        if c.workflow_id:
+            a = by_run.setdefault(c.workflow_id, {"workflow_id": c.workflow_id, "usd": Decimal(0), "records": 0})
+            a["usd"] += c.usd
+            a["records"] += 1
+    pools_fn = getattr(reader, "worker_pools", None)
+    pools = pools_fn() if callable(pools_fn) else None
+    p = render.Page("Spend", "spend", "spend", crumbs=(("Spend", None),), attrs={"source": "/api/spend", "poll-ms": "10000"}, live="updated 0s ago")
+    return page(p, pages.spend_body(reader.spend(), costs, settings.spend_cap_usd, [{**v, "usd": str(v["usd"])} for v in by_run.values()], pools), reader, identity, settings)
+
+
+@app.get("/api/spend")
+def api_spend(reader=Depends(reader_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    rows = [_dump(s) for s in reader.spend()]
+    total = sum((Decimal(str(s["usd"])) for s in rows), Decimal(0))
+    return _json(200, {"spend": rows, "tiles": {"spend_usd": float(total), "spend_text": f"${total:,.2f}"}, "cap_usd": str(settings.spend_cap_usd) if settings.spend_cap_usd is not None else None})
+
+
+@app.get("/search", response_class=HTMLResponse)
+async def search(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    q = (request.query_params.get("q") or "").strip()[:200]
+    hits: dict = {}
+    if q:
+        hits["scenarios"] = reader.scenarios(R.ScenarioFilter(q=q, limit=50)).items
+        trials = reader.trials(R.TrialFilter(q=q, limit=50)).items
+        hits["trials"] = trials
+        live, _ = await live_jobs(settings)
+        hits["workflows"], _ = workflow_views(reader, live, settings, R.WorkflowFilter(q=q, limit=50))
+        hits["models"] = sorted({t.model for t in reader.trials(R.TrialFilter(limit=500)).items if q.lower() in t.model.lower()})
+    p = render.Page("Search", "", "search", crumbs=(("Search", None),))
+    return page(p, pages.search_body(q, hits), reader, identity, settings)
+
+
+# ----------------------------------------------------------------------------- database browser
+
+def _table_filter(request: Request) -> R.TableFilter:
+    offset, limit = _paging(request, 100)
+    where = {k[6:]: v for k, v in request.query_params.items() if k.startswith("where.") and v}
+    col, val = request.query_params.get("where_col"), request.query_params.get("where_val")
+    if col and val:
+        where[col] = val
+    return R.TableFilter(where=where, q=request.query_params.get("q") or None, order_by=request.query_params.get("order_by") or None,
+                         desc=request.query_params.get("asc") != "1", offset=offset, limit=limit)
+
+
+@app.get("/db", response_class=HTMLResponse)
+def db_index(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    cnt = {}
+    for t in R.TABLES:
+        try:
+            cnt[t] = reader.table(t, R.TableFilter(limit=1)).total
+        except ValueError:
+            cnt[t] = "—"
+    p = render.Page("Database", "db", "db", crumbs=(("Database", None),))
+    return page(p, pages.db_index_body(list(R.TABLES), cnt, reader.rebuilds(), settings.index_enabled), reader, identity, settings)
+
+
+@app.get("/db/{name}", response_class=HTMLResponse)
+def db_table(name: str, request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    if name not in R.TABLES:
+        raise HTTPException(404)
+    f = _table_filter(request)
+    pg = reader.table(name, f)
+    cols = list(R.ROW_OF[name].model_fields) if name in R.ROW_OF else (list(pg.items[0]) if pg.items else [])
+    if not identity.evaluator:
+        cols = [c for c in cols if c not in PRIVATE_KEYS]
+        pg = pg.model_copy(update={"items": [project(r) for r in pg.items]})
+    p = render.Page(f"Table {name}", "db", "db-table", crumbs=(("Database", "/db"), (name, None)))
+    return page(p, pages.db_table_body(name, pg, cols, f.where or {}, f.q, f.order_by), reader, identity, settings)
+
+
+@app.get("/api/db/{name}.csv")
+def api_db_csv(name: str, request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep)) -> Response:
+    if name not in R.TABLES:
+        raise HTTPException(404)
+    f = _table_filter(request)
+    buf = io.StringIO()
+    writer = None
+    offset = 0
+    while True:
+        pg = reader.table(name, f.model_copy(update={"offset": offset, "limit": 500}))
+        items = pg.items if identity.evaluator else [project(r) for r in pg.items]
+        if writer is None:
+            cols = list(R.ROW_OF[name].model_fields) if name in R.ROW_OF else (list(items[0]) if items else [])
+            if not identity.evaluator:
+                cols = [c for c in cols if c not in PRIVATE_KEYS]
+            writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+            writer.writeheader()
+        for r in items:
+            writer.writerow({k: (json.dumps(v, default=str) if isinstance(v, (dict, list)) else v) for k, v in r.items()})
+        offset += 500
+        if offset >= pg.total or not pg.items:
+            break
+    return Response(buf.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename={name}.csv"})
+
+
+@app.get("/api/db/{name}")
+def api_db(name: str, request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep)) -> JSONResponse:
+    if name not in R.TABLES:
+        raise HTTPException(404)
+    pg = reader.table(name, _table_filter(request))
+    items = pg.items if identity.evaluator else [project(r) for r in pg.items]
+    return _json(200, {"items": items, "total": pg.total, "offset": pg.offset, "limit": pg.limit})
+
+
+# ----------------------------------------------------------------------------- artifacts
+
+def _rel(path: str | None) -> Path:
+    rel = Path((path or "").strip("/"))
+    if any(part in ("..", "") for part in rel.parts):
+        raise HTTPException(400, detail="invalid path")
+    return rel
+
+
+@app.get("/artifacts", response_class=HTMLResponse)
+def artifacts(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    rel = _rel(request.query_params.get("path"))
+    root = settings.workspace
+    ok, why = pages.is_listable(rel, identity.evaluator) if rel.parts else (True, "")
+    if not ok:
+        raise HTTPException(403, detail=why)
+    offset, _ = _paging(request, pages.PAGE_SIZE)
+    target = pages.artifact_path(root, rel)
+    preview = None
+    if target.is_file():
+        preview = pages.preview_file(root, rel, evaluator=identity.evaluator)
+        listing = pages.list_dir(root, rel.parent, identity.evaluator, offset)
+        crumb_rel = rel.parent
+    else:
+        listing = pages.list_dir(root, rel, identity.evaluator, offset) if rel.parts else {"rel": "", "entries": [], "total": 0, "offset": 0, "missing": False}
+        crumb_rel = rel
+    p = render.Page("Artifacts", "artifacts", "artifacts", crumbs=(("Artifacts", "/artifacts"),) + tuple((part, None) for part in rel.parts[-1:]))
+    return page(p, pages.artifacts_body(root, listing, preview, crumb_rel if not preview else rel), reader, identity, settings)
+
+
+@app.get("/api/artifacts")
+def api_artifacts(request: Request, identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    rel = _rel(request.query_params.get("path"))
+    ok, why = pages.is_listable(rel, identity.evaluator) if rel.parts else (True, "")
+    if not ok:
+        raise HTTPException(403, detail=why)
+    offset, _ = _paging(request, pages.PAGE_SIZE)
+    return _json(200, pages.list_dir(settings.workspace, rel, identity.evaluator, offset))
+
+
+@app.get("/artifacts/download")
+def artifact_download(request: Request, identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> FileResponse:
+    rel = _rel(request.query_params.get("path"))
+    ok, why = pages.is_listable(rel, identity.evaluator)
+    if not ok:
+        raise HTTPException(403, detail=why)
+    p = pages.artifact_path(settings.workspace, rel)
+    if not p.is_file():
+        raise HTTPException(404)
+    if p.suffix == ".json" and not identity.evaluator:
+        return Response(json.dumps(project(data.read_json(p)), indent=2), media_type="application/json",
+                        headers={"Content-Disposition": f'attachment; filename="{p.name}"'})
+    return FileResponse(p, filename=p.name, media_type="application/octet-stream")
+
+
+# ----------------------------------------------------------------------------- static
 
 @app.get("/static/{name}")
 def static(name: str) -> Response:
@@ -266,182 +824,143 @@ def static(name: str) -> Response:
     return Response((STATIC / name).read_bytes(), media_type=STATIC_TYPES[name], headers={"Cache-Control": "no-cache"})
 
 
-# ----------------------------------------------------------------------------- routes: JSON
+# ----------------------------------------------------------------------------- actions (two-step)
 
-@app.get("/api/overview")
-async def api_overview() -> dict:
-    # Live patience for running trials is fetched concurrently within a fixed budget; the poll never waits on a hung stakeholder.
-    return await data.overview_async(ROOT, REGISTRY)
+def _describe(action: str, params: dict, reader, settings: Settings) -> tuple[dict, list[str], str, str, str | None]:
+    """(validated params, errors, CLI equivalent, what, target) for one action."""
+    if action == "create":
+        p, errs = console.validate_create(params)
+        return p, errs, console.cli_for_create(p), "Start a creation job (CreateTasksWorkflow) over the listed sources.", ",".join(p.get("repos") or p.get("instance_ids") or ["swebench:A"])
+    if action == "run":
+        valid = {r.scenario_id for r in reader.scenarios(R.ScenarioFilter(validation_status=["valid"], latest_only=True, limit=500)).items if r.registry_json}
+        p, errs = console.validate_run(params, valid)
+        return p, errs, console.cli_for_run(p), "Start a run (RunTasksWorkflow): k attempts per model per condition on the selected scenarios.", ",".join(p.get("scenario_ids") or [])
+    if action == "cancel":
+        wid = str(params.get("workflow_id") or "")
+        errs = [] if console.WORKFLOW_ID_RE.fullmatch(wid) else ["invalid workflow id"]
+        return {"workflow_id": wid}, errs, f"temporal workflow cancel --workflow-id {console._q(wid)}", "Request cancellation of this workflow and its children.", wid
+    if action == "review":
+        sid, decision = str(params.get("scenario_id") or ""), str(params.get("decision") or "")
+        errs = []
+        if not access.ID_RE.fullmatch(sid):
+            errs.append("invalid scenario id")
+        if decision not in ("approve", "reject"):
+            errs.append("decision must be approve or reject")
+        p = {"scenario_id": sid, "decision": decision, "spec_hash": str(params.get("spec_hash") or ""), "workflow_id": str(params.get("workflow_id") or ""),
+             "reason": str(params.get("reason") or params.get("note") or "")[:2000]}
+        cli = (f"uv run swesim workflows approve {console._q(p['workflow_id'])} {console._q(sid)} {console._q(p['spec_hash'])} --decision {decision}" if p["workflow_id"]
+               else (f"uv run swesim approve {console._q(sid)}   # supervised approval of the local draft" if decision == "approve" else f"# reject: writes scenarios/{sid}/review.json with decision=reject"))
+        return p, errs, cli, f"{decision.capitalize()} the held draft {sid} (spec hash {p['spec_hash'][:12]}…).", sid
+    if action == "label":
+        tid, label = str(params.get("trial_id") or ""), str(params.get("label") or "")
+        errs = []
+        if not access.TRIAL_RE.fullmatch(tid):
+            errs.append("invalid trial id")
+        if label not in LABELS:
+            errs.append(f"label must be one of {list(LABELS)}")
+        p = {"trial_id": tid, "label": label, "note": str(params.get("note") or "")[:2000]}
+        cli = f"printf '%s' {console._q(json.dumps({'label': label, 'note': p['note']}))} > {console._q(str(settings.workspace / 'trials' / tid / 'label.json'))}"
+        return p, errs, cli, "Record a reviewer label on this episode (evaluator annotation; never changes reward).", tid
+    if action == "retry":
+        ref = params.get("retry_of") if isinstance(params.get("retry_of"), dict) else params  # the confirm step carries the previewed params
+        iid, key = str(ref.get("instance_id") or ""), str(ref.get("source_key") or "")
+        cand = next((c for c in reader.candidates(R.CandidateFilter(source_key=[key] if key else None, limit=500)).items if c.instance_id == iid), None)
+        p, errs = console.validate_retry(params, _dump(cand) if cand else None)
+        return p, errs, console.cli_for_create(p) if p else "", f"Retry candidate {iid}: a creation job over its source only.", iid
+    if action == "rebuild":
+        return {}, [], "uv run swesim index rebuild", "Rebuild the index from the record files and report the diff.", None
+    return {}, [f"unknown action {action!r}"], "", "", None
 
 
-@app.get("/api/trial/{tid}/timeline")
-def timeline(tid: str, evaluator: int = 0) -> dict:
-    t = load_trial(tid)
-    rows = _timeline_rows(t)
-    patience = t["patience"] if evaluator else {k: v for k, v in t["patience"].items() if k != "tier"}  # tier is a stakeholder internal
-    return {"trial_id": tid, "status": t["status"], "live": t["live"], "live_transcript_error": t["live_transcript_error"],
-            "unresolved": t["unresolved"], "evaluator": bool(evaluator),
-            "timeline": rows if evaluator else _public_rows(rows), "report": t["report"], "reward": t["reward"],
-            "label": t["label"], "patience": patience, "meta": t["meta"]}
+async def _execute(action: str, p: dict, reader, layout, settings: Settings) -> tuple[int, dict]:
+    if action == "create":
+        started = await console.start_create(p, settings)
+        return 200, {"ok": True, **started, "params": p}
+    if action == "run":
+        started = await console.start_run(p, settings, settings.workspace)
+        return 200, {"ok": True, **started, "params": p}
+    if action == "cancel":
+        return 200, {"ok": True, **(await console.cancel_job(p["workflow_id"])), "workflow_id": p["workflow_id"]}
+    if action == "review":
+        status, payload = await console.decide(settings.workspace, settings.registry_path, p["scenario_id"],
+                                               {"decision": p["decision"], "spec_hash": p["spec_hash"], "workflow_id": p["workflow_id"], "note": p["reason"]})
+        return status, payload
+    if action == "label":
+        d = layout.trial_dir(p["trial_id"])
+        if not d.is_dir():
+            return 404, {"ok": False, "error": "no such trial"}
+        atomic_json(d / "label.json", {"label": p["label"], "note": p["note"]})
+        return 200, {"ok": True, "saved": True, "message": f"Label {p['label']} saved."}
+    if action == "retry":
+        started = await console.start_create(p, settings)
+        return 200, {"ok": True, **started, "params": p}
+    if action == "rebuild":
+        try:
+            from swesim.index.store import IndexStore  # type: ignore
+        except ImportError:
+            inv = getattr(reader, "invalidate", None)
+            if callable(inv):
+                inv()
+            return 200, {"ok": True, "message": "Index disabled on this host: the file reader re-projected the record on the next request (no Postgres to rebuild).", "indexed": False}
+        store = IndexStore.from_settings(settings)
+        if store is None:
+            return 200, {"ok": True, "message": "Index disabled (no SWESIM_DATABASE_URL); nothing to rebuild.", "indexed": False}
+        row = store.rebuild_from_layout(layout, settings.registry_path)
+        return 200, {"ok": True, "message": "Index rebuilt.", "rebuild": _dump(row)}
+    return 400, {"ok": False, "error": f"unknown action {action!r}"}
 
 
-@app.post("/trial/{tid}/label", dependencies=[Depends(same_origin)])
-def label(tid: str, body: dict) -> dict:
-    d = trial_path(tid)
-    if not d.is_dir():
+@app.post("/api/{action}/preview", dependencies=[Depends(origin_dep)])
+async def api_preview(action: str, request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    if action not in actions.ACTIONS:
         raise HTTPException(404)
-    if not isinstance(body, dict) or body.get("label") not in LABELS:
-        raise HTTPException(400, detail=f"label must be one of {list(LABELS)}")
-    atomic_json(d / "label.json", {"label": body["label"], "note": str(body.get("note", ""))[:2000]})
-    return {"saved": True}
+    body = await _body(request)
+    p, errs, cli, what, _target = _describe(action, body, reader, settings)
+    if errs:
+        return _json(400, {"ok": False, "errors": errs, "cli": cli})
+    token, exp = actions.issue_token(action, p, identity, settings)
+    _key, shared = actions.signing_key(settings)
+    return _json(200, {"ok": True, "action": action, "what": what, "cli": cli, "params": p, "token": token, "expires_at": exp.isoformat(timespec="seconds"),
+                       "actor": identity.actor, "token_scope": "all console instances" if shared else "this console process only (SWESIM_WORKER_SECRET unset)"})
 
 
-@app.get("/trial/{tid}/file/{name}")
-def trial_file(tid: str, name: str, evaluator: int = 0) -> PlainTextResponse:
-    if name not in TRIAL_FILES:
+@app.post("/api/{action}", dependencies=[Depends(origin_dep)])
+async def api_action(action: str, request: Request, reader=Depends(reader_dep), layout=Depends(layout_dep), identity: Identity = Depends(identity_dep),
+                     settings: Settings = Depends(settings_dep)) -> JSONResponse:
+    if action not in actions.ACTIONS:
         raise HTTPException(404)
-    t = load_trial(tid)  # 404 for unknown trials before the evaluator gate
-    if name in EVALUATOR_TRIAL_FILES and not evaluator:
-        raise HTTPException(403, detail="evaluator-only file: add ?evaluator=1")
-    p = _resolve_file(t, name)
-    if p is None or not p.is_file():
-        raise HTTPException(404)
-    media = "application/json" if name.endswith(".json") else "text/markdown; charset=utf-8"
-    return PlainTextResponse(p.read_text(), media_type=media)
+    body = await _body(request)
+    params = body.get("params") if isinstance(body.get("params"), dict) else {}
+    origin_header = request.headers.get("origin")
+    p, errs, cli, _what, target = _describe(action, params, reader, settings)
 
-
-# ----------------------------------------------------------------------------- operator console
-
-def _json_error(status: int, body: dict) -> JSONResponse:
-    return JSONResponse(body, status_code=status)
-
-
-def _unavailable(e: console.ConsoleUnavailable) -> JSONResponse:
-    return _json_error(502, {"ok": False, "error": str(e), "cli": e.cli})
-
-
-@app.get("/create", response_class=HTMLResponse)
-def create_form() -> HTMLResponse:
-    return HTMLResponse(render_console.create_page(console.defaults()))
-
-
-@app.post("/api/create", dependencies=[Depends(same_origin)])
-async def api_create(body: dict) -> JSONResponse:
-    params, errors = console.validate_create(body)
-    if errors:
-        return _json_error(400, {"ok": False, "errors": errors, "cli": console.cli_for_create(params)})
+    def audit(result: str, wid: str | None, confirmed: bool) -> None:
+        access.record_action(reader, settings, actions.audit_row(identity=identity, action=action, target=target, params=p or params, confirmed=confirmed,
+                                                                 origin_header=origin_header, result=result, workflow_id=wid, settings=settings))
     try:
-        started = await console.start_create(params)
+        actions.verify_token(body.get("token"), action, p if not errs else params, identity, settings)
+    except actions.TokenError as e:
+        audit("rejected", None, False)
+        return _json(409 if "expired" in str(e) or "changed" in str(e) else 403, {"ok": False, "error": str(e), "cli": cli})
+    if errs:
+        audit("rejected", None, True)
+        return _json(400, {"ok": False, "errors": errs, "cli": cli})
+    try:
+        status, payload = await _execute(action, p, reader, layout, settings)
     except console.ConsoleUnavailable as e:
-        return _unavailable(e)
-    return JSONResponse({"ok": True, **started, "params": params, "cli": console.cli_for_create(params)})
+        audit("failed", None, True)
+        return _json(502, {"ok": False, "error": str(e), "cli": e.cli, "kind": e.kind})
+    wids = payload.get("workflow_ids") or ([payload["workflow_id"]] if payload.get("workflow_id") else [])
+    audit("accepted" if status < 400 and payload.get("ok", True) else ("failed" if status >= 500 else "rejected"), wids[0] if wids else None, True)
+    payload.setdefault("cli", cli)
+    return _json(status, payload)
 
 
-@app.get("/run", response_class=HTMLResponse)
-def run_form() -> HTMLResponse:
-    return HTMLResponse(render_console.run_page(console.defaults(), console.valid_registered(REGISTRY)))
-
-
-@app.post("/api/run", dependencies=[Depends(same_origin)])
-async def api_run(body: dict) -> JSONResponse:
-    params, errors = console.validate_run(body, REGISTRY)
-    if errors:
-        return _json_error(400, {"ok": False, "errors": errors, "cli": console.cli_for_run(params)})
+async def _body(request: Request) -> dict:
     try:
-        started = await console.start_run(params, ROOT)
-    except console.ConsoleUnavailable as e:
-        return _unavailable(e)
-    return JSONResponse({"ok": True, **started, "params": params, "cli": console.cli_for_run(params)})
-
-
-@app.get("/jobs", response_class=HTMLResponse)
-async def jobs_page() -> HTMLResponse:
-    try:
-        jobs, error = await console.list_jobs(), None
-    except console.ConsoleUnavailable as e:
-        jobs, error = None, e
-    return HTMLResponse(render_console.jobs_page(jobs, error))
-
-
-@app.get("/api/jobs")
-async def api_jobs() -> JSONResponse:
-    try:
-        return JSONResponse({"ok": True, "jobs": await console.list_jobs(), "generated_at": iso(console.now_ts())})
-    except console.ConsoleUnavailable as e:
-        return _unavailable(e)
-
-
-def _workflow_id(wid: str) -> str:
-    if not console.WORKFLOW_ID_RE.fullmatch(wid):
-        raise HTTPException(404)
-    return wid
-
-
-@app.get("/jobs/{wid}", response_class=HTMLResponse)
-async def job_page(wid: str) -> HTMLResponse:
-    wid = _workflow_id(wid)
-    job = None
-    try:
-        job = next((j for j in await console.list_jobs() if j["workflow_id"] == wid), None)
-    except console.ConsoleUnavailable:
-        pass
-    try:
-        progress, error = await console.job_progress(wid), None
-    except console.ConsoleUnavailable as e:
-        progress, error = None, e
-    return HTMLResponse(render_console.job_page(wid, progress, error, job))
-
-
-@app.get("/api/jobs/{wid}")
-async def api_job(wid: str) -> JSONResponse:
-    wid = _workflow_id(wid)
-    try:
-        return JSONResponse({"ok": True, "workflow_id": wid, "progress": await console.job_progress(wid)})
-    except console.ConsoleUnavailable as e:
-        return _unavailable(e)
-
-
-@app.post("/api/jobs/{wid}/cancel", dependencies=[Depends(same_origin)])
-async def api_cancel(wid: str, body: dict) -> JSONResponse:
-    wid = _workflow_id(wid)
-    if not isinstance(body, dict) or body.get("confirm") is not True:
-        return _json_error(400, {"ok": False, "error": "cancellation requires confirm: true"})
-    try:
-        return JSONResponse({"ok": True, **(await console.cancel_job(wid))})
-    except console.ConsoleUnavailable as e:
-        return _unavailable(e)
-
-
-@app.get("/review", response_class=HTMLResponse)
-async def review_queue() -> HTMLResponse:
-    return HTMLResponse(render_console.review_queue_page(await console.review_queue(ROOT)))
-
-
-@app.get("/api/review")
-async def api_review_queue() -> JSONResponse:
-    return JSONResponse({"ok": True, **(await console.review_queue(ROOT))})
-
-
-@app.get("/review/{sid}", response_class=HTMLResponse)
-async def review_item(sid: str, evaluator: int = 0, workflow_id: str = "") -> HTMLResponse:
-    d = data.scenario_detail(ROOT, REGISTRY, sid, evaluator=bool(evaluator))
-    if d is None or not d["exists"]:
-        raise HTTPException(404)
-    sdir = ROOT / "scenarios" / sid
-    wid = workflow_id if workflow_id and console.WORKFLOW_ID_RE.fullmatch(workflow_id) else ""
-    if not wid:
-        try:  # is this draft held by a running creation job? then decisions go through the signal
-            wid = next((i["workflow_id"] for i in (await console.review_queue(ROOT))["items"]
-                        if i["scenario_id"] == sid and i.get("workflow_id")), "")
-        except Exception:  # noqa: BLE001 - the queue is a convenience; the page still renders
-            wid = ""
-    return HTMLResponse(render_console.review_page(d, console.draft_hash(sdir), wid or None, read_json(sdir / "approval.json"),
-                                                   read_json(sdir / "review.json"), evaluator=bool(evaluator)))
-
-
-@app.post("/api/review/{sid}", dependencies=[Depends(same_origin)])
-async def api_review(sid: str, body: dict) -> JSONResponse:
-    if not data.ID_RE.fullmatch(sid):
-        raise HTTPException(404)
-    status, payload = await console.decide(ROOT, REGISTRY, sid, body)
-    return JSONResponse(payload, status_code=status)
+        body = await request.json()
+    except ValueError as e:
+        raise HTTPException(400, detail="JSON body required") from e
+    if not isinstance(body, dict):
+        raise HTTPException(400, detail="JSON object required")
+    return body
