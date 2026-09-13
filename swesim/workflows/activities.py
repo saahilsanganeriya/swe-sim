@@ -1192,6 +1192,16 @@ def recorded_spend(settings: Settings, ws: Workspace) -> dict:
 
 
 @swesim_activity
+async def reconcile_workflows_activity(p: dict) -> dict:
+    """P1-6 (CONTROL): close stale `running` workflow rows from Temporal's own view of each execution
+    (`swesim.workflows.client.reconcile_workflows`). `{"max_age_hours"?: int}` (default 48; 0 or null: every running row)."""
+    from swesim.workflows import client
+
+    hours = p.get("max_age_hours", 48)
+    return await client.reconcile_workflows(SETTINGS, max_age_hours=int(hours) if hours else None)
+
+
+@swesim_activity
 async def spend_check_activity(p: dict) -> dict:
     """Recorded spend against the cap: {"spend_usd", "cap_usd", "exceeded", ...}. The cap is `p["cap_usd"]` when given, else
     `Settings.spend_cap_usd`; no cap means never exceeded (the operator enforces the budget by hand)."""
@@ -1324,6 +1334,7 @@ ALL = [probe_models_activity, discover_activity, mine_activity, judge_activity, 
        prepare_trial_plan_activity, prepare_candidate_plan_activity, read_plan_page_activity, checkpoint_workflow_activity]
 ALL.append(difficulty_label_activity)
 ALL.append(frontier_gate_activity)
+ALL.append(reconcile_workflows_activity)
 
 if __name__ == "__main__":
     raise SystemExit(main())

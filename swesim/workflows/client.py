@@ -7,8 +7,10 @@ reaches the same namespace as the worker without exporting anything. Temporal Cl
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
@@ -159,6 +161,82 @@ async def list_runs(kind: str = "all", limit: int = 50) -> list[dict]:
                     "start_time": wf.start_time.isoformat() if wf.start_time else None,
                     "close_time": wf.close_time.isoformat() if wf.close_time else None,
                     "summary": (memo or {}).get("summary", {})})
+    return out
+
+
+# Temporal's `WorkflowExecutionStatus` names -> the index's `WorkflowStatus` (interfaces §2). RUNNING is left alone.
+TEMPORAL_STATUS: dict[str, str] = {"COMPLETED": "completed", "FAILED": "failed", "CANCELED": "cancelled", "TERMINATED": "terminated",
+                                   "TIMED_OUT": "timed_out", "CONTINUED_AS_NEW": "continued_as_new"}
+UNKNOWN_FAILURE = "Temporal has no execution for this workflow/run (retention passed, or a row from another namespace): the terminal state is unknown"
+RECONCILE_PAGE = 500     # rows read per index page
+RECONCILE_ROWS = 200     # rows listed in the result (the activity result must stay small)
+
+
+async def reconcile_workflows(store_or_settings, *, max_age_hours: int | None = 48, client: Client | None = None) -> dict:
+    """P1-6: close `running` workflow rows from Temporal's own view of each execution. Every `running` row started within the
+    last `max_age_hours` (None or 0: every running row) is `describe`d by workflow id and run id; a closed execution writes
+    its terminal status (completed | failed | cancelled | terminated | timed_out | continued_as_new) with Temporal's close
+    time and `lifecycle_source="temporal"`, which no later workflow hook can reopen (`swesim.index.history.choose_workflow`);
+    an execution Temporal no longer has is closed as `unknown`; a still-running one is left alone. Rows already terminal are
+    never read. One row's RPC error is reported in `errors`, never raised. The summary is also written to the record
+    (`Layout.reconciliation_checkpoint`). Returns `{"checked", "reconciled", "unknown", "still_running", "errors", "rows"}`,
+    or `{"indexed": False, "reason": "index disabled"}` without a database."""
+    from temporalio.service import RPCError, RPCStatusCode
+    from swesim.index.activities import index_workflow
+    from swesim.index.models import WorkflowFilter
+    from swesim.index.store import IndexStore
+    from swesim.paths import atomic_json
+    from swesim.storage.layout import Layout
+    if isinstance(store_or_settings, IndexStore):
+        store, settings = store_or_settings, store_or_settings.settings
+    else:
+        settings = store_or_settings; store = IndexStore.from_settings(settings)
+    if store is None:
+        return {"indexed": False, "reason": "index disabled"}
+    now = datetime.now(UTC)
+    since = now - timedelta(hours=max_age_hours) if max_age_hours else None
+    rows: list = []; offset = 0
+    while True:
+        page = store.workflows(WorkflowFilter(status=["running"], started_from=since, offset=offset, limit=RECONCILE_PAGE, order_by="started_at", desc=False))
+        rows.extend(page.items); offset += len(page.items)
+        if not page.items or offset >= page.total:
+            break
+    out: dict = {"checked": len(rows), "reconciled": 0, "unknown": 0, "still_running": 0, "errors": [], "rows": []}
+    c = client if client is not None else (await connect() if rows else None)
+    for row in rows:
+        try:
+            desc = await c.get_workflow_handle(row.workflow_id, run_id=row.run_id).describe()
+        except RPCError as e:
+            if e.status != RPCStatusCode.NOT_FOUND:
+                out["errors"].append({"workflow_id": row.workflow_id, "run_id": row.run_id, "error": f"{e.status.name}: {str(e)[:200]}"})
+                continue
+            status, closed_at, failure, type_, queue = "unknown", now, UNKNOWN_FAILURE, row.type, row.task_queue
+        else:
+            name = desc.status.name if desc.status is not None else "RUNNING"
+            if name == "RUNNING":
+                out["still_running"] += 1
+                continue
+            status = TEMPORAL_STATUS.get(name)
+            if status is None:
+                out["errors"].append({"workflow_id": row.workflow_id, "run_id": row.run_id, "error": f"unmapped Temporal status {name}"})
+                continue
+            closed_at = getattr(desc, "close_time", None) or now
+            failure = f"Temporal reports the execution {name.lower().replace('_', ' ')}" if status in ("failed", "terminated", "timed_out") else None
+            type_ = getattr(desc, "workflow_type", None) or row.type; queue = getattr(desc, "task_queue", None) or row.task_queue
+        payload = {"workflow_id": row.workflow_id, "run_id": row.run_id, "type": type_, "status": status, "params_summary": row.params_summary,
+                   "failure": failure, "parent_workflow_id": row.parent_workflow_id, "started_at": row.started_at.isoformat(), "closed_at": closed_at.isoformat(),
+                   "task_queue": queue, "cost_usd": str(row.cost_usd) if row.cost_usd is not None else None, "search_attributes": row.search_attributes,
+                   "lifecycle_source": "temporal"}
+        await asyncio.to_thread(index_workflow, payload, settings)
+        out["unknown" if status == "unknown" else "reconciled"] += 1
+        if len(out["rows"]) < RECONCILE_ROWS:
+            out["rows"].append({"workflow_id": row.workflow_id, "run_id": row.run_id, "from": "running", "to": status})
+    try:
+        atomic_json(Layout(root=settings.workspace).reconciliation_checkpoint(),
+                    {"at": now.isoformat(), "max_age_hours": max_age_hours, **{k: out[k] for k in ("checked", "reconciled", "unknown", "still_running")},
+                     "errors": len(out["errors"]), "origin": settings.origin, "worker_image_digest": settings.worker_image_digest})
+    except OSError:  # a read-only mount (the console) still gets the answer; the record keeps the last writable run
+        pass
     return out
 
 
