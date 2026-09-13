@@ -269,6 +269,10 @@ def test_rejects_bad_inputs(tmp_path):
         comp.compile_scenario(ws, spec, RunConfig.default("full"), "http://x.modal.run", resolve_digest=False)
     with pytest.raises(ValueError, match="provider"):
         comp.compile_scenario(ws, spec, RunConfig.model_validate({"condition": "full", "model": "mystery/model-1"}), URL, resolve_digest=False)
+    # C4: OpenRouter solvers compile; the allowlist carries the OpenRouter API host from the shared provider table
+    res = comp.compile_scenario(ws, spec, RunConfig.model_validate({"condition": "full", "model": "openrouter/deepseek/deepseek-chat-v3-0324"}), URL, resolve_digest=False)
+    assert tomllib.loads((res.task_dirs["full"] / "task.toml").read_text())["agent"]["allowed_hosts"] == ["openrouter.ai", "x.modal.run"]
+    assert comp.MODEL_HOSTS == {"anthropic": ["api.anthropic.com"], "openai": ["api.openai.com"], "openrouter": ["openrouter.ai"]}
     d = minimal_spec_dict(); d["controls"]["tamper"].append({"name": "keyerror", "asset": "tamper.diff", "rationale": "dup", "cls": "benign-edit"})
     ws2, spec2 = _materialize(tmp_path / "b", d)
     with pytest.raises(ValueError, match="control name"):

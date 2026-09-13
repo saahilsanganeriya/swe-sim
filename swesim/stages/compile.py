@@ -21,6 +21,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from swesim.models import Discovery, RunConfig, ScenarioSpec
 from swesim.paths import Workspace
+from swesim.roles import PROVIDERS
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 # Owned by the verifier and stakeholder streams; tests monkeypatch these to placeholder trees.
@@ -28,7 +29,8 @@ VERIFIER_SRC = Path(__file__).resolve().parent.parent / "verifier"
 SHIMS = Path(__file__).resolve().parent.parent / "stakeholder" / "shims"
 VERIFIER_FILES = ("grader.py", "policy.py", "parsers.py", "run_pytest.py")
 SHIM_FILES = ("ask-user", "confirm-behavior", "request-review")
-MODEL_HOSTS = {"anthropic": ["api.anthropic.com"], "openai": ["api.openai.com"]}
+# Provider API hosts the sandbox allowlist carries, from the one provider table (`swesim.roles.PROVIDERS`: anthropic, openai, openrouter).
+MODEL_HOSTS = {name: [p.host] for name, p in PROVIDERS.items()}
 AGENT_PYTHON = "3.12"  # Harbor's mini-swe-agent adapter pin (_MINI_SWE_AGENT_PYTHON_VERSION)
 CONDITIONS = ("full", "hidden", "interactive")
 VERIFIER_TIMEOUT_SEC = 1800.0

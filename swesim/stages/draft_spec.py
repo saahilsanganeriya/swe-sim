@@ -19,8 +19,9 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from swesim import tamper
-from swesim.llm import chat_json
+from swesim import costs, tamper
+from swesim.costs import Usage
+from swesim.llm import chat_json, take_last_usage
 from swesim.paths import atomic_json
 from swesim.sources import threads
 from swesim.sources.github_repo import _TEST_PATH, is_code_path, probe_binding, runner_prefix
@@ -260,6 +261,17 @@ def verbatim_fact_text(span: str) -> str:
     return WITHHELD_TEXT_PREFIX + body
 
 
+def _accumulate(usage: Usage | None) -> Usage | None:
+    """Add the usage of the `chat_json` call just made (`take_last_usage`) to a running total. None once any call left no
+    usage behind (a monkeypatched or failed call): unknown is never recorded as zero."""
+    last = take_last_usage()
+    return None if usage is None or last is None else usage + last
+
+
+def _usage_json(usage: Usage | None) -> dict | None:
+    return usage.model_dump(mode="json") if usage is not None else None
+
+
 def _fact_text_violation(fact_text: str, span: str, natural: str) -> str | None:
     """The ledger text of a withheld fact is model prose: bound it and forbid content words absent from the span/issue."""
     if not fact_text.strip():
@@ -303,17 +315,20 @@ def withhold(natural_issue: str, model_id: str) -> dict:
     bad: list[str] = []
     removed: list[dict] = []
     attempts = 0
+    usage: Usage | None = Usage()  # summed over every withholder call; None when a call left no usage behind
 
     rejected: list[str] = []
 
     def none_removed(reason: str) -> dict:
-        return {"withheld_brief": None, "removed": [], "deleted": [], "kept": [(0, len(natural_issue))],
+        return {"withheld_brief": None, "removed": [], "deleted": [], "kept": [(0, len(natural_issue))], "usage": _usage_json(usage),
                 "stats": {"sentences_total": len(segs), "sentences_removed": 0, "fraction_removed": 0.0, "duplicate_selections": 0,
                           "prompt_version": WITHHOLD_PROMPT_VERSION, "attempts": attempts, "reason": reason, "rejected_selections": rejected}}
 
     for _attempt in range(2):
         attempts += 1
+        take_last_usage()
         out = chat_json(model_id, WITHHOLD_PROMPT, messages, WITHHOLD_SCHEMA, max_tokens=5000)
+        usage = _accumulate(usage)
         # `rejected` = per-selection problems (that selection is dropped); `bad` = result-level problems (fatal after the correction round)
         bad, rejected, removed, ranges, seen_ranges, duplicates = [], [], [], [], set(), 0
         items = (out.get("removed") if isinstance(out, dict) else None) or []
@@ -385,7 +400,7 @@ def withhold(natural_issue: str, model_id: str) -> dict:
         if removed and reconstruct_withheld(natural_issue, [r["excerpt"] for r in removed]) != brief:
             bad.append("the recorded excerpts do not reconstruct the withheld brief (an excerpt occurs where no removal was recorded)")
         def success() -> dict:
-            return {"withheld_brief": brief, "removed": removed, "deleted": deleted, "kept": kept,
+            return {"withheld_brief": brief, "removed": removed, "deleted": deleted, "kept": kept, "usage": _usage_json(usage),
                     "stats": {"sentences_total": len(segs), "sentences_removed": removed_segs,
                               "fraction_removed": round(removed_segs / max(1, len(segs)), 3), "duplicate_selections": duplicates,
                               "prompt_version": WITHHOLD_PROMPT_VERSION, "attempts": attempts, "reason": None, "rejected_selections": rejected}}
@@ -1200,8 +1215,11 @@ def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | No
     bad: list[str] = []
     d: dict = {}
     single: list[str] = []
+    usage: Usage | None = Usage()  # summed over every drafter call; None when a call left no usage behind
     for attempt in range(2):
+        take_last_usage()
         d = chat_json(model_id, SYSTEM, messages, SCHEMA, max_tokens=8000)
+        usage = _accumulate(usage)
         if not isinstance(d, dict):
             d = {}
         single = link_single_target(d, f2p)
@@ -1209,7 +1227,7 @@ def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | No
         if validate:
             bad = bad + validate(d)  # both violation kinds reach the single correction round
         if not bad:
-            return d, {"auto_linked": single, "auto_linked_single_target": bool(single)}
+            return d, {"auto_linked": single, "auto_linked_single_target": bool(single), "usage": _usage_json(usage)}
         if attempt == 0:
             messages.append({"role": "assistant", "content": json.dumps(d)})
             messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(bad, ensure_ascii=False)})
@@ -1221,7 +1239,7 @@ def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | No
                 if links:
                     f["tests"] = sorted(set(f.get("tests") or []) | set(links))
                     auto_linked.append(f.get("id"))
-    info = {"auto_linked": auto_linked, "auto_linked_single_target": bool(single)}
+    info = {"auto_linked": auto_linked, "auto_linked_single_target": bool(single), "usage": _usage_json(usage)}
     if auto_linked:
         bad = ledger_violations(d, row, extra_facts)
         if not bad and validate:
@@ -1255,7 +1273,11 @@ def _normalize_groups(groups: list[dict]) -> list[dict]:
     return groups
 
 
-def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_version: str = "0.1.0", require_probe: bool = True, version: int = 1) -> Path:
+def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_version: str = "0.1.0", require_probe: bool = True, version: int = 1,
+          layout=None, workflow_id: str | None = None) -> Path:
+    """Write `scenario.draft.json`, `assets/`, `judge.json` and `draft.meta.json` under `out_dir`. Model usage of the
+    withholder and drafter calls is written to `draft.meta.json["usage"]`; when `layout` (a storage Layout or Workspace)
+    is given it is also recorded through `costs.record_cost` (roles "withholder"/"drafter", trial None, `workflow_id`)."""
     if judged.get("model_id") and judged["model_id"] == model_id:
         raise ValueError(f"judge and draft models must differ so their errors are not correlated (both {model_id})")
     probe = row.get("probe") or {}
@@ -1455,6 +1477,12 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
 
     spec, files, protected_dropped = assemble(d, {"result": withheld, "facts": withheld_facts, "operations": withheld_ops}, lenient=True, extra_ledger=rescued)
     parsed = ScenarioSpec.model_validate(spec)  # the model's part already validated; a failure here is a drafter error
+    usage = {"withholder": withheld.get("usage"), "drafter": links.get("usage"), "recorded": False, "workflow_id": workflow_id}
+    if layout is not None and workflow_id:  # a cost without a trial is filed under the workflow; without one there is nowhere to file it
+        for role in ("withholder", "drafter"):
+            if usage[role] is not None:
+                costs.record_cost(layout, None, workflow_id, role, model_id, Usage.model_validate(usage[role]))
+                usage["recorded"] = True
     for name, data in files.items():
         (assets / name).write_bytes(data)
     p = out_dir / "scenario.draft.json"
@@ -1465,7 +1493,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                                               "version": int(version), "created_at": spec["created_at"], "spec_hash": parsed.spec_hash,
                                               "auto_linked": links["auto_linked"], "auto_linked_single_target": links["auto_linked_single_target"],
                                               "fact_filter": fact_filter, "rescue_facts": links.get("rescue_facts", []),
-                                              "protected_paths_dropped": protected_dropped,
+                                              "protected_paths_dropped": protected_dropped, "usage": usage,
                                               "controls": control_notes.get("controls", {}), "controls_dropped": control_notes.get("controls_dropped", []),
                                               "controls_fallback": control_notes.get("controls_fallback", {}),
                                               "oracle_apply": {"verified": oracle_ok, "note": oracle_msg, "base_files_fetched": sorted(base_sources), "base_files_skipped": base_skipped},

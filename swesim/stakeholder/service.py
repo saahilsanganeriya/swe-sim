@@ -20,7 +20,7 @@ from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from swesim.llm import chat_json
+from swesim.llm import chat_json_with_usage
 from swesim.models import StakeholderConfig
 from swesim.paths import atomic_json
 from swesim.stakeholder.session import DIFF_REVIEW_UNAVAILABLE, Session
@@ -38,7 +38,11 @@ REQUIRED_VIEW_KEYS = {"brief": str, "facts": list, "requirements": list, "person
 
 
 def call_llm(system: str, messages: list[dict], schema: str, cfg: StakeholderConfig) -> dict:
-    return chat_json(cfg.model_id, system, messages, schema, temperature=cfg.temperature)
+    """The model's JSON reply plus `usage` (tokens of the call, `costs.Usage` as JSON). The session keeps `usage` on the
+    transcript event (evaluator-only, summed over regeneration attempts) so the worker can add a `stakeholder` cost row;
+    `Reply.public()` never returns it."""
+    res = chat_json_with_usage(cfg.model_id, system, messages, schema, temperature=cfg.temperature)
+    return {**res.data, "usage": res.usage.model_dump(mode="json")}
 
 
 async def _maybe(fn) -> None:
