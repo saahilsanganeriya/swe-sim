@@ -73,6 +73,10 @@ def test_candidate_probe_evidence_and_job_paths(layout: Layout):
         layout.jobs_dir("smoke")
     assert layout.registry_path() == root / "registry.json"
     assert layout.dataset_path() == root / "dataset.json"
+    assert layout.costs_dir() == root / "costs"
+    assert layout.workflow_costs_path("create:py-pdf--pypdf-3826") == root / "costs" / "create:py-pdf--pypdf-3826.json"
+    with pytest.raises(LayoutError):
+        layout.workflow_costs_path("../x")
 
 
 def test_ids_are_validated(layout: Layout):

@@ -78,7 +78,7 @@ def test_upserts_are_idempotent_on_the_primary_key(store: IndexStore):
 
 def test_rebuild_reprojects_every_file_and_reports_counts_and_skips(rebuilt, record: Record):
     store, row = rebuilt
-    assert row.counts["scenarios"] == 5 and row.counts["candidates"] == 5 and row.counts["scores"] == 3 and row.counts["exchanges"] == 6 and row.counts["costs"] == 2
+    assert row.counts["scenarios"] == 5 and row.counts["candidates"] == 5 and row.counts["scores"] == 3 and row.counts["exchanges"] == 6 and row.counts["costs"] == 3
     assert row.counts["trials"] == len(record.tids) - 1  # every attempt but the status.json-only one
     assert [s["id"] for s in row.counts["skipped"]["trials"]] == [record.tids["stale-running"]]
     assert row.counts["skipped"]["scenarios"] == [] and row.counts["projected"]["trials"] == row.counts["trials"]
@@ -99,7 +99,9 @@ def test_rebuild_removes_rows_the_files_no_longer_have_and_keeps_activity_fed_ta
     second = store.rebuild_from_layout(record.layout, record.registry_path, origin="vm-systemd")
     assert store.trial("2" * 24) is None and second.diff["trials"]["delta"] == -1
     assert store.workflow("run-1") == wf.model_copy(update={"updated_at": store.workflow("run-1").updated_at, "created_at": store.workflow("run-1").created_at})
-    assert {c.cost_id for c in store.costs(M.CostFilter())} >= {"01J8Z0000000000000000JUDGE"} and len(store.costs(M.CostFilter())) == 3
+    # costs are file-backed: the row no file backs is gone, the workflow cost file's row is back
+    ids = {c.cost_id for c in store.costs(M.CostFilter())}
+    assert "01J8Z0000000000000000JUDGE" not in ids and "01J8Z0000000000000000JUDG1" in ids and len(ids) == 3 and second.diff["costs"]["delta"] == -1
     assert store.trial(record.tids["done"]).origin == "vm-systemd"  # the rebuild's origin labels rows whose files carry none
     assert [r.rebuild_id for r in store.rebuilds()] == [second.rebuild_id, first.rebuild_id]
 
@@ -152,15 +154,16 @@ def test_sql_reader_leaderboard_spend_costs_and_tables(rebuilt, record: Record):
     assert len(board) == 1 and (board[0].n, board[0].success_count, board[0].pass_rate) == (2, 1, Decimal("0.5"))
     assert store.leaderboard(M.LeaderboardFilter(purpose="calibration", include_saturated=True))[0].n == 3
     spend = store.spend()
-    assert [(s.provider, s.model, s.usd) for s in spend] == [("openai", GPT, Decimal("0.02")), ("anthropic", HAIKU, Decimal("0.01"))]
-    assert spend[0].cap_usd == Decimal("100") and spend[0].share_of_cap == Decimal("0.000200") and spend[0].input_tokens == 500
+    assert [(s.provider, s.model, s.usd, s.records) for s in spend] == [("openai", GPT, Decimal("0.025"), 2), ("anthropic", HAIKU, Decimal("0.01"), 1)]
+    assert spend[0].cap_usd == Decimal("100") and spend[0].share_of_cap == Decimal("0.000250") and spend[0].input_tokens == 600
     assert [c.role for c in store.costs(M.CostFilter(trial_id=[record.tids["done"]]))] == ["stakeholder", "solver"]  # newest first
-    assert store.costs(M.CostFilter(provider=["openai"], at_from=datetime(2026, 9, 13, 10, 1, tzinfo=UTC)))[0].model == GPT
+    assert [c.role for c in store.costs(M.CostFilter(provider=["openai"], at_from=datetime(2026, 9, 13, 10, 1, tzinfo=UTC)))] == ["stakeholder"]
+    assert [c.role for c in store.costs(M.CostFilter(workflow_id=["create-1"]))] == ["judge"]
     page = store.table("trials", M.TableFilter(where={"status": "completed"}, order_by="trial_id", desc=False, limit=2))
     assert page.total == 5 and len(page.items) == 2 and isinstance(page.items[0], dict) and page.items[0]["status"] == "completed"
     done = store.table("trials", M.TableFilter(where={"trial_id": record.tids["done"]})).items[0]
     assert done["reward"] == "1.000000" and done["started_at"] == "2026-09-13T09:59:00+00:00"  # JSON-safe values for the browser
-    assert store.table("costs", M.TableFilter(where={"trial_id": None})).total == 0 and store.table("costs", M.TableFilter(q="openai")).total == 1
+    assert store.table("costs", M.TableFilter(where={"trial_id": None})).total == 1 and store.table("costs", M.TableFilter(q="openai")).total == 2
     with pytest.raises(ValueError):
         store.table("nope", M.TableFilter())
     with pytest.raises(ValueError):

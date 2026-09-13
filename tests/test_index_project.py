@@ -13,6 +13,7 @@ import pytest
 from swesim.index import models as M
 from swesim.index import project as P
 from swesim.index import reports as R
+from swesim.models import StakeholderConfig
 from swesim.paths import Workspace
 from swesim.stages.register import register_scenario
 from swesim.stages.score import score_scenario
@@ -117,6 +118,12 @@ def build_record(tmp_path: Path) -> Record:
          "input_tokens": 500, "output_tokens": 50, "cached_tokens": None, "usd": 0.02, "price_source": "openai-2026-09", "at": "2026-09-13T10:02:00+00:00"},
         {"cost_id": "01J8Z0000000000000000COST3", "trial_id": tids["done"], "workflow_id": None, "role": "judge", "provider": "openai", "model": "openai/unknown",
          "input_tokens": 10, "output_tokens": 1, "cached_tokens": None, "usd": None, "price_source": "unknown", "at": T0 + 70},
+    ])
+    _w(ws.root / "costs" / "create-1.json", [
+        {"cost_id": "01J8Z0000000000000000JUDG1", "trial_id": None, "workflow_id": "create-1", "role": "judge", "provider": "openai", "model": GPT,
+         "input_tokens": 100, "output_tokens": 10, "cached_tokens": None, "usd": "0.005", "price_source": "openai-2026-09", "at": "2026-09-13T08:00:00+00:00"},
+        {"cost_id": "01J8Z0000000000000000JUDG2", "trial_id": None, "workflow_id": "create-1", "role": "drafter", "provider": "anthropic", "model": "anthropic/unknown",
+         "input_tokens": 5, "output_tokens": 5, "cached_tokens": None, "usd": None, "price_source": "unknown", "at": "2026-09-13T08:01:00+00:00"},
     ])
     _w(done / "audit.json", {"questions": [{"seq": 0, "specific": True, "decision_oriented": True, "before_implementation": True, "redundant": False, "fishing": False, "reason": "asks the exception type"}],
                              "replies": [{"seq": 1, "targeted": True, "volunteered": False, "test_or_identifier_disclosed": False, "behaviour_level": True, "reason": "names the behaviour"}],
@@ -260,7 +267,9 @@ def test_completed_trial_projects_row_exchanges_and_costs(record: Record):
     assert row.started_at == datetime(2026, 9, 13, 9, 59, tzinfo=UTC) and row.finished_at == datetime(2026, 9, 13, 10, 5, tzinfo=UTC)
     assert row.launcher is None and row.job_name is None
     assert row.cost_usd == Decimal("0.03") and row.input_tokens == 1510 and row.output_tokens == 251  # tokens include the unpriced record
-    assert row.stakeholder_model == GPT and row.stakeholder_prompt_version == "v1" and row.origin == "laptop"
+    default_stakeholder = StakeholderConfig()  # the RunConfig the fixture ran with carries the current defaults
+    assert row.stakeholder_model == default_stakeholder.model_id and row.stakeholder_prompt_version == default_stakeholder.prompt_version
+    assert row.origin == "laptop"
     assert [e.seq for e in exchanges] == [0, 1, 2, 3, 4, 5]
     by_seq = {e.seq: e for e in exchanges}
     assert (by_seq[0].role, by_seq[0].exchange, by_seq[0].text_public) == ("agent", "ask", "Which exception should be raised?")
@@ -306,6 +315,17 @@ def test_attempts_without_a_record_get_a_status_from_the_evidence(record: Record
         P.project_trial(record.layout, "0" * 24, origin="laptop")
     assert "notatrial" not in P.trial_ids(record.layout) and "f" * 24 not in P.trial_ids(record.layout)
     assert len(P.trial_ids(record.layout)) == len(record.tids)
+
+
+def test_workflow_costs_come_from_the_costs_directory(record: Record, tmp_path: Path):
+    rows = P.project_workflow_costs(record.layout, origin="laptop")
+    assert [(r.cost_id, r.workflow_id, r.trial_id, r.usd) for r in rows] == [("01J8Z0000000000000000JUDG1", "create-1", None, Decimal("0.005"))]
+    assert P.project_workflow_costs(Layout(root=tmp_path), origin="laptop") == []
+    bad = Layout(root=tmp_path)
+    (tmp_path / "costs").mkdir()
+    (tmp_path / "costs" / "w.json").write_text("{}")
+    with pytest.raises(P.ProjectionError):
+        P.project_workflow_costs(bad, origin="laptop")
 
 
 def test_costs_file_must_be_a_list_of_records(tmp_path: Path):
