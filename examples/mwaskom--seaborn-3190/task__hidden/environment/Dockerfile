@@ -19,8 +19,8 @@ RUN cd /testbed && rm -rf .git && git init -q && git config user.name swesim && 
  && git add -A && git -c core.hooksPath=/dev/null commit -qm 'scenario base' && git reflog expire --expire=now --all
 RUN mkdir -p /opt/swesim/bin /var/swesim-collect && chmod 700 /var/swesim-collect
 COPY collect.py /opt/swesim/collect.py
-COPY shims/ask-user shims/request-review /opt/swesim/bin/
-RUN chmod 755 /opt/swesim/collect.py /opt/swesim/bin/* && ln -s /opt/swesim/bin/ask-user /usr/local/bin/ask-user && ln -s /opt/swesim/bin/request-review /usr/local/bin/request-review
+COPY shims/ask-user shims/confirm-behavior shims/request-review /opt/swesim/bin/
+RUN chmod 755 /opt/swesim/collect.py /opt/swesim/bin/* && ln -s /opt/swesim/bin/ask-user /usr/local/bin/ask-user && ln -s /opt/swesim/bin/confirm-behavior /usr/local/bin/confirm-behavior && ln -s /opt/swesim/bin/request-review /usr/local/bin/request-review
 RUN chown -R agent:agent /testbed /home/agent
 USER agent
 ENV HOME=/home/agent

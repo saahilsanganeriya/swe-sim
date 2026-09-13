@@ -6,9 +6,9 @@
       "sha256": "e014761e43e1a1d3eb8879a4ac67aadc810db3aab87701a8f499ba7c4571fe77"
     },
     "plausible-wrong.diff": {
-      "bytes": 678,
+      "bytes": 32804,
       "path": "assets/plausible-wrong.diff",
-      "sha256": "6a0564f5b8eb99c67781246aa1aed1765890e6e61ab33b1671cf2cf3b6615d14"
+      "sha256": "792164c244f07316b44484d6bfbef56f866affa8d1f38c3717b9bcd55b605e0b"
     },
     "tamper-root-conftest.diff": {
       "bytes": 220,
@@ -36,27 +36,15 @@
       "profile": "natural",
       "provenance": "original-issue",
       "text": "Color mapping fails with boolean data\n```python\r\nso.Plot([\"a\", \"b\"], [1, 2], color=[True, False]).add(so.Bar())\r\n```\r\n```python-traceback\r\n---------------------------------------------------------------------------\r\nTypeError                                 Traceback (most recent call last)\r\n...\r\nFile ~/code/seaborn/seaborn/_core/plot.py:841, in Plot._plot(self, pyplot)\r\n    838 plotter._compute_stats(self, layers)\r\n    840 # Process scale spec for semantic variables and coordinates computed by stat\r\n--> 841 plotter._setup_scales(self, common, layers)\r\n    843 # TODO Remove these after updating other methods\r\n    844 # ---- Maybe have debug= param that attaches these when True?\r\n    845 plotter._data = common\r\n\r\nFile ~/code/seaborn/seaborn/_core/plot.py:1252, in Plotter._setup_scales(self, p, common, layers, variables)\r\n   1250     self._scales[var] = Scale._identity()\r\n   1251 else:\r\n-> 1252     self._scales[var] = scale._setup(var_df[var], prop)\r\n   1254 # Everything below here applies only to coordinate variables\r\n   1255 # We additionally skip it when we're working with a value\r\n   1256 # that is derived from a coordinate we've already processed.\r\n   1257 # e.g., the Stat consumed y and added ymin/ymax. In that case,\r\n   1258 # we've already setup the y scale and ymin/max are in scale space.\r\n   1259 if axis is None or (var != coord and coord in p._variables):\r\n\r\nFile ~/code/seaborn/seaborn/_core/scales.py:351, in ContinuousBase._setup(self, data, prop, axis)\r\n    349 vmin, vmax = axis.convert_units((vmin, vmax))\r\n    350 a = forward(vmin)\r\n--> 351 b = forward(vmax) - forward(vmin)\r\n    353 def normalize(x):\r\n    354     return (x - a) / b\r\n\r\nTypeError: numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the `^` operator, or the logical_xor function instead.\r\n```\n"
-    },
-    {
-      "profile": "withheld",
-      "provenance": "withheld",
-      "text": "Color mapping fails with boolean data\n```python\r\n```\r\n```python-traceback\r\n---------------------------------------------------------------------------\r\nTypeError                                 Traceback (most recent call last)\r\n...\r\nFile ~/code/seaborn/seaborn/_core/plot.py:841, in Plot._plot(self, pyplot)\r\n    838 plotter._compute_stats(self, layers)\r\n    840 # Process scale spec for semantic variables and coordinates computed by stat\r\n--> 841 plotter._setup_scales(self, common, layers)\r\n    843 # TODO Remove these after updating other methods\r\n    844 # ---- Maybe have debug= param that attaches these when True?\r\n    845 plotter._data = common\r\n\r\nFile ~/code/seaborn/seaborn/_core/plot.py:1252, in Plotter._setup_scales(self, p, common, layers, variables)\r\n   1250     self._scales[var] = Scale._identity()\r\n   1251 else:\r\n-> 1252     self._scales[var] = scale._setup(var_df[var], prop)\r\n   1254 # Everything below here applies only to coordinate variables\r\n   1255 # We additionally skip it when we're working with a value\r\n   1256 # that is derived from a coordinate we've already processed.\r\n   1257 # e.g., the Stat consumed y and added ymin/ymax. In that case,\r\n   1258 # we've already setup the y scale and ymin/max are in scale space.\r\n   1259 if axis is None or (var != coord and coord in p._variables):\r\n\r\nFile ~/code/seaborn/seaborn/_core/scales.py:351, in ContinuousBase._setup(self, data, prop, axis)\r\n    349 vmin, vmax = axis.convert_units((vmin, vmax))\r\n    350 a = forward(vmin)\r\n--> 351 b = forward(vmax) - forward(vmin)\r\n    353 def normalize(x):\r\n    354     return (x - a) / b\r\n\r\nTypeError: numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the `^` operator, or the logical_xor function instead.\r\n```\n"
     }
   ],
   "checks": [
     {
       "asset": null,
-      "command": "python -c \"import seaborn.objects as so; so.Plot(['a','b'], [1,2], color=[True, False]).add(so.Bar()).plot()\"",
-      "description": "Reproduce the original issue with a Plot using boolean color data and confirm no TypeError is raised.",
-      "expected_observation": "No TypeError is raised; the plot is constructed successfully.",
-      "id": "c01"
-    },
-    {
-      "asset": null,
       "command": "python -c \"import pandas as pd; from seaborn._core.scales import Continuous; from seaborn._core.properties import IntervalProperty; x = pd.Series([True, False, False]); s = Continuous()._setup(x, IntervalProperty()); print(list(s(x)))\"",
-      "description": "Directly test Continuous._setup with boolean pandas Series data and IntervalProperty.",
-      "expected_observation": "Prints [1.0, 0.0, 0.0] (or equivalent numeric values) without raising an exception.",
-      "id": "c02"
+      "description": "Setting up a Continuous scale with boolean data does not raise",
+      "expected_observation": "prints [1.0, 0.0, 0.0] without raising TypeError",
+      "id": "c01"
     }
   ],
   "contract": {
@@ -178,8 +166,8 @@
         "expected_reward_max": 0.5,
         "expected_signals": [],
         "expected_success": 0,
-        "name": "xor-based-boolean-handling",
-        "rationale": "A tempting but incomplete fix is to special-case boolean dtype using logical_xor as the issue commenter suggested, instead of coercing to float, which doesn't generalize and may still fail downstream normalization math (e.g. division of bool by bool)."
+        "name": "xor-based-fix",
+        "rationale": "Tempting but wrong fix that follows the issue commenter's suggestion literally, using logical_xor instead of properly coercing to float, which fixes the immediate subtraction error but produces incorrect/boolean results rather than numeric 0/1 float outputs."
       }
     ],
     "tamper": [
@@ -215,7 +203,7 @@
       }
     ]
   },
-  "created_at": "2026-09-13T03:08:49.044313Z",
+  "created_at": "2026-09-13T06:01:40.854725Z",
   "difficulty": {
     "annotated": "<15 min fix",
     "judged": {
@@ -229,25 +217,41 @@
           "derivable_from_repo": false,
           "evidence": "assert_array_equal(s(x), [1, 0, 0])",
           "evidence_grounded": true,
+          "evidence_in_tests": true,
           "id": "g1",
-          "question": "When boolean data are passed through a continuous interval scale, should they be coerced to numeric 0/1 values, and what exact output should True and False produce?",
+          "question": "When boolean data are passed through the continuous interval scale, should they be coerced to numeric 0/1 values, and specifically should True map to 1 and False to 0?",
           "resolution_excerpt": "This result isn't ideal, we'd like to propagate the boolean-ness of the data through to the visualization, but this is consistent with other numpy / matplotlib behavior where boolean data are upcast to 0/1 floats in numeric contexts.",
           "resolved_by": "thread",
-          "source": "test-literal",
-          "text": "The fix should treat boolean values in a continuous/numeric normalization context as numeric 0/1 values, with False mapping to 0 and True mapping to 1, rather than using logical xor or a categorical/nominal mapping."
+          "source": "proposed",
+          "text": "Boolean values on a Continuous interval scale are expected to be treated numerically, with True mapping to 1 and False mapping to 0, rather than using XOR semantics, a nominal scale, or merely avoiding the exception without specifying the mapped values."
         },
         {
-          "category": "context",
+          "category": "scope",
           "consequential": true,
           "derivable_from_repo": true,
           "evidence": "s = Continuous()._setup(x, IntervalProperty())",
           "evidence_grounded": true,
+          "evidence_in_tests": true,
           "id": "g2",
-          "question": "Should the fix be implemented and validated specifically in Continuous._setup for IntervalProperty, or only at the higher-level Plot color-mapping API shown in the issue?",
+          "question": "Should the fix be implemented and validated at the Continuous interval scale level, rather than only in the Plot color-mapping path shown in the report?",
           "resolution_excerpt": "s = Continuous()._setup(x, IntervalProperty())",
           "resolved_by": "tests",
-          "source": "test-literal",
-          "text": "The regression is covered at the lower-level Continuous scale with an IntervalProperty, not by rendering the originally reported Plot with a color semantic."
+          "source": "proposed",
+          "text": "The regression test targets the lower-level Continuous scale with an IntervalProperty, not the high-level Plot color example from the issue."
+        },
+        {
+          "category": "reproduction",
+          "consequential": false,
+          "derivable_from_repo": false,
+          "evidence": "x = pd.Series([True, False, False])",
+          "evidence_grounded": true,
+          "evidence_in_tests": true,
+          "id": "g3",
+          "question": "What concrete boolean input shape/type should be supported in the regression test: a pandas Series, a Python list, a NumPy array, or all of them, and should repeated boolean values be handled?",
+          "resolution_excerpt": "x = pd.Series([True, False, False])",
+          "resolved_by": "tests",
+          "source": "proposed",
+          "text": "The boolean input case covered by the tests uses a pandas Series containing both True and False values, including repeated False values."
         },
         {
           "category": "behavior",
@@ -255,39 +259,43 @@
           "derivable_from_repo": false,
           "evidence": "vmin, vmax = map(float, axis.convert_units((vmin, vmax)))",
           "evidence_grounded": true,
-          "id": "g3",
-          "question": "Should the normalization bounds be explicitly converted to floats before subtraction, or should boolean bounds be handled with a separate boolean-specific operation such as xor?",
-          "resolution_excerpt": "This result isn't ideal, we'd like to propagate the boolean-ness of the data through to the visualization, but this is consistent with other numpy / matplotlib behavior where boolean data are upcast to 0/1 floats in numeric contexts.",
+          "evidence_in_tests": false,
+          "id": "g4",
+          "question": "Should boolean endpoints be handled by casting converted units to float before computing the normalization interval, or by a boolean-specific operation such as xor/logical_xor?",
+          "resolution_excerpt": "So boolean data should still get a non-continuous scale by default but contra #3135 I think there should be a separate `Boolean` scale concept rather than default to `Nominal`.",
           "resolved_by": "thread",
           "source": "proposed",
-          "text": "The implementation resolves the TypeError by coercing the converted normalization endpoints to Python floats before applying the scale transform and subtracting, rather than special-casing boolean subtraction or using xor."
+          "text": "The merged fix coerces the converted normalization endpoints to Python floats before applying the scale transform, rather than changing subtraction to XOR or adding a boolean-specific branch."
         },
         {
-          "category": "reproduction",
-          "consequential": false,
-          "derivable_from_repo": true,
-          "evidence": "x = pd.Series([True, False, False])",
+          "category": "behavior",
+          "consequential": true,
+          "derivable_from_repo": false,
+          "evidence": "assert_array_equal(s(x), [1, 0, 0])",
           "evidence_grounded": true,
-          "id": "g4",
-          "question": "What specific boolean input shape/container and ordering should be supported by the continuous interval scale regression?",
-          "resolution_excerpt": "x = pd.Series([True, False, False])",
+          "evidence_in_tests": true,
+          "id": "g5",
+          "question": "Is avoiding the TypeError sufficient, or must the returned scale produce exact numeric interval outputs for the original boolean data?",
+          "resolution_excerpt": "assert_array_equal(s(x), [1, 0, 0])",
           "resolved_by": "tests",
-          "source": "test-literal",
-          "text": "The added regression uses a pandas Series containing both True and False with duplicate False values, and expects the mapping to preserve input order elementwise."
+          "source": "proposed",
+          "text": "The expected behavior is not only that setup succeeds without raising TypeError; the resulting scale must transform the original boolean Series into the exact numeric interval values [1, 0, 0]."
         }
       ],
       "gaps_dropped": 0,
       "gaps_extracted": 0,
-      "gaps_proposed": 1,
+      "gaps_proposed": 5,
       "keep": true,
       "model_id": "openai/gpt-5.5",
+      "payload_chars": 10191,
+      "payload_trimmed": {},
       "prompt_version": "judge-v3",
-      "rationale": "The issue clearly reports a concrete TypeError from boolean color data and includes the traceback pointing to normalization subtraction, so the main task is well localized. The main underspecified point is the desired semantic treatment of booleans: xor, nominal scale, or numeric 0/1 coercion could all be imagined from the issue alone, though the PR discussion settles that choice. The tests are behavioral in that they assert the resulting scale output for boolean inputs, but they exercise a lower-level Continuous/Interval path rather than the exact Plot color example.",
+      "rationale": "The issue clearly identifies a traceback caused by boolean color data, but it does not specify the desired semantic treatment of booleans. The merged test and PR choose numeric upcasting to 0/1 through the Continuous interval scale, while other plausible fixes could include nominal/boolean-specific handling or simply avoiding the subtraction error in the high-level color path. The code change is small and the regression is behavioral, but the precise accepted behavior is pinned mostly by the PR/tests rather than the original issue text.",
       "resolution_downgraded": 0,
       "self_contained": true,
       "structural_tests": false,
       "test_behavioralness": 4,
-      "verified_rubric_score": 1
+      "verified_rubric_score": 2
     },
     "measured": null
   },
@@ -325,116 +333,95 @@
       "source_excerpt": "TypeError: numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the `^` operator, or the logical_xor function instead.",
       "source_url": "https://github.com/mwaskom/seaborn/issues/3106",
       "tests": [],
-      "text": "Passing boolean color data to so.Plot raises a TypeError from numpy boolean subtract when computing forward(vmax) - forward(vmin) in ContinuousBase._setup."
+      "text": "Plotting with boolean color data raises TypeError: numpy boolean subtract, the `-` operator, is not supported."
+    },
+    {
+      "authored_rationale": null,
+      "discovery": "on-request",
+      "id": "f02",
+      "kind": "behavior",
+      "provenance": "pr-thread",
+      "source_excerpt": "this is consistent with other numpy / matplotlib behavior where boolean data are upcast to 0/1 floats in numeric contexts.",
+      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "tests": [
+        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+      ],
+      "text": "The maintainer decided boolean data should be upcast to 0/1 floats in numeric contexts, consistent with numpy/matplotlib conventions, rather than special-cased with xor logic."
     },
     {
       "authored_rationale": null,
       "discovery": "brief",
-      "id": "f02",
+      "id": "f03",
       "kind": "context",
       "provenance": "issue-thread",
       "source_excerpt": "Would this simply mean refactoring the code to use `^` or `xor` functions instead?",
-      "source_url": "https://github.com/mwaskom/seaborn/issues/3106#issuecomment-1303169229",
-      "tests": [],
-      "text": "A commenter suggested refactoring to use xor operators as a possible fix approach."
-    },
-    {
-      "authored_rationale": null,
-      "discovery": "on-request",
-      "id": "f03",
-      "kind": "behavior",
-      "provenance": "pr-thread",
-      "source_excerpt": "This result isn't ideal, we'd like to propagate the boolean-ness of the data through to the visualization, but this is consistent with other numpy / matplotlib behavior where boolean data are upcast to 0/1 floats in numeric contexts.",
-      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
-      "tests": [
-        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
-      ],
-      "text": "The maintainer decided that boolean data passed through a continuous scale should be upcast to 0/1 floats consistent with numpy/matplotlib numeric behavior, rather than given a separate boolean treatment, even though ideally boolean-ness would be preserved."
-    },
-    {
-      "authored_rationale": null,
-      "discovery": "on-request",
-      "id": "f04",
-      "kind": "constraint",
-      "provenance": "pr-thread",
-      "source_excerpt": "So boolean data should still get a non-continuous scale by default but contra #3135 I think there should be a separate `Boolean` scale concept rather than default to `Nominal`.",
-      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
-      "tests": [
-        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
-      ],
-      "text": "The maintainer explicitly ruled out treating booleans as a Nominal scale by default, planning instead a separate Boolean scale concept in the future."
-    },
-    {
-      "authored_rationale": "The thread doesn't specify the exact test data or shape used; this is pinned only by the merged test_patch.",
-      "discovery": "on-request",
-      "id": "f05",
-      "kind": "reproduction",
-      "provenance": "authored",
-      "source_excerpt": "x = pd.Series([True, False, False])\n        s = Continuous()._setup(x, IntervalProperty())\n        assert_array_equal(s(x), [1, 0, 0])",
-      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
-      "tests": [
-        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
-      ],
-      "text": "The regression test constructs a pandas Series of booleans and passes it directly to Continuous()._setup with IntervalProperty(), expecting mapped output [1, 0, 0]."
-    },
-    {
-      "authored_rationale": null,
-      "discovery": "repo-derivable",
-      "id": "withheld-001",
-      "kind": "reproduction",
-      "provenance": "original-issue",
-      "source_excerpt": "so.Plot([\"a\", \"b\"], [1, 2], color=[True, False]).add(so.Bar())",
       "source_url": "https://github.com/mwaskom/seaborn/issues/3106",
       "tests": [],
-      "text": "Reporter's original statement: so.Plot([\"a\", \"b\"], [1, 2], color=[True, False]).add(so.Bar())"
-    }
-  ],
-  "operations": [
-    {
-      "rationale": "The desired semantic (0/1 upcast vs xor) is not derivable from the issue traceback alone; only the PR body resolves it.",
-      "target": "f03",
-      "type": "clarification"
+      "text": "A commenter asked if the fix should simply refactor the subtraction to use xor or logical_xor instead."
     },
     {
-      "rationale": "Exact test input/output values are only pinned by the merged test patch, not stated in the issue thread.",
-      "target": "f05",
-      "type": "clarification"
+      "authored_rationale": "No thread comment states the precise numeric mapping; only the merged patch and its accompanying test pin this exact behavior.",
+      "discovery": "on-request",
+      "id": "f04",
+      "kind": "behavior",
+      "provenance": "authored",
+      "source_excerpt": "vmin, vmax = map(float, axis.convert_units((vmin, vmax)))",
+      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "tests": [
+        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+      ],
+      "text": "Applying a Continuous interval scale to boolean input data should produce numeric output where True maps to 1 and False maps to 0, for each value in the data."
     },
     {
-      "rationale": "Removed category: reproduction; natural[49:111] = 'so.Plot([\"a\", \"b\"], [1, 2], color=[True, False]).add(so.Bar())'",
-      "target": "withheld-001",
-      "type": "withholding"
+      "authored_rationale": "Pinned only by the merged tests (judge gap g5); no phrasing free of test construction was available, so this fact is evaluator-only. Question a developer would ask: Is avoiding the TypeError sufficient, or must the returned scale produce exact numeric interval outputs for the original boolean data?",
+      "discovery": "author-only",
+      "id": "tests-001",
+      "kind": "behavior",
+      "provenance": "authored",
+      "source_excerpt": "assert_array_equal(s(x), [1, 0, 0])",
+      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "tests": [],
+      "text": "assert_array_equal(s(x), [1, 0, 0])"
     }
   ],
+  "operations": [],
   "persona": {
     "derived_from_urls": [
-      "https://github.com/mwaskom/seaborn/pull/3190",
-      "https://github.com/mwaskom/seaborn/issues/3106"
+      "https://github.com/mwaskom/seaborn/pull/3190"
     ],
-    "disclosure_style": "reveals rationale only when pressed, referencing numpy/matplotlib conventions",
+    "disclosure_style": "reveals details only when pressed, references numpy/matplotlib conventions",
     "role": "maintainer",
-    "summary": "A seaborn maintainer (mwaskom) responding to a reported TypeError with boolean color data, explaining the narrow scope and rationale of the fix in the PR description.",
-    "tone": "terse, technical, pragmatic"
+    "summary": "Maintainer (mwaskom) who filed and fixed the issue himself, describing the narrow scope of the fix and open questions about future boolean scale support.",
+    "tone": "terse, technical"
   },
   "pipeline_version": "0.1.0",
   "requirements": [
     {
-      "fact_id": "f03",
+      "fact_id": "f01",
       "id": "r01",
-      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "source_url": "https://github.com/mwaskom/seaborn/issues/3106",
       "tests": [
         "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
       ],
-      "text": "Boolean data passed through Continuous._setup with IntervalProperty must be coerced to numeric floats so that no TypeError is raised on subtraction, and True/False must map to 1/0 respectively."
+      "text": "Continuous scale setup must not raise TypeError when given boolean data."
     },
     {
-      "fact_id": "f04",
+      "fact_id": "f02",
       "id": "r02",
       "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
       "tests": [
         "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
       ],
-      "text": "The fix must not introduce a separate boolean-specific Nominal scale default; boolean values should be treated numerically within the Continuous scale path."
+      "text": "Boolean values must be coerced to numeric 0/1 floats consistent with numpy/matplotlib upcasting behavior."
+    },
+    {
+      "fact_id": "f04",
+      "id": "r03",
+      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "tests": [
+        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+      ],
+      "text": "The interval scale applied to boolean data must map True to numeric 1 and False to numeric 0."
     }
   ],
   "source": "swebench-annotated",
@@ -482,5 +469,5 @@
     "review_comments": [],
     "reviews": []
   },
-  "version": 1
+  "version": 2
 }

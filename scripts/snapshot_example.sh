@@ -130,6 +130,10 @@ for tid in tids:
     if not export.is_file():
         fail('missing ' + shown(export) + ' (run: swesim export ' + sid + ')')
     harbor = Path(record['trial_dir'])
+    if not harbor.exists():  # recorded on the VM (/opt/swesim/workspace/...); re-root onto this workspace (scripts/vm/pull.sh mirror)
+        s_ = str(harbor); i_ = s_.find('/workspace/')
+        if i_ >= 0:
+            harbor = ws / s_[i_ + len('/workspace/'):]
     for rel in ('agent/trajectory.json', 'verifier/submission.diff'):
         if not (harbor / rel).is_file():
             fail('missing ' + shown(harbor / rel))

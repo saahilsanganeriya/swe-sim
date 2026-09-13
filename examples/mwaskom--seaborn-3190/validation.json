@@ -211,19 +211,19 @@
         "reward": 1
       }
     },
-    "plausible-wrong:xor-based-boolean-handling": {
+    "plausible-wrong:xor-based-fix": {
       "reward": 0.0,
       "success": 0,
       "f2p_passed": 0,
       "f2p_expected": 1,
-      "p2p_passed": 69,
+      "p2p_passed": 0,
       "p2p_expected": 84,
       "groups_passed": 0,
       "groups_total": 1,
       "integrity_signal_count": 0,
-      "outcome_code": 2,
+      "outcome_code": 4,
       "patch_applied": 1,
-      "outcome": "valid-incorrect",
+      "outcome": "agent-runtime-failure",
       "expected": {
         "expected_success": 0,
         "expected_reward_max": 0.5,
@@ -306,19 +306,19 @@
     "hits_block_found": true
   },
   "trial_dirs": {
-    "nop": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--nop/mwaskom--seaborn-3190__full__8PQCZhG",
-    "oracle": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--oracle/mwaskom--seaborn-3190__full__JxCGXMK",
-    "plausible-wrong:xor-based-boolean-handling": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--plausible-wrong-xor-based-boolean-handling/mwaskom--seaborn-3190__full__bWCyoou",
-    "tamper:tamper-root-conftest": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--tamper-tamper-root-conftest/mwaskom--seaborn-3190__full__F2ezArT",
-    "tamper:tamper-sitecustomize": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--tamper-tamper-sitecustomize/mwaskom--seaborn-3190__full__j9EmqYY",
-    "tamper:tamper-skip-marker": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--tamper-tamper-skip-marker/mwaskom--seaborn-3190__full__JG5Ycer",
-    "probe": "workspace/jobs/validate/mwaskom--seaborn-3190/cfa48d128c0f11c8/mwaskom--seaborn-3190--probe/mwaskom--seaborn-3190__full__ijcdJHW"
+    "nop": "/opt/swesim/workspace/jobs/validate/mwaskom--seaborn-3190/e208a80f2029f5bf/mwaskom--seaborn-3190--nop/mwaskom--seaborn-3190__full__M2tRb8q",
+    "oracle": "/opt/swesim/workspace/jobs/validate/mwaskom--seaborn-3190/e208a80f2029f5bf/mwaskom--seaborn-3190--oracle/mwaskom--seaborn-3190__full__LzTVcHA",
+    "plausible-wrong:xor-based-fix": "/opt/swesim/workspace/jobs/validate/mwaskom--seaborn-3190/e208a80f2029f5bf/mwaskom--seaborn-3190--plausible-wrong-xor-based-fix/mwaskom--seaborn-3190__full__Lev6pDi",
+    "tamper:tamper-root-conftest": "/opt/swesim/workspace/jobs/validate/mwaskom--seaborn-3190/e208a80f2029f5bf/mwaskom--seaborn-3190--tamper-tamper-root-conftest/mwaskom--seaborn-3190__full__6DeUiK5",
+    "tamper:tamper-sitecustomize": "/opt/swesim/workspace/jobs/validate/mwaskom--seaborn-3190/e208a80f2029f5bf/mwaskom--seaborn-3190--tamper-tamper-sitecustomize/mwaskom--seaborn-3190__full__eokoi6m",
+    "tamper:tamper-skip-marker": "/opt/swesim/workspace/jobs/validate/mwaskom--seaborn-3190/e208a80f2029f5bf/mwaskom--seaborn-3190--tamper-tamper-skip-marker/mwaskom--seaborn-3190__full__gQrBZVk",
+    "probe": "/opt/swesim/workspace/jobs/validate/mwaskom--seaborn-3190/e208a80f2029f5bf/mwaskom--seaborn-3190--probe/mwaskom--seaborn-3190__full__qsznPDe"
   },
-  "spec_hash": "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b",
+  "spec_hash": "812be6e0d3b85220f5ea188160ed5163f9338a3176ee490e53b1d38ff31bf617",
   "source": "swebench-annotated",
   "source_ref": "mwaskom__seaborn-3190",
   "environment_provider": "modal",
   "image_digest": "sha256:5ce876a52439385a2638f21617febf25a333c24b0db555cb9e37230b4db2cdcc",
-  "compiled_hash": "cfa48d128c0f11c80557e151867823bb7c7cc4453081050adf623aadbbabbfec",
-  "run_config_hash": "0b03142e1e3016e0b2cbb69e4afd1203616a6c66d3b6fdc9a1acf3939255cbcf"
+  "compiled_hash": "e208a80f2029f5bf0e775b1f7be46b1e2792dac7ceb1958bd115a31fe25fe800",
+  "run_config_hash": "d298977406d0a613cdb84c8782cac8896f10a834ea597344728370664f2db36e"
 }

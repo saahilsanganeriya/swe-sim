@@ -1,0 +1,15 @@
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -329,6 +329,12 @@
+         if new._label_params is None:
+             new = new.label()
+ 
++        # Convert boolean data to numeric for continuous scale operations
++        # Boolean values (True/False) are coerced to (1.0/0.0) to support
++        # arithmetic operations in normalization and transform functions
++        if data.dtype == bool:
++            data = data.astype(float)
++
+         forward, inverse = new._get_transform()
+ 
+         mpl_scale = new._get_scale(str(data.name), forward, inverse)

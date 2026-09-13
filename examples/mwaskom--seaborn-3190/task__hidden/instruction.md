@@ -1,5 +1,6 @@
 Color mapping fails with boolean data
 ```python
+so.Plot(["a", "b"], [1, 2], color=[True, False]).add(so.Bar())
 ```
 ```python-traceback
 ---------------------------------------------------------------------------

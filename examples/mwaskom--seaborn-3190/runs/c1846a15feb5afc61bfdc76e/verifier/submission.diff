@@ -1,0 +1,14 @@
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -329,6 +329,11 @@
+         if new._label_params is None:
+             new = new.label()
+ 
++        # Matplotlib's PseudoAxis and various scale classes don't support
++        # boolean data (e.g., subtraction fails), so ensure we have floats
++        if data.dtype == bool:
++            data = data.astype(float)
++
+         forward, inverse = new._get_transform()
+ 
+         mpl_scale = new._get_scale(str(data.name), forward, inverse)

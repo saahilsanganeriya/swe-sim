@@ -3,18 +3,18 @@ artifacts = ["/var/swesim-collect/app.tar", "/var/swesim-collect/collect.status"
 
 [task]
 name = "swesim/mwaskom--seaborn-3190--full"
-version = "1"
+version = "2"
 description = "swebench-annotated mwaskom__seaborn-3190 [full]"
 
 [metadata]
 source = "swebench-annotated"
 source_ref = "mwaskom__seaborn-3190"
 scenario_id = "mwaskom--seaborn-3190"
-spec_hash = "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b"
+spec_hash = "812be6e0d3b85220f5ea188160ed5163f9338a3176ee490e53b1d38ff31bf617"
 condition = "full"
 brief_profile = "natural"
-run_config_hash = "0b03142e1e3016e0b2cbb69e4afd1203616a6c66d3b6fdc9a1acf3939255cbcf"
-compiled_hash = "cfa48d128c0f11c80557e151867823bb7c7cc4453081050adf623aadbbabbfec"
+run_config_hash = "d298977406d0a613cdb84c8782cac8896f10a834ea597344728370664f2db36e"
+compiled_hash = "e208a80f2029f5bf0e775b1f7be46b1e2792dac7ceb1958bd115a31fe25fe800"
 annotated_difficulty = "\u003c15 min fix"
 image_digest = "sha256:5ce876a52439385a2638f21617febf25a333c24b0db555cb9e37230b4db2cdcc"
 

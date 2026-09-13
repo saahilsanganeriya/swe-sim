@@ -1,0 +1,65 @@
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -347,6 +347,12 @@
+             else:
+                 vmin, vmax = new.norm
+             vmin, vmax = axis.convert_units((vmin, vmax))
++            # Convert boolean values to float to allow arithmetic operations
++            # numpy.bool_ subtraction is not supported
++            if isinstance(vmin, (bool, np.bool_)):
++                vmin = float(vmin)
++            if isinstance(vmax, (bool, np.bool_)):
++                vmax = float(vmax)
+             a = forward(vmin)
+             b = forward(vmax) - forward(vmin)
+ 
+--- /dev/null
++++ b/test_fix_summary.md
+@@ -0,0 +1,47 @@
++# Fix for: Color mapping fails with boolean data
++
++## Issue
++When using boolean values for the `color` parameter in `seaborn.objects.Plot`, a TypeError occurs:
++```
++TypeError: numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the `^` operator, or the logical_xor function instead.
++```
++
++Example failing code:
++```python
++so.Plot(["a", "b"], [1, 2], color=[True, False]).add(so.Bar())
++```
++
++## Root Cause
++In `seaborn/_core/scales.py`, the `ContinuousBase._setup()` method attempts to normalize continuous data by computing:
++```python
++b = forward(vmax) - forward(vmin)
++```
++
++When `vmin` and `vmax` are boolean values (which happens when boolean data is treated as numeric), this operation fails because NumPy doesn't support subtraction on boolean arrays.
++
++## Solution
++Convert boolean values to float before performing arithmetic operations in the normalization setup:
++
++```python
++# Convert boolean values to float to allow arithmetic operations
++# numpy.bool_ subtraction is not supported
++if isinstance(vmin, (bool, np.bool_)):
++    vmin = float(vmin)
++if isinstance(vmax, (bool, np.bool_)):
++    vmax = float(vmax)
++```
++
++This fix handles both:
++- Python's built-in `bool` type
++- NumPy's `np.bool_` type
++
++## Location
++File: `seaborn/_core/scales.py`
++Method: `ContinuousBase._setup()`
++Lines: 350-355 (after `axis.convert_units()` call)
++
++## Effect
++- Boolean values are properly converted to float (True → 1.0, False → 0.0)
++- The subtraction operation works correctly
++- The normalize function is created successfully
++- Boolean data can now be mapped to colors in plots

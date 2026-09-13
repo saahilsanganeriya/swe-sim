@@ -37,12 +37,10 @@ TypeError: numpy boolean subtract, the `-` operator, is not supported, use the b
 
 
 ## Requirements (complete)
-- Passing boolean color data to so.Plot raises a TypeError from numpy boolean subtract when computing forward(vmax) - forward(vmin) in ContinuousBase._setup.
-- A commenter suggested refactoring to use xor operators as a possible fix approach.
-- The maintainer decided that boolean data passed through a continuous scale should be upcast to 0/1 floats consistent with numpy/matplotlib numeric behavior, rather than given a separate boolean treatment, even though ideally boolean-ness would be preserved.
-- The maintainer explicitly ruled out treating booleans as a Nominal scale by default, planning instead a separate Boolean scale concept in the future.
-- The regression test constructs a pandas Series of booleans and passes it directly to Continuous()._setup with IntervalProperty(), expecting mapped output [1, 0, 0].
-- Reporter's original statement: so.Plot(["a", "b"], [1, 2], color=[True, False]).add(so.Bar())
+- Plotting with boolean color data raises TypeError: numpy boolean subtract, the `-` operator, is not supported.
+- The maintainer decided boolean data should be upcast to 0/1 floats in numeric contexts, consistent with numpy/matplotlib conventions, rather than special-cased with xor logic.
+- A commenter asked if the fix should simply refactor the subtraction to use xor or logical_xor instead.
+- Applying a Continuous interval scale to boolean input data should produce numeric output where True maps to 1 and False maps to 0, for each value in the data.
 No stakeholder is available for questions.
 
 Repository: `/testbed`. Time budget: 40 minutes. Work in place; your changes are collected automatically when you finish.

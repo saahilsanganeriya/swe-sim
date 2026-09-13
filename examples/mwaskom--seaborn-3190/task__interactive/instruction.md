@@ -1,5 +1,6 @@
 Color mapping fails with boolean data
 ```python
+so.Plot(["a", "b"], [1, 2], color=[True, False]).add(so.Bar())
 ```
 ```python-traceback
 ---------------------------------------------------------------------------
@@ -41,7 +42,9 @@ depend on (expected behavior on edge cases, exact error types or messages, scope
 The stakeholder is available now and will answer a limited number of questions before they have to leave, so ask about any
 decision the brief does not settle before you implement it, and ask early. Repository facts (where code lives, how it works)
 you should find yourself.
-- Ask a question: `ask-user "your question"`
-- Request a review of your current changes: `request-review`
+- Ask a question: `ask-user "your question"`. You may state what you intend to do and ask whether that is what they want;
+  they answer in terms of behavior they want, not code.
+- Confirm your result: `confirm-behavior "plain-language description of how the program now behaves"`. The stakeholder says
+  whether that matches what they wanted and which requirement still sounds unmet. They cannot read code or diffs.
 
 Repository: `/testbed`. Time budget: 40 minutes. Work in place; your changes are collected automatically when you finish.

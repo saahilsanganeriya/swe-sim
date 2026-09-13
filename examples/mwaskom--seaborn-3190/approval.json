@@ -1,5 +1,5 @@
 {
-  "approved_at": "2026-09-13T03:08:50+00:00",
+  "approved_at": "2026-09-13T06:02:14+00:00",
   "approved_by": "auto-validators",
   "gates": [
     "schema",
@@ -11,6 +11,6 @@
   ],
   "review_needed": true,
   "scenario_id": "mwaskom--seaborn-3190",
-  "spec_hash": "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b",
-  "version": 1
+  "spec_hash": "812be6e0d3b85220f5ea188160ed5163f9338a3176ee490e53b1d38ff31bf617",
+  "version": 2
 }
