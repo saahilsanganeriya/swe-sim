@@ -1,0 +1,57 @@
+schema_version = "1.4"
+artifacts = ["/var/swesim-collect/app.tar", "/var/swesim-collect/collect.status"]
+
+[task]
+name = "swesim/mwaskom--seaborn-3190--hidden"
+version = "1"
+description = "swebench-annotated mwaskom__seaborn-3190 [hidden]"
+
+[metadata]
+source = "swebench-annotated"
+source_ref = "mwaskom__seaborn-3190"
+scenario_id = "mwaskom--seaborn-3190"
+spec_hash = "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b"
+condition = "hidden"
+brief_profile = "withheld"
+run_config_hash = "0b03142e1e3016e0b2cbb69e4afd1203616a6c66d3b6fdc9a1acf3939255cbcf"
+compiled_hash = "750e014c977e71c35690029a96337399f29bde25a1ac14598699247580c55fd7"
+annotated_difficulty = "\u003c15 min fix"
+image_digest = "sha256:5ce876a52439385a2638f21617febf25a333c24b0db555cb9e37230b4db2cdcc"
+
+[verifier]
+timeout_sec = 1800.0
+network_mode = "no-network"
+environment_mode = "separate"
+
+[verifier.environment]
+network_mode = "no-network"
+build_timeout_sec = 1800.0
+
+[[verifier.collect]]
+user = "root"
+timeout_sec = 600.0
+command = "/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin SWESIM_REPO_DIR=/testbed SWESIM_STAKEHOLDER_URL=https://example--swesim-stakeholder-web.modal.run SWESIM_SESSION_TOKEN=\"$SWESIM_SESSION_TOKEN\" /usr/local/bin/swesim-python -I /opt/swesim/collect.py"
+
+[agent]
+timeout_sec = 2400
+user = "agent"
+network_mode = "allowlist"
+allowed_hosts = ["api.anthropic.com", "example--swesim-stakeholder-web.modal.run"]
+
+[environment]
+network_mode = "allowlist"
+allowed_hosts = ["api.anthropic.com", "example--swesim-stakeholder-web.modal.run"]
+build_timeout_sec = 3600.0
+os = "linux"
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+
+[environment.env]
+UV_OFFLINE = "1"
+UV_NO_PROGRESS = "1"
+UV_CACHE_DIR = "/tmp/uv-cache"
+SWESIM_STAKEHOLDER_URL = "https://example--swesim-stakeholder-web.modal.run"
+SWESIM_SESSION_TOKEN = ""
+SWESIM_TRIAL_ID = ""
+SWESIM_REPO_DIR = "/testbed"

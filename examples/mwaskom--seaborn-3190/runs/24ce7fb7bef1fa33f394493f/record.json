@@ -1,0 +1,620 @@
+{
+  "trial_id": "24ce7fb7bef1fa33f394493f",
+  "scenario_id": "mwaskom--seaborn-3190",
+  "condition": "interactive",
+  "attempt_index": 20,
+  "run_config_hash": "6fb358b27aa1ba6425b9613a72382e962facc669d7ccf678736a4297ceeb1d64",
+  "task_dir": "workspace/trials/24ce7fb7bef1fa33f394493f/task",
+  "trial_dir": "runs/24ce7fb7bef1fa33f394493f",
+  "reward": {
+    "reward": 1.0,
+    "success": 1,
+    "f2p_passed": 1,
+    "f2p_expected": 1,
+    "p2p_passed": 84,
+    "p2p_expected": 84,
+    "groups_passed": 1,
+    "groups_total": 1,
+    "integrity_signal_count": 0,
+    "outcome_code": 1,
+    "patch_applied": 1
+  },
+  "report": {
+    "outcome": "valid-correct",
+    "outcome_code": 1,
+    "per_test": [
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools",
+        "kind": "f2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_coordinate_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_coordinate_transform",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_with_parameter",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_error",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_interval_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_interval_with_range",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_interval_with_norm",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_interval_with_range_norm_and_transform",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_color_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_color_named_values",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_color_tuple_values",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_color_callable_values",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_color_with_norm",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_color_with_transform",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_tick_locator",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_tick_locator_input_check",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_tick_upto",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_tick_every",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_tick_every_between",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_tick_at",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_tick_count",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_tick_count_between",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_tick_minor",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_log_tick_default",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_log_tick_upto",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_log_tick_count",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_log_tick_format_disabled",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_log_tick_every",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_symlog_tick_default",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_formatter",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_like_pattern",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_like_string",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_like_function",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_base",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_unit",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_unit_with_sep",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_empty_unit",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_base_from_transform",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestContinuous::test_label_type_checks",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_coordinate_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_coordinate_with_order",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_coordinate_with_subset_order",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_coordinate_axis",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_order",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_subset_order",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_category_dtype",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data_with_order",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_color_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_color_named_palette",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_color_list_palette",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_color_dict_palette",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_color_numeric_data",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_color_numeric_with_order_subset",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_color_alpha_in_palette",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_color_unknown_palette",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_object_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_object_list",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_object_dict",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_object_order",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_object_order_subset",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_objects_that_are_weird",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_alpha_default",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_fill",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_fill_dict",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_fill_nunique_warning",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_interval_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_interval_tuple",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_interval_tuple_numeric",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_interval_list",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_interval_dict",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_interval_with_transform",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestNominal::test_empty_data",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_coordinate_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_interval_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_interval_with_range",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_interval_with_norm",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_color_defaults",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_color_named_values",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_coordinate_axis",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_tick_locator",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_tick_upto",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_label_formatter",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      },
+      {
+        "id": "tests/_core/test_scales.py::TestTemporal::test_label_concise",
+        "kind": "p2p",
+        "expected": "passed",
+        "observed": "passed"
+      }
+    ],
+    "per_group": [
+      {
+        "id": "g01",
+        "weight": 1.0,
+        "passed": true
+      }
+    ],
+    "patch_sha256": "c35013cb2c80d80338add18d199f6c293d8058349033fa5d265334a8d2fdedc0",
+    "submission_sha256": "c35013cb2c80d80338add18d199f6c293d8058349033fa5d265334a8d2fdedc0",
+    "transcript_hash": "8a01a7f39b7adc012b503ee60365e0a64b772a0fb853f03c07eef1064c07c632",
+    "reviewed_diff_sha256": null,
+    "dropped_paths": [],
+    "rejected_members": [],
+    "integrity_signals": [],
+    "receipt": {
+      "status": "ok",
+      "rc": 0,
+      "user": "root",
+      "sha256": "863b92a03680e5228953ae3e42169c7748a0e74018bdd7a69527ed2b84a6b981",
+      "bytes": 5433987,
+      "files": 353,
+      "freeze_status": "ok",
+      "transcript_hash": "8a01a7f39b7adc012b503ee60365e0a64b772a0fb853f03c07eef1064c07c632",
+      "freeze_elapsed_sec": 3.358
+    },
+    "freeze_status": "ok",
+    "target_mode": "in-place",
+    "refused_paths": [],
+    "applied_paths": [
+      "FIX_DESCRIPTION.md",
+      "IMPLEMENTATION_COMPLETE.md",
+      "seaborn/_core/scales.py",
+      "test_boolean_color_mapping.py"
+    ],
+    "change_counts": {
+      "added": 3,
+      "modified": 1,
+      "deleted": 0
+    },
+    "contract_patch_applied": 1,
+    "runner_command": "/opt/miniconda3/envs/testbed/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} tests/_core/test_scales.py::TestContinuous::test_coordinate_defaults tests/_core/test_scales.py::TestContinuous::test_coordinate_transform tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_with_parameter tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_error tests/_core/test_scales.py::TestContinuous::test_interval_defaults tests/_core/test_scales.py::TestContinuous::test_interval_with_range tests/_core/test_scales.py::TestContinuous::test_interval_with_norm tests/_core/test_scales.py::TestContinuous::test_interval_with_range_norm_and_transform tests/_core/test_scales.py::TestContinuous::test_interval_with_bools tests/_core/test_scales.py::TestContinuous::test_color_defaults tests/_core/test_scales.py::TestContinuous::test_color_named_values tests/_core/test_scales.py::TestContinuous::test_color_tuple_values tests/_core/test_scales.py::TestContinuous::test_color_callable_values tests/_core/test_scales.py::TestContinuous::test_color_with_norm tests/_core/test_scales.py::TestContinuous::test_color_with_transform tests/_core/test_scales.py::TestContinuous::test_tick_locator tests/_core/test_scales.py::TestContinuous::test_tick_locator_input_check tests/_core/test_scales.py::TestContinuous::test_tick_upto tests/_core/test_scales.py::TestContinuous::test_tick_every tests/_core/test_scales.py::TestContinuous::test_tick_every_between tests/_core/test_scales.py::TestContinuous::test_tick_at tests/_core/test_scales.py::TestContinuous::test_tick_count tests/_core/test_scales.py::TestContinuous::test_tick_count_between tests/_core/test_scales.py::TestContinuous::test_tick_minor tests/_core/test_scales.py::TestContinuous::test_log_tick_default tests/_core/test_scales.py::TestContinuous::test_log_tick_upto tests/_core/test_scales.py::TestContinuous::test_log_tick_count tests/_core/test_scales.py::TestContinuous::test_log_tick_format_disabled tests/_core/test_scales.py::TestContinuous::test_log_tick_every tests/_core/test_scales.py::TestContinuous::test_symlog_tick_default tests/_core/test_scales.py::TestContinuous::test_label_formatter tests/_core/test_scales.py::TestContinuous::test_label_like_pattern tests/_core/test_scales.py::TestContinuous::test_label_like_string tests/_core/test_scales.py::TestContinuous::test_label_like_function tests/_core/test_scales.py::TestContinuous::test_label_base tests/_core/test_scales.py::TestContinuous::test_label_unit tests/_core/test_scales.py::TestContinuous::test_label_unit_with_sep tests/_core/test_scales.py::TestContinuous::test_label_empty_unit tests/_core/test_scales.py::TestContinuous::test_label_base_from_transform tests/_core/test_scales.py::TestContinuous::test_label_type_checks tests/_core/test_scales.py::TestNominal::test_coordinate_defaults tests/_core/test_scales.py::TestNominal::test_coordinate_with_order tests/_core/test_scales.py::TestNominal::test_coordinate_with_subset_order tests/_core/test_scales.py::TestNominal::test_coordinate_axis tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_order tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_subset_order tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_category_dtype tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data_with_order tests/_core/test_scales.py::TestNominal::test_color_defaults tests/_core/test_scales.py::TestNominal::test_color_named_palette tests/_core/test_scales.py::TestNominal::test_color_list_palette tests/_core/test_scales.py::TestNominal::test_color_dict_palette tests/_core/test_scales.py::TestNominal::test_color_numeric_data tests/_core/test_scales.py::TestNominal::test_color_numeric_with_order_subset tests/_core/test_scales.py::TestNominal::test_color_alpha_in_palette tests/_core/test_scales.py::TestNominal::test_color_unknown_palette tests/_core/test_scales.py::TestNominal::test_object_defaults tests/_core/test_scales.py::TestNominal::test_object_list tests/_core/test_scales.py::TestNominal::test_object_dict tests/_core/test_scales.py::TestNominal::test_object_order tests/_core/test_scales.py::TestNominal::test_object_order_subset tests/_core/test_scales.py::TestNominal::test_objects_that_are_weird tests/_core/test_scales.py::TestNominal::test_alpha_default tests/_core/test_scales.py::TestNominal::test_fill tests/_core/test_scales.py::TestNominal::test_fill_dict tests/_core/test_scales.py::TestNominal::test_fill_nunique_warning tests/_core/test_scales.py::TestNominal::test_interval_defaults tests/_core/test_scales.py::TestNominal::test_interval_tuple tests/_core/test_scales.py::TestNominal::test_interval_tuple_numeric tests/_core/test_scales.py::TestNominal::test_interval_list tests/_core/test_scales.py::TestNominal::test_interval_dict tests/_core/test_scales.py::TestNominal::test_interval_with_transform tests/_core/test_scales.py::TestNominal::test_empty_data tests/_core/test_scales.py::TestTemporal::test_coordinate_defaults tests/_core/test_scales.py::TestTemporal::test_interval_defaults tests/_core/test_scales.py::TestTemporal::test_interval_with_range tests/_core/test_scales.py::TestTemporal::test_interval_with_norm tests/_core/test_scales.py::TestTemporal::test_color_defaults tests/_core/test_scales.py::TestTemporal::test_color_named_values tests/_core/test_scales.py::TestTemporal::test_coordinate_axis tests/_core/test_scales.py::TestTemporal::test_tick_locator tests/_core/test_scales.py::TestTemporal::test_tick_upto tests/_core/test_scales.py::TestTemporal::test_label_formatter tests/_core/test_scales.py::TestTemporal::test_label_concise",
+    "tests_ran_as": "tester",
+    "runner_exit_code": 0,
+    "runner_tail": "inuous::test_label_like_string\nPASSED tests/_core/test_scales.py::TestContinuous::test_label_like_function\nPASSED tests/_core/test_scales.py::TestContinuous::test_label_base\nPASSED tests/_core/test_scales.py::TestContinuous::test_label_unit\nPASSED tests/_core/test_scales.py::TestContinuous::test_label_unit_with_sep\nPASSED tests/_core/test_scales.py::TestContinuous::test_label_empty_unit\nPASSED tests/_core/test_scales.py::TestContinuous::test_label_base_from_transform\nPASSED tests/_core/test_scales.py::TestContinuous::test_label_type_checks\nPASSED tests/_core/test_scales.py::TestNominal::test_coordinate_defaults\nPASSED tests/_core/test_scales.py::TestNominal::test_coordinate_with_order\nPASSED tests/_core/test_scales.py::TestNominal::test_coordinate_with_subset_order\nPASSED tests/_core/test_scales.py::TestNominal::test_coordinate_axis\nPASSED tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_order\nPASSED tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_subset_order\nPASSED tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_category_dtype\nPASSED tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data\nPASSED tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data_with_order\nPASSED tests/_core/test_scales.py::TestNominal::test_color_defaults\nPASSED tests/_core/test_scales.py::TestNominal::test_color_named_palette\nPASSED tests/_core/test_scales.py::TestNominal::test_color_list_palette\nPASSED tests/_core/test_scales.py::TestNominal::test_color_dict_palette\nPASSED tests/_core/test_scales.py::TestNominal::test_color_numeric_data\nPASSED tests/_core/test_scales.py::TestNominal::test_color_numeric_with_order_subset\nPASSED tests/_core/test_scales.py::TestNominal::test_color_alpha_in_palette\nPASSED tests/_core/test_scales.py::TestNominal::test_color_unknown_palette\nPASSED tests/_core/test_scales.py::TestNominal::test_object_defaults\nPASSED tests/_core/test_scales.py::TestNominal::test_object_list\nPASSED tests/_core/test_scales.py::TestNominal::test_object_dict\nPASSED tests/_core/test_scales.py::TestNominal::test_object_order\nPASSED tests/_core/test_scales.py::TestNominal::test_object_order_subset\nPASSED tests/_core/test_scales.py::TestNominal::test_objects_that_are_weird\nPASSED tests/_core/test_scales.py::TestNominal::test_alpha_default\nPASSED tests/_core/test_scales.py::TestNominal::test_fill\nPASSED tests/_core/test_scales.py::TestNominal::test_fill_dict\nPASSED tests/_core/test_scales.py::TestNominal::test_fill_nunique_warning\nPASSED tests/_core/test_scales.py::TestNominal::test_interval_defaults\nPASSED tests/_core/test_scales.py::TestNominal::test_interval_tuple\nPASSED tests/_core/test_scales.py::TestNominal::test_interval_tuple_numeric\nPASSED tests/_core/test_scales.py::TestNominal::test_interval_list\nPASSED tests/_core/test_scales.py::TestNominal::test_interval_dict\nPASSED tests/_core/test_scales.py::TestNominal::test_interval_with_transform\nPASSED tests/_core/test_scales.py::TestNominal::test_empty_data\nPASSED tests/_core/test_scales.py::TestTemporal::test_coordinate_defaults\nPASSED tests/_core/test_scales.py::TestTemporal::test_interval_defaults\nPASSED tests/_core/test_scales.py::TestTemporal::test_interval_with_range\nPASSED tests/_core/test_scales.py::TestTemporal::test_interval_with_norm\nPASSED tests/_core/test_scales.py::TestTemporal::test_color_defaults\nPASSED tests/_core/test_scales.py::TestTemporal::test_color_named_values\nPASSED tests/_core/test_scales.py::TestTemporal::test_coordinate_axis\nPASSED tests/_core/test_scales.py::TestTemporal::test_tick_locator\nPASSED tests/_core/test_scales.py::TestTemporal::test_tick_upto\nPASSED tests/_core/test_scales.py::TestTemporal::test_label_formatter\nPASSED tests/_core/test_scales.py::TestTemporal::test_label_concise\n==================================================================================== 85 passed, 2 warnings in 2.05s ====================================================================================\n",
+    "runner_error": null,
+    "runner_output_bytes": 8270,
+    "regression": false,
+    "elapsed_sec": 3.8,
+    "harbor_exception": null,
+    "transcript_binding_valid": true,
+    "reviewed_equals_submitted": null,
+    "image_digest": "sha256:5ce876a52439385a2638f21617febf25a333c24b0db555cb9e37230b4db2cdcc",
+    "simulator_validity": "unadjudicated"
+  },
+  "transcript": {
+    "trial_id": "24ce7fb7bef1fa33f394493f",
+    "events": [
+      {
+        "condition": "interactive",
+        "kind": "session",
+        "run_config_hash": "6fb358b27aa1ba6425b9613a72382e962facc669d7ccf678736a4297ceeb1d64",
+        "seq": 0,
+        "spec_hash": "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b",
+        "ts": 1789270743.4601865
+      }
+    ],
+    "patience_start": 6,
+    "patience_end": 6,
+    "frozen": true,
+    "transcript_hash": "8a01a7f39b7adc012b503ee60365e0a64b772a0fb853f03c07eef1064c07c632",
+    "created_at": 1789270743.4601817,
+    "frozen_at": 1789271047.6724238,
+    "service_failure": null,
+    "pending": null
+  },
+  "status": "completed",
+  "spec_hash": "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b",
+  "model": "anthropic/claude-haiku-4-5-20251001",
+  "purpose": "demonstration",
+  "compiled_hash": "750e014c977e71c35690029a96337399f29bde25a1ac14598699247580c55fd7",
+  "brief_profile": "withheld",
+  "started_at": "2026-09-13T03:39:02.789360+00:00",
+  "finished_at": "2026-09-13T03:44:29.897028+00:00"
+}

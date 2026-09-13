@@ -1,0 +1,16 @@
+{
+  "approved_at": "2026-09-13T03:08:50+00:00",
+  "approved_by": "auto-validators",
+  "gates": [
+    "schema",
+    "assets",
+    "judge-accept",
+    "on-request-fact-linked-to-f2p",
+    "withholding-leak",
+    "controls"
+  ],
+  "review_needed": true,
+  "scenario_id": "mwaskom--seaborn-3190",
+  "spec_hash": "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b",
+  "version": 1
+}

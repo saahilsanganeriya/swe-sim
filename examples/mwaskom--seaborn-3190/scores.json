@@ -1,0 +1,404 @@
+{
+  "full|natural|59dbc94dc181b0aa35c0cc1017b193f09db13e7ae2f0bfd5da76d45bf5922499": {
+    "attempts_total": 1,
+    "attempts_unresolved": 0,
+    "brief_profile": "natural",
+    "condition": "full",
+    "configured_k": 3,
+    "estimator": "without-replacement",
+    "inconsistent_reward": [],
+    "labels": {},
+    "mean_reward": 1.0,
+    "model": "anthropic/claude-haiku-4-5-20251001",
+    "n": 1,
+    "n_agent_failures": 0,
+    "n_infra_failures": 0,
+    "n_total": 1,
+    "n_valid": 1,
+    "outcomes": {
+      "valid-correct": 1
+    },
+    "pass_at_k": null,
+    "pass_pow_k": null,
+    "patience_end": [
+      null
+    ],
+    "purpose": "demonstration",
+    "questions_asked": [
+      0
+    ],
+    "requested_k": 3,
+    "reviewed_equals_submitted": [
+      null
+    ],
+    "reviews": [
+      0
+    ],
+    "reviews_requested": [
+      0
+    ],
+    "run_config_hash": "59dbc94dc181b0aa35c0cc1017b193f09db13e7ae2f0bfd5da76d45bf5922499",
+    "success_count": 1,
+    "trial_ids": [
+      "2ef141969ebfa9d1de615921"
+    ],
+    "unresolved": [],
+    "unresolved_by_status": {}
+  },
+  "hidden|natural|47bcebfa3d75dd5d81c44fa68db3c7def55b71782d4d59c24898265b0e0a8145": {
+    "attempts_total": 1,
+    "attempts_unresolved": 0,
+    "brief_profile": "natural",
+    "condition": "hidden",
+    "configured_k": 3,
+    "estimator": "without-replacement",
+    "inconsistent_reward": [],
+    "labels": {},
+    "mean_reward": 1.0,
+    "model": "anthropic/claude-haiku-4-5-20251001",
+    "n": 1,
+    "n_agent_failures": 0,
+    "n_infra_failures": 0,
+    "n_total": 1,
+    "n_valid": 1,
+    "outcomes": {
+      "valid-correct": 1
+    },
+    "pass_at_k": null,
+    "pass_pow_k": null,
+    "patience_end": [
+      null
+    ],
+    "purpose": "demonstration",
+    "questions_asked": [
+      0
+    ],
+    "requested_k": 3,
+    "reviewed_equals_submitted": [
+      null
+    ],
+    "reviews": [
+      0
+    ],
+    "reviews_requested": [
+      0
+    ],
+    "run_config_hash": "47bcebfa3d75dd5d81c44fa68db3c7def55b71782d4d59c24898265b0e0a8145",
+    "success_count": 1,
+    "trial_ids": [
+      "78874ff17a9dcd379ac1c9a8"
+    ],
+    "unresolved": [],
+    "unresolved_by_status": {}
+  },
+  "hidden|withheld|79f863cd2b494998a66d1c5ec44a2257f6d9a0442d9b8a7366c0adaaea0d2060": {
+    "attempts_total": 1,
+    "attempts_unresolved": 0,
+    "brief_profile": "withheld",
+    "condition": "hidden",
+    "configured_k": 3,
+    "estimator": "without-replacement",
+    "inconsistent_reward": [],
+    "labels": {},
+    "mean_reward": 0.0,
+    "model": "anthropic/claude-haiku-4-5-20251001",
+    "n": 1,
+    "n_agent_failures": 0,
+    "n_infra_failures": 0,
+    "n_total": 1,
+    "n_valid": 1,
+    "outcomes": {
+      "valid-incorrect": 1
+    },
+    "pass_at_k": null,
+    "pass_pow_k": null,
+    "patience_end": [
+      null
+    ],
+    "purpose": "demonstration",
+    "questions_asked": [
+      0
+    ],
+    "requested_k": 3,
+    "reviewed_equals_submitted": [
+      null
+    ],
+    "reviews": [
+      0
+    ],
+    "reviews_requested": [
+      0
+    ],
+    "run_config_hash": "79f863cd2b494998a66d1c5ec44a2257f6d9a0442d9b8a7366c0adaaea0d2060",
+    "success_count": 0,
+    "trial_ids": [
+      "3ea85d94b07e93301dfe1b8f"
+    ],
+    "unresolved": [],
+    "unresolved_by_status": {}
+  },
+  "interactive|withheld|53d303f4a39238e744a6f3f7373a583906addb0606987294fc3a75fcf07dbf8e": {
+    "attempts_total": 1,
+    "attempts_unresolved": 1,
+    "brief_profile": "withheld",
+    "condition": "interactive",
+    "configured_k": null,
+    "estimator": "without-replacement",
+    "inconsistent_reward": [],
+    "labels": {},
+    "mean_reward": null,
+    "model": null,
+    "n": 0,
+    "n_agent_failures": 0,
+    "n_infra_failures": 0,
+    "n_total": 0,
+    "n_valid": 0,
+    "outcomes": {},
+    "pass_at_k": null,
+    "pass_pow_k": null,
+    "patience_end": [],
+    "purpose": null,
+    "questions_asked": [],
+    "requested_k": 3,
+    "reviewed_equals_submitted": [],
+    "reviews": [],
+    "reviews_requested": [],
+    "run_config_hash": "53d303f4a39238e744a6f3f7373a583906addb0606987294fc3a75fcf07dbf8e",
+    "success_count": 0,
+    "trial_ids": [],
+    "unresolved": [
+      {
+        "error_type": null,
+        "finished_at": null,
+        "source_file": "status.json",
+        "started_at": "2026-09-13T03:45:23.681038+00:00",
+        "status": "running",
+        "trial_id": "e54052254969566b15d6cb1b"
+      }
+    ],
+    "unresolved_by_status": {
+      "running": 1
+    }
+  },
+  "interactive|withheld|6fb358b27aa1ba6425b9613a72382e962facc669d7ccf678736a4297ceeb1d64": {
+    "attempts_total": 4,
+    "attempts_unresolved": 2,
+    "brief_profile": "withheld",
+    "condition": "interactive",
+    "configured_k": 3,
+    "estimator": "without-replacement",
+    "inconsistent_reward": [],
+    "labels": {},
+    "mean_reward": 1.0,
+    "model": "anthropic/claude-haiku-4-5-20251001",
+    "n": 2,
+    "n_agent_failures": 0,
+    "n_infra_failures": 0,
+    "n_total": 2,
+    "n_valid": 2,
+    "outcomes": {
+      "valid-correct": 2
+    },
+    "pass_at_k": null,
+    "pass_pow_k": null,
+    "patience_end": [
+      6,
+      6
+    ],
+    "purpose": "demonstration",
+    "questions_asked": [
+      0,
+      0
+    ],
+    "requested_k": 3,
+    "reviewed_equals_submitted": [
+      null,
+      null
+    ],
+    "reviews": [
+      0,
+      0
+    ],
+    "reviews_requested": [
+      0,
+      0
+    ],
+    "run_config_hash": "6fb358b27aa1ba6425b9613a72382e962facc669d7ccf678736a4297ceeb1d64",
+    "success_count": 2,
+    "trial_ids": [
+      "24ce7fb7bef1fa33f394493f",
+      "6e22b0ad258bbf31737c9cea"
+    ],
+    "unresolved": [
+      {
+        "error_type": null,
+        "finished_at": null,
+        "source_file": "status.json",
+        "started_at": "2026-09-13T03:53:11.984968+00:00",
+        "status": "running",
+        "trial_id": "c39a73b6cfdffdc66581af1a"
+      },
+      {
+        "error_type": null,
+        "finished_at": null,
+        "source_file": "status.json",
+        "started_at": "2026-09-13T03:53:11.996206+00:00",
+        "status": "running",
+        "trial_id": "f88eb6db86d53d343eb54eb1"
+      }
+    ],
+    "unresolved_by_status": {
+      "running": 2
+    }
+  },
+  "interactive|withheld|e8450e172001333e49d9acbb749ae54e28f6c575ab8d85dd279dcdb590ef3a84": {
+    "attempts_total": 1,
+    "attempts_unresolved": 0,
+    "brief_profile": "withheld",
+    "condition": "interactive",
+    "configured_k": 3,
+    "estimator": "without-replacement",
+    "inconsistent_reward": [],
+    "labels": {},
+    "mean_reward": 1.0,
+    "model": "anthropic/claude-sonnet-5",
+    "n": 1,
+    "n_agent_failures": 0,
+    "n_infra_failures": 0,
+    "n_total": 1,
+    "n_valid": 1,
+    "outcomes": {
+      "valid-correct": 1
+    },
+    "pass_at_k": null,
+    "pass_pow_k": null,
+    "patience_end": [
+      6
+    ],
+    "purpose": "demonstration",
+    "questions_asked": [
+      0
+    ],
+    "requested_k": 3,
+    "reviewed_equals_submitted": [
+      null
+    ],
+    "reviews": [
+      0
+    ],
+    "reviews_requested": [
+      0
+    ],
+    "run_config_hash": "e8450e172001333e49d9acbb749ae54e28f6c575ab8d85dd279dcdb590ef3a84",
+    "success_count": 1,
+    "trial_ids": [
+      "ebdad6f745322a682430982d"
+    ],
+    "unresolved": [],
+    "unresolved_by_status": {}
+  },
+  "interactive|withheld|fa680c21d85b0da574d600ca91018fed588fbbd85c84520000da19f61cb04ebb": {
+    "attempts_total": 1,
+    "attempts_unresolved": 0,
+    "brief_profile": "withheld",
+    "condition": "interactive",
+    "configured_k": 3,
+    "estimator": "without-replacement",
+    "inconsistent_reward": [],
+    "labels": {},
+    "mean_reward": 1.0,
+    "model": "anthropic/claude-sonnet-5",
+    "n": 1,
+    "n_agent_failures": 0,
+    "n_infra_failures": 0,
+    "n_total": 1,
+    "n_valid": 1,
+    "outcomes": {
+      "valid-correct": 1
+    },
+    "pass_at_k": null,
+    "pass_pow_k": null,
+    "patience_end": [
+      1
+    ],
+    "purpose": "demonstration",
+    "questions_asked": [
+      1
+    ],
+    "requested_k": 3,
+    "reviewed_equals_submitted": [
+      null
+    ],
+    "reviews": [
+      2
+    ],
+    "reviews_requested": [
+      2
+    ],
+    "run_config_hash": "fa680c21d85b0da574d600ca91018fed588fbbd85c84520000da19f61cb04ebb",
+    "success_count": 1,
+    "trial_ids": [
+      "e49349d80b190bf73f14a66f"
+    ],
+    "unresolved": [],
+    "unresolved_by_status": {}
+  },
+  "interactive|withheld|fd6eb08f2787952c5c0d8f96df7f379d89fe0edd78d88bb15eb39f858fdc27af": {
+    "attempts_total": 3,
+    "attempts_unresolved": 0,
+    "brief_profile": "withheld",
+    "condition": "interactive",
+    "configured_k": 3,
+    "estimator": "without-replacement",
+    "inconsistent_reward": [],
+    "labels": {},
+    "mean_reward": 1.0,
+    "model": "anthropic/claude-haiku-4-5-20251001",
+    "n": 3,
+    "n_agent_failures": 0,
+    "n_infra_failures": 0,
+    "n_total": 3,
+    "n_valid": 3,
+    "outcomes": {
+      "valid-correct": 3
+    },
+    "pass_at_k": 1.0,
+    "pass_pow_k": 1.0,
+    "patience_end": [
+      6,
+      6,
+      6
+    ],
+    "purpose": "demonstration",
+    "questions_asked": [
+      0,
+      0,
+      0
+    ],
+    "requested_k": 3,
+    "reviewed_equals_submitted": [
+      null,
+      null,
+      null
+    ],
+    "reviews": [
+      0,
+      0,
+      0
+    ],
+    "reviews_requested": [
+      0,
+      0,
+      0
+    ],
+    "run_config_hash": "fd6eb08f2787952c5c0d8f96df7f379d89fe0edd78d88bb15eb39f858fdc27af",
+    "success_count": 3,
+    "trial_ids": [
+      "8a2f1f59590121137e879dc0",
+      "51d1c5ea09dc49e8234cafc4",
+      "78cb5149f1db50ccc79f9448"
+    ],
+    "unresolved": [],
+    "unresolved_by_status": {}
+  }
+}

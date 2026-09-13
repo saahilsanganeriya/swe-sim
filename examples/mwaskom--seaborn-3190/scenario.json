@@ -1,0 +1,486 @@
+{
+  "assets": {
+    "oracle.diff": {
+      "bytes": 476,
+      "path": "assets/oracle.diff",
+      "sha256": "e014761e43e1a1d3eb8879a4ac67aadc810db3aab87701a8f499ba7c4571fe77"
+    },
+    "plausible-wrong.diff": {
+      "bytes": 678,
+      "path": "assets/plausible-wrong.diff",
+      "sha256": "6a0564f5b8eb99c67781246aa1aed1765890e6e61ab33b1671cf2cf3b6615d14"
+    },
+    "tamper-root-conftest.diff": {
+      "bytes": 220,
+      "path": "assets/tamper-root-conftest.diff",
+      "sha256": "09489b6aa26cf1fe775da218b236a172dd9404af79ee2d159edaa56e5aa1d219"
+    },
+    "tamper-sitecustomize.diff": {
+      "bytes": 164,
+      "path": "assets/tamper-sitecustomize.diff",
+      "sha256": "16095af578db53700585e0eb8a6d4cc36154e8a23802306532716542ad83ac56"
+    },
+    "tamper-skip-marker.diff": {
+      "bytes": 415,
+      "path": "assets/tamper-skip-marker.diff",
+      "sha256": "70e09390a49a3ae0181a0ef5c0165f2e2925a821fd771238d23eb70913942297"
+    },
+    "test.patch": {
+      "bytes": 622,
+      "path": "assets/test.patch",
+      "sha256": "01e17193a78a28dd4f466984444568127713dc21a3f1fc6a75a30ddec5aacefe"
+    }
+  },
+  "briefs": [
+    {
+      "profile": "natural",
+      "provenance": "original-issue",
+      "text": "Color mapping fails with boolean data\n```python\r\nso.Plot([\"a\", \"b\"], [1, 2], color=[True, False]).add(so.Bar())\r\n```\r\n```python-traceback\r\n---------------------------------------------------------------------------\r\nTypeError                                 Traceback (most recent call last)\r\n...\r\nFile ~/code/seaborn/seaborn/_core/plot.py:841, in Plot._plot(self, pyplot)\r\n    838 plotter._compute_stats(self, layers)\r\n    840 # Process scale spec for semantic variables and coordinates computed by stat\r\n--> 841 plotter._setup_scales(self, common, layers)\r\n    843 # TODO Remove these after updating other methods\r\n    844 # ---- Maybe have debug= param that attaches these when True?\r\n    845 plotter._data = common\r\n\r\nFile ~/code/seaborn/seaborn/_core/plot.py:1252, in Plotter._setup_scales(self, p, common, layers, variables)\r\n   1250     self._scales[var] = Scale._identity()\r\n   1251 else:\r\n-> 1252     self._scales[var] = scale._setup(var_df[var], prop)\r\n   1254 # Everything below here applies only to coordinate variables\r\n   1255 # We additionally skip it when we're working with a value\r\n   1256 # that is derived from a coordinate we've already processed.\r\n   1257 # e.g., the Stat consumed y and added ymin/ymax. In that case,\r\n   1258 # we've already setup the y scale and ymin/max are in scale space.\r\n   1259 if axis is None or (var != coord and coord in p._variables):\r\n\r\nFile ~/code/seaborn/seaborn/_core/scales.py:351, in ContinuousBase._setup(self, data, prop, axis)\r\n    349 vmin, vmax = axis.convert_units((vmin, vmax))\r\n    350 a = forward(vmin)\r\n--> 351 b = forward(vmax) - forward(vmin)\r\n    353 def normalize(x):\r\n    354     return (x - a) / b\r\n\r\nTypeError: numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the `^` operator, or the logical_xor function instead.\r\n```\n"
+    },
+    {
+      "profile": "withheld",
+      "provenance": "withheld",
+      "text": "Color mapping fails with boolean data\n```python\r\n```\r\n```python-traceback\r\n---------------------------------------------------------------------------\r\nTypeError                                 Traceback (most recent call last)\r\n...\r\nFile ~/code/seaborn/seaborn/_core/plot.py:841, in Plot._plot(self, pyplot)\r\n    838 plotter._compute_stats(self, layers)\r\n    840 # Process scale spec for semantic variables and coordinates computed by stat\r\n--> 841 plotter._setup_scales(self, common, layers)\r\n    843 # TODO Remove these after updating other methods\r\n    844 # ---- Maybe have debug= param that attaches these when True?\r\n    845 plotter._data = common\r\n\r\nFile ~/code/seaborn/seaborn/_core/plot.py:1252, in Plotter._setup_scales(self, p, common, layers, variables)\r\n   1250     self._scales[var] = Scale._identity()\r\n   1251 else:\r\n-> 1252     self._scales[var] = scale._setup(var_df[var], prop)\r\n   1254 # Everything below here applies only to coordinate variables\r\n   1255 # We additionally skip it when we're working with a value\r\n   1256 # that is derived from a coordinate we've already processed.\r\n   1257 # e.g., the Stat consumed y and added ymin/ymax. In that case,\r\n   1258 # we've already setup the y scale and ymin/max are in scale space.\r\n   1259 if axis is None or (var != coord and coord in p._variables):\r\n\r\nFile ~/code/seaborn/seaborn/_core/scales.py:351, in ContinuousBase._setup(self, data, prop, axis)\r\n    349 vmin, vmax = axis.convert_units((vmin, vmax))\r\n    350 a = forward(vmin)\r\n--> 351 b = forward(vmax) - forward(vmin)\r\n    353 def normalize(x):\r\n    354     return (x - a) / b\r\n\r\nTypeError: numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the `^` operator, or the logical_xor function instead.\r\n```\n"
+    }
+  ],
+  "checks": [
+    {
+      "asset": null,
+      "command": "python -c \"import seaborn.objects as so; so.Plot(['a','b'], [1,2], color=[True, False]).add(so.Bar()).plot()\"",
+      "description": "Reproduce the original issue with a Plot using boolean color data and confirm no TypeError is raised.",
+      "expected_observation": "No TypeError is raised; the plot is constructed successfully.",
+      "id": "c01"
+    },
+    {
+      "asset": null,
+      "command": "python -c \"import pandas as pd; from seaborn._core.scales import Continuous; from seaborn._core.properties import IntervalProperty; x = pd.Series([True, False, False]); s = Continuous()._setup(x, IntervalProperty()); print(list(s(x)))\"",
+      "description": "Directly test Continuous._setup with boolean pandas Series data and IntervalProperty.",
+      "expected_observation": "Prints [1.0, 0.0, 0.0] (or equivalent numeric values) without raising an exception.",
+      "id": "c02"
+    }
+  ],
+  "contract": {
+    "expected_base": {},
+    "expected_gold": {},
+    "fail_to_pass": [
+      "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+    ],
+    "pass_to_pass": [
+      "tests/_core/test_scales.py::TestContinuous::test_coordinate_defaults",
+      "tests/_core/test_scales.py::TestContinuous::test_coordinate_transform",
+      "tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_with_parameter",
+      "tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_error",
+      "tests/_core/test_scales.py::TestContinuous::test_interval_defaults",
+      "tests/_core/test_scales.py::TestContinuous::test_interval_with_range",
+      "tests/_core/test_scales.py::TestContinuous::test_interval_with_norm",
+      "tests/_core/test_scales.py::TestContinuous::test_interval_with_range_norm_and_transform",
+      "tests/_core/test_scales.py::TestContinuous::test_color_defaults",
+      "tests/_core/test_scales.py::TestContinuous::test_color_named_values",
+      "tests/_core/test_scales.py::TestContinuous::test_color_tuple_values",
+      "tests/_core/test_scales.py::TestContinuous::test_color_callable_values",
+      "tests/_core/test_scales.py::TestContinuous::test_color_with_norm",
+      "tests/_core/test_scales.py::TestContinuous::test_color_with_transform",
+      "tests/_core/test_scales.py::TestContinuous::test_tick_locator",
+      "tests/_core/test_scales.py::TestContinuous::test_tick_locator_input_check",
+      "tests/_core/test_scales.py::TestContinuous::test_tick_upto",
+      "tests/_core/test_scales.py::TestContinuous::test_tick_every",
+      "tests/_core/test_scales.py::TestContinuous::test_tick_every_between",
+      "tests/_core/test_scales.py::TestContinuous::test_tick_at",
+      "tests/_core/test_scales.py::TestContinuous::test_tick_count",
+      "tests/_core/test_scales.py::TestContinuous::test_tick_count_between",
+      "tests/_core/test_scales.py::TestContinuous::test_tick_minor",
+      "tests/_core/test_scales.py::TestContinuous::test_log_tick_default",
+      "tests/_core/test_scales.py::TestContinuous::test_log_tick_upto",
+      "tests/_core/test_scales.py::TestContinuous::test_log_tick_count",
+      "tests/_core/test_scales.py::TestContinuous::test_log_tick_format_disabled",
+      "tests/_core/test_scales.py::TestContinuous::test_log_tick_every",
+      "tests/_core/test_scales.py::TestContinuous::test_symlog_tick_default",
+      "tests/_core/test_scales.py::TestContinuous::test_label_formatter",
+      "tests/_core/test_scales.py::TestContinuous::test_label_like_pattern",
+      "tests/_core/test_scales.py::TestContinuous::test_label_like_string",
+      "tests/_core/test_scales.py::TestContinuous::test_label_like_function",
+      "tests/_core/test_scales.py::TestContinuous::test_label_base",
+      "tests/_core/test_scales.py::TestContinuous::test_label_unit",
+      "tests/_core/test_scales.py::TestContinuous::test_label_unit_with_sep",
+      "tests/_core/test_scales.py::TestContinuous::test_label_empty_unit",
+      "tests/_core/test_scales.py::TestContinuous::test_label_base_from_transform",
+      "tests/_core/test_scales.py::TestContinuous::test_label_type_checks",
+      "tests/_core/test_scales.py::TestNominal::test_coordinate_defaults",
+      "tests/_core/test_scales.py::TestNominal::test_coordinate_with_order",
+      "tests/_core/test_scales.py::TestNominal::test_coordinate_with_subset_order",
+      "tests/_core/test_scales.py::TestNominal::test_coordinate_axis",
+      "tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_order",
+      "tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_subset_order",
+      "tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_category_dtype",
+      "tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data",
+      "tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data_with_order",
+      "tests/_core/test_scales.py::TestNominal::test_color_defaults",
+      "tests/_core/test_scales.py::TestNominal::test_color_named_palette",
+      "tests/_core/test_scales.py::TestNominal::test_color_list_palette",
+      "tests/_core/test_scales.py::TestNominal::test_color_dict_palette",
+      "tests/_core/test_scales.py::TestNominal::test_color_numeric_data",
+      "tests/_core/test_scales.py::TestNominal::test_color_numeric_with_order_subset",
+      "tests/_core/test_scales.py::TestNominal::test_color_alpha_in_palette",
+      "tests/_core/test_scales.py::TestNominal::test_color_unknown_palette",
+      "tests/_core/test_scales.py::TestNominal::test_object_defaults",
+      "tests/_core/test_scales.py::TestNominal::test_object_list",
+      "tests/_core/test_scales.py::TestNominal::test_object_dict",
+      "tests/_core/test_scales.py::TestNominal::test_object_order",
+      "tests/_core/test_scales.py::TestNominal::test_object_order_subset",
+      "tests/_core/test_scales.py::TestNominal::test_objects_that_are_weird",
+      "tests/_core/test_scales.py::TestNominal::test_alpha_default",
+      "tests/_core/test_scales.py::TestNominal::test_fill",
+      "tests/_core/test_scales.py::TestNominal::test_fill_dict",
+      "tests/_core/test_scales.py::TestNominal::test_fill_nunique_warning",
+      "tests/_core/test_scales.py::TestNominal::test_interval_defaults",
+      "tests/_core/test_scales.py::TestNominal::test_interval_tuple",
+      "tests/_core/test_scales.py::TestNominal::test_interval_tuple_numeric",
+      "tests/_core/test_scales.py::TestNominal::test_interval_list",
+      "tests/_core/test_scales.py::TestNominal::test_interval_dict",
+      "tests/_core/test_scales.py::TestNominal::test_interval_with_transform",
+      "tests/_core/test_scales.py::TestNominal::test_empty_data",
+      "tests/_core/test_scales.py::TestTemporal::test_coordinate_defaults",
+      "tests/_core/test_scales.py::TestTemporal::test_interval_defaults",
+      "tests/_core/test_scales.py::TestTemporal::test_interval_with_range",
+      "tests/_core/test_scales.py::TestTemporal::test_interval_with_norm",
+      "tests/_core/test_scales.py::TestTemporal::test_color_defaults",
+      "tests/_core/test_scales.py::TestTemporal::test_color_named_values",
+      "tests/_core/test_scales.py::TestTemporal::test_coordinate_axis",
+      "tests/_core/test_scales.py::TestTemporal::test_tick_locator",
+      "tests/_core/test_scales.py::TestTemporal::test_tick_upto",
+      "tests/_core/test_scales.py::TestTemporal::test_label_formatter",
+      "tests/_core/test_scales.py::TestTemporal::test_label_concise"
+    ],
+    "protected_paths": [
+      "tests/_core/test_scales.py"
+    ],
+    "runner": {
+      "command": "/opt/miniconda3/envs/testbed/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} tests/_core/test_scales.py::TestContinuous::test_coordinate_defaults tests/_core/test_scales.py::TestContinuous::test_coordinate_transform tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_with_parameter tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_error tests/_core/test_scales.py::TestContinuous::test_interval_defaults tests/_core/test_scales.py::TestContinuous::test_interval_with_range tests/_core/test_scales.py::TestContinuous::test_interval_with_norm tests/_core/test_scales.py::TestContinuous::test_interval_with_range_norm_and_transform tests/_core/test_scales.py::TestContinuous::test_interval_with_bools tests/_core/test_scales.py::TestContinuous::test_color_defaults tests/_core/test_scales.py::TestContinuous::test_color_named_values tests/_core/test_scales.py::TestContinuous::test_color_tuple_values tests/_core/test_scales.py::TestContinuous::test_color_callable_values tests/_core/test_scales.py::TestContinuous::test_color_with_norm tests/_core/test_scales.py::TestContinuous::test_color_with_transform tests/_core/test_scales.py::TestContinuous::test_tick_locator tests/_core/test_scales.py::TestContinuous::test_tick_locator_input_check tests/_core/test_scales.py::TestContinuous::test_tick_upto tests/_core/test_scales.py::TestContinuous::test_tick_every tests/_core/test_scales.py::TestContinuous::test_tick_every_between tests/_core/test_scales.py::TestContinuous::test_tick_at tests/_core/test_scales.py::TestContinuous::test_tick_count tests/_core/test_scales.py::TestContinuous::test_tick_count_between tests/_core/test_scales.py::TestContinuous::test_tick_minor tests/_core/test_scales.py::TestContinuous::test_log_tick_default tests/_core/test_scales.py::TestContinuous::test_log_tick_upto tests/_core/test_scales.py::TestContinuous::test_log_tick_count tests/_core/test_scales.py::TestContinuous::test_log_tick_format_disabled tests/_core/test_scales.py::TestContinuous::test_log_tick_every tests/_core/test_scales.py::TestContinuous::test_symlog_tick_default tests/_core/test_scales.py::TestContinuous::test_label_formatter tests/_core/test_scales.py::TestContinuous::test_label_like_pattern tests/_core/test_scales.py::TestContinuous::test_label_like_string tests/_core/test_scales.py::TestContinuous::test_label_like_function tests/_core/test_scales.py::TestContinuous::test_label_base tests/_core/test_scales.py::TestContinuous::test_label_unit tests/_core/test_scales.py::TestContinuous::test_label_unit_with_sep tests/_core/test_scales.py::TestContinuous::test_label_empty_unit tests/_core/test_scales.py::TestContinuous::test_label_base_from_transform tests/_core/test_scales.py::TestContinuous::test_label_type_checks tests/_core/test_scales.py::TestNominal::test_coordinate_defaults tests/_core/test_scales.py::TestNominal::test_coordinate_with_order tests/_core/test_scales.py::TestNominal::test_coordinate_with_subset_order tests/_core/test_scales.py::TestNominal::test_coordinate_axis tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_order tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_subset_order tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_category_dtype tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data_with_order tests/_core/test_scales.py::TestNominal::test_color_defaults tests/_core/test_scales.py::TestNominal::test_color_named_palette tests/_core/test_scales.py::TestNominal::test_color_list_palette tests/_core/test_scales.py::TestNominal::test_color_dict_palette tests/_core/test_scales.py::TestNominal::test_color_numeric_data tests/_core/test_scales.py::TestNominal::test_color_numeric_with_order_subset tests/_core/test_scales.py::TestNominal::test_color_alpha_in_palette tests/_core/test_scales.py::TestNominal::test_color_unknown_palette tests/_core/test_scales.py::TestNominal::test_object_defaults tests/_core/test_scales.py::TestNominal::test_object_list tests/_core/test_scales.py::TestNominal::test_object_dict tests/_core/test_scales.py::TestNominal::test_object_order tests/_core/test_scales.py::TestNominal::test_object_order_subset tests/_core/test_scales.py::TestNominal::test_objects_that_are_weird tests/_core/test_scales.py::TestNominal::test_alpha_default tests/_core/test_scales.py::TestNominal::test_fill tests/_core/test_scales.py::TestNominal::test_fill_dict tests/_core/test_scales.py::TestNominal::test_fill_nunique_warning tests/_core/test_scales.py::TestNominal::test_interval_defaults tests/_core/test_scales.py::TestNominal::test_interval_tuple tests/_core/test_scales.py::TestNominal::test_interval_tuple_numeric tests/_core/test_scales.py::TestNominal::test_interval_list tests/_core/test_scales.py::TestNominal::test_interval_dict tests/_core/test_scales.py::TestNominal::test_interval_with_transform tests/_core/test_scales.py::TestNominal::test_empty_data tests/_core/test_scales.py::TestTemporal::test_coordinate_defaults tests/_core/test_scales.py::TestTemporal::test_interval_defaults tests/_core/test_scales.py::TestTemporal::test_interval_with_range tests/_core/test_scales.py::TestTemporal::test_interval_with_norm tests/_core/test_scales.py::TestTemporal::test_color_defaults tests/_core/test_scales.py::TestTemporal::test_color_named_values tests/_core/test_scales.py::TestTemporal::test_coordinate_axis tests/_core/test_scales.py::TestTemporal::test_tick_locator tests/_core/test_scales.py::TestTemporal::test_tick_upto tests/_core/test_scales.py::TestTemporal::test_label_formatter tests/_core/test_scales.py::TestTemporal::test_label_concise",
+      "kind": "pytest-ra",
+      "nodeid_map": {},
+      "single_command": "/opt/miniconda3/envs/testbed/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} {nodeid}",
+      "test_files": [
+        "tests/_core/test_scales.py"
+      ]
+    },
+    "test_assets": [
+      "test.patch"
+    ]
+  },
+  "controls": {
+    "alternative_correct": [],
+    "oracle": "oracle.diff",
+    "plausible_wrong": [
+      {
+        "asset": "plausible-wrong.diff",
+        "cls": "plausible-wrong",
+        "expected_reward": null,
+        "expected_reward_max": 0.5,
+        "expected_signals": [],
+        "expected_success": 0,
+        "name": "xor-based-boolean-handling",
+        "rationale": "A tempting but incomplete fix is to special-case boolean dtype using logical_xor as the issue commenter suggested, instead of coercing to float, which doesn't generalize and may still fail downstream normalization math (e.g. division of bool by bool)."
+      }
+    ],
+    "tamper": [
+      {
+        "asset": "tamper-root-conftest.diff",
+        "cls": "incorrect-exploit",
+        "expected_reward": 0.0,
+        "expected_reward_max": null,
+        "expected_signals": [],
+        "expected_success": null,
+        "name": "tamper-root-conftest",
+        "rationale": "code-generated exploit"
+      },
+      {
+        "asset": "tamper-sitecustomize.diff",
+        "cls": "incorrect-exploit",
+        "expected_reward": 0.0,
+        "expected_reward_max": null,
+        "expected_signals": [],
+        "expected_success": null,
+        "name": "tamper-sitecustomize",
+        "rationale": "code-generated exploit"
+      },
+      {
+        "asset": "tamper-skip-marker.diff",
+        "cls": "incorrect-exploit",
+        "expected_reward": 0.0,
+        "expected_reward_max": null,
+        "expected_signals": [],
+        "expected_success": null,
+        "name": "tamper-skip-marker",
+        "rationale": "code-generated exploit"
+      }
+    ]
+  },
+  "created_at": "2026-09-13T03:08:49.044313Z",
+  "difficulty": {
+    "annotated": "<15 min fix",
+    "judged": {
+      "alternatives_accepted": true,
+      "candidate_gaps": [],
+      "complexity": 1,
+      "gaps": [
+        {
+          "category": "behavior",
+          "consequential": true,
+          "derivable_from_repo": false,
+          "evidence": "assert_array_equal(s(x), [1, 0, 0])",
+          "evidence_grounded": true,
+          "id": "g1",
+          "question": "When boolean data are passed through a continuous interval scale, should they be coerced to numeric 0/1 values, and what exact output should True and False produce?",
+          "resolution_excerpt": "This result isn't ideal, we'd like to propagate the boolean-ness of the data through to the visualization, but this is consistent with other numpy / matplotlib behavior where boolean data are upcast to 0/1 floats in numeric contexts.",
+          "resolved_by": "thread",
+          "source": "test-literal",
+          "text": "The fix should treat boolean values in a continuous/numeric normalization context as numeric 0/1 values, with False mapping to 0 and True mapping to 1, rather than using logical xor or a categorical/nominal mapping."
+        },
+        {
+          "category": "context",
+          "consequential": true,
+          "derivable_from_repo": true,
+          "evidence": "s = Continuous()._setup(x, IntervalProperty())",
+          "evidence_grounded": true,
+          "id": "g2",
+          "question": "Should the fix be implemented and validated specifically in Continuous._setup for IntervalProperty, or only at the higher-level Plot color-mapping API shown in the issue?",
+          "resolution_excerpt": "s = Continuous()._setup(x, IntervalProperty())",
+          "resolved_by": "tests",
+          "source": "test-literal",
+          "text": "The regression is covered at the lower-level Continuous scale with an IntervalProperty, not by rendering the originally reported Plot with a color semantic."
+        },
+        {
+          "category": "behavior",
+          "consequential": true,
+          "derivable_from_repo": false,
+          "evidence": "vmin, vmax = map(float, axis.convert_units((vmin, vmax)))",
+          "evidence_grounded": true,
+          "id": "g3",
+          "question": "Should the normalization bounds be explicitly converted to floats before subtraction, or should boolean bounds be handled with a separate boolean-specific operation such as xor?",
+          "resolution_excerpt": "This result isn't ideal, we'd like to propagate the boolean-ness of the data through to the visualization, but this is consistent with other numpy / matplotlib behavior where boolean data are upcast to 0/1 floats in numeric contexts.",
+          "resolved_by": "thread",
+          "source": "proposed",
+          "text": "The implementation resolves the TypeError by coercing the converted normalization endpoints to Python floats before applying the scale transform and subtracting, rather than special-casing boolean subtraction or using xor."
+        },
+        {
+          "category": "reproduction",
+          "consequential": false,
+          "derivable_from_repo": true,
+          "evidence": "x = pd.Series([True, False, False])",
+          "evidence_grounded": true,
+          "id": "g4",
+          "question": "What specific boolean input shape/container and ordering should be supported by the continuous interval scale regression?",
+          "resolution_excerpt": "x = pd.Series([True, False, False])",
+          "resolved_by": "tests",
+          "source": "test-literal",
+          "text": "The added regression uses a pandas Series containing both True and False with duplicate False values, and expects the mapping to preserve input order elementwise."
+        }
+      ],
+      "gaps_dropped": 0,
+      "gaps_extracted": 0,
+      "gaps_proposed": 1,
+      "keep": true,
+      "model_id": "openai/gpt-5.5",
+      "prompt_version": "judge-v3",
+      "rationale": "The issue clearly reports a concrete TypeError from boolean color data and includes the traceback pointing to normalization subtraction, so the main task is well localized. The main underspecified point is the desired semantic treatment of booleans: xor, nominal scale, or numeric 0/1 coercion could all be imagined from the issue alone, though the PR discussion settles that choice. The tests are behavioral in that they assert the resulting scale output for boolean inputs, but they exercise a lower-level Continuous/Interval path rather than the exact Plot color example.",
+      "resolution_downgraded": 0,
+      "self_contained": true,
+      "structural_tests": false,
+      "test_behavioralness": 4,
+      "verified_rubric_score": 1
+    },
+    "measured": null
+  },
+  "environment": {
+    "base_commit": "4a9e54962a29c12a8b103d75f838e0e795a6974d",
+    "build_context_assets": [],
+    "dockerfile_asset": null,
+    "gold_commit": "72710354ecc8470683e15f452ba0af841464e84a",
+    "image": "swebench/sweb.eval.x86_64.mwaskom_1776_seaborn-3190:latest",
+    "image_digest": null,
+    "install_notes": "",
+    "kind": "prebuilt-image",
+    "language": "python",
+    "repo_dir": "/testbed",
+    "repo_url": "https://github.com/mwaskom/seaborn",
+    "test_command": "/opt/miniconda3/envs/testbed/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} tests/_core/test_scales.py::TestContinuous::test_coordinate_defaults tests/_core/test_scales.py::TestContinuous::test_coordinate_transform tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_with_parameter tests/_core/test_scales.py::TestContinuous::test_coordinate_transform_error tests/_core/test_scales.py::TestContinuous::test_interval_defaults tests/_core/test_scales.py::TestContinuous::test_interval_with_range tests/_core/test_scales.py::TestContinuous::test_interval_with_norm tests/_core/test_scales.py::TestContinuous::test_interval_with_range_norm_and_transform tests/_core/test_scales.py::TestContinuous::test_interval_with_bools tests/_core/test_scales.py::TestContinuous::test_color_defaults tests/_core/test_scales.py::TestContinuous::test_color_named_values tests/_core/test_scales.py::TestContinuous::test_color_tuple_values tests/_core/test_scales.py::TestContinuous::test_color_callable_values tests/_core/test_scales.py::TestContinuous::test_color_with_norm tests/_core/test_scales.py::TestContinuous::test_color_with_transform tests/_core/test_scales.py::TestContinuous::test_tick_locator tests/_core/test_scales.py::TestContinuous::test_tick_locator_input_check tests/_core/test_scales.py::TestContinuous::test_tick_upto tests/_core/test_scales.py::TestContinuous::test_tick_every tests/_core/test_scales.py::TestContinuous::test_tick_every_between tests/_core/test_scales.py::TestContinuous::test_tick_at tests/_core/test_scales.py::TestContinuous::test_tick_count tests/_core/test_scales.py::TestContinuous::test_tick_count_between tests/_core/test_scales.py::TestContinuous::test_tick_minor tests/_core/test_scales.py::TestContinuous::test_log_tick_default tests/_core/test_scales.py::TestContinuous::test_log_tick_upto tests/_core/test_scales.py::TestContinuous::test_log_tick_count tests/_core/test_scales.py::TestContinuous::test_log_tick_format_disabled tests/_core/test_scales.py::TestContinuous::test_log_tick_every tests/_core/test_scales.py::TestContinuous::test_symlog_tick_default tests/_core/test_scales.py::TestContinuous::test_label_formatter tests/_core/test_scales.py::TestContinuous::test_label_like_pattern tests/_core/test_scales.py::TestContinuous::test_label_like_string tests/_core/test_scales.py::TestContinuous::test_label_like_function tests/_core/test_scales.py::TestContinuous::test_label_base tests/_core/test_scales.py::TestContinuous::test_label_unit tests/_core/test_scales.py::TestContinuous::test_label_unit_with_sep tests/_core/test_scales.py::TestContinuous::test_label_empty_unit tests/_core/test_scales.py::TestContinuous::test_label_base_from_transform tests/_core/test_scales.py::TestContinuous::test_label_type_checks tests/_core/test_scales.py::TestNominal::test_coordinate_defaults tests/_core/test_scales.py::TestNominal::test_coordinate_with_order tests/_core/test_scales.py::TestNominal::test_coordinate_with_subset_order tests/_core/test_scales.py::TestNominal::test_coordinate_axis tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_order tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_subset_order tests/_core/test_scales.py::TestNominal::test_coordinate_axis_with_category_dtype tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data tests/_core/test_scales.py::TestNominal::test_coordinate_numeric_data_with_order tests/_core/test_scales.py::TestNominal::test_color_defaults tests/_core/test_scales.py::TestNominal::test_color_named_palette tests/_core/test_scales.py::TestNominal::test_color_list_palette tests/_core/test_scales.py::TestNominal::test_color_dict_palette tests/_core/test_scales.py::TestNominal::test_color_numeric_data tests/_core/test_scales.py::TestNominal::test_color_numeric_with_order_subset tests/_core/test_scales.py::TestNominal::test_color_alpha_in_palette tests/_core/test_scales.py::TestNominal::test_color_unknown_palette tests/_core/test_scales.py::TestNominal::test_object_defaults tests/_core/test_scales.py::TestNominal::test_object_list tests/_core/test_scales.py::TestNominal::test_object_dict tests/_core/test_scales.py::TestNominal::test_object_order tests/_core/test_scales.py::TestNominal::test_object_order_subset tests/_core/test_scales.py::TestNominal::test_objects_that_are_weird tests/_core/test_scales.py::TestNominal::test_alpha_default tests/_core/test_scales.py::TestNominal::test_fill tests/_core/test_scales.py::TestNominal::test_fill_dict tests/_core/test_scales.py::TestNominal::test_fill_nunique_warning tests/_core/test_scales.py::TestNominal::test_interval_defaults tests/_core/test_scales.py::TestNominal::test_interval_tuple tests/_core/test_scales.py::TestNominal::test_interval_tuple_numeric tests/_core/test_scales.py::TestNominal::test_interval_list tests/_core/test_scales.py::TestNominal::test_interval_dict tests/_core/test_scales.py::TestNominal::test_interval_with_transform tests/_core/test_scales.py::TestNominal::test_empty_data tests/_core/test_scales.py::TestTemporal::test_coordinate_defaults tests/_core/test_scales.py::TestTemporal::test_interval_defaults tests/_core/test_scales.py::TestTemporal::test_interval_with_range tests/_core/test_scales.py::TestTemporal::test_interval_with_norm tests/_core/test_scales.py::TestTemporal::test_color_defaults tests/_core/test_scales.py::TestTemporal::test_color_named_values tests/_core/test_scales.py::TestTemporal::test_coordinate_axis tests/_core/test_scales.py::TestTemporal::test_tick_locator tests/_core/test_scales.py::TestTemporal::test_tick_upto tests/_core/test_scales.py::TestTemporal::test_label_formatter tests/_core/test_scales.py::TestTemporal::test_label_concise"
+  },
+  "groups": [
+    {
+      "id": "g01",
+      "tests": [
+        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+      ],
+      "weight": 1.0
+    }
+  ],
+  "id": "mwaskom--seaborn-3190",
+  "ledger": [
+    {
+      "authored_rationale": null,
+      "discovery": "brief",
+      "id": "f01",
+      "kind": "behavior",
+      "provenance": "original-issue",
+      "source_excerpt": "TypeError: numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the `^` operator, or the logical_xor function instead.",
+      "source_url": "https://github.com/mwaskom/seaborn/issues/3106",
+      "tests": [],
+      "text": "Passing boolean color data to so.Plot raises a TypeError from numpy boolean subtract when computing forward(vmax) - forward(vmin) in ContinuousBase._setup."
+    },
+    {
+      "authored_rationale": null,
+      "discovery": "brief",
+      "id": "f02",
+      "kind": "context",
+      "provenance": "issue-thread",
+      "source_excerpt": "Would this simply mean refactoring the code to use `^` or `xor` functions instead?",
+      "source_url": "https://github.com/mwaskom/seaborn/issues/3106#issuecomment-1303169229",
+      "tests": [],
+      "text": "A commenter suggested refactoring to use xor operators as a possible fix approach."
+    },
+    {
+      "authored_rationale": null,
+      "discovery": "on-request",
+      "id": "f03",
+      "kind": "behavior",
+      "provenance": "pr-thread",
+      "source_excerpt": "This result isn't ideal, we'd like to propagate the boolean-ness of the data through to the visualization, but this is consistent with other numpy / matplotlib behavior where boolean data are upcast to 0/1 floats in numeric contexts.",
+      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "tests": [
+        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+      ],
+      "text": "The maintainer decided that boolean data passed through a continuous scale should be upcast to 0/1 floats consistent with numpy/matplotlib numeric behavior, rather than given a separate boolean treatment, even though ideally boolean-ness would be preserved."
+    },
+    {
+      "authored_rationale": null,
+      "discovery": "on-request",
+      "id": "f04",
+      "kind": "constraint",
+      "provenance": "pr-thread",
+      "source_excerpt": "So boolean data should still get a non-continuous scale by default but contra #3135 I think there should be a separate `Boolean` scale concept rather than default to `Nominal`.",
+      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "tests": [
+        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+      ],
+      "text": "The maintainer explicitly ruled out treating booleans as a Nominal scale by default, planning instead a separate Boolean scale concept in the future."
+    },
+    {
+      "authored_rationale": "The thread doesn't specify the exact test data or shape used; this is pinned only by the merged test_patch.",
+      "discovery": "on-request",
+      "id": "f05",
+      "kind": "reproduction",
+      "provenance": "authored",
+      "source_excerpt": "x = pd.Series([True, False, False])\n        s = Continuous()._setup(x, IntervalProperty())\n        assert_array_equal(s(x), [1, 0, 0])",
+      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "tests": [
+        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+      ],
+      "text": "The regression test constructs a pandas Series of booleans and passes it directly to Continuous()._setup with IntervalProperty(), expecting mapped output [1, 0, 0]."
+    },
+    {
+      "authored_rationale": null,
+      "discovery": "repo-derivable",
+      "id": "withheld-001",
+      "kind": "reproduction",
+      "provenance": "original-issue",
+      "source_excerpt": "so.Plot([\"a\", \"b\"], [1, 2], color=[True, False]).add(so.Bar())",
+      "source_url": "https://github.com/mwaskom/seaborn/issues/3106",
+      "tests": [],
+      "text": "Reporter's original statement: so.Plot([\"a\", \"b\"], [1, 2], color=[True, False]).add(so.Bar())"
+    }
+  ],
+  "operations": [
+    {
+      "rationale": "The desired semantic (0/1 upcast vs xor) is not derivable from the issue traceback alone; only the PR body resolves it.",
+      "target": "f03",
+      "type": "clarification"
+    },
+    {
+      "rationale": "Exact test input/output values are only pinned by the merged test patch, not stated in the issue thread.",
+      "target": "f05",
+      "type": "clarification"
+    },
+    {
+      "rationale": "Removed category: reproduction; natural[49:111] = 'so.Plot([\"a\", \"b\"], [1, 2], color=[True, False]).add(so.Bar())'",
+      "target": "withheld-001",
+      "type": "withholding"
+    }
+  ],
+  "persona": {
+    "derived_from_urls": [
+      "https://github.com/mwaskom/seaborn/pull/3190",
+      "https://github.com/mwaskom/seaborn/issues/3106"
+    ],
+    "disclosure_style": "reveals rationale only when pressed, referencing numpy/matplotlib conventions",
+    "role": "maintainer",
+    "summary": "A seaborn maintainer (mwaskom) responding to a reported TypeError with boolean color data, explaining the narrow scope and rationale of the fix in the PR description.",
+    "tone": "terse, technical, pragmatic"
+  },
+  "pipeline_version": "0.1.0",
+  "requirements": [
+    {
+      "fact_id": "f03",
+      "id": "r01",
+      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "tests": [
+        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+      ],
+      "text": "Boolean data passed through Continuous._setup with IntervalProperty must be coerced to numeric floats so that no TypeError is raised on subtraction, and True/False must map to 1/0 respectively."
+    },
+    {
+      "fact_id": "f04",
+      "id": "r02",
+      "source_url": "https://github.com/mwaskom/seaborn/pull/3190",
+      "tests": [
+        "tests/_core/test_scales.py::TestContinuous::test_interval_with_bools"
+      ],
+      "text": "The fix must not introduce a separate boolean-specific Nominal scale default; boolean values should be treated numerically within the Continuous scale path."
+    }
+  ],
+  "source": "swebench-annotated",
+  "source_ref": "mwaskom__seaborn-3190",
+  "thread": {
+    "author": "mwaskom",
+    "gold_commit": "72710354ecc8470683e15f452ba0af841464e84a",
+    "issue_comments": [
+      {
+        "body": "Would this simply mean refactoring the code to use `^` or `xor` functions instead?",
+        "created_at": "2022-11-04T09:29:37Z",
+        "path": null,
+        "url": "https://github.com/mwaskom/seaborn/issues/3106#issuecomment-1303169229",
+        "user": "kostyafarber"
+      }
+    ],
+    "issue_url": "https://github.com/mwaskom/seaborn/issues/3106",
+    "linked_issues": [
+      {
+        "body": "```python\r\nso.Plot([\"a\", \"b\"], [1, 2], color=[True, False]).add(so.Bar())\r\n```\r\n```python-traceback\r\n---------------------------------------------------------------------------\r\nTypeError                                 Traceback (most recent call last)\r\n...\r\nFile ~/code/seaborn/seaborn/_core/plot.py:841, in Plot._plot(self, pyplot)\r\n    838 plotter._compute_stats(self, layers)\r\n    840 # Process scale spec for semantic variables and coordinates computed by stat\r\n--> 841 plotter._setup_scales(self, common, layers)\r\n    843 # TODO Remove these after updating other methods\r\n    844 # ---- Maybe have debug= param that attaches these when True?\r\n    845 plotter._data = common\r\n\r\nFile ~/code/seaborn/seaborn/_core/plot.py:1252, in Plotter._setup_scales(self, p, common, layers, variables)\r\n   1250     self._scales[var] = Scale._identity()\r\n   1251 else:\r\n-> 1252     self._scales[var] = scale._setup(var_df[var], prop)\r\n   1254 # Everything below here applies only to coordinate variables\r\n   1255 # We additionally skip it when we're working with a value\r\n   1256 # that is derived from a coordinate we've already processed.\r\n   1257 # e.g., the Stat consumed y and added ymin/ymax. In that case,\r\n   1258 # we've already setup the y scale and ymin/max are in scale space.\r\n   1259 if axis is None or (var != coord and coord in p._variables):\r\n\r\nFile ~/code/seaborn/seaborn/_core/scales.py:351, in ContinuousBase._setup(self, data, prop, axis)\r\n    349 vmin, vmax = axis.convert_units((vmin, vmax))\r\n    350 a = forward(vmin)\r\n--> 351 b = forward(vmax) - forward(vmin)\r\n    353 def normalize(x):\r\n    354     return (x - a) / b\r\n\r\nTypeError: numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the `^` operator, or the logical_xor function instead.\r\n```",
+        "comments": [
+          {
+            "body": "Would this simply mean refactoring the code to use `^` or `xor` functions instead?",
+            "created_at": "2022-11-04T09:29:37Z",
+            "path": null,
+            "url": "https://github.com/mwaskom/seaborn/issues/3106#issuecomment-1303169229",
+            "user": "kostyafarber"
+          }
+        ],
+        "created_at": "2022-10-22T14:50:33Z",
+        "issue_url": "https://github.com/mwaskom/seaborn/issues/3106",
+        "number": 3106,
+        "title": "Color mapping fails with boolean data",
+        "user": "mwaskom"
+      }
+    ],
+    "linked_prs": [],
+    "merged_at": "2022-12-28T01:27:41Z",
+    "number": 3190,
+    "pr_body": "Fixes #3106 in a narrow way by avoiding a TypeError when sorting out the normalization:\r\n\r\n<img width=500 src=https://user-images.githubusercontent.com/315810/208310583-89cc1099-81ae-4dc9-9320-6b4b3640c419.png />\r\n\r\nThis result isn't ideal, we'd like to propagate the boolean-ness of the data through to the visualization, but this is consistent with other numpy / matplotlib behavior where boolean data are upcast to 0/1 floats in numeric contexts. So boolean data should still get a non-continuous scale by default but contra #3135 I think there should be a separate `Boolean` scale concept rather than default to `Nominal`.",
+    "pr_comments": [],
+    "pr_created_at": "2022-12-18T17:13:51Z",
+    "pr_title": "Avoid exception from Continuous scale for normed property with non-float data",
+    "pr_url": "https://github.com/mwaskom/seaborn/pull/3190",
+    "review_comments": [],
+    "reviews": []
+  },
+  "version": 1
+}

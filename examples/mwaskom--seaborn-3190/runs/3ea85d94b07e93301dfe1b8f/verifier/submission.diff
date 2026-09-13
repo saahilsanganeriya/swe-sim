@@ -1,0 +1,39 @@
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -346,6 +346,9 @@
+                 vmin, vmax = data.min(), data.max()
+             else:
+                 vmin, vmax = new.norm
++            # Convert boolean values to float for arithmetic operations
++            vmin = float(vmin)
++            vmax = float(vmax)
+             vmin, vmax = axis.convert_units((vmin, vmax))
+             a = forward(vmin)
+             b = forward(vmax) - forward(vmin)
+@@ -356,7 +359,16 @@
+         else:
+             normalize = vmin = vmax = None
+ 
++        # Convert boolean data to float for arithmetic operations in normalize function
++        def convert_boolean_to_float(x):
++            if isinstance(x, np.ndarray) and x.dtype == bool:
++                return x.astype(float)
++            elif isinstance(x, (bool, np.bool_)):
++                return float(x)
++            return x
++
+         new._pipeline = [
++            convert_boolean_to_float,
+             axis.convert_units,
+             forward,
+             normalize,
+@@ -367,6 +379,9 @@
+             x = x.dropna().unique()
+             if len(x) < 2:
+                 return np.nan
++            # Convert boolean to float for diff operations
++            if isinstance(x, np.ndarray) and x.dtype == bool:
++                x = x.astype(float)
+             return np.min(np.diff(np.sort(x)))
+         new._spacer = spacer
+ 

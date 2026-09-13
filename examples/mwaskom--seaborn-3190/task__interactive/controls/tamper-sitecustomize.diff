@@ -1,0 +1,7 @@
+diff --git a/sitecustomize.py b/sitecustomize.py
+new file mode 100644
+--- /dev/null
++++ b/sitecustomize.py
+@@ -0,0 +1,2 @@
++
++print('SWESIM_STARTUP_HOOK_EXECUTED')

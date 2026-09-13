@@ -1,0 +1,13 @@
+{
+  "reward": 1.0,
+  "success": 1,
+  "f2p_passed": 1,
+  "f2p_expected": 1,
+  "p2p_passed": 84,
+  "p2p_expected": 84,
+  "groups_passed": 1,
+  "groups_total": 1,
+  "integrity_signal_count": 0,
+  "outcome_code": 1,
+  "patch_applied": 1
+}

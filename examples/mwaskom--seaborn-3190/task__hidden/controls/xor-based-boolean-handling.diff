@@ -1,0 +1,15 @@
+diff --git a/seaborn/_core/scales.py b/seaborn/_core/scales.py
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -346,7 +346,10 @@ def _setup(
+                 vmin, vmax = data.min(), data.max()
+             else:
+                 vmin, vmax = new.norm
+-            vmin, vmax = axis.convert_units((vmin, vmax))
++            vmin, vmax = axis.convert_units((vmin, vmax))
++            if isinstance(vmin, (bool, np.bool_)) or isinstance(vmax, (bool, np.bool_)):
++                import numpy as np
++                vmin, vmax = np.logical_xor(vmin, False), np.logical_xor(vmax, False)
+             a = forward(vmin)
+             b = forward(vmax) - forward(vmin)
+ 
