@@ -119,3 +119,39 @@ def test_worker_executor_is_sized_to_the_activity_concurrency(tmp_path):
     assert W.executor_size(s) >= W.concurrency(s, "swesim-authoring") + 8
     s_all = S.Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env")})
     assert W.executor_size(s_all) >= sum(W.concurrency(s_all, q) for q in s_all.task_queues)
+
+
+def test_blocking_without_drain_releases_immediately_on_cancel_and_slot_wait_heartbeats():
+    """Discovery must release its slot the moment it is cancelled (the thread finishes on its own) and a later attempt
+    waiting for the slot must heartbeat instead of sitting silent (measured 2026-09-13: five attempts timed out in a row)."""
+    import asyncio, threading, time
+    from swesim.workflows import activities as A
+
+    async def scenario():
+        gate = threading.Event()
+        def slow():
+            gate.wait(5); return "done"
+        t = asyncio.ensure_future(A.blocking(slow, every=0.05, drain_on_cancel=False))
+        await asyncio.sleep(0.15); t.cancel()
+        started = time.monotonic()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        assert time.monotonic() - started < 1.0, "cancel must not wait for the thread when drain_on_cancel is False"
+        gate.set()
+        # slot wait heartbeats: hold the slot, then acquire from another coroutine with a tiny poll interval
+        beats = []
+        orig = A._heartbeat
+        A._heartbeat = lambda *d: beats.append(d)
+        try:
+            await A.DISCOVERY_SLOTS.acquire()
+            waiter = asyncio.ensure_future(A.acquire_discovery_slot(every=0.05))
+            await asyncio.sleep(0.2)
+            assert beats and beats[0][0]["waiting_for"] == "discovery-slot"
+            A.DISCOVERY_SLOTS.release()
+            await asyncio.wait_for(waiter, 2)
+            A.DISCOVERY_SLOTS.release()
+        finally:
+            A._heartbeat = orig
+    asyncio.run(scenario())

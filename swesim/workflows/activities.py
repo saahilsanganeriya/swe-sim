@@ -133,7 +133,7 @@ def _cancelled() -> bool:
     return activity.in_activity() and activity.is_cancelled()
 
 
-async def blocking(fn, every: float | None = None):
+async def blocking(fn, every: float | None = None, *, drain_on_cancel: bool = True):
     """Run a blocking stage function in a thread while heartbeating every `every` seconds. Between heartbeats the activity's
     cancellation is observed: the activity ends as cancelled (the thread cannot be interrupted and runs to completion; a launcher's
     runtime is stopped by `cancel_trial_activity`, not here)."""
@@ -149,6 +149,12 @@ async def blocking(fn, every: float | None = None):
                 return task.result()
             _heartbeat()
     except asyncio.CancelledError:
+        if not drain_on_cancel:
+            # Stages holding a shared slot (discovery) release it now; the orphaned thread finishes on its own and its
+            # result is consumed silently. Measured 2026-09-13: draining a cancelled scan kept the discovery slot for
+            # minutes and every later attempt on that worker waited for it without a heartbeat until the server timed it out.
+            task.add_done_callback(lambda t: (t.exception() if not t.cancelled() else None))
+            raise
         # A Python thread cannot be killed. Drain this stage before acknowledging cancellation so that
         # launch_trial cannot create a Job after the workflow's cancellation cleanup has already run.
         try:
@@ -235,12 +241,24 @@ def _github_quota() -> tuple[int, int, float] | None:
 
 async def await_github_quota(margin: int | None = None) -> None:
     """Before a scan or a batch: with fewer than `margin` core calls left, wait for the quota's reset rather than run into it."""
-    status = await blocking(_github_quota)  # heartbeats while queued behind other stage threads (never a bare to_thread here)
+    status = await blocking(_github_quota, drain_on_cancel=False)  # heartbeats while queued; never a bare to_thread here
     if status is None:
         return
     remaining, _limit, reset_at = status
     if remaining < (GH_RATE_MARGIN if margin is None else margin):
         await wait_for_github_rate_limit(reset_at, remaining=remaining)
+
+
+async def acquire_discovery_slot(every: float = 25.0) -> None:
+    """Take the worker's discovery slot, heartbeating while another scan holds it: a slot wait is never a silent 180 s."""
+    while True:
+        try:
+            await asyncio.wait_for(DISCOVERY_SLOTS.acquire(), timeout=every)
+            return
+        except asyncio.TimeoutError:
+            if _cancelled():
+                raise asyncio.CancelledError("activity cancelled while waiting for the discovery slot")
+            _heartbeat({"waiting_for": "discovery-slot"})
 
 
 async def run_discovery(scan) -> None:
@@ -251,7 +269,7 @@ async def run_discovery(scan) -> None:
     consecutive = 0
     while not scan.done:
         try:
-            await blocking(lambda: scan.run(DISCOVERY_BATCH))
+            await blocking(lambda: scan.run(DISCOVERY_BATCH), drain_on_cancel=False)
         except threads.RateLimited as limited:
             log.warning("discovery %s: %s", getattr(scan, "repo", "?"), limited)
             await wait_for_github_rate_limit(rate_limit_horizon(limited, consecutive), remaining=limited.remaining, secondary=limited.secondary)
@@ -331,11 +349,14 @@ async def discover_activity(p: dict) -> dict:
     # Every listed PR keeps its decision in an immutable scan record (candidates/<source_key>/scans/<sha256>.json); the
     # returned histogram already includes the max-candidates cut. GitHub's rate limits are waited out inside the attempt
     # (`run_discovery`); gh being down (5xx, network, auth, timeout) raises DiscoveryUnavailable and the attempt is retried.
-    async with DISCOVERY_SLOTS:
+    await acquire_discovery_slot()
+    try:
         state = gr.begin_scan(repo, **kwargs)
         await run_discovery(state)
         cands, rejects, scan = gr.finish_scan(state, max_candidates=int(p.get("max_candidates") or 0) or None, source_key=source_key,
                                               workflow_id=workflow_id if run_id else None, run_id=run_id)
+    finally:
+        DISCOVERY_SLOTS.release()
     rows = []
     for c in cands:
         row = gr.candidate_to_row(c); row.update(gr.build_recipe(repo, c["base_commit"])); rows.append(row)
