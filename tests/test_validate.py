@@ -12,6 +12,24 @@ from swesim.stages.compile import CompileResult
 from swesim.stages.validate import evaluate_controls, gold_lines, gold_probes, is_distinctive
 
 
+@pytest.fixture(autouse=True)
+def stub_compiled_manifest(monkeypatch):
+    # Validation orchestration uses placeholder compile results; compiler integrity has its own behavioral tests.
+    monkeypatch.setattr(validate, "verify_compiled_artifacts", lambda task, record, condition: None)
+
+
+def test_validate_rejects_unbound_compilation_before_harbor(tmp_path, monkeypatch):
+    from swesim.stages.compile import verify_compiled_artifacts
+    ws, spec = _spec_ws(tmp_path)
+    monkeypatch.setattr(validate, "compile_scenario", _fake_compile(tmp_path, spec))
+    monkeypatch.setattr(validate, "verify_compiled_artifacts", verify_compiled_artifacts)
+    calls = []
+    monkeypatch.setattr(harbor_cli, "run_task", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(ValueError, match="recompile"):
+        validate.validate_scenario(ws, spec, RunConfig.default("full"), "")
+    assert calls == []
+
+
 def test_expectations():
     results = {"nop": {"reward": 0, "success": 0, "outcome_code": 3}, "oracle": {"reward": 1.0, "success": 1, "outcome_code": 1},
                "plausible-wrong:keyerror": {"reward": 0.0, "success": 0, "outcome_code": 2},

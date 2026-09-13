@@ -34,6 +34,7 @@ from swesim.roles import PROVIDERS, parse_model_id
 from swesim.settings import Settings
 from swesim.settings import has_secret as _has_secret
 from swesim.stakeholder.view import forbidden_terms, visible_view
+from swesim.stages.compile import verify_compiled_artifacts
 
 PROVIDER_HOSTS = {name: p.host for name, p in PROVIDERS.items()}   # anthropic, openai, openrouter -> API host for the sandbox allowlist
 OUTCOME_NAMES = {3: "agent-invalid-submission", 4: "agent-runtime-failure", 7: "evaluator-failure"}
@@ -153,6 +154,7 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
         raise ValueError("scenario/build not validated")
     profile = "natural" if rc.condition == "full" or not any(b.profile == rc.brief_profile for b in spec.briefs) else rc.brief_profile
     compiled = ws.task_dir(spec.id, rc.condition)
+    verify_compiled_artifacts(compiled, comp, rc.condition)
     # The agent scaffold is part of the run identity: a compiled interactive task carries agent_config.yaml (bound by
     # compiled_hash) and its identity enters RunConfig.agent_config, so scaffold and default-agent trials never share a group.
     agent_config = scaffold_identity(compiled, rc)

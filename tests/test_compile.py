@@ -193,10 +193,58 @@ def test_compile_json_and_compiled_hash(tmp_path, neighbours):
     bumped = RunConfig.model_validate({"condition": "full", "agent_version": "2.4.7"})
     v = json.loads(comp.compile_scenario(ws, spec, bumped, URL, resolve_digest=False).compile_json.read_text())
     assert v["compiled_hash"] != a["compiled_hash"]  # a different pre-baked agent is a different environment
-    assert comp.compiled_hash(spec, None, "2.4.6") == a["compiled_hash"] and comp.compiled_hash(spec, None, "2.4.7") == v["compiled_hash"]
+    assert comp.compiled_hash(spec, None, "2.4.6", compile_config=a["compile_config"], rendered_manifest=a["rendered_manifest"]) == a["compiled_hash"]
     (neighbours[0] / "grader.py").write_text("# changed\n")
     c = json.loads(comp.compile_scenario(ws, spec, rc, URL, resolve_digest=False).compile_json.read_text())
     assert c["compiled_hash"] != a["compiled_hash"]
+
+
+def test_compiled_hash_binds_render_configuration_and_constants(tmp_path, monkeypatch):
+    ws, spec = _materialize(tmp_path, minimal_spec_dict())
+    rc = RunConfig.default("interactive")
+
+    def build(config=rc, url=URL):
+        result = comp.compile_scenario(ws, spec, config, url, resolve_digest=False)
+        return json.loads(result.compile_json.read_text())["compiled_hash"]
+
+    original = build()
+    assert build(url=URL + "/other-endpoint") != original
+    assert build(config=rc.model_copy(update={"solver_timeout_sec": rc.solver_timeout_sec + 60})) != original
+    assert build(config=rc.model_copy(update={"stakeholder": rc.stakeholder.model_copy(update={"temperature": 0.5})})) != original
+    monkeypatch.setattr(comp, "COLLECT_TIMEOUT_SEC", comp.COLLECT_TIMEOUT_SEC + 1)
+    assert build() != original
+
+
+@pytest.mark.parametrize("change", ["modify", "delete", "add", "chmod", "symlink", "metadata"])
+def test_compiled_manifest_rejects_changed_tree(tmp_path, change):
+    ws, spec = _materialize(tmp_path, minimal_spec_dict())
+    result = comp.compile_scenario(ws, spec, RunConfig.default("interactive"), URL, resolve_digest=False)
+    record = json.loads(result.compile_json.read_text())
+    task = result.task_dirs["interactive"]
+    comp.verify_compiled_artifacts(task, record, "interactive")
+    target = task / "instruction.md"
+    if change == "modify": target.write_text("changed brief")
+    elif change == "delete": target.unlink()
+    elif change == "add": (task / "environment" / "extra.py").write_text("pass")
+    elif change == "chmod": target.chmod(0o755)
+    elif change == "symlink":
+        target.unlink(); target.symlink_to(task / "instruction.natural.md")
+    else:
+        path = task / "task.toml"
+        path.write_text(path.read_text().replace(record["compiled_hash"], "0" * 64))
+    with pytest.raises(ValueError, match="compiled"):
+        comp.verify_compiled_artifacts(task, record, "interactive")
+
+
+def test_compiled_manifest_requires_bound_record(tmp_path):
+    ws, spec = _materialize(tmp_path, minimal_spec_dict())
+    result = comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
+    record = json.loads(result.compile_json.read_text())
+    with pytest.raises(ValueError, match="recompile"):
+        comp.verify_compiled_artifacts(result.task_dirs["full"], {"compiled_hash": record["compiled_hash"]}, "full")
+    record["compile_config"]["stakeholder_url"] = "https://changed.example"
+    with pytest.raises(ValueError, match="compiled"):
+        comp.verify_compiled_artifacts(result.task_dirs["full"], record, "full")
 
 
 def test_session_token_only_reaches_interactive(tmp_path):
