@@ -144,6 +144,75 @@ def test_main_refuses_names_that_are_not_secrets(capsys):
     assert "not secrets" in capsys.readouterr().err
 
 
+PEM = b"-----BEGIN RSA PRIVATE KEY-----\nfake-key-material\n-----END RSA PRIVATE KEY-----\n"
+
+
+def test_collect_values_reads_a_file_valued_secret_from_the_key_path_or_an_explicit_file(tmp_path: Path):
+    key = tmp_path / "app.pem"
+    key.write_bytes(PEM)
+    env = tmp_path / "ops.env"
+    env.write_text(f"GH_TOKEN=g\nGH_APP_PRIVATE_KEY_PATH={key}\n")
+    values = push_secrets.collect_values([env], None, ["GH_TOKEN", "GH_APP_PRIVATE_KEY"])
+    assert values == {"GH_TOKEN": "g", "GH_APP_PRIVATE_KEY": PEM}  # the file's exact bytes, from the path the env file names
+    other = tmp_path / "other.pem"
+    other.write_bytes(b"other\n")
+    values = push_secrets.collect_values([env], None, ["GH_APP_PRIVATE_KEY"], files={"GH_APP_PRIVATE_KEY": other})
+    assert values["GH_APP_PRIVATE_KEY"] == b"other\n"  # an explicit --file wins over the env file's path
+    assert "GH_APP_PRIVATE_KEY" not in push_secrets.collect_values([], None, ["GH_APP_PRIVATE_KEY"])
+    env.write_text(f"GH_APP_PRIVATE_KEY_PATH={tmp_path / 'absent.pem'}\n")
+    assert "GH_APP_PRIVATE_KEY" not in push_secrets.collect_values([env], None, ["GH_APP_PRIVATE_KEY"])  # an unreadable path: missing, not a crash
+    assert push_secrets.FILE_PATH_KEYS == {"GH_APP_PRIVATE_KEY": "GH_APP_PRIVATE_KEY_PATH"}
+
+
+def test_push_streams_a_file_valued_secret_s_bytes_and_prints_only_the_status():
+    fake = FakeSecretManager(existing={"GH_APP_PRIVATE_KEY"})
+    pusher = push_secrets.SecretPusher("proj", run=fake)
+    out = io.StringIO()
+    assert push_secrets.push_all(pusher, {"GH_APP_PRIVATE_KEY": PEM}, ["GH_APP_PRIVATE_KEY"], out=out) == 0
+    assert fake.versions["GH_APP_PRIVATE_KEY"] == [PEM] and out.getvalue() == "GH_APP_PRIVATE_KEY: updated\n"
+    out = io.StringIO()
+    assert push_secrets.push_all(pusher, {"GH_APP_PRIVATE_KEY": PEM}, ["GH_APP_PRIVATE_KEY"], out=out) == 0
+    assert fake.adds() == 1 and out.getvalue() == "GH_APP_PRIVATE_KEY: unchanged\n"
+    assert "fake-key-material" not in out.getvalue() and push_secrets._sha256(PEM) not in out.getvalue()
+    assert all("fake-key-material" not in " ".join(c) for c in fake.calls)  # the payload travels on stdin, never in argv
+
+
+def test_an_absent_optional_secret_is_skipped_without_failing_the_run():
+    fake = FakeSecretManager(existing={"GH_TOKEN", "GH_APP_PRIVATE_KEY"})
+    out = io.StringIO()
+    rc = push_secrets.push_all(push_secrets.SecretPusher("proj", run=fake), {"GH_TOKEN": "g"}, ["GH_TOKEN", "GH_APP_PRIVATE_KEY"], out=out)
+    assert rc == 0 and fake.adds() == 1
+    lines = out.getvalue().splitlines()
+    assert lines[0] == "GH_TOKEN: updated" and lines[1].startswith("GH_APP_PRIVATE_KEY: skipped (optional") and "GH_APP_PRIVATE_KEY_PATH" in lines[1]
+    assert push_secrets.OPTIONAL == frozenset({"GH_APP_PRIVATE_KEY"}) and "GH_APP_PRIVATE_KEY" in push_secrets.DEFAULT_NAMES
+
+
+def test_main_file_flag_pushes_the_named_file_and_refuses_bad_arguments(tmp_path: Path, monkeypatch, capsys):
+    key = tmp_path / "app.pem"
+    key.write_bytes(PEM)
+    fake = FakeSecretManager(existing={"GH_APP_PRIVATE_KEY"})
+    monkeypatch.setattr(push_secrets, "subprocess_runner", fake)
+    assert push_secrets.main(["--project", "p", "--names", "GH_APP_PRIVATE_KEY", "--file", f"GH_APP_PRIVATE_KEY={key}"]) == 0
+    assert fake.versions["GH_APP_PRIVATE_KEY"] == [PEM] and capsys.readouterr().out == "GH_APP_PRIVATE_KEY: updated\n"
+    assert push_secrets.main(["--project", "p", "--file", "SWESIM_WORKSPACE=" + str(key)]) == 2  # not a secret
+    assert "not secrets" in capsys.readouterr().err
+    assert push_secrets.main(["--project", "p", "--file", f"GH_APP_PRIVATE_KEY={tmp_path / 'absent.pem'}"]) == 2
+    assert "absent.pem" in capsys.readouterr().err
+    assert push_secrets.main(["--project", "p", "--file", "GH_APP_PRIVATE_KEY"]) == 2  # no '=': NAME=PATH is the only form
+    assert fake.adds() == 1
+
+
+def test_github_app_ids_are_copied_to_tfvars_only_when_set():
+    base = dict(account="op@example.com", repo_url=None, project="p", region="r")
+    assert not ({"gh_app_id", "gh_app_installation_id"} & set(tfvars_from_env.build_tfvars({}, **base)))
+    values = {"GH_APP_ID": "1234567", "GH_APP_INSTALLATION_ID": "987654321", "GH_APP_PRIVATE_KEY_PATH": "/home/op/app.pem", "GH_APP_PRIVATE_KEY": "pem-content"}
+    doc = tfvars_from_env.build_tfvars(values, **base)
+    assert doc["gh_app_id"] == "1234567" and doc["gh_app_installation_id"] == "987654321"  # strings: Terraform's variables are string-typed ids
+    assert "app.pem" not in json.dumps(doc) and "pem-content" not in json.dumps(doc) and "GH_APP_PRIVATE_KEY" not in json.dumps(doc)
+    with pytest.raises(tfvars_from_env.TfvarsError, match="GH_APP_INSTALLATION_ID"):
+        tfvars_from_env.build_tfvars({"GH_APP_ID": "1234567"}, **base)  # half a configuration is an operator error, caught before Terraform
+
+
 @pytest.mark.parametrize("url", [
     "https://github.com/acme/swesim.git",
     "https://github.com/acme/swesim",

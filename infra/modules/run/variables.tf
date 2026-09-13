@@ -97,6 +97,18 @@ variable "temporal_namespace" {
   type = string
 }
 
+variable "gh_app_id" {
+  type     = string
+  nullable = true
+  default  = null
+}
+
+variable "gh_app_installation_id" {
+  type     = string
+  nullable = true
+  default  = null
+}
+
 variable "worker_cpu" {
   type = string
 }
