@@ -67,16 +67,26 @@ def is_distinctive(line: str) -> bool:
 
 
 def _informative(removed: str) -> bool:
-    s = removed.strip(); return bool(s) and not re.fullmatch(r"[\W_]*", s)
+    """A removed line worth matching (whole line, after strip): >= 8 chars with an identifier, not punctuation only.
+    Shorter/common lines such as `else:` would suppress genuine post-fix copies."""
+    s = removed.strip()
+    return len(s) >= 8 and bool(_IDENT.search(s)) and not re.fullmatch(r"[\W_]*", s)
+
+
+def _header_target(text: str) -> bool:
+    t = text.strip(); return t == "/dev/null" or t.startswith(("a/", "b/", '"a/', '"b/'))
 
 
 def gold_probes(oracle_diff: str, max_probes: int = 6, per_hunk: int = 2) -> list[dict]:
-    """Distinctive added lines paired with their hunk's removed lines: [{"line", "removed": [...], "path"}].
+    """Distinctive added lines paired with their hunk's removed lines: [{"line", "removed": [...], "path", "new"}].
 
-    A base copy of a modified file (e.g. build/lib/...) contains the hunk's removed lines; a leaked post-fix copy does
-    not, so the probe counts a file only when it holds the added line and none of the removed ones. Pure-addition
-    hunks keep the plain grep; the file the patch modifies at its own base path is skipped for them (host side)."""
-    probes: list[dict] = []; path: str | None = None; added: list[str] = []; removed: list[str] = []; open_hunk = False
+    A base copy of a modified file (e.g. build/lib/...) contains the hunk's removed lines as whole lines; a leaked
+    post-fix copy does not, so the probe counts a file only when it holds the added line and none of the removed ones.
+    Pure-addition hunks keep the plain grep; for an existing file the probe first checks whether the line already
+    exists at the base path (then no copy is evidence) and the host skips that path. `new` marks `--- /dev/null`
+    files, which have no base copy anywhere, so nothing is skipped for them."""
+    lines = oracle_diff.splitlines()
+    probes: list[dict] = []; path: str | None = None; new = False; added: list[str] = []; removed: list[str] = []; open_hunk = False
 
     def flush():
         nonlocal added, removed
@@ -84,18 +94,24 @@ def gold_probes(oracle_diff: str, max_probes: int = 6, per_hunk: int = 2) -> lis
             rem = [r.strip() for r in removed if _informative(r)]
             for line in [a.strip() for a in added if is_distinctive(a)][:per_hunk]:
                 if len(probes) < max_probes and not any(p["line"] == line for p in probes):
-                    probes.append({"line": line, "removed": rem, "path": path})
+                    probes.append({"line": line, "removed": rem, "path": path, "new": new})
         added, removed = [], []
 
-    for raw in oracle_diff.splitlines():
-        if raw.startswith("+++ "):
-            flush(); target = raw[4:].strip()
-            path = target[2:] if target.startswith("b/") else (None if target == "/dev/null" else target); open_hunk = True; continue
-        if raw.startswith("--- ") or raw.startswith("diff --git "): flush(); open_hunk = False; continue
-        if raw.startswith("@@"): flush(); open_hunk = True; continue
-        if not open_hunk: continue
-        if raw.startswith("+"): added.append(raw[1:])
-        elif raw.startswith("-"): removed.append(raw[1:])
+    i = 0
+    while i < len(lines):
+        raw = lines[i]; nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if raw.startswith("diff --git "): flush(); open_hunk = False; new = False; i += 1; continue
+        # `--- `/`+++ ` form a file header outside a hunk, or inside one only with canonical a/ b/ /dev/null targets
+        # (otherwise they are removed/added content lines that happen to start with `-- ` / `++ `).
+        if raw.startswith("--- ") and nxt.startswith("+++ ") and (not open_hunk or (_header_target(raw[4:]) and _header_target(nxt[4:]))):
+            flush(); new = raw[4:].strip() == "/dev/null"; target = nxt[4:].strip()
+            path = target[2:] if target.startswith("b/") else (None if target == "/dev/null" else target)
+            open_hunk = True; i += 2; continue
+        if raw.startswith("@@"): flush(); open_hunk = True; i += 1; continue
+        if open_hunk:
+            if raw.startswith("+"): added.append(raw[1:])
+            elif raw.startswith("-"): removed.append(raw[1:])
+        i += 1
     flush()
     return probes
 
@@ -151,6 +167,7 @@ def validate_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, 
             probe = {"raw": probe_txt[-2000:], "gold_hits": parsed["gold_line_hits"], "raw_hits": parsed["raw_hits"], "filtered_hits": parsed["filtered_hits"],
                      "probes": probes, "all_refs": parsed["all_refs"], "reflog_entries": parsed["reflog_entries"],
                      "gold_object_reachable": parsed["gold_object_reachable"], "hits_block_found": parsed["hits_block_found"]}
+    if not probes: probe["note"] = "line probe skipped: no distinctive added lines in the oracle diff"  # not a clean scan
     ok, control_failures = evaluate_controls(results, spec.controls.model_dump()); failures.extend(control_failures)
     base = {t["id"]: t["observed"] for t in results.get("nop", {}).get("report", {}).get("per_test", [])}
     gold = {t["id"]: t["observed"] for t in results.get("oracle", {}).get("report", {}).get("per_test", [])}

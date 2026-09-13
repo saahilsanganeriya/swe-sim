@@ -63,10 +63,22 @@ def test_gold_probes_select_distinctive_lines_and_pair_removed():
     assert [p["line"] for p in probes] == ["TooManyRedirects, InvalidSchema, ChunkedEncodingError, ContentDecodingError)",
                                             "return self.build_response_for_request(request, resp)",  # at most two probes per hunk
                                             "if not stream and response.content is not None:", "new_value = compute_with_dimension(a, dim)"]
-    assert probes[0] == {"line": probes[0]["line"], "removed": ["from .exceptions import TooManyRedirects, InvalidSchema"], "path": "x.py"}
+    assert probes[0] == {"line": probes[0]["line"], "removed": ["from .exceptions import TooManyRedirects, InvalidSchema"], "path": "x.py", "new": False}
     assert probes[2]["removed"] == [] and probes[2]["path"] == "x.py"  # pure-addition hunk
     assert probes[3]["removed"] == ["old_value = compute(a)"] and probes[3]["path"] == "y.py"  # blank / punctuation-only removed lines carry no signal
     assert gold_lines(diff) == [p["line"] for p in probes] and gold_probes("") == []
+    # removed lines need an identifier and >= 8 chars (else `else:`-style lines suppress real hits); none left -> pure-addition rule
+    short = gold_probes("--- a/z.py\n+++ b/z.py\n@@ -1,3 +1,3 @@\n-else:\n-x = 1\n-    return r\n+    handled = dispatch_to_dimension_handler(value)\n")
+    assert short == [{"line": "handled = dispatch_to_dimension_handler(value)", "removed": ["return r"], "path": "z.py", "new": False}]
+    # a removed line that is a substring of the added line is kept: it distinguishes base copies under whole-line matching
+    sub = gold_probes("--- a/s.py\n+++ b/s.py\n@@ -1 +1 @@\n-    result = compute_value(payload)\n+    result = compute_value(payload) + dimension_offset(dim)\n")
+    assert sub[0]["removed"] == ["result = compute_value(payload)"]
+    # new file: pure addition at a path that cannot exist at base
+    new = gold_probes("diff --git a/pkg/newmod.py b/pkg/newmod.py\n--- /dev/null\n+++ b/pkg/newmod.py\n@@ -0,0 +1,2 @@\n+    def brand_new_helper_for_dimensions(value, dim):\n+        return value\n")
+    assert new == [{"line": "def brand_new_helper_for_dimensions(value, dim):", "removed": [], "path": "pkg/newmod.py", "new": True}]
+    # `--- ` / `+++ ` inside a hunk are content unless they form a header pair
+    sql = gold_probes("--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1,2 @@\n--- legacy comment about the dimension column\n+++ plus\n+    select dimension_value from dimension_table;\n")
+    assert sql == [{"line": "select dimension_value from dimension_table;", "removed": ["-- legacy comment about the dimension column"], "path": "q.sql", "new": False}]
     for bad in ("from .exceptions import (", "    return r", "    return None", "        pass", "# " + "x" * 40, '"""' + "d" * 40, "import os, sys, json, re, pathlib, shutil",
                 "    ) + ((((((((((((((((((((((((((((((((", "", "   "):
         assert not is_distinctive(bad), bad
@@ -77,25 +89,43 @@ def test_gold_probes_select_distinctive_lines_and_pair_removed():
 def test_probe_filters_base_copies_on_fake_tree(tmp_path):
     from swesim.agents.patch_agent import build_probe_command, parse_probe_output
     diff = ("--- a/pkg/mod.py\n+++ b/pkg/mod.py\n@@ -1,3 +1,3 @@\n import os\n-    result = compute_legacy_value(payload, strict=True)\n+    result = compute_modern_value(payload, strict=True, dim=dim)\n"
-            "--- a/pkg/other.py\n+++ b/pkg/other.py\n@@ -1,2 +1,3 @@\n import os\n+    registry.register_default_handler(handler_for_dimension)\n")
+            "--- a/pkg/other.py\n+++ b/pkg/other.py\n@@ -1,2 +1,3 @@\n import os\n+    registry.register_default_handler(handler_for_dimension)\n"
+            "--- a/pkg/third.py\n+++ b/pkg/third.py\n@@ -1,2 +1,3 @@\n import os\n+    registry.register_fallback_handler(handler_for_dimension)\n"
+            "--- a/pkg/sub.py\n+++ b/pkg/sub.py\n@@ -1 +1 @@\n-    result = compute_value(payload)\n+    result = compute_value(payload) + dimension_offset(dim)\n"
+            "--- /dev/null\n+++ b/pkg/newmod.py\n@@ -0,0 +1 @@\n+    def brand_new_helper_for_dimensions(value, dim):\n")
     probes = gold_probes(diff)
-    assert [p["path"] for p in probes] == ["pkg/mod.py", "pkg/other.py"] and probes[1]["removed"] == []
-    added, removed, added2 = probes[0]["line"], probes[0]["removed"][0], probes[1]["line"]
+    assert [p["path"] for p in probes] == ["pkg/mod.py", "pkg/other.py", "pkg/third.py", "pkg/sub.py", "pkg/newmod.py"] and probes[4]["new"] is True
+    added, removed, added1, added2, added3, removed3, added4 = (probes[0]["line"], probes[0]["removed"][0], probes[1]["line"], probes[2]["line"],
+                                                              probes[3]["line"], probes[3]["removed"][0], probes[4]["line"])
     tree = tmp_path / "repo"
     files = {"pkg/mod.py": f"import os\n    {added}\n    {removed}\n",        # base path holding both: a base copy (re-added line), not a hit
              "build/lib/pkg/mod.py": f"    {added}\n    {removed}\n",          # base copy among build products: not a hit
              "stale/pkg/mod.py": f"    {added}\nother\n",                     # post-fix copy (removed lines absent): a hit
-             "pkg/other.py": f"    {added2}\n",                                # pure-addition hunk at its own base path: skipped
-             "dist/pkg/other.py": f"    {added2}\n",                           # pure-addition hunk, stale copy elsewhere: a hit
+             "pkg/other.py": "import os\n",                                    # pure-addition hunk; the line is genuinely new at base
+             "dist/pkg/other.py": f"    {added1}\n",                           # stale copy carrying the new line: a hit
+             "pkg/third.py": f"    {added2}\n",                                # pure-addition hunk whose line already exists at base...
+             "build/lib/pkg/third.py": f"    {added2}\n",                      # ...so no copy of it is evidence (PREEXISTS)
+             "pkg/sub.py": f"    {removed3}\n",                                # base copy holds only the removed line: not even RAW
+             "stale/pkg/sub.py": f"    {added3}\n",                            # added line contains the removed line as a substring: still a hit
+             "pkg/newmod.py": f"    {added4}\n",                               # new file at its own path cannot be a base copy: a hit
+             "build/lib/pkg/newmod.py": f"    {added4}\n",                     # copy of the new file elsewhere: a hit
              ".git/objects/leak.py": f"    {added}\n"}                         # never in scope
     for rel, content in files.items():
         (tree / rel).parent.mkdir(parents=True, exist_ok=True); (tree / rel).write_text(content)
     r = subprocess.run(["sh", "-c", build_probe_command(str(tree), probes)], capture_output=True, text=True)
     parsed = parse_probe_output(r.stdout, probes)
     assert parsed["hits_block_found"], r.stdout + r.stderr
-    assert {(h["probe"], h["file"]) for h in parsed["raw_hits"]} == {(0, "./pkg/mod.py"), (0, "./build/lib/pkg/mod.py"), (0, "./stale/pkg/mod.py"), (1, "./pkg/other.py"), (1, "./dist/pkg/other.py")}
-    assert {(h["probe"], h["file"]) for h in parsed["filtered_hits"]} == {(0, "./stale/pkg/mod.py"), (1, "./dist/pkg/other.py")}
-    assert parsed["gold_line_hits"] == ["./dist/pkg/other.py", "./stale/pkg/mod.py"]
+    assert {(h["probe"], h["file"]) for h in parsed["raw_hits"]} == {(0, "./pkg/mod.py"), (0, "./build/lib/pkg/mod.py"), (0, "./stale/pkg/mod.py"),
+                                                                     (1, "./dist/pkg/other.py"), (2, "./pkg/third.py"), (2, "./build/lib/pkg/third.py"),
+                                                                     (3, "./stale/pkg/sub.py"), (4, "./pkg/newmod.py"), (4, "./build/lib/pkg/newmod.py")}
+    assert {(h["probe"], h["file"]) for h in parsed["filtered_hits"]} == {(0, "./stale/pkg/mod.py"), (1, "./dist/pkg/other.py"), (3, "./stale/pkg/sub.py"),
+                                                                          (4, "./pkg/newmod.py"), (4, "./build/lib/pkg/newmod.py")}
+    assert parsed["preexisting_probes"] == [2]
+    assert parsed["gold_line_hits"] == sorted(["./stale/pkg/mod.py", "./dist/pkg/other.py", "./stale/pkg/sub.py", "./pkg/newmod.py", "./build/lib/pkg/newmod.py"])
+    # whole-line matching: a removed line present only as part of a longer line does not mark a base copy
+    (tree / "stale/pkg/mod.py").write_text(f"    {added}\n    x{removed}x\n")
+    parsed = parse_probe_output(subprocess.run(["sh", "-c", build_probe_command(str(tree), probes[:1])], capture_output=True, text=True).stdout, probes[:1])
+    assert {h["file"] for h in parsed["filtered_hits"]} == {"./stale/pkg/mod.py"}
 
 
 # ---- validate_scenario end to end with fake compile + fake harbor ------------------------------
@@ -105,10 +135,13 @@ def _spec_ws(tmp_path):
     ws.scenario_dir(spec.id).mkdir(parents=True); return ws, spec
 
 
-def _fake_compile(tmp_path, spec):
+ORACLE_DIFF = "--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n import os\n-    def new_helper(value):\n+    def new_helper_for_dimension(value, dim):\n"
+
+
+def _fake_compile(tmp_path, spec, oracle_diff=ORACLE_DIFF):
     task = tmp_path / "task-full"; (task / "controls").mkdir(parents=True); (task / "solution").mkdir()
     for c in spec.controls.plausible_wrong + spec.controls.alternative_correct + spec.controls.tamper: (task / "controls" / f"{c.name}.diff").write_text("diff")
-    (task / "solution" / "oracle.diff").write_text("--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n import os\n-    def new_helper(value):\n+    def new_helper_for_dimension(value, dim):\n")
+    (task / "solution" / "oracle.diff").write_text(oracle_diff)
     cj = tmp_path / "compile.json"; cj.write_text(json.dumps({"compiled_hash": "c" * 64}))
     return lambda ws, s, rc, url: CompileResult({"full": task, "hidden": task, "interactive": task}, "sha256:" + "d" * 64, cj)
 
@@ -149,7 +182,8 @@ def test_validate_scenario_valid(tmp_path, monkeypatch):
     assert ctl["reward"] == 0.0 and ctl["success"] == 0 and ctl["outcome"] == "valid-incorrect" and ctl["expected"]["cls"] == "incorrect-exploit" and "report" not in ctl
     assert out["controls"]["nop"]["outcome"] == "agent-invalid-submission"
     assert out["probe"]["gold_hits"] == [] and out["probe"]["all_refs"] == 1 and out["probe"]["raw_hits"] == [] and out["probe"]["filtered_hits"] == []
-    assert out["probe"]["probes"] == [{"line": "def new_helper_for_dimension(value, dim):", "removed": ["def new_helper(value):"], "path": "x.py"}]
+    assert out["probe"]["probes"] == [{"line": "def new_helper_for_dimension(value, dim):", "removed": ["def new_helper(value):"], "path": "x.py", "new": False}]
+    assert "note" not in out["probe"]
     assert set(out["trial_dirs"]) == {"nop", "oracle", "plausible-wrong:keyerror", "tamper:root-conftest", "probe"}
     assert out["compiled_hash"] == "c" * 64 and out["image_digest"] == "sha256:" + "d" * 64 and out["spec_hash"] == spec.spec_hash
     assert json.loads((ws.scenario_dir(spec.id) / "validation.json").read_text())["status"] == "valid"
@@ -183,6 +217,16 @@ def test_validate_scenario_invalid_reasons(tmp_path, monkeypatch):
     monkeypatch.setattr(harbor_cli, "run_task", run_task)
     out = validate.validate_scenario(ws3, spec3, RunConfig.default("full"), "https://x.modal.run")
     assert out["status"] == "valid" and len(out["probe"]["raw_hits"]) == 2 and out["probe"]["filtered_hits"] == []
+
+
+def test_validate_notes_skipped_line_probe(tmp_path, monkeypatch):
+    ws, spec = _spec_ws(tmp_path)
+    monkeypatch.setattr(validate, "compile_scenario", _fake_compile(tmp_path, spec, oracle_diff="--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"))
+    run_task, launched = _fake_harbor(ws.jobs_dir, GOOD, "REFS=1\nREFLOG=0\nGOLD_SHA_CHECKED=none\nHITS_BEGIN\nHITS_END\n")
+    monkeypatch.setattr(harbor_cli, "run_task", run_task)
+    out = validate.validate_scenario(ws, spec, RunConfig.default("full"), "https://x.modal.run")
+    assert out["status"] == "valid" and out["probe"]["probes"] == [] and json.loads(launched[4][2]["gold_lines"]) == []
+    assert out["probe"]["note"] == "line probe skipped: no distinctive added lines in the oracle diff"  # a clean scan was not performed
 
 
 def test_validate_scenario_missing_probe_and_launch_failure(tmp_path, monkeypatch):

@@ -444,6 +444,7 @@ def _checkout(root: Path, gitmodules: str | None = GITMODULES, populate: bool = 
 
 def test_inspect_submodules_fake_checkout(tmp_path):
     co = _checkout(tmp_path / "co")
+    assert comp.parse_gitmodules(GITMODULES) == ["sample-files", "resources/other"]
     assert comp.inspect_submodules(co) == {"declared": ["sample-files", "resources/other"], "populated": []}
     assert comp.check_submodules(co)["populated"] == []  # declared + empty/absent: allowed
     _checkout(co, populate=True)
@@ -452,6 +453,10 @@ def test_inspect_submodules_fake_checkout(tmp_path):
     (tmp_path / "co2" / "resources").mkdir(parents=True); _checkout(tmp_path / "co2"); (tmp_path / "co2" / "resources" / "other").write_text("file, not a dir")
     assert comp.inspect_submodules(tmp_path / "co2")["populated"] == ["resources/other"]
     assert comp.inspect_submodules(_checkout(tmp_path / "plain", gitmodules=None)) == {"declared": [], "populated": []}
+    link = _checkout(tmp_path / "link"); (link / "sample-files").rmdir(); (link / "empty").mkdir(); os.symlink(link / "empty", link / "sample-files")
+    assert comp.inspect_submodules(link)["populated"] == ["sample-files"]  # a symlink is never an empty placeholder
+    spaced = _checkout(tmp_path / "spaced", gitmodules='[submodule "s"]\n\tpath = my dir\n\turl = u\n')
+    with pytest.raises(ValueError, match="whitespace"): comp.check_submodules(spaced)  # the shell guard cannot check such a path: fail closed
 
 
 @pytest.mark.skipif(not all(shutil.which(x) for x in ("sh", "git", "awk")), reason="needs sh, git and awk")
@@ -464,6 +469,12 @@ def test_submodule_guard_shell_matches_python_rule(tmp_path):
     bad = _checkout(tmp_path / "bad", populate=True); r = run(bad)
     assert r.returncode != 0 and "populated submodule path" in r.stderr and "sample-files" in r.stderr and "GUARD_OK" not in r.stdout
     r = run(_checkout(tmp_path / "plain", gitmodules=None)); assert r.returncode == 0 and "GUARD_OK" in r.stdout
+    spaced = _checkout(tmp_path / "spaced", gitmodules='[submodule "s"]\n\tpath = my dir\n\turl = u\n'); (spaced / "my dir").mkdir(); (spaced / "my dir" / "x").write_text("x")
+    r = run(spaced); assert r.returncode != 0 and "whitespace" in r.stderr and "GUARD_OK" not in r.stdout  # word splitting would have skipped it
+    link = _checkout(tmp_path / "link"); (link / "sample-files").rmdir(); (link / "empty").mkdir(); os.symlink(link / "empty", link / "sample-files")
+    r = run(link); assert r.returncode != 0 and "populated submodule path" in r.stderr  # symlink to an empty dir is not a placeholder
+    malformed = _checkout(tmp_path / "malformed", gitmodules='[submodule "x"\npath = y\n')
+    r = run(malformed); assert r.returncode != 0 and "malformed" in r.stderr and "GUARD_OK" not in r.stdout
 
 
 def test_both_dockerfiles_run_submodule_guard_before_manifest(tmp_path):
@@ -480,13 +491,23 @@ def test_both_dockerfiles_run_submodule_guard_before_manifest(tmp_path):
 def test_compile_records_submodules(tmp_path):
     ws, spec = _materialize(tmp_path, minimal_spec_dict())
     res = comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
-    assert json.loads(res.compile_json.read_text())["submodules"] == {"declared": [], "populated": [], "evidence": "build-time"}
+    # nothing local to inspect: say so; never an empty list that reads as "verified: no submodules"
+    assert json.loads(res.compile_json.read_text())["submodules"] == {"declared": None, "populated": None, "evidence": "build-time guard"}
     co = _checkout(ws.scenario_dir(spec.id) / comp.CHECKOUT_DIRNAME)
     res = comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
     assert json.loads(res.compile_json.read_text())["submodules"] == {"declared": ["sample-files", "resources/other"], "populated": [], "evidence": "checkout"}
     _checkout(co, populate=True)
     with pytest.raises(ValueError, match="populated submodule"):
         comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
+    # a .gitmodules asset gives the declared paths; populated-ness is still decided by the build-time guard
+    d = minimal_spec_dict(); d["assets"]["gitmodules"] = {"path": "assets/.gitmodules", "sha256": "0" * 64, "bytes": 1}
+    ws2, spec2 = _materialize(tmp_path / "b", d)
+    (ws2.scenario_dir(spec2.id) / "assets" / ".gitmodules").write_text(GITMODULES)
+    d["assets"]["gitmodules"] = {"path": "assets/.gitmodules", "sha256": hashlib.sha256(GITMODULES.encode()).hexdigest(), "bytes": len(GITMODULES.encode())}
+    spec2 = ScenarioSpec.model_validate(d)
+    res = comp.compile_scenario(ws2, spec2, RunConfig.default("full"), URL, resolve_digest=False)
+    assert json.loads(res.compile_json.read_text())["submodules"] == {"declared": ["sample-files", "resources/other"], "populated": None,
+                                                                      "evidence": "asset gitmodules; populated checked by build-time guard"}
 
 
 def _dockerfile_kind(tmp_path, dockerfile: str):
@@ -516,7 +537,10 @@ def test_pypdf_style_dockerfile_compiles_without_submodule_recursion(tmp_path):
         assert df.startswith(PYPDF_DOCKERFILE) and "--recurse-submodules" not in df and "git submodule deinit --all -f" in df
     for bad in (PYPDF_DOCKERFILE.replace("git clone ", "git clone --recurse-submodules "),
                 PYPDF_DOCKERFILE.replace("git clone ", "git clone --recursive "),
-                PYPDF_DOCKERFILE.replace("WORKDIR /app", "RUN cd /app && git submodule update --init\nWORKDIR /app")):
+                PYPDF_DOCKERFILE.replace("WORKDIR /app", "RUN cd /app && git submodule update --init\nWORKDIR /app"),
+                PYPDF_DOCKERFILE.replace("git clone ", "git clone \\\n    --recurse-submodules "),      # line continuation
+                PYPDF_DOCKERFILE.replace("git clone ", "git -c submodule.recurse=true clone "),
+                PYPDF_DOCKERFILE.replace("WORKDIR /app", "RUN git -C /app submodule update --init\nWORKDIR /app")):
         ws2, spec2 = _dockerfile_kind(tmp_path / hashlib.sha256(bad.encode()).hexdigest()[:8], bad)
         with pytest.raises(ValueError, match="submodule"):
             comp.compile_scenario(ws2, spec2, RunConfig.default("full"), URL, resolve_digest=True)

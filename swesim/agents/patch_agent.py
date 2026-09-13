@@ -22,67 +22,81 @@ def build_apply_command(repo_dir: str, remote_patch: str) -> str:
 
 
 def _probe_spec(item) -> dict:
-    """Probe items are plain lines (legacy) or {"line", "removed": [...], "path"} from validate.gold_probes."""
-    if isinstance(item, str): return {"line": item, "removed": [], "path": None}
-    return {"line": item["line"], "removed": list(item.get("removed") or []), "path": item.get("path")}
+    """Probe items are plain lines (legacy) or {"line", "removed": [...], "path", "new"} from validate.gold_probes."""
+    if isinstance(item, str): return {"line": item, "removed": [], "path": None, "new": False}
+    return {"line": item["line"], "removed": list(item.get("removed") or []), "path": item.get("path"), "new": bool(item.get("new", False))}
+
+
+_STRIP_LINES = "sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'"
 
 
 def build_probe_command(repo_dir: str, gold_lines: list, gold_sha: str = "") -> str:
     """Counts refs/reflog entries, checks the gold object, and greps for each probe's added line.
 
     Between the HITS markers: `RAW <i>\\t<file>` for every file containing probe i's added line, and `HIT <i>\\t<file>`
-    only when that file also lacks all of the hunk's removed lines (a base copy such as build/lib/... keeps the
-    pre-fix lines; a leaked post-fix copy does not). Pure-addition probes emit HIT for every RAW; the host drops the
-    patch's own base path for those. `.git/` is excluded; build/, dist/, *.egg-info and site-packages stay in scope."""
+    only when that file also lacks all of the hunk's removed lines, matched as whole lines after stripping whitespace
+    (a base copy such as build/lib/... keeps the pre-fix lines; a leaked post-fix copy does not; a removed line that
+    is a substring of the added line therefore never masks a hit). Pure-addition probes emit HIT for every RAW; for an
+    existing file the probe first prints `PREEXISTS <i>` when the added line is already present at the base path (the
+    line pre-exists at base, so no copy is evidence) and the host skips that path. New files (`new`) skip nothing.
+    `.git/` is excluded; build/, dist/, *.egg-info and site-packages stay in scope."""
     q = shlex.quote
     gold_probe = f"git cat-file -e {q(gold_sha)} 2>/dev/null && echo GOLD_OBJECT_REACHABLE:{q(gold_sha)} || true" if gold_sha else "true"
     parts = []
     for i, spec in enumerate(_probe_spec(x) for x in gold_lines):
         raw = f"printf 'RAW {i}\\t%s\\n' \"$f\""
         hit = f"printf 'HIT {i}\\t%s\\n' \"$f\""
+        pre = ""
         if spec["removed"]:
             removed = " ".join(f"-e {q(r)}" for r in spec["removed"])
-            body = f"{raw}; if ! grep -qF {removed} -- \"$f\"; then {hit}; fi"
+            body = f"{raw}; if ! {_STRIP_LINES} < \"$f\" | grep -qxF {removed}; then {hit}; fi"
         else:
             body = f"{raw}; {hit}"
-        parts.append(f"grep -rF --exclude-dir=.git -l -- {q(spec['line'])} . 2>/dev/null | head -50 | while IFS= read -r f; do {body}; done")
+            if spec["path"] and not spec["new"]:
+                pre = f"if [ -f {q(spec['path'])} ] && grep -qF -- {q(spec['line'])} {q(spec['path'])}; then printf 'PREEXISTS {i}\\n'; fi; "
+        parts.append(f"{pre}grep -rF --exclude-dir=.git -l -- {q(spec['line'])} . 2>/dev/null | head -50 | while IFS= read -r f; do {body}; done")
     greps = " ; ".join(parts) or "true"
     return (f"cd {q(repo_dir)} && echo REFS=$(git rev-list --all | wc -l) && echo REFLOG=$(git reflog | wc -l) "
             f"&& echo GOLD_SHA_CHECKED={q(gold_sha) if gold_sha else 'none'} && echo HITS_BEGIN && ({gold_probe}; {greps}) ; echo HITS_END")
 
 
-def _keep_hit(idx: int | None, path: str, specs: list[dict]) -> bool:
+def _keep_hit(idx: int | None, path: str, specs: list[dict], preexisting: set[int] = frozenset()) -> bool:
     norm = path[2:] if path.startswith("./") else path
     if norm == ".git" or norm.startswith(".git/") or "/.git/" in norm: return False
-    if idx is not None and idx < len(specs):
-        spec = specs[idx]
-        if not spec["removed"] and spec["path"] and norm == spec["path"]: return False  # pure addition: the modified file's base copy is expected to hold it
+    if idx is not None:
+        if idx in preexisting: return False  # the added line already exists at base in the modified file: copies are not evidence
+        if idx < len(specs):
+            spec = specs[idx]
+            if not spec["removed"] and not spec["new"] and spec["path"] and norm == spec["path"]: return False  # pure addition: the modified file's own base copy
     return True
 
 
 def parse_probe_output(text: str, probes: list | None = None) -> dict:
     """Markers are matched as whole lines so a file named like `HITS_END_fixture.py` cannot truncate the block;
     `hits_block_found` is False when the probe output is incomplete. `raw_hits` are every file containing an added
-    line; `filtered_hits` survive the removed-line, base-path and .git/ rules; `gold_line_hits` lists their files."""
+    line; `filtered_hits` survive the removed-line, PREEXISTS, base-path and .git/ rules; `gold_line_hits` lists their
+    files; `preexisting_probes` are the probes whose added line already existed at the base path."""
     refs = re.search(r"^REFS=\s*(\d+)", text, re.M)
     reflog = re.search(r"^REFLOG=\s*(\d+)", text, re.M)
     block = re.search(r"^HITS_BEGIN$\n(.*?)^HITS_END$", text, re.M | re.S)
     specs = [_probe_spec(p) for p in (probes or [])]
-    raw_hits: list[dict] = []; filtered: list[dict] = []; gold_object = False
+    raw_hits: list[dict] = []; candidates: list[tuple[int | None, str]] = []; preexisting: set[int] = set(); gold_object = False
     for line in (block.group(1).splitlines() if block else []):
         if not line.strip(): continue
         if line.startswith("GOLD_OBJECT_REACHABLE"): gold_object = True; continue
+        pre = re.match(r"^PREEXISTS (\d+)$", line)
+        if pre: preexisting.add(int(pre.group(1))); continue
         m = re.match(r"^(RAW|HIT) (\d+)\t(.+)$", line)
         if m:
             kind, idx, path = m.group(1), int(m.group(2)), m.group(3)
             if kind == "RAW": raw_hits.append({"probe": idx, "file": path})
-            elif _keep_hit(idx, path, specs): filtered.append({"probe": idx, "file": path})
+            else: candidates.append((idx, path))
         else:  # legacy probe.txt: bare file lines were both raw and hit
-            path = line.strip(); raw_hits.append({"probe": None, "file": path})
-            if _keep_hit(None, path, specs): filtered.append({"probe": None, "file": path})
+            path = line.strip(); raw_hits.append({"probe": None, "file": path}); candidates.append((None, path))
+    filtered = [{"probe": idx, "file": path} for idx, path in candidates if _keep_hit(idx, path, specs, preexisting)]
     return {"reflog_entries": int(reflog.group(1)) if reflog else None, "all_refs": int(refs.group(1)) if refs else None,
             "gold_line_hits": sorted({h["file"] for h in filtered}), "gold_object_reachable": gold_object,
-            "hits_block_found": block is not None, "raw_hits": raw_hits, "filtered_hits": filtered}
+            "hits_block_found": block is not None, "raw_hits": raw_hits, "filtered_hits": filtered, "preexisting_probes": sorted(preexisting)}
 
 
 class PatchAgent(BaseAgent):
