@@ -1292,6 +1292,21 @@ def _run_in_env(scenario):
     asyncio.run(go())
 
 
+def test_env_built_workers_carry_the_heartbeat_throttle_and_concurrency():
+    """`build_workers` hands every production Worker the five-second heartbeat throttle and the per-queue concurrency."""
+    from datetime import timedelta
+    from swesim.settings import Settings
+    from swesim.workflows import worker as WK
+    async def scenario(env):
+        s = Settings.from_env({"SWESIM_ENV_FILE": "/nonexistent/.env"})
+        built = WK.build_workers(env.client, s)
+        assert [w.task_queue for w in built] == list(s.task_queues) and len(built) == len(QUEUES)
+        for w in built:
+            assert w.config()["max_heartbeat_throttle_interval"] == timedelta(seconds=5)
+            assert w.config()["max_concurrent_activities"] == WK.concurrency(s, w.task_queue)
+    _run_in_env(scenario)
+
+
 def test_env_trial_workflow_rejects_duplicate_id_and_launches_once():
     from temporalio import activity
     from temporalio.exceptions import WorkflowAlreadyStartedError
@@ -1396,6 +1411,11 @@ def test_worker_registers_all_workflows_and_partitions_activities_by_queue(monke
     s = Settings.from_env({"SWESIM_TASK_QUEUE": "swesim-build,swesim-control", "SWESIM_WORKER_IMAGE_DIGEST": "sha256:abc", "TEMPORAL_API_KEY": "tmprl_x",
                            "SWESIM_ENV_FILE": "/nonexistent/.env"})
     assert WK.concurrency(s, Q.BUILD) == 8 and WK.concurrency(s.model_copy(update={"max_concurrent_activities": 3}), Q.BUILD) == 3
+    # heartbeats are throttled to five seconds so an operator's cancel reaches a running stage within seconds, not the SDK's 60 s
+    from datetime import timedelta
+    assert WK.HEARTBEAT_THROTTLE == timedelta(seconds=5)
+    assert WK.worker_options(s, Q.BUILD) == {"max_concurrent_activities": 8, "max_heartbeat_throttle_interval": timedelta(seconds=5)}
+    assert WK.worker_options(s.model_copy(update={"max_concurrent_activities": 3}), Q.CONTROL)["max_concurrent_activities"] == 3
     line = WK.startup_line(s)
     assert "queues=swesim-build,swesim-control" in line and "worker_image_digest=sha256:abc" in line and "tmprl_x" not in line
     # the control pool migrates the index at startup when it is enabled; other pools and a disabled index skip; a missing entry point is reported
