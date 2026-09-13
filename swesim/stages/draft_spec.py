@@ -20,7 +20,9 @@ from swesim.llm import chat_json
 from swesim.paths import atomic_json
 from swesim.sources import threads
 from swesim.sources.swebench_annotated import TEST_PYTHON, test_files_from_patch
-from swesim.stages.judge import _BLOCKQUOTE, llm_view, norm_text
+import keyword
+
+from swesim.stages.judge import DIFF_HEADER_PREFIXES, _BLOCKQUOTE, evidence_text, llm_view, norm_text
 
 DRAFT_PROMPT_VERSION = "draft-v1"
 CONTEXT_BUDGET_CHARS = 120000
@@ -33,8 +35,8 @@ maintainer decided are discovery=on-request. Private helper names chosen by the 
 not link tests. Requirements come from review comments. Checks are user-level reproducers (not the hidden tests).
 Groups partition FAIL_TO_PASS test ids into requirement groups with weights summing to 1. Also write one plausible-wrong patch
 as a unified diff against the repository at the base commit: a tempting incomplete or wrong fix (e.g. wrong exception type).
-Constraints the record must satisfy: at least one on-request fact links a FAIL_TO_PASS test id (the decision the agent has to
-ask about); fact, requirement, check and group ids match ^[a-z0-9][a-z0-9._-]{2,63}$ and never start with "withheld-" or
+Constraints the record must satisfy: every on-request fact carries `tests` drawn from the FAIL_TO_PASS ids listed at the top
+of the user message (the decision the agent has to ask about is what those tests pin); fact, requirement, check and group ids match ^[a-z0-9][a-z0-9._-]{2,63}$ and never start with "withheld-" or
 "tests-" (code-generated facts use those); test links use only the FAIL_TO_PASS and PASS_TO_PASS ids given; check ids differ
 from test ids. Every fact's source_excerpt is copied verbatim (no paraphrase) from the text its provenance names: issue-thread
 = linked issue title/body/comments or hints_text, pr-thread = PR title/body/comments, pr-review = review bodies and review
@@ -338,7 +340,7 @@ def _corpora(row: dict) -> dict[str, str]:
             "pr-thread": _norm("\n".join([t.get("pr_title") or "", t.get("pr_body") or "", *bodies(t.get("pr_comments"))])),
             "pr-review": _norm("\n".join(bodies(t.get("reviews")) + bodies(t.get("review_comments")))),
             "annotator-note": _norm("\n".join([ann.get("underspecified_notes") or "", ann.get("false_negative_notes") or ""])),
-            "authored": _norm("\n".join([row.get("test_patch") or "", row.get("patch") or ""]))}
+            "authored": _norm(evidence_text(row))}  # diff markers/headers stripped, so excerpts may span adjacent added lines
 
 
 def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None, *, corpus_by_fact: dict[str, str] | None = None,
@@ -369,17 +371,17 @@ def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None,
             bad.append(f"{fid}: source_excerpt is not a verbatim span of the {where}: {excerpt[:80]!r}")
         if not (f.get("source_url") or "").casefold().startswith(url_prefix):
             bad.append(f"{fid}: source_url must be under https://github.com/{row['repo']}/")
+        if require_f2p_link and f.get("discovery") == "on-request" and not (set(f.get("tests") or []) & set(row.get("fail_to_pass") or [])):
+            bad.append(f"{fid}: every on-request fact must carry `tests` drawn from the FAIL_TO_PASS ids {sorted(row.get('fail_to_pass') or [])}")
     f2p = set(row.get("fail_to_pass") or [])
     if require_f2p_link and not any(f.get("discovery") == "on-request" and set(f.get("tests") or []) & f2p for f in [*ledger, *(extra_facts or [])]):
-        bad.append("no on-request fact links a FAIL_TO_PASS test id (interaction would not be load-bearing)")
+        bad.append(f"no on-request fact links a FAIL_TO_PASS test id (interaction would not be load-bearing); link one of {sorted(f2p)}")
     return bad
 
 
-def tests_for_excerpt(test_patch: str, excerpt: str, fail_to_pass: list[str]) -> list[str]:
-    """FAIL_TO_PASS ids whose test function (in the unified diff of the hidden tests) contains `excerpt`. Falls back to the
-    F2P tests of the containing file when the excerpt sits at module level, and to every F2P test when the excerpt is not in
-    the test patch at all (evidence from the source patch)."""
-    needle = _norm(excerpt)
+def _test_blocks(test_patch: str) -> list[tuple[str | None, str | None, list[str]]]:
+    """(file, test function or None, body lines) blocks of the hidden-test diff, built from added and context lines with the
+    diff markers stripped; a block runs from a `def test_*` to the next def or file."""
     blocks: list[tuple[str | None, str | None, list[str]]] = []
     current_file = None
     for raw in (test_patch or "").splitlines():
@@ -388,22 +390,59 @@ def tests_for_excerpt(test_patch: str, excerpt: str, fail_to_pass: list[str]) ->
             current_file = m.group(1)
             blocks.append((current_file, None, []))
             continue
-        line = raw[1:] if raw[:1] in "+- " else raw
+        if raw.startswith(DIFF_HEADER_PREFIXES) or raw[:1] == "-":
+            continue
+        line = raw[1:] if raw[:1] in ("+", " ") else raw
         d = _TEST_DEF.match(line)
         if d:
             blocks.append((current_file, d.group(1), []))
         if blocks:
             blocks[-1][2].append(line)
-    hits = [(f, fn) for f, fn, lines in blocks if needle and needle in _norm("\n".join(lines))]
+    return blocks
+
+
+def _f2p_for_block(file: str | None, fn: str | None, fail_to_pass: list[str]) -> set[str]:
+    out = set()
+    for t in fail_to_pass:
+        path, *rest = t.split("::")
+        func = re.split(r"[\[(]", rest[-1])[0] if rest else ""
+        if path == file and (fn is None or func == fn):
+            out.add(t)
+    return out
+
+
+_KEYWORDS = set(keyword.kwlist) | set(getattr(keyword, "softkwlist", []))
+
+
+def content_words(text: str | None) -> set[str]:
+    """Casefolded alphanumeric tokens of length >= 5 that are not Python keywords."""
+    return {t for t in re.findall(r"[^\W_]+", (text or "").casefold()) if len(t) >= 5 and t not in _KEYWORDS}
+
+
+def auto_link_tests(text: str | None, test_patch: str, fail_to_pass: list[str], min_shared: int = 2) -> list[str]:
+    """Code-owned fallback link for an on-request fact without tests: the FAIL_TO_PASS tests whose function body in the
+    hidden-test diff shares at least `min_shared` distinct content words with the fact text."""
+    words = content_words(text)
+    out: set[str] = set()
+    if not words:
+        return []
+    for file, fn, lines in _test_blocks(test_patch):
+        if fn is not None and len(words & content_words("\n".join(lines))) >= min_shared:
+            out |= _f2p_for_block(file, fn, fail_to_pass)
+    return sorted(out)
+
+
+def tests_for_excerpt(test_patch: str, excerpt: str, fail_to_pass: list[str]) -> list[str]:
+    """FAIL_TO_PASS ids whose test function (in the unified diff of the hidden tests) contains `excerpt`. Falls back to the
+    F2P tests of the containing file when the excerpt sits at module level, and to every F2P test when the excerpt is not in
+    the test patch at all (evidence from the source patch)."""
+    needle = _norm(excerpt)
+    hits = [(f, fn) for f, fn, lines in _test_blocks(test_patch) if needle and needle in _norm("\n".join(lines))]
     if not hits:
         return sorted(fail_to_pass)
-    out = set()
+    out: set[str] = set()
     for f, fn in hits:
-        for t in fail_to_pass:
-            path, *rest = t.split("::")
-            func = re.split(r"[\[(]", rest[-1])[0] if rest else ""
-            if path == f and (fn is None or func == fn):
-                out.add(t)
+        out |= _f2p_for_block(f, fn, fail_to_pass)
     return sorted(out) or sorted(fail_to_pass)
 
 
@@ -433,20 +472,37 @@ def tests_resolved_facts(row: dict, judged: dict) -> list[dict]:
     return out
 
 
-def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None) -> dict:
-    """One LLM authoring call, validated by `ledger_violations`, one correction round, then fail."""
-    user = json.dumps({"candidate": llm_view(row), "judge": judged}, ensure_ascii=False)
+def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None) -> tuple[dict, list[str]]:
+    """One LLM authoring call, validated by `ledger_violations`, one correction round, then a code-owned fallback that links
+    on-request facts without tests to the FAIL_TO_PASS tests sharing content words with them (`auto_link_tests`), then fail.
+    Returns (draft dict, ids of auto-linked facts)."""
+    f2p = list(row.get("fail_to_pass") or [])
+    user = ("FAIL_TO_PASS ids (every on-request fact must carry `tests` drawn from this list): " + json.dumps(f2p) + "\n\n"
+            + json.dumps({"candidate": llm_view(row), "judge": judged}, ensure_ascii=False))
     if len(user) > CONTEXT_BUDGET_CHARS:
         raise ValueError("candidate exceeds authoring context budget")
     messages = [{"role": "user", "content": user}]
     bad: list[str] = []
-    for _attempt in range(2):
+    d: dict = {}
+    for attempt in range(2):
         d = chat_json(model_id, SYSTEM, messages, SCHEMA, max_tokens=8000)
         bad = ledger_violations(d, row, extra_facts)
         if not bad:
-            return d
-        messages.append({"role": "assistant", "content": json.dumps(d)})
-        messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(bad)})
+            return d, []
+        if attempt == 0:
+            messages.append({"role": "assistant", "content": json.dumps(d)})
+            messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(bad)})
+    auto_linked = []
+    for f in d.get("ledger") or []:
+        if isinstance(f, dict) and f.get("discovery") == "on-request" and not (set(f.get("tests") or []) & set(f2p)):
+            links = auto_link_tests(f.get("text"), row.get("test_patch") or "", f2p)
+            if links:
+                f["tests"] = sorted(set(f.get("tests") or []) | set(links))
+                auto_linked.append(f.get("id"))
+    if auto_linked:
+        bad = ledger_violations(d, row, extra_facts)
+        if not bad:
+            return d, auto_linked
     raise ValueError("draft failed grounding validation after two attempts: " + "; ".join(bad))
 
 
@@ -466,7 +522,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     assets = out_dir / "assets"
     assets.mkdir(exist_ok=True)
     synthesized = tests_resolved_facts(row, judged)
-    d = _author(row, judged, model_id, extra_facts=synthesized)
+    d, auto_linked = _author(row, judged, model_id, extra_facts=synthesized)
 
     pw = d.get("plausible_wrong") or {}
     if not (pw.get("diff") or "").strip():
@@ -562,7 +618,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     atomic_json(out_dir / "judge.json", {"gaps": judged.get("gaps", []), "verified_rubric_score": judged.get("verified_rubric_score"),
                                          "keep": judged.get("keep"), **judged})
     atomic_json(out_dir / "draft.meta.json", {"model_id": model_id, "prompt_version": DRAFT_PROMPT_VERSION, "pipeline_version": pipeline_version,
-                                              "created_at": spec["created_at"], "spec_hash": parsed.spec_hash,
+                                              "created_at": spec["created_at"], "spec_hash": parsed.spec_hash, "auto_linked": auto_linked,
                                               "withholding": {"removed": [{**r, "fact_id": f"withheld-{i + 1:03d}"} for i, r in enumerate(withheld["removed"])],
                                                               "kept": withheld["kept"], "stats": withheld["stats"]}})
     return p

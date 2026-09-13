@@ -402,9 +402,99 @@ def test_authored_facts_must_ground_in_tests_or_patch():
     assert any("f04" in v and "source_url" in v for v in ledger_violations(d, _row()))
     d = _draft_llm(); d["ledger"].append({**d["ledger"][3], "id": "tests-001"})
     assert any("tests-001" in v and "reserved" in v for v in ledger_violations(d, _row()))
-    d = _draft_llm(); d["ledger"][0]["discovery"] = "repo-derivable"                                                   # no model fact links a F2P test any more ...
+    d = _draft_llm(); d["ledger"][0]["discovery"] = d["ledger"][3]["discovery"] = "repo-derivable"                     # no model fact links a F2P test any more ...
     assert any("on-request" in v for v in ledger_violations(d, _row()))
     assert not any("on-request" in v for v in ledger_violations(d, _row(), [{"discovery": "on-request", "tests": [F2P]}]))   # ... but a synthesized one does
+
+
+# ---------------------------------------------------------------- urgent drafter fixes: diff-body corpus, on-request facts carry tests, auto-link fallback
+
+SPHINX_TEST_PATCH = ("diff --git a/tests/test_ext_autodoc.py b/tests/test_ext_autodoc.py\nindex 1111111..2222222 100644\n--- a/tests/test_ext_autodoc.py\n+++ b/tests/test_ext_autodoc.py\n"
+                     "@@ -10,3 +10,6 @@ def test_other():\n     pass\n+def test_table_rows(app):\n+    content = app.render()\n+    rows = content.splitlines()\n"
+                     "+    assert len(content.splitlines()) == 11\n+    assert len(rows) == 11\n-    assert old_value == 7\n\\ No newline at end of file\n")
+
+
+def test_diff_body_text_strips_markers_and_headers():
+    from swesim.stages.judge import diff_body_lines, diff_body_text
+    body = diff_body_text(SPHINX_TEST_PATCH)
+    assert body == ("    pass\ndef test_table_rows(app):\n    content = app.render()\n    rows = content.splitlines()\n"
+                    "    assert len(content.splitlines()) == 11\n    assert len(rows) == 11")
+    assert "diff --git" not in body and "index " not in body and "+++" not in body and "@@" not in body and "No newline" not in body and "old_value" not in body
+    assert "    assert old_value == 7" in diff_body_lines(SPHINX_TEST_PATCH, include_removed=True)
+    assert diff_body_text("plain text, not a diff\nsecond line") == "plain text, not a diff\nsecond line"
+
+
+def test_grounding_excerpt_may_span_adjacent_added_lines():
+    """sphinx-doc__sphinx-9467: `assert len(content.splitlines()) == 11 assert len(rows) == 11` sits on two adjacent `+` lines."""
+    from swesim.stages.draft_spec import ledger_violations
+    from swesim.stages.judge import ground_gaps
+    f2p = ["tests/test_ext_autodoc.py::test_table_rows"]
+    row = _row(repo="sphinx-doc/sphinx", test_patch=SPHINX_TEST_PATCH, fail_to_pass=f2p, thread=_thread("sphinx-doc/sphinx", 9467))
+    excerpt = "assert len(content.splitlines()) == 11 assert len(rows) == 11"
+    d = _draft_llm(repo="sphinx-doc/sphinx", pr=9467)
+    d["ledger"] = [{"id": "f01", "text": "The rendered table has eleven rows", "kind": "behavior", "provenance": "authored", "source_excerpt": excerpt,
+                    "source_url": "https://github.com/sphinx-doc/sphinx/pull/9467", "authored_rationale": "only the tests pin the count", "discovery": "on-request", "tests": f2p}]
+    assert ledger_violations(d, row) == []
+    d["ledger"][0]["source_excerpt"] = "assert len(rows) == 11 assert old_value == 7"     # removed (`-`) lines are not evidence of the merged state
+    assert any("f01" in v and "verbatim" in v for v in ledger_violations(d, row))
+    gap = {"id": "g9", "source": "proposed", "text": "row count", "evidence": excerpt, "question": "how many rows?", "derivable_from_repo": False, "consequential": True,
+           "resolved_by": "tests", "category": "behavior"}
+    kept, stats = ground_gaps([gap], row)
+    assert kept and kept[0]["evidence_grounded"] is True and kept[0]["resolved_by"] == "tests" and stats["gaps_dropped"] == 0
+
+
+MPL_TEST_PATCH = ("diff --git a/lib/matplotlib/tests/test_figure.py b/lib/matplotlib/tests/test_figure.py\n--- a/lib/matplotlib/tests/test_figure.py\n+++ b/lib/matplotlib/tests/test_figure.py\n"
+                  "@@ -1 +1,9 @@\n x\n+def test_subplot_mosaic_width_ratios():\n+    fig = plt.figure()\n+    fig.subplot_mosaic([[\"A\", [[\"B\"], [\"C\"]]]], width_ratios=[2, 1])\n"
+                  "+    assert fig.axes\n+def test_subplot_mosaic_height_ratios_nested():\n+    fig = plt.figure()\n+    fig.subplot_mosaic([[\"A\"], [[[\"B\", \"C\"]]]], height_ratios=[1, 3])\n"
+                  "+def test_unrelated_colorbar_label():\n+    assert plt.colorbar().ax.get_ylabel() == \"\"\n")
+MPL_F2P = ["lib/matplotlib/tests/test_figure.py::test_subplot_mosaic_width_ratios", "lib/matplotlib/tests/test_figure.py::test_subplot_mosaic_height_ratios_nested[a]",
+           "lib/matplotlib/tests/test_figure.py::test_unrelated_colorbar_label"]
+
+
+def test_auto_link_tests_by_shared_content_words():
+    from swesim.stages.draft_spec import auto_link_tests, content_words
+    assert content_words("Nested subplot_mosaic layouts must apply width_ratios while nothing is None") == {"nested", "subplot", "mosaic", "layouts", "apply", "width", "ratios", "nothing"}
+    assert auto_link_tests("Nested subplot_mosaic layouts must apply width_ratios to every level", MPL_TEST_PATCH, MPL_F2P) == sorted([MPL_F2P[0], MPL_F2P[1]])   # mosaic+subplot shared with both; width+ratios with the first
+    assert auto_link_tests("Only the height_ratios of nested mosaics matter here", MPL_TEST_PATCH, MPL_F2P) == [MPL_F2P[1]]
+    assert auto_link_tests("The maintainer prefers a friendly wording", MPL_TEST_PATCH, MPL_F2P) == []                  # no shared content words
+    assert auto_link_tests("figure figure figure", MPL_TEST_PATCH, MPL_F2P) == []                                    # one distinct shared word is not enough
+    assert auto_link_tests("", MPL_TEST_PATCH, MPL_F2P) == [] and auto_link_tests("assert while return", MPL_TEST_PATCH, MPL_F2P) == []   # keywords never count
+
+
+def test_on_request_facts_must_carry_f2p_tests_named_in_the_violation():
+    from swesim.stages.draft_spec import ledger_violations
+    d = _draft_llm(); d["ledger"][0]["tests"] = []
+    bad = ledger_violations(d, _row())
+    assert any(v.startswith("f01:") and "on-request" in v and F2P in v for v in bad)
+    d["ledger"][0]["tests"] = [P2P]                                                       # a PASS_TO_PASS link does not satisfy the rule
+    assert any(v.startswith("f01:") for v in ledger_violations(d, _row()))
+    # withheld facts are on-request without tests by design: exempt via require_f2p_link=False
+    w = {"id": "withheld-001", "text": "t", "kind": "context", "provenance": "original-issue", "source_excerpt": "Traceback shows no error at all.",
+         "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": []}
+    assert ledger_violations({"ledger": [w]}, _row(), corpus_by_fact={"withheld-001": w["source_excerpt"]}, allow_reserved=True, require_f2p_link=False) == []
+
+
+def test_draft_lists_f2p_ids_and_auto_links_on_request_facts_before_failing(monkeypatch, tmp_path):
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    d = _draft_llm(); d["ledger"][0].update(tests=[], text="Raise ValueError with the dimension not found message")   # shares valueerror/dimension/found with the test body
+    calls = _patch_llm(monkeypatch, d, _withhold_llm())
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert next(f for f in spec.ledger if f.id == "f01").tests == [F2P]
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert meta["auto_linked"] == ["f01"]
+    draft_calls = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
+    assert len(draft_calls) == 2                                                                        # correction round happened before the fallback
+    assert draft_calls[0]["messages"][0]["content"].startswith("FAIL_TO_PASS ids") and F2P in draft_calls[0]["messages"][0]["content"].splitlines()[0]
+    correction = draft_calls[1]["messages"][-1]["content"]
+    assert "Correct these violations" in correction and "f01:" in correction and F2P in correction
+    # no shared content words: the fallback cannot link, so the draft fails as before
+    d = _draft_llm(); d["ledger"][0].update(tests=[], text="The maintainer prefers a friendly wording")
+    _patch_llm(monkeypatch, d, _withhold_llm())
+    with pytest.raises(ValueError, match="grounding validation after two attempts.*f01: every on-request fact must carry"):
+        draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s2")
+    assert not (tmp_path / "s2" / "scenario.draft.json").exists()
 
 
 def test_calibrate_reports_agreement_at_threshold(monkeypatch):
@@ -663,7 +753,7 @@ def _draft_llm(alt=None, repo="pydata/xarray", pr=5362):
                         "source_url": f"https://github.com/{repo}/issues/5360", "authored_rationale": None, "discovery": "brief", "tests": []},
                        {"id": "f04", "text": "The tests pin the exact error message", "kind": "behavior", "provenance": "authored",
                         "source_excerpt": "with pytest.raises(ValueError, match=\"dimension 'z' not found\"):", "source_url": url,   # authored = pinned only by the merged tests
-                        "authored_rationale": "only the merged tests state the message", "discovery": "on-request", "tests": []}],
+                        "authored_rationale": "only the merged tests state the message", "discovery": "on-request", "tests": [F2P]}],
             "operations": [{"type": "clarification", "target": "f01", "rationale": "issue never names the exception"}],
             "persona": {"summary": "xarray maintainer", "tone": "terse", "disclosure_style": "answers what is asked",
                         "derived_from_urls": [url], "role": "maintainer"},
@@ -745,7 +835,7 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     assert tf.source_excerpt == "match=\"dimension 'z' not found\"" and "g2" in tf.authored_rationale and "resolved_by=tests" in tf.authored_rationale
     assert [f.id for f in spec.ledger] == ["f01", "f02", "f03", "f04", "tests-001", "withheld-001", "withheld-002", "withheld-003"]
     meta = json.loads((out_dir / "draft.meta.json").read_text())
-    assert [r["fact_id"] for r in meta["withholding"]["removed"]] == ["withheld-001", "withheld-002", "withheld-003"]
+    assert meta["auto_linked"] == [] and [r["fact_id"] for r in meta["withholding"]["removed"]] == ["withheld-001", "withheld-002", "withheld-003"]
     assert meta["withholding"]["stats"]["sentences_removed"] == 3 and meta["withholding"]["kept"]
     # the on-request fact linked to a FAIL_TO_PASS test survives for the approval gate
     assert any(f.discovery == "on-request" and F2P in f.tests for f in spec.ledger)
@@ -757,7 +847,8 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     assert {"gaps", "verified_rubric_score", "keep"} <= set(j) and j["keep"] is True
     # LLM calls: one draft, one withhold, both with the requested model
     assert [c["model"] for c in calls] == ["fake/model", "fake/model"] and calls[0]["kw"].get("max_tokens") == 8000
-    assert json.loads(calls[0]["messages"][0]["content"])["candidate"]["instance_id"] == "pydata__xarray-5362"
+    first = calls[0]["messages"][0]["content"]
+    assert first.startswith("FAIL_TO_PASS ids") and json.loads(first.split("\n\n", 1)[1])["candidate"]["instance_id"] == "pydata__xarray-5362"
 
 
 def test_draft_structural_tests_require_alternative_correct(monkeypatch, tmp_path):
@@ -829,7 +920,7 @@ def test_llm_view_trims_pass_to_pass_but_spec_keeps_it(monkeypatch, tmp_path):
     p = draft_spec.draft(_row(pass_to_pass=p2p), _judged(), "fake/model", tmp_path / "s")
     spec = ScenarioSpec.model_validate_json(p.read_text())
     assert spec.contract.pass_to_pass == p2p and all(t in spec.contract.runner.command for t in p2p)
-    assert json.loads(calls[0]["messages"][0]["content"])["candidate"]["pass_to_pass_count"] == 300
+    assert json.loads(calls[0]["messages"][0]["content"].split("\n\n", 1)[1])["candidate"]["pass_to_pass_count"] == 300
 
 
 def test_draft_fails_without_a_source_url_for_withheld_facts(monkeypatch, tmp_path):
@@ -853,9 +944,9 @@ def test_ledger_violations_ground_every_non_authored_fact():
     assert any("f02" in v for v in ledger_violations(d, _row()))
     d = _draft_llm(); d["ledger"][2]["source_excerpt"] = "Expected: raise KeyError."                    # not in the original issue
     assert any("f03" in v for v in ledger_violations(d, _row()))
-    d = _draft_llm(); d["ledger"][0]["discovery"] = "repo-derivable"                                    # nothing on-request links a F2P test any more
+    d = _draft_llm(); d["ledger"][0]["discovery"] = d["ledger"][3]["discovery"] = "repo-derivable"      # nothing on-request links a F2P test any more
     assert any("on-request" in v for v in ledger_violations(d, _row()))
-    d = _draft_llm(); d["ledger"].append({"id": "f05", "text": "n", "kind": "context", "provenance": "annotator-note", "source_excerpt": "The note says n", "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": []})
+    d = _draft_llm(); d["ledger"].append({"id": "f05", "text": "n", "kind": "context", "provenance": "annotator-note", "source_excerpt": "The note says n", "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": [F2P]})
     assert ledger_violations(d, _row(annotation={**_row()["annotation"], "underspecified_notes": "The note says n"})) == []  # annotator notes are a valid corpus
     assert any("f05" in v for v in ledger_violations(d, _row()))                                        # blank annotation notes cannot ground a fact
     # hints_text counts as issue-thread text (SWE-bench issue comments)

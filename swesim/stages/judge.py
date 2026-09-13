@@ -103,9 +103,36 @@ def thread_text(row: dict) -> str:
     return "\n".join(parts)
 
 
+DIFF_HEADER_PREFIXES = ("diff ", "index ", "--- ", "+++ ", "@@", "\\ No newline", "new file mode", "deleted file mode", "old mode", "new mode",
+                        "similarity index", "dissimilarity index", "rename from", "rename to", "copy from", "copy to", "Binary files")
+
+
+def diff_body_lines(patch: str | None, include_removed: bool = False) -> list[str]:
+    """Hunk body lines of a unified diff with the leading marker stripped: added and context lines (removed lines only on
+    request); diff/index/---/+++/@@ headers and `\\ No newline` markers dropped. Text that is not a diff line passes through."""
+    out = []
+    for raw in (patch or "").splitlines():
+        if raw.startswith(DIFF_HEADER_PREFIXES):
+            continue
+        head = raw[:1]
+        if head in ("+", " "):
+            out.append(raw[1:])
+        elif head == "-":
+            if include_removed:
+                out.append(raw[1:])
+        else:
+            out.append(raw)
+    return out
+
+
+def diff_body_text(patch: str | None) -> str:
+    return "\n".join(diff_body_lines(patch))
+
+
 def evidence_text(row: dict) -> str:
-    """The merged tests and fix: the only admissible evidence for a proposed gap."""
-    return (row.get("test_patch") or "") + "\n" + (row.get("patch") or "")
+    """The merged tests and fix as they read after the fix (diff markers and headers removed): the only admissible evidence
+    for a proposed gap. Adjacent added lines therefore normalize to adjacent sentences."""
+    return diff_body_text(row.get("test_patch")) + "\n" + diff_body_text(row.get("patch"))
 
 
 def ground_gaps(gaps: list, row: dict) -> tuple[list[dict], dict]:
