@@ -90,6 +90,7 @@ Commands:
 ```bash
 bash scripts/vm/create.sh            # creates e2-standard-4 Debian 12 VM (or reuses it), copies env + modal.toml, runs setup.sh on the VM
 bash scripts/vm/tunnel.sh            # second terminal; forwards 8233, 7233, 8080 to localhost
+bash scripts/vm/pull.sh              # mirror the VM record (scenarios, tasks, trials, exports, evidence, registry.json, job essentials) into the laptop workspace
 ```
 
 `setup.sh` (runs on the VM as the login user): apt `git gh curl ca-certificates file`; `uv` and `uv python install 3.12`;
@@ -375,6 +376,9 @@ Every item below was caught by a code-owned gate; none reached a registered scen
 | sphinx-doc__sphinx-10097 | validate | the model's alternative-correct control did not pass the tests (`success != 1`) | rejected honestly |
 | matplotlib__matplotlib-24189, pytest-dev__pytest-7283 (fourth attempt) | probe | exact-id probe stages disagreed with the whole-file run (`unreliable exact-id probe`) | rejected; kept as evidence of order-dependent tests |
 | scikit-learn__scikit-learn-13584 (probe) | probe | probe controller imported the grader under the image's Python < 3.7 (`from __future__ import annotations`) | probe controller runs under `/usr/local/bin/swesim-python` |
+| seaborn-3190 v2, sklearn-13584 v2 (first interactive `RunTasksWorkflow`s, 2026-09-13 06:14Z) | run | every interactive trial ended `unresolved` although each unit completed with reward 1.0: `plan_trials` hashed `agent_config: ""` while `run_trial` added the scaffold digest, so the planned trial id was not the recorded one | shared `run.scaffold_identity` used by planner and runner (`ec16791`); resubmitted workflows resolved against the existing records without a second launch; the phantom ids stay in `unresolved_runs` |
+| py-pdf/pypdf (rebuild `create-4ad1…`) | mine | 0 candidates from 188 merged PRs (`diff-too-small` 36, `feature-label-missing` 2): the Temporal path never passed a discovery band and `github_repo.discover` defaults to `feature` (200–1500 diff lines, label required); PR 3826 was found under `bugfix` | `--pr-kind bugfix|feature` on `swesim create` and the console, mapped to the mine activity (`ec16791`); relaunched as `create-66fa…` |
+| seaborn-3190 v2 | draft | the withholding model selected no spans, so v2 has only the natural brief (v1 had withheld the reproduction snippet) | one nudge when nothing is selected but the issue carries a fenced code block or a traceback (`383a8fc`); zero removals remains valid |
 | interactive trials | run | 10 of 10 trials under the packaged mini-swe-agent workflow asked the stakeholder nothing | interactive instruction strengthened, then a condition-specific scaffold config; afterwards Sonnet 5, Opus 5 and Haiku 4.5 each produced question/reply episodes |
 
 Operational notes: killing a local `swesim probe`/`validate` process leaves its `harbor run` child running; the child later writes

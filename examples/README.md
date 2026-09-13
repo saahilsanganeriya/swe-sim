@@ -18,7 +18,7 @@ Modal, Docker, Temporal or the stakeholder service.
 | `compile.json` | `compiled_hash`, pinned `image_digest`, `run_config_hash`, agent hosts, the three task directories | `compile` |
 | `validation.json` | executed controls on Modal (`nop`, `oracle`, one plausible-wrong, three tamper), each with the full reward row and its expectation, plus the git-history probe; `status: valid` is what lets the scenario exist | `validate` |
 | `scores.json` | per `condition|brief_profile|run_config_hash`: `n`, `pass_at_k`, `pass_pow_k`, `mean_reward`, outcome counts, `trial_ids`, unresolved attempts | `score` |
-| `task__full/`, `task__hidden/`, `task__interactive/` | the Harbor 0.23 task directories: `task.toml`, `instruction.md`, `environment/` (agent image, root-only collector, `ask-user` and `request-review` shims), `tests/` (verifier image, `test.sh`, `grader.py`, `policy.py`, `parsers.py`, `run_pytest.py`, `test.patch`, `grader_config.json`), `solution/`, `controls/` | `compile` |
+| `task__full/`, `task__hidden/`, `task__interactive/` | the Harbor 0.23 task directories: `task.toml`, `instruction.md`, `environment/` (agent image, root-only collector, `ask-user`, `confirm-behavior` and `request-review` shims), `tests/` (verifier image, `test.sh`, `grader.py`, `policy.py`, `parsers.py`, `run_pytest.py`, `test.patch`, `grader_config.json`), `solution/`, `controls/` | `compile` |
 | `runs/<trial_id>/record.json` | the ledger row: condition, profile, model, attempt, `spec_hash`, `compiled_hash`, `run_config_hash`, timings, reward, report, transcript | `run` |
 | `runs/<trial_id>/reward.json` | the finite numbers the verifier wrote (`reward`, `success`, F2P and P2P counts, groups, `integrity_signal_count`, `outcome_code`, `patch_applied`) | verifier |
 | `runs/<trial_id>/report.json` | the verifier report (`per_test`, `per_group`, `applied_paths`, `dropped_paths`, `integrity_signals`, `regression`, `receipt`, runner tail) plus the fields the run stage adds: `transcript_binding_valid`, `simulator_validity`, `image_digest`, `harbor_exception`, `reviewed_equals_submitted` | verifier, then `run` |
@@ -37,30 +37,34 @@ the ignored env file and the environment) and lists `files_changed`; the replace
 `manifest.path_rewrites` lists how absolute host paths were rewritten: to `runs/<trial_id>` or `task__<condition>`
 when the target is in the package, to a repo-relative `workspace/...` path when it is not.
 
-## The included example: `mwaskom--seaborn-3190`
+## The included example: `mwaskom--seaborn-3190` (version 2)
 
-SWE-bench annotated instance `mwaskom__seaborn-3190` (boolean data in a continuous color scale), spec
-`6915ece6...`, compiled `750e014c...`, image `sha256:5ce876a5...`, validated on Modal. `validation.json` shows the
-control table that admitted it: `nop` reward 0 (F2P 0 of 1, P2P 84 of 84, outcome 3), `oracle` reward 1 (outcome 1),
-`plausible-wrong:xor-based-boolean-handling` reward 0 (outcome 2, 15 regressions), each of the three tamper
-controls reward 0 with one `protected-path-edit` signal (outcome 3), and a probe that could not reach the gold commit
-from the shipped git object database. `task__full/tests/grader_config.json` has 85 expected ids (1 FAIL_TO_PASS, 84
-PASS_TO_PASS), one requirement group `g01` of weight 1.0, and 18 protected path patterns.
+SWE-bench annotated instance `mwaskom__seaborn-3190` (boolean data in a continuous color scale), rebuilt as version 2 on
+2026-09-13 through `CreateTasksWorkflow` with `--rebuild`: spec `812be6e0...`, compiled `e208a80f...`, image
+`sha256:5ce876a5...`, validated on Modal. `validation.json` shows the control table that admitted it: `nop` reward 0 (F2P 0
+of 1, P2P 84 of 84, outcome 3), `oracle` reward 1 (outcome 1), one plausible-wrong control reward 0, each of the three
+tamper controls reward 0 with a `protected-path-edit` signal, and a probe that could not reach the gold commit from the
+shipped git object database. `task__full/tests/grader_config.json` has 85 expected ids (1 FAIL_TO_PASS, 84 PASS_TO_PASS)
+and one requirement group `g01`. Version 2 differs from version 1 in three ways: the stakeholder speaks as the reporter and
+answers `confirm-behavior` (the `environment/shims/` directory now has three shims), the fact that described the regression
+test is author-only, and the withholding model selected no spans on this draft, so the scenario has only the `natural`
+brief (`scenario.json` → `briefs`). Version 1 is archived on the VM under `workspace/scenarios/mwaskom--seaborn-3190/archive/v1/`.
 
-Two runs, both `claude-haiku-4-5`, both on the `withheld` brief, chosen to show both outcomes:
+Three runs, all on the `natural` brief, all reward 1.0, chosen to show the v2 interaction:
 
-- `runs/24ce7fb7bef1fa33f394493f/` is `interactive`: reward 1.0, `success` 1, outcome 1 `valid-correct`, 85 of 85
-  passed, no integrity signal. The agent asked nothing (`interaction.questions` 0, patience 6 to 6), so the transcript
-  holds a single `session` event; it is frozen, its hash `8a01a7f3...` recomputes from `events` and equals
-  `report.receipt.transcript_hash`, so `transcript_binding_valid` is true. `training_eligible` is still false because
-  interactive episodes stay `simulator_validity: unadjudicated` until a person labels them. The graded change set
-  includes two markdown notes and a scratch test file the agent left in the tree next to `seaborn/_core/scales.py`.
-- `runs/3ea85d94b07e93301dfe1b8f/` is `hidden`: reward 0.0, `success` 0, outcome 2 `valid-incorrect`. The FAIL_TO_PASS
-  test passed and `g01` passed, but five `TestTemporal` PASS_TO_PASS tests failed, so `regression` is true and the
-  reward is 0 by the regression rule. The agent also edited `tests/_core/test_scales.py`; the path policy dropped it
-  (`dropped_paths`, one `protected-path-edit` signal) and graded the rest. Its `compiled_hash` `befc959d...` differs
-  from the package's because the interactive instruction was reworded after this run; `spec_hash` and image digest
-  are the same, and `manifest.runs[...].compiled_hash_matches_package` records the difference.
+- `runs/c1846a15feb5afc61bfdc76e/` is `interactive`, `claude-sonnet-5`: the agent asked one question that stated its
+  intent (treat booleans as categorical or as 0/1 on a continuous scale?), the stakeholder answered in behavior ("False ->
+  0.0 and True -> 1.0 … should not fail"), the agent then ran `confirm-behavior` with a description of the fix and the
+  stakeholder confirmed it with no unmet requirement. Patience 6 → 3. The transcript is frozen, its hash recomputes from
+  `events` and equals `report.receipt.transcript_hash` (`transcript_binding_valid` true); every reply carries
+  `regenerated: false` and an empty `redacted_terms`.
+- `runs/dc88e7322955749303867fee/` is `interactive`, `claude-haiku-4-5`: one question with the same two options, the same
+  behavior-level answer, one `confirm-behavior`, reward 1.0 with 85 of 85 tests passed.
+- `runs/f9435904e9de18475cbd980e/` is `hidden`, `claude-haiku-4-5`: the same brief with no stakeholder, reward 1.0. It is
+  the control for the two interactive runs; on this scenario the model does not need the stakeholder to pass.
+
+`training_eligible` is false on the interactive runs because interactive episodes stay `simulator_validity: unadjudicated`
+until a person labels them. All three `compiled_hash` values match the package.
 
 ## Reproducing the grading offline
 
