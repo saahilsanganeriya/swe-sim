@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from swesim.sources import threads
+from swesim.sources import observations as obs
+from swesim.sources.observations import DiscoveryPRObservation
 
 log = logging.getLogger(__name__)
 LINK = re.compile(r"(?:[Ff]ix(?:es|ed)?|[Cc]los(?:es|ed)?|[Rr]esolves?)\s*:?\s*#(\d+)")
@@ -131,66 +133,166 @@ def _candidate(repo: str, p: dict, patch: str) -> dict:
             "test_files": _DIFF_HEADER.findall(tst), "issue": None, "issue_body": None, "thread": None, "linked_prs": [], "linked_missing": []}
 
 
-def _merged_details(repo: str, since: str, max_prs: int, pr: int | None) -> list[dict]:
-    if pr:
-        return [threads._gh(f"repos/{repo}/pulls/{pr}")]
-    summaries = []
-    for page in range(1, (max_prs + 99) // 100 + 1):
-        rows = threads._gh(f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}")
-        if not isinstance(rows, list):
-            raise ValueError("expected page array")
-        summaries.extend(rows)
-        if len(rows) < 100:
-            break
+class DiscoveryUnavailable(RuntimeError):
+    """`gh api` could not answer (rate limit after threads' own waits, 5xx, network, timeout, auth): an infrastructure
+    failure of this attempt, never a PR decision. It propagates out of `discover` so the Temporal activity fails and is
+    retried; the message names the kind and the PR, never `gh` stderr."""
+
+    def __init__(self, kind: str, repo: str, where: str, error_class: str):
+        self.kind, self.repo, self.where, self.error_class = kind, repo, where, error_class
+        super().__init__(f"gh api unavailable ({kind}, {error_class}) while scanning {repo} {where}")
+
+
+unavailable_kind = threads.unavailable_kind  # gh unavailability classifier lives with the gh wrapper
+
+
+def _fetch(repo: str, where: str, call):
+    """One gh call: unavailability propagates as `DiscoveryUnavailable`; every other failure is the caller's to classify."""
+    try:
+        return call()
+    except subprocess.SubprocessError as error:
+        kind = unavailable_kind(error)
+        if kind is not None:
+            log.warning("github-repo %s %s: gh api unavailable (%s, %s); this attempt fails and is retried", repo, where, kind, type(error).__name__)
+            raise DiscoveryUnavailable(kind, repo, where, type(error).__name__) from error
+        raise
+
+
+def _is_not_found(error: BaseException) -> bool:
+    return isinstance(error, subprocess.CalledProcessError) and bool(threads._NOT_FOUND.search(str(error.stderr or "")))
+
+
+def _observed_update(observations: list[DiscoveryPRObservation], seq: int, **changes) -> None:
+    observations[seq] = DiscoveryPRObservation.model_validate({**observations[seq].model_dump(), **changes})
+
+
+def _merged_details(repo: str, since: str, max_prs: int, pr: int | None, observations: list[DiscoveryPRObservation]) -> list[dict]:
+    summaries = [{"number": pr}] if pr else []
+    if not pr:
+        for page in range(1, (max_prs + 99) // 100 + 1):
+            rows = _fetch(repo, f"list page {page}", lambda: threads._gh(f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"))
+            if not isinstance(rows, list):
+                raise ValueError("expected page array")
+            summaries.extend(rows)
+            if len(rows) < 100:
+                break
     details = []
-    for p in summaries[:max_prs]:
-        # List rows already tell us closed-unmerged and pre-`since` merges; everything else needs the detail (labels, base sha, stats).
-        if "merged_at" in p and (p["merged_at"] is None or p["merged_at"] < since):
+    for summary in summaries[:max_prs]:
+        number = int(summary['number']); seq = len(observations)
+        observations.append(DiscoveryPRObservation(seq=seq, pr_number=number, pr_url=f'https://github.com/{repo}/pull/{number}',
+                                                    stages=['listed'], status='pending'))
+        if 'merged_at' in summary and (summary['merged_at'] is None or summary['merged_at'] < since):
+            _observed_update(observations, seq, status='rejected', reason='not-merged' if summary['merged_at'] is None else 'before-since')
             continue
-        details.append(threads._gh(f"repos/{repo}/pulls/{p['number']}"))
+        try:
+            detail = _fetch(repo, f"PR {number}", lambda: threads._gh(f"repos/{repo}/pulls/{number}"))
+            if detail.get('number') != number:
+                raise ValueError('PR detail does not match listed identity')
+            if not detail.get('merged_at') or detail['merged_at'] < since:
+                _observed_update(observations, seq, status='rejected', reason='not-merged' if not detail.get('merged_at') else 'before-since')
+                continue
+            _observed_update(observations, seq, stages=['listed', 'merged-in-range'],
+                             base_commit=(detail.get('base') or {}).get('sha'), merge_commit=detail.get('merge_commit_sha'))
+            details.append({**detail, '_observation_seq': seq})
+        except (subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+            if _is_not_found(error):  # the PR is gone or invisible: a business outcome of this PR, not an infrastructure failure
+                _observed_update(observations, seq, status='rejected', reason='not-found')
+            else:
+                _observed_update(observations, seq, status='error', reason='fetch-error', error_class=type(error).__name__)
     return details
 
 
 def discover(repo: str, since: str, max_prs: int = 400, min_comments: int = 4, diff_min: int = 20, diff_max: int = 600, pr: int | None = None,
-             kind: str = "feature") -> tuple[list[dict], dict]:
-    """Candidates and a reject histogram for merged PRs of `repo` since `since` (ISO date), bounded by `max_prs` list rows."""
+             kind: str = "feature", observations: list[DiscoveryPRObservation] | None = None) -> tuple[list[dict], dict]:
+    """Candidates and legacy reject counts; an optional sink preserves every listed PR and its measured stage.
+
+    Business outcomes are PR decisions: not merged, before `since`, 404 (`not-found`), no linked issue, band filters.
+    A malformed or unclassifiable gh answer for one PR is a `fetch-error` observation (status=error). gh being
+    unavailable (rate limit, 5xx, network, timeout, auth) raises `DiscoveryUnavailable` so the attempt is retried by
+    Temporal instead of counting PRs as rejected. Error details never carry gh stderr. Prefilter observations do not
+    change legacy histograms.
+    """
     repo = normalize_repo(repo)
+    if max_prs < 1:
+        raise ValueError('max_prs must be positive')
     if kind == "feature":
         min_comments, diff_min, diff_max = FEATURE_BAND["min_comments"], FEATURE_BAND["diff_min"], FEATURE_BAND["diff_max"]
     elif kind != "bugfix":
         raise ValueError("kind must be feature or bugfix")
-    prs = [p for p in _merged_details(repo, since, max_prs, pr) if p.get("merged_at") and p["merged_at"] >= since]
-    cands, rejects = [], Counter()
+    observed = observations if observations is not None else []
+    prs = _merged_details(repo, since, max_prs, pr, observed)
+    cands, rejects = [], Counter(obs.legacy_rejects(observed))  # list/detail-stage decisions (not-found, fetch-error) already taken
     for p in prs:
+        seq = p['_observation_seq']
         try:
-            targets = threads.linked_targets(repo, p["number"], threads.closing_text(p))
+            targets = _fetch(repo, f"PR {p['number']} links", lambda: threads.linked_targets(repo, p["number"], threads.closing_text(p)))
             issues = targets["issues"]
-            c = _candidate(repo, p, _pr_diff(repo, p["number"]))
+            _observed_update(observed, seq, linked_issue_numbers=list(issues),
+                             stages=[*observed[seq].stages, *(['linked-issue'] if issues else [])])
+            c = _candidate(repo, p, _fetch(repo, f"PR {p['number']} diff", lambda: _pr_diff(repo, p["number"])))
             c["linked_prs"], c["linked_missing"], c["link_kind"] = targets["prs"], targets["missing"], targets.get("link_kind")
             if issues:
                 c["issue"] = issues[0]
-                c["thread"] = threads.fetch_pr_thread(repo, p["number"])
+                c["thread"] = _fetch(repo, f"PR {p['number']} thread", lambda: threads.fetch_pr_thread(repo, p["number"]))
                 c["issue_body"] = c["thread"]["linked_issues"][0]["body"] if c["thread"]["linked_issues"] else None
                 c["comments_total"] = (len(c["thread"]["pr_comments"]) + len(c["thread"]["review_comments"])
                                        + sum(len(i["comments"]) for i in c["thread"]["linked_issues"]))
-        except (subprocess.CalledProcessError, ValueError) as e:
-            log.warning("github-repo: PR %s/%s fetch failed: %s", repo, p.get("number"), e)
+            _observed_update(observed, seq, source_changed_lines=c['additions']+c['deletions'], source_file_count=len(c['source_files']),
+                             test_file_count=len(c['test_files']), comment_count=c.get('comments_total'))
+        except (subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+            if _is_not_found(error):
+                rejects["not-found"] += 1
+                _observed_update(observed, seq, status='rejected', reason='not-found')
+                continue
+            log.warning("github-repo PR %s/%s fetch failed (%s)", repo, p.get("number"), type(error).__name__)
             rejects["fetch-error"] += 1
+            _observed_update(observed, seq, status='error', reason='fetch-error', error_class=type(error).__name__)
             continue
         c["labels"] = [x["name"].lower() for x in p.get("labels") or []]
-        r = reject_reason(c, min_comments, diff_min, diff_max)
-        if not r and kind == "feature":
+        reason = reject_reason(c, min_comments, diff_min, diff_max)
+        if not reason and kind == "feature":
             lo, hi = FEATURE_BAND["source_files"]
             if not lo <= len(c["source_files"]) <= hi:
-                r = "feature-source-file-band"
+                reason = "feature-source-file-band"
             elif not any(any(word in label for word in FEATURE_LABEL_WORDS) for label in c["labels"]):
-                r = "feature-label-missing"
+                reason = "feature-label-missing"
         c["discovery"] = {"kind": kind, "repo_only": pr is None, "since": since, "max_prs": max_prs}
-        if r:
-            rejects[r] += 1
+        c['_observation_seq'] = seq
+        if reason:
+            rejects[reason] += 1
+            _observed_update(observed, seq, status='rejected', reason=reason)
         else:
             cands.append(c)
+            _observed_update(observed, seq, stages=[*observed[seq].stages, 'band-passed', 'retained'], status='retained')
     return cands, dict(rejects)
+
+
+def source_key_for(repo: str, band: str) -> str:
+    """The candidates key of a repository scan in one band: `github-repo--<owner>__<repo>--<band>`."""
+    return f"github-repo--{normalize_repo(repo).replace('/', '__')}--{band}"
+
+
+def discover_scan(repo: str, since: str, *, max_prs: int = 400, kind: str = "feature", pr: int | None = None, max_candidates: int | None = None,
+                  source_key: str | None = None, workflow_id: str | None = None, run_id: str | None = None,
+                  scanned_at: datetime | None = None) -> tuple[list[dict], dict[str, int], obs.DiscoveryScan]:
+    """`discover` plus its immutable record: the retained candidates (capped at `max_candidates`), the legacy reject
+    histogram including `max-candidates-cut`, and a `DiscoveryScan` in which every listed PR keeps its decision.
+
+    A capped candidate is a recorded `max-candidates-cut` decision after band acceptance, not a vanished PR. The returned
+    histogram is exactly the scan's `rejects`, so the `.rejects.json` artifact and the scan can never disagree."""
+    repo = normalize_repo(repo)
+    if max_candidates is not None and max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
+    observations: list[DiscoveryPRObservation] = []
+    cands, _ = discover(repo, since, max_prs=max_prs, pr=pr, kind=kind, observations=observations)
+    kept = cands[: max_candidates or len(cands)]
+    observations = obs.retain_selected(observations, {c["_observation_seq"] for c in kept})
+    rejects = obs.legacy_rejects(observations)
+    scan = obs.DiscoveryScan(source_key=source_key or source_key_for(repo, kind), repo=repo, band=kind, since=since, max_prs=max_prs,
+                             max_candidates=max_candidates, pr=pr, scanned_at=scanned_at or datetime.now(timezone.utc),
+                             workflow_id=workflow_id, run_id=run_id, observations=observations, funnel=obs.funnel(observations),
+                             rejects=rejects, rejects_sha256=hashlib.sha256(obs.rejects_bytes(rejects)).hexdigest())
+    return kept, rejects, scan
 
 
 def build_recipe(repo: str, base_commit: str, profile: str = "python-pytest") -> dict:

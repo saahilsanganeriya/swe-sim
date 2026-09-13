@@ -85,7 +85,7 @@ def fmt_elapsed(s: float | None, running: bool = False) -> str:
 STATUS_KIND = {
     # good
     "valid": "good", "completed": "good", "finished": "good", "done": "good", "registered": "good", "kept": "good",
-    "approved": "good", "accepted": "good", "informative": "good",
+    "approved": "good", "accepted": "good", "informative": "good", "retained": "good",
     # running / pending (pulsing)
     "running": "run", "launched": "run", "pending": "run", "requested": "run", "drafting": "run", "compiling": "run",
     "validating": "run", "planned": "run", "awaiting-approval": "run", "open": "run",

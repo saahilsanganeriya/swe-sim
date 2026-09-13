@@ -147,6 +147,16 @@ class Layout(Strict):
             raise LayoutError(f"invalid discovery id: {discovery_id!r}")
         return self.discovery_dir(source_key) / (discovery_id + ".json")
 
+    def scan_dir(self, source_key: str) -> Path:
+        """Immutable per-scan discovery records (`swesim.sources.observations.DiscoveryScan`): every listed PR's decision."""
+        return self.candidates_dir() / _segment(source_key, "source key") / "scans"
+
+    def scan_file(self, source_key: str, scan_id: str) -> Path:
+        """`candidates/<source_key>/scans/<sha256>.json`; the name is the sha256 of the file's bytes."""
+        if not isinstance(scan_id, str) or not re.fullmatch(r"[0-9a-f]{64}", scan_id):
+            raise LayoutError(f"invalid discovery scan id: {scan_id!r}")
+        return self.scan_dir(source_key) / (scan_id + ".json")
+
     def probe_dir(self, instance_id: str) -> Path:
         return self.root / "probes" / _segment(instance_id, "instance id")
 

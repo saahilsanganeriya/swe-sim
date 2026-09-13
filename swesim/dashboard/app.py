@@ -42,6 +42,7 @@ from swesim.dashboard.public import PRIVATE_KEYS, project
 from swesim.dashboard.access import all_rows
 from swesim.index.cohorts import cohort_of
 from swesim.settings import Settings, get_settings
+from swesim.sources import observations
 
 app = FastAPI(title="swesim console", docs_url=None, redoc_url=None)
 app.state.verify_jwt = None  # tests inject a verifier; None means google.auth
@@ -320,29 +321,41 @@ def candidates(request: Request, reader=Depends(reader_dep), layout=Depends(layo
     steps = [_dump(s) for s in reader.funnel(key)]
     everything = list(all_rows(reader.candidates, R.CandidateFilter()))
     hist = pages.reject_histogram(reader, everything, key)
-    keys = {r.source_key for r in everything}
-    if "discoveries" in R.TABLES:
-        keys.update(row["source_key"] for row in all_rows(lambda f: reader.table("discoveries", f), R.TableFilter()))
-    keys = sorted(keys)
+    latest = observations.latest_scans(layout)
+    keys = sorted({r.source_key for r in everything} | set(latest) | {row["source_key"] for row in _discoveries(reader)})
+    funnels = pages.source_funnels(latest, everything, keys)
     p = render.Page("Candidates", "candidates", "candidates", crumbs=(("Candidates", None),),
                     attrs={"source": "/api/candidates?" + str(request.query_params), "chart-target": "candidate-charts", "poll-ms": "8000"}, live="updated 0s ago")
-    body = pages.candidates_body(pg, [pages.candidate_view(r) for r in pg.items], steps, hist, keys, key)
+    body = pages.candidates_body(pg, [pages.candidate_view(r) for r in pg.items], steps, hist, keys, key, funnels, latest.get(key) if key else None)
     if not callable(getattr(reader, "reject_histogram", None)):
         body += "<p class='muted'>Discovery-time reject counts are unavailable in this reader; the histogram shows indexed candidate gates.</p>"
     return page(p, body, reader, identity, settings)
 
 
 @app.get("/api/candidates")
-def api_candidates(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
+def api_candidates(request: Request, reader=Depends(reader_dep), layout=Depends(layout_dep)) -> JSONResponse:
     offset, limit = _paging(request, 200)
     key = request.query_params.get("source_key") or None
     pg = reader.candidates(R.CandidateFilter(source_key=[key] if key else None, **_lists(request, "stage", "status", "gate"), offset=offset, limit=limit))
     steps = [_dump(s) for s in reader.funnel(key)]
     rows = list(all_rows(reader.candidates, R.CandidateFilter(source_key=[key] if key else None)))
     hist = pages.reject_histogram(reader, rows, key)
+    latest = observations.latest_scans(layout, key)
     return _json(200, {"items": [pages.candidate_view(r) for r in pg.items], "total": pg.total, "funnel": steps,
+                       "source_funnels": pages.source_funnels(latest, rows, [key] if key else None),
+                       "decisions": pages.decision_views(latest.get(key)) if key else [],
                        "charts": {"funnel": pages.charts.funnel(steps, "chart-funnel"),
                                   "rejects": pages.charts.hbars(list(hist.items()), "chart-rejects", "rejects by gate")}})
+
+
+def _discoveries(reader) -> list[dict]:
+    """Indexed discovery observations (rejects histograms); readers without the table give none."""
+    if "discoveries" not in R.TABLES or not callable(getattr(reader, "table", None)):
+        return []
+    try:
+        return list(all_rows(lambda f: reader.table("discoveries", f), R.TableFilter()))
+    except ValueError:
+        return []
 
 
 @app.get("/workflows", response_class=HTMLResponse)
