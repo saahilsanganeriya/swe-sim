@@ -203,7 +203,11 @@ def load_trial(tid: str) -> dict:
         "image_digest": (report or {}).get("image_digest"),
         "trial_dir": record.get("trial_dir"),
     }
-    return {"trial_id": tid, "dir": d, "status": status, "record": record, "request": request, "live": live,
+    # ISO-8601 timestamps: status.json first, record.json as fallback (both written by the run stage when present).
+    timestamps = {k: status.get(k) or record.get(k) for k in ("started_at", "finished_at")}
+    meta.update(timestamps)
+    status_view = {**{k: v for k, v in timestamps.items() if v}, **status}
+    return {"trial_id": tid, "dir": d, "status": status_view, "record": record, "request": request, "live": live,
             "live_transcript_error": live_error, "transcript": transcript or {}, "report": report or {},
             "reward": reward or {}, "trajectory": traj, "instruction": ins.read_text() if ins else None,
             "label": read_json(d / "label.json", default=None) or None, "meta": meta,
@@ -230,7 +234,8 @@ def trial_summary(d: Path) -> dict:
             "outcome": OUTCOME_NAMES[code] if code is not None else None,
             "success": (rec.get("reward") or {}).get("success"), "reward": (rec.get("reward") or {}).get("reward"),
             "questions": count_exchanges(rec, "ask") if rec else None, "reviews": count_exchanges(rec, "review") if rec else None,
-            "label": label.get("label"), "started_at": status.get("started_at"), "finished_at": status.get("finished_at")}
+            "label": label.get("label"), "started_at": status.get("started_at") or rec.get("started_at"),
+            "finished_at": status.get("finished_at") or rec.get("finished_at")}
 
 
 # ----------------------------------------------------------------------------- HTML
@@ -329,7 +334,8 @@ def render_runs_page() -> str:
     # scores
     parts.append("<h2>Scores</h2><p class='muted'>Groups are condition · brief profile · frozen run config (model, purpose, build). "
                  "Calibration and comparison runs are never pooled. pass@k and pass^k are null (n/a) when fewer than k valid attempts exist; "
-                 "k is never reduced. Denominators count outcomes valid-correct and valid-incorrect only.</p>")
+                 "k is never reduced. Denominators count agent-attributable outcomes (valid-correct, valid-incorrect, "
+                 "agent-invalid-submission, agent-runtime-failure); infrastructure failures are excluded from n.</p>")
     score_files = sorted((ROOT / "scenarios").glob("*/scores.json")) if (ROOT / "scenarios").is_dir() else []
     if not score_files:
         parts.append("<p class='muted'>No scores.json yet (run <code>swesim score &lt;id&gt;</code>).</p>")
@@ -521,6 +527,8 @@ def render_episode(t: dict) -> str:
     st = t["status"].get("status") or ("finished" if t["record"] else "unknown")
     parts = [f"<h1>Episode <span class='mono'>{h(tid)}</span></h1>", "<dl class='meta'>",
              f"<dt>status</dt><dd><span class='status {status_class(st)}'>{h(st)}</span> <span id='live'></span></dd>",
+             f"<dt>started</dt><dd class='mono'>{h(m.get('started_at') or '—')}</dd>",
+             f"<dt>finished</dt><dd class='mono'>{h(m.get('finished_at') or '—')}</dd>",
              f"<dt>scenario</dt><dd>{h(m.get('scenario_id'))}</dd><dt>condition</dt><dd>{h(m.get('condition'))}</dd>",
              f"<dt>brief profile</dt><dd>{h(m.get('brief_profile'))}</dd><dt>model</dt><dd>{h(m.get('model'))}</dd>",
              f"<dt>purpose</dt><dd>{h(m.get('purpose'))}</dd><dt>attempt</dt><dd>{h(m.get('attempt_index'))}</dd>",

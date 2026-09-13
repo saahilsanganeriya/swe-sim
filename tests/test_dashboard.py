@@ -223,3 +223,33 @@ def test_file_route_serves_whitelisted_trial_files_only(site):
     assert c.get(f'/trial/{tid}/file/..%2Fspec.json').status_code == 404
     assert c.get(f"/trial/{site['running']}/file/trajectory.json").status_code == 404  # not there yet
     assert c.get('/trial/' + 'f' * 24 + '/file/record.json').status_code == 404
+
+
+def test_timestamps_read_from_status_then_record_with_flagged_fallback(site):
+    c, tid = site['client'], site['wrong']
+    d = site['ws'].root / 'trials' / tid
+    # status.json without timestamps, record.json with them (the run stage may write either or both)
+    (d / 'status.json').write_text(json.dumps({'status': 'finished', 'trial_id': tid}))
+    rec = json.loads((d / 'record.json').read_text())
+    rec['started_at'] = '2026-09-13T11:00:00Z'
+    rec['finished_at'] = '2026-09-13T11:07:30Z'
+    (d / 'record.json').write_text(json.dumps(rec))
+    body = c.get(f'/api/trial/{tid}/timeline').json()
+    verifier = next(r for r in body['timeline'] if r['actor'] == 'verifier')
+    assert verifier['ts_iso'] == '2026-09-13T11:07:30+00:00' and verifier['no_timestamp'] is False
+    assert body['meta']['started_at'] == '2026-09-13T11:00:00Z' and body['status']['status'] == 'finished'
+    page = c.get(f'/trial/{tid}').text
+    assert '2026-09-13T11:00:00Z' in page and '2026-09-13T11:07:30Z' in page and 'no timestamp' not in page
+    assert '2026-09-13T11:00:00Z' in c.get('/').text  # runs table falls back to record.json too
+    # status.json wins when both are present
+    (d / 'status.json').write_text(json.dumps({'status': 'finished', 'trial_id': tid, 'finished_at': '2026-09-13T11:09:00Z'}))
+    body = c.get(f'/api/trial/{tid}/timeline').json()
+    assert next(r for r in body['timeline'] if r['actor'] == 'verifier')['ts_iso'] == '2026-09-13T11:09:00+00:00'
+    # neither: the verifier row stays, last and flagged
+    (d / 'status.json').write_text(json.dumps({'status': 'finished', 'trial_id': tid}))
+    rec.pop('started_at')
+    rec.pop('finished_at')
+    (d / 'record.json').write_text(json.dumps(rec))
+    body = c.get(f'/api/trial/{tid}/timeline').json()
+    assert body['timeline'][-1]['actor'] == 'verifier' and body['timeline'][-1]['no_timestamp'] is True
+    assert 'no timestamp' in c.get(f'/trial/{tid}').text

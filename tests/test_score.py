@@ -183,16 +183,31 @@ def test_summarize_outcomes():
     assert s["labels"] == {}
 
 
-def test_summarize_only_valid_outcomes_enter_denominators():
-    def rec(code, success, reward):
-        return {"condition": "hidden", "brief_profile": "withheld", "run_config_hash": "r", "model": HAIKU, "purpose": "calibration",
-                "reward": {"success": success, "reward": reward, "outcome_code": code}, "transcript": {}, "report": {}}
-    s = summarize([rec(1, 1, 1.0), rec(2, 0, 0.0), rec(2, 0, 0.5), rec(3, 0, 0.0), rec(4, 0, 0.0), rec(7, 0, 0.0)], k=3)["hidden|withheld|r"]
-    assert s["n_total"] == 6 and s["n_valid"] == 3 and s["n_agent_failures"] == 2 and s["n_infra_failures"] == 1
-    assert s["success_count"] == 1 and s["pass_at_k"] == pytest.approx(1.0) and s["pass_pow_k"] == 0.0
-    assert s["mean_reward"] == pytest.approx(0.5) and s["model"] == HAIKU and s["purpose"] == "calibration"
+def _rec(code, success, reward, **extra):
+    return {"condition": "hidden", "brief_profile": "withheld", "run_config_hash": "r", "model": HAIKU, "purpose": "calibration",
+            "reward": {"success": success, "reward": reward, "outcome_code": code}, "transcript": {}, "report": {}, **extra}
+
+
+def test_summarize_agent_attributable_outcomes_enter_denominators():
+    # Ruling: outcomes 1-4 are all agent-attributable attempts (1 success, 2-4 failures); 5-7 are excluded from n.
+    s = summarize([_rec(1, 1, 1.0), _rec(2, 0, 0.0), _rec(2, 0, 0.5), _rec(3, 0, 0.0), _rec(4, 0, 0.0), _rec(7, 0, 0.0)], k=3)["hidden|withheld|r"]
+    assert s["n_total"] == 6 and s["n_valid"] == 5 and s["n"] == 5 and s["n_agent_failures"] == 2 and s["n_infra_failures"] == 1
+    assert s["success_count"] == 1 and s["pass_at_k"] == pytest.approx(1 - 4 / 10) and s["pass_pow_k"] == 0.0
+    assert s["mean_reward"] == pytest.approx(1.5 / 5) and s["model"] == HAIKU and s["purpose"] == "calibration"
     assert s["outcomes"] == {"valid-correct": 1, "valid-incorrect": 2, "agent-invalid-submission": 1, "agent-runtime-failure": 1,
                              "evaluator-failure": 1}
+
+
+def test_agent_failure_lowers_pass_at_1_but_infra_failure_does_not_change_n():
+    base = [_rec(1, 1, 1.0, trial_id="a" * 24), _rec(1, 1, 1.0, trial_id="b" * 24)]
+    s0 = summarize(base, k=1)["hidden|withheld|r"]
+    assert s0["n"] == 2 and s0["pass_at_k"] == pytest.approx(1.0)
+    s3 = summarize(base + [_rec(3, 0, 0.0, trial_id="c" * 24)], k=1)["hidden|withheld|r"]
+    assert s3["n"] == 3 and s3["pass_at_k"] == pytest.approx(2 / 3) and s3["pass_at_k"] < s0["pass_at_k"]
+    assert s3["outcomes"]["agent-invalid-submission"] == 1 and s3["n_agent_failures"] == 1
+    s6 = summarize(base + [_rec(3, 0, 0.0, trial_id="c" * 24), _rec(6, 0, 0.0, trial_id="d" * 24)], k=1)["hidden|withheld|r"]
+    assert s6["n"] == 3 and s6["pass_at_k"] == pytest.approx(2 / 3) and s6["n_total"] == 4
+    assert s6["outcomes"]["simulator-failure"] == 1 and s6["n_infra_failures"] == 1 and s6["success_count"] == 2
 
 
 def test_summarize_never_pools_purposes_or_configs():
@@ -305,7 +320,9 @@ def test_register_scenario_writes_registry_and_dataset(tmp_path):
     assert entry["compiled_hash"] == COMPILED
     assert entry["calibration_runs"] == [cal] and entry["comparison_runs"] == [cmp_] and entry["demonstration_runs"] == [demo]
     ds = json.loads((ws.root / "dataset.json").read_text())
-    assert [t["path"] for t in ds["tasks"]] == [str(ws.task_dir(spec.id, c)) for c in ("full", "hidden", "interactive")]
+    # paths are relative to the workspace root: the workspace moves between the laptop and the VM
+    assert [t["path"] for t in ds["tasks"]] == [f"tasks/{spec.id}__{c}" for c in ("full", "hidden", "interactive")]
+    assert all((ws.root / t["path"]) == ws.task_dir(spec.id, t["condition"]) for t in ds["tasks"])
     assert all(t["scenario_id"] == spec.id and t["spec_hash"] == spec.spec_hash for t in ds["tasks"])
     assert {t["condition"] for t in ds["tasks"]} == {"full", "hidden", "interactive"}
     # idempotent re-register keeps a single entry

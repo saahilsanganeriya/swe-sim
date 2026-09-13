@@ -5,9 +5,11 @@ under ``run_config``; sibling files fill gaps), groups attempts by ``condition|b
 -- ``run_config_hash`` already binds the actual model, purpose and build, so calibration and comparison
 runs can never share a group -- and writes ``workspace/scenarios/<id>/scores.json``.
 
-Denominators: only outcomes 1 (valid-correct) and 2 (valid-incorrect) are attempts for pass@k / pass^k.
-Agent failures (3, 4) and infrastructure failures (5, 6, 7) are reported as counts only. Metrics with
-insufficient samples (n < k, or n == 0) are ``null``; k is never silently reduced.
+Denominators (integrator ruling 2026-09-12): outcomes 1-4 are agent-attributable trial results and all
+count in n for pass@k / pass^k; only 1 (valid-correct) counts as a success, 2-4 (valid-incorrect,
+agent-invalid-submission, agent-runtime-failure) count as failures. Infrastructure outcomes 5-7 are excluded
+from n and appear only in the outcome counts. Metrics with insufficient samples (n < k, or n == 0) are
+``null``; k is never silently reduced.
 """
 from __future__ import annotations
 
@@ -20,9 +22,9 @@ from swesim.paths import Workspace, atomic_json
 
 OUTCOME_NAMES = {1: "valid-correct", 2: "valid-incorrect", 3: "agent-invalid-submission", 4: "agent-runtime-failure",
                  5: "collection-failure", 6: "simulator-failure", 7: "evaluator-failure"}
-VALID = {1, 2}
-AGENT_FAILURE = {3, 4}
-INFRA = {5, 6, 7}
+VALID = {1, 2, 3, 4}  # agent-attributable results: in the pass@k denominator; only 1 is a success
+AGENT_FAILURE = {3, 4}  # subset of VALID, reported separately as n_agent_failures
+INFRA = {5, 6, 7}  # excluded from n; counted in outcomes / n_infra_failures
 PURPOSES = ("calibration", "comparison", "demonstration")
 # RunConfig fields a record may carry flat (TrialRecord dataclass) or nested under ``run_config``.
 _LINEAGE_FIELDS = ("model", "purpose", "brief_profile", "compiled_hash")

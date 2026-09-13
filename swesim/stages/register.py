@@ -53,8 +53,10 @@ def register_scenario(ws: Workspace, spec: ScenarioSpec) -> dict:
                 entry.setdefault(f"{purpose}_runs", []).append(r["trial_id"])
             reg["scenarios"][spec.id] = entry
             atomic_json(ws.registry_path, reg)
-            # swesim manifest, not claimed to be Harbor's undocumented dataset.toml format.
-            tasks = [{"path": str(ws.task_dir(e["id"], c)), "scenario_id": e["id"], "condition": c, "spec_hash": e["spec_hash"]}
+            # swesim manifest, not claimed to be Harbor's undocumented dataset.toml format. Paths are relative to
+            # the workspace root because the workspace moves between the laptop and the VM.
+            tasks = [{"path": ws.task_dir(e["id"], c).relative_to(ws.root).as_posix(), "scenario_id": e["id"],
+                      "condition": c, "spec_hash": e["spec_hash"]}
                      for e in reg["scenarios"].values() for c in e.get("conditions", CONDITIONS)]
             atomic_json(ws.root / "dataset.json", {"tasks": tasks})
         finally:
