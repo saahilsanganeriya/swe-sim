@@ -468,7 +468,8 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
 def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenario ids"), models: str | None = typer.Option(None, help="Comma-separated model ids; defaults to the screen model for screening, otherwise Haiku 4.5."),
               conditions: str = typer.Option("full,hidden,interactive"), k: int = typer.Option(3), purpose: str = typer.Option("comparison", help="calibration | comparison | demonstration | screen"),
               brief_profile: str = typer.Option("withheld"), stakeholder_model: str = typer.Option("", help="resolved stakeholder id (workspace/evidence/model-probe.json)"),
-              attempt_offset: int = typer.Option(0), max_parallel_trials: int = typer.Option(1, help="Maximum concurrent trial Jobs for this workflow"),
+              attempt_offset: int = typer.Option(0), max_parallel_trials: int = typer.Option(8, help="Maximum concurrent trial Jobs for this workflow"),
+              frontier_override: str = typer.Option("", help="Proceed past a refused frontier admission gate with this recorded reason (actor: the CLI user; brief §3.2 override)"),
               stakeholder_url: str = typer.Option("", envvar="SWESIM_STAKEHOLDER_URL")) -> None:
     """Run selected task ids on selected models: one RunTasksWorkflow, TrialWorkflow children with REJECT_DUPLICATE ids."""
     import asyncio
@@ -478,12 +479,17 @@ def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenar
     models = models or (ROLE_CHAINS["screen_model"][0] if purpose == "screen" else SOLVER_MODEL_DEFAULT)
     params = {"scenario_ids": scenario_ids.split(","), "models": models.split(","), "conditions": conditions.split(","), "k": k, "purpose": purpose,
               "brief_profile": brief_profile, "attempt_offset": attempt_offset, "max_parallel_trials": max_parallel_trials, "stakeholder_url": _stakeholder_url(stakeholder_url)}
+    if frontier_override:
+        from swesim.workflows.client import override_request
+        params["frontier_override"] = override_request(frontier_override)
     if stakeholder_model:
         params["stakeholder_model"] = stakeholder_model
     typer.echo(asyncio.run(start_run(params)))
 
 workflows_app = typer.Typer(help="Inspect and steer Temporal workflows.")
 app.add_typer(workflows_app, name="workflows")
+from swesim.workflows.cli_reconcile import mount as mount_reconcile  # noqa: E402
+mount_reconcile(workflows_app)
 from swesim.index.cli import index_app  # noqa: E402  (mounted after the root app exists)
 app.add_typer(index_app, name="index")
 from swesim.audit.cli import app as audit_app  # noqa: E402
