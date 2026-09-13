@@ -187,8 +187,10 @@ def test_audit_trial_writes_the_interfaces_shape_and_combines_mechanical_and_mod
     q = audit.questions[0]
     assert q.seq == 1 and q.before_implementation is True and q.specific is True and q.redundant is False and q.reason
     r = {x.seq: x for x in audit.replies}
-    # the model said no identifier was disclosed, but the reply filter's own terms find one: the mechanical evidence wins
-    assert r[2].test_or_identifier_disclosed is True and r[2].hits == ["test_raises_value_error"] and "test_raises_value_error" in r[2].reason
+    # the model said no identifier was disclosed, but the reply filter's own terms find a test name: the mechanical evidence
+    # wins; the generic exception name is not a hit whatever the deny-list contains
+    assert r[2].test_or_identifier_disclosed is True and "test_raises_value_error" in r[2].hits and "ValueError" not in r[2].hits
+    assert "test_raises_value_error" in r[2].reason
     assert r[2].targeted is True and r[2].behaviour_level is True
     assert r[4].seq == 4 and r[4].test_or_identifier_disclosed is False    # the confirm reply was not labelled by the fake: mechanical only
     assert audit.useful_question_rate == 1.0 and audit.patience.spent == 3 and audit.patience.sensible is True
@@ -229,7 +231,8 @@ def test_audit_trial_labels_stakeholder_v1_as_legacy_without_calling_the_model(t
     assert audit.legacy is True and audit.stakeholder_version == "v1" and audit.model is None and chat.calls == []
     assert audit.asked_before_implementing is True                      # mechanical labels still computed
     assert audit.questions[0].specific is None and audit.questions[0].before_implementation is True
-    assert audit.replies[0].behaviour_level is None and audit.replies[0].hits == []
+    assert audit.replies[0].behaviour_level is None and audit.replies[0].test_or_identifier_disclosed is None
+    assert R.code_like_hits(audit.replies[0].hits) == []                 # "ValueError, not KeyError." names no test identifier
 
 
 def test_audit_trial_without_exchanges_or_non_interactive_needs_no_model(tmp_path):
@@ -250,6 +253,17 @@ def test_audit_trial_without_trajectory_leaves_before_implementation_unknown(tmp
     tid = write_trial(ws, spec, events=v2_events(), traj=None)
     a = RUN.audit_trial(ws, tid, judge=L.Judge(chat=FakeChat()))
     assert a.asked_before_implementing is None and a.questions[0].before_implementation is None and a.trajectory_source is None
+
+
+def test_audit_trial_flags_a_reply_that_restates_an_ungrounded_requirement(tmp_path):
+    ws, spec = make_record(tmp_path)
+    events = v2_events()
+    events[3]["content"] = "Yes. The remaining requirement is bounding the backward scan so crafted files fail quickly rather than scanning indefinitely."
+    tid = write_trial(ws, spec, events=events, traj=trajectory())
+    a = RUN.audit_trial(ws, tid, judge=L.Judge(chat=FakeChat()))
+    r = {x.seq: x for x in a.replies}
+    assert r[4].ungrounded == ["r02"] and r[4].test_or_identifier_disclosed is True and "r02" in r[4].reason
+    assert r[2].ungrounded == []
 
 
 def test_audit_trial_edit_before_ask_and_volunteered_facts(tmp_path):

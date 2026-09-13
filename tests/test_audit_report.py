@@ -50,7 +50,8 @@ def test_report_pools_only_current_v2_interactive_trials_and_lists_the_rest(tmp_
     assert haiku["trials"] == 1 and haiku["asked_trials"] == 0 and haiku["asked_before_implementing"] == {"true": 0, "false": 1, "unknown": 0, "rate": 0.0}
     assert haiku["questions"] == 0 and haiku["useful_question_rate"] is None and haiku["unknown_version_trials"] == [ids["b"]]
     v = rep["disclosure_violations"]
-    assert [(x["trial_id"], x["seq"], x["kinds"], x["hits"]) for x in v] == [(ids["a"], 2, ["test_or_identifier_disclosed"], ["test_raises_value_error"])]
+    assert [(x["trial_id"], x["seq"], x["kinds"]) for x in v] == [(ids["a"], 2, ["test_or_identifier_disclosed"])]
+    assert "test_raises_value_error" in v[0]["hits"] and "ValueError" not in v[0]["hits"]
     s = rep["scenarios"][0]
     assert s["scenario_id"] == spec.id and s["current"] is True and s["coherent"] is True and s["fair_tests"] is False and s["leaderboard_eligible"] is False
     assert s["unfair_tests"] == ["t1"] and rep["unaudited_scenarios"] == []

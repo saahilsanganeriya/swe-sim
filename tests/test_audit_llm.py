@@ -49,6 +49,9 @@ def spec_with_withholding() -> ScenarioSpec:
     d["ledger"].append({"id": "f09", "text": "SECRET author-only note about the oracle", "kind": "context", "provenance": "authored",
                         "authored_rationale": "internal", "discovery": "author-only"})
     d["operations"] = [{"type": "withholding", "target": "withheld-001", "rationale": "Removed category: reproduction"}]
+    # a requirement with no grounding fact: pinned by the hidden test alone (the B-P1-2 shape)
+    d["requirements"].append({"id": "r02", "text": "Bound the backward scan so crafted files fail quickly rather than scanning indefinitely",
+                              "fact_id": None, "tests": ["t1"]})
     return ScenarioSpec.model_validate(d)
 
 
