@@ -1,5 +1,40 @@
 # swesim operations: VM, Temporal, laptop-off runs
 
+## Codex takeover (2026-09-13, in progress)
+
+Claude Code stopped when its workspace usage allowance was exhausted. The 08:00 PDT hosted-pipeline target was missed;
+the user resumed the work with Codex. The starting checkout was `30ef8af`, 53 commits ahead of `origin/main`, with unfinished
+console, launcher and review-fix edits in their original worktrees. Those edits are being preserved and completed.
+
+The first exact offline suite returned 785 passed, 3 skipped, 2 failed (a stale console model default assertion and an
+order-dependent cost mock). The recovered storage and task-sense changes subsequently passed 112 focused tests.
+Temporal Cloud was queried using API-key authentication: no workflows existed at takeover. The earlier hosted verification
+file `workspace/evidence/cloud/verify_cloud-20260913T091709Z.txt` used a local plain-text Temporal connection, so it does not
+establish that the Cloud namespace executed a smoke workflow. Fresh connection evidence is in
+`workspace/evidence/cloud/takeover-workflows.json`.
+
+Two operator authentication steps were required before remote verification and the final push could complete. The user was
+asked to run `gcloud auth login` (the CLI reports `Reauthentication failed`) and
+`gh auth refresh -h github.com -s workflow` (both configured GitHub tokens report only `gist, read:org, repo`; the new
+workflow files require the `workflow` scope). No credential values were printed. Local integration continues while these
+steps were pending; the user completed both and GCP reads now succeed. The repository's ignored `.env` was changed from
+mode 0644 to 0600.
+
+The integrated checkpoint passes the exact offline command (849 passed, 3 skipped; output in
+`workspace/evidence/takeover-offline-tests.log`) and `ruff check --select E9,F swesim tests scripts`. Terraform validation
+passes. The reviewed plan adds one index maintenance Job, updates the four worker pools and console, and destroys no
+resources. No smoke creation or trial has been claimed from these checks.
+
+Live queue verification found the trials pool had zero activity pollers: its logs repeatedly reported missing
+`SWESIM_WORKER_IMAGE` and `SWESIM_WORKER_SERVICE_ACCOUNT`. Terraform now supplies both plus the SQL connection, and the
+Job's GCS volume is writable by its non-root runtime user. `verify_runtime.py` requires the Cloud API-key connection and
+pollers on every activity queue plus the workflow queue; a resource's Ready condition alone is insufficient.
+
+Fresh model probes (`workspace/evidence/model-probe-takeover.json`) found the configured Anthropic primaries unavailable
+with `BadRequestError`. Both OpenAI fallbacks and the probed cheap solvers were reachable. The existing collision rule
+resolves judge=`openai/gpt-5.5`, drafter=`openai/gpt-5.6-sol`, stakeholder=`openai/gpt-5.6-sol`, audit=`openai/gpt-5.6-sol`,
+screen=`openrouter/deepseek/deepseek-v3.2`. The judge advances to GPT-5.5 because the drafter has no remaining distinct model.
+
 Status legend: **[measured]** values come from inspected artifacts; **[measured above]** is filled in by the
 integrator during Phase 3. Nothing below claims a cloud result until the placeholder is replaced.
 
