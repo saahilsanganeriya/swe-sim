@@ -69,11 +69,26 @@ bash scripts/vm/tunnel.sh            # second terminal; forwards 8233, 7233, 808
 `setup.sh` (runs on the VM as the login user): apt `git gh curl ca-certificates file`; `uv` and `uv python install 3.12`;
 Temporal CLI v1.8.3 pinned (archive inspected with `file` and `tar -t` before extraction, installed to `/usr/local/bin/temporal`);
 directories `/opt/swesim`, `/var/lib/swesim`, `/etc/swesim` owned by the service user; `/etc/swesim/env` and `~/.modal.toml`
-installed mode 0600 from the copied files; `gh repo clone` + `git checkout --detach <commit>` at `/opt/swesim`;
+installed mode 0600 from the copied files; `git clone` at `/opt/swesim` with the read-only `GH_TOKEN` passed through a
+transient credential helper (process environment only; nothing in `.git/config`), then a `main` branch tracking `origin/main`
+at the requested commit;
 `uv sync --extra dev --frozen --python 3.12`; `loginctl enable-linger`; units installed to `~/.config/systemd/user/`,
 verified with `systemd-analyze --user verify`, then `systemctl --user enable --now swesim-temporal swesim-worker swesim-dashboard`.
 
-Update to a new commit (re-runnable):
+Update the VM to the current `origin/main` (routine deploys):
+
+```bash
+git push                         # update.sh refuses while `git status -sb` shows the branch is ahead of its upstream
+bash scripts/vm/update.sh        # on the VM: cd /opt/swesim && git pull --ff-only && uv sync --extra dev --frozen
+                                 #            && systemctl --user restart swesim-worker swesim-dashboard
+```
+
+It prints the three unit states (`swesim-temporal`, `swesim-worker`, `swesim-dashboard`) and the checked-out commit. It never
+restarts the Temporal server or a trial unit; a restarted worker resumes polling running trials (the launch-once rule
+applies). `/opt/swesim` is a `main` checkout tracking `origin/main` (set up by `setup.sh`) with no stored credentials; the
+pull reads the read-only `GH_TOKEN` from `/etc/swesim/env` with the `env_get` line parser and passes it through a transient
+credential helper (`git -c credential.helper= -c 'credential.helper=!f() { ... }; f' pull --ff-only`, token in the process
+environment only, never in `.git/config`). Full re-bootstrap (packages, Temporal CLI, units) or pinning a specific commit:
 
 ```bash
 gcloud compute ssh swesim-worker --project "$GCP_PROJECT" --zone "$GCP_ZONE" -- \

@@ -1179,7 +1179,7 @@ def test_env_run_tasks_two_scenarios_bounded_and_progress():
 
 # ---------------------------------------------------------------- Task 13 deployment files (syntax and contracts)
 
-@pytest.mark.parametrize("script", ["create.sh", "setup.sh", "tunnel.sh"])
+@pytest.mark.parametrize("script", ["create.sh", "setup.sh", "tunnel.sh", "update.sh"])
 def test_vm_scripts_parse(script):
     path = ROOT / "scripts" / "vm" / script
     assert path.is_file() and os.access(path, os.X_OK), script
@@ -1232,6 +1232,30 @@ def test_setup_script_contract():
                    "loginctl enable-linger", "systemd-analyze --user verify", "systemctl --user enable --now", "swesim-temporal", "swesim-worker", "swesim-dashboard", "/opt/swesim", "/var/lib/swesim"):
         assert needle in text, needle
     assert "docker" not in text.lower() or "not required" in text.lower()
+
+
+def test_update_script_contract():
+    text = (ROOT / "scripts/vm/update.sh").read_text(); setup = (ROOT / "scripts/vm/setup.sh").read_text()
+    for needle in ("git status -sb", "[ahead", "refusing to update", "gcloud compute ssh --quiet", "cd /opt/swesim", "pull --ff-only",
+                   "uv sync --extra dev --frozen", "systemctl --user restart swesim-worker swesim-dashboard", "is-active", "git rev-parse --short HEAD",
+                   "GCP_PROJECT", "GCP_ZONE", "SWESIM_ENV_FILE"):
+        assert needle in text, needle
+    assert "swesim-temporal" in text and "restart swesim-temporal" not in text and "swesim-trial" not in text   # never restarts the server or trial units
+    assert "checkout --quiet -B main" in setup and "--set-upstream-to=origin/main" in setup                  # pull --ff-only needs a tracking branch
+    # the clone stores no credentials: both scripts hand GH_TOKEN to git through a transient helper, never .git/config
+    helper = "credential.helper=!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f"
+    assert helper in text and "-c credential.helper= -c" in text and "env_get /etc/swesim/env GH_TOKEN" in text
+    assert helper in setup and "gh auth setup-git" not in setup and "gh repo clone" not in setup and 'GH_TOKEN="$GH_TOKEN_VALUE" git' in setup
+    # the helper emits the token from the environment only (no token appears in any git argument)
+    cp = subprocess.run(["bash", "-c", "f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f"], capture_output=True, text=True, env={**os.environ, "GH_TOKEN": "fake-token-value"})
+    assert cp.stdout == "username=x-access-token\npassword=fake-token-value\n"
+    # the refusal really triggers on an "ahead" status line (function-level check of the guard logic)
+    guard = 'STATUS_LINE="## main...origin/main [ahead 2]"; if printf "%s" "$STATUS_LINE" | grep -q "\\[ahead"; then echo refusing; exit 1; fi; echo ok'
+    cp = subprocess.run(["bash", "-c", guard], capture_output=True, text=True); assert cp.returncode == 1 and "refusing" in cp.stdout
+    ok = 'STATUS_LINE="## main...origin/main"; if printf "%s" "$STATUS_LINE" | grep -q "\\[ahead"; then echo refusing; exit 1; fi; echo ok'
+    cp = subprocess.run(["bash", "-c", ok], capture_output=True, text=True); assert cp.returncode == 0 and "ok" in cp.stdout
+    doc = (ROOT / "docs/ops.md").read_text()
+    assert "scripts/vm/update.sh" in doc and "git pull --ff-only" in doc
 
 
 def test_ops_doc_has_required_sections():
