@@ -1,10 +1,14 @@
 """GitHub issue / pull-request threads via the authenticated `gh api` CLI.
 
 Every call returns one JSON document (never `--paginate`, whose output is several concatenated documents).
-Paging is explicit and bounded. Nothing here sleeps through GitHub's rate limit: a refused call raises `RateLimited`
-(a `DiscoveryUnavailable`) carrying the reset time read from the response headers (`gh api -i` output) or from one
-uncounted `gh api rate_limit` call, and the owner of the clock (the discovery activity, which heartbeats while it
-waits) decides how to wait and resume. `rate_limit_status()` exposes that quota, cached for 30 s.
+Paging is explicit and bounded. GitHub has two limits: the hourly core quota (primary; `x-ratelimit-remaining: 0`,
+"API rate limit exceeded") and the secondary (burst/abuse) limit, triggered by concurrent or rapid requests while the
+quota is untouched ("You have exceeded a secondary rate limit", sometimes with `retry-after`). Against the secondary
+limit every gh call in this process goes through one lock and is paced `GH_PACING_SEC` apart. Nothing here sleeps
+through either limit: a refused call raises `RateLimited` (a `DiscoveryUnavailable`) carrying `secondary`, the
+`retry_after` GitHub named, if any, and a reset time read from the response headers (`gh api -i` output) or from one
+uncounted `gh api rate_limit` call; the owner of the clock (the discovery activity, which heartbeats while it waits)
+decides how long to wait and resumes. `rate_limit_status()` exposes the core quota, cached for 30 s.
 """
 from __future__ import annotations
 
@@ -13,12 +17,16 @@ import json
 import logging
 import re
 import subprocess
+import threading
 import time
 from urllib.parse import quote, urlencode
 
 log = logging.getLogger(__name__)
 RATE_LIMIT_STATUS_TTL = 30.0
-SECONDARY_LIMIT_WAIT = 60.0  # GitHub asks for at least a minute after a secondary (burst) limit; also the horizon when the quota cannot be read
+SECONDARY_LIMIT_WAIT = 120.0  # horizon for a secondary (burst) limit without retry-after, and when the quota cannot be read; the activity doubles it
+GH_PACING_SEC = 0.25  # minimum spacing between two gh calls of this process (tests set 0)
+_GH_LOCK = threading.Lock()
+_last_call_end = 0.0  # time.monotonic() when the previous gh process ended
 _RATE_LIMIT = re.compile(r"rate limit|HTTP 429|abuse detection", re.I)
 _SECONDARY = re.compile(r"secondary|abuse detection", re.I)
 _HEADER_REMAINING = re.compile(r"^x-ratelimit-remaining:\s*(\d+)\s*$", re.I | re.M)
@@ -53,24 +61,47 @@ class DiscoveryUnavailable(RuntimeError):
 
 
 class RateLimited(DiscoveryUnavailable):
-    """GitHub refused the call under its rate limit. `reset_at` is the epoch second the quota (or the burst window)
-    resets; `remaining` the core calls left when the quota was read (None when it could not be read); `secondary`
-    marks a burst limit (quota left, GitHub asks for a minute's pause)."""
+    """GitHub refused the call under a rate limit. `secondary` marks the burst limit (quota left); `retry_after` is the
+    pause GitHub named in seconds, when it named one; `reset_at` is the epoch second to retry at: `retry-after` when
+    present, the core quota's reset for an exhausted primary limit, else `SECONDARY_LIMIT_WAIT` from now (a default the
+    activity may lengthen: `authoritative` is False then); `remaining` the core calls left when the quota was read
+    (None when it could not be read)."""
 
-    def __init__(self, reset_at: float, remaining: int | None, *, secondary: bool = False, repo: str = "", where: str = "",
-                 error_class: str = "CalledProcessError"):
-        self.reset_at, self.remaining, self.secondary = float(reset_at), remaining, secondary
+    def __init__(self, reset_at: float, remaining: int | None, *, secondary: bool = False, retry_after: float | None = None,
+                 repo: str = "", where: str = "", error_class: str = "CalledProcessError"):
+        self.reset_at, self.remaining, self.secondary, self.retry_after = float(reset_at), remaining, secondary, retry_after
         super().__init__("rate-limit", repo, where, error_class)
-        self.args = (f"{self.args[0]}; {'secondary limit' if secondary else 'quota exhausted'}, resets at epoch {int(self.reset_at)}",)
+        named = f"retry-after {int(retry_after)}s" if retry_after is not None else f"resets at epoch {int(self.reset_at)}"
+        self.args = (f"{self.args[0]}; {'secondary limit' if secondary else 'quota exhausted'}, {named}",)
+
+    @property
+    def authoritative(self) -> bool:
+        """GitHub named this horizon (retry-after, or the exhausted quota's reset); False for the default pause."""
+        return self.retry_after is not None or (not self.secondary and self.remaining is not None)
 
     def located(self, repo: str, where: str) -> "RateLimited":
-        return RateLimited(self.reset_at, self.remaining, secondary=self.secondary, repo=repo, where=where, error_class=self.error_class)
+        return RateLimited(self.reset_at, self.remaining, secondary=self.secondary, retry_after=self.retry_after, repo=repo, where=where,
+                           error_class=self.error_class)
 
     def wait_seconds(self, now: float | None = None) -> float:
         return max(0.0, self.reset_at - (_now() if now is None else now))
 
 
 _status_cache: tuple[float, tuple[int, int, float]] | None = None
+
+
+def _run_gh(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """One gh process at a time per worker process, at least `GH_PACING_SEC` apart: GitHub's secondary limit is about
+    concurrency and bursts, not the hourly quota, and a worker running several scans must still look like one client."""
+    global _last_call_end
+    with _GH_LOCK:
+        pause = GH_PACING_SEC - (time.monotonic() - _last_call_end)
+        if pause > 0:
+            time.sleep(pause)
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
+        finally:
+            _last_call_end = time.monotonic()
 
 
 def rate_limit_status(*, fresh: bool = False) -> tuple[int, int, float]:
@@ -80,7 +111,7 @@ def rate_limit_status(*, fresh: bool = False) -> tuple[int, int, float]:
     now = _now()
     if not fresh and _status_cache is not None and 0 <= now - _status_cache[0] < RATE_LIMIT_STATUS_TTL:
         return _status_cache[1]
-    proc = subprocess.run(["gh", "api", "rate_limit"], capture_output=True, text=True, check=True, timeout=60)
+    proc = _run_gh(["gh", "api", "rate_limit"], timeout=60)
     core = json.loads(proc.stdout)["resources"]["core"]
     status = (int(core["remaining"]), int(core["limit"]), float(core["reset"]))
     _status_cache = (now, status)
@@ -120,7 +151,8 @@ def rate_limited(error: BaseException) -> RateLimited | None:
     headers = rate_limit_headers(text)
     retry_after = _HEADER_RETRY_AFTER.search(text)
     if retry_after:
-        return RateLimited(_now() + int(retry_after.group(1)), headers[0] if headers else None, secondary=True)
+        pause = float(retry_after.group(1))
+        return RateLimited(_now() + pause, headers[0] if headers else None, secondary=True, retry_after=pause)
     if headers is not None and headers[0] == 0:
         return RateLimited(headers[1], 0)
     try:
@@ -135,7 +167,7 @@ def rate_limited(error: BaseException) -> RateLimited | None:
 def _gh_text(path: str, accept: str | None = None) -> str:
     cmd = ["gh", "api", path] + (["-H", f"Accept: {accept}"] if accept else [])
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120).stdout
+        return _run_gh(cmd, timeout=120).stdout
     except subprocess.CalledProcessError as e:
         limited = rate_limited(e)
         if limited is None:

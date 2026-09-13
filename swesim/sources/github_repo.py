@@ -11,7 +11,6 @@ import json
 import logging
 import re
 import subprocess
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -90,17 +89,28 @@ def code_stats(src: str) -> dict:
     return {"files": files, "additions": add, "deletions": dele, "non_code_files": non_code}
 
 
-def reject_reason(c: dict, min_comments: int, diff_min: int, diff_max: int) -> str | None:
+def link_reason(c: dict) -> str | None:
+    """Rejections decided by the PR's links alone (no diff, no thread)."""
     if not c.get("issue"):
         if c.get("linked_prs"):
             return "linked-target-is-pr"
         if c.get("linked_missing"):
             return "linked-target-missing"
         return "no-linked-issue"
+    return None
+
+
+def thread_reason(c: dict) -> str | None:
+    """Rejections decided by the fetched thread (skipped while `thread` is None)."""
     if c.get("thread") and not c["thread"].get("linked_issues"):
         return "missing-linked-issue"
     if c.get("thread") and any(i["created_at"] >= c["thread"]["pr_created_at"] for i in c["thread"]["linked_issues"]):
         return "issue-not-before-pr"
+    return None
+
+
+def size_reason(c: dict, diff_min: int, diff_max: int) -> str | None:
+    """Rejections decided by the diff: test/source presence and the code-only line band."""
     if not c.get("test_files"):
         return "no-test-changes"
     if not c.get("source_files"):
@@ -110,9 +120,15 @@ def reject_reason(c: dict, min_comments: int, diff_min: int, diff_max: int) -> s
         return "diff-too-small"
     if n > diff_max:
         return "diff-too-large"
-    if c.get("comments_total", 0) < min_comments:
-        return "thin-thread"
     return None
+
+
+def reject_reason(c: dict, min_comments: int, diff_min: int, diff_max: int) -> str | None:
+    """The first failing rule for a fully measured candidate, in the order links, thread, diff, thread size."""
+    reason = link_reason(c) or thread_reason(c) or size_reason(c, diff_min, diff_max)
+    if reason is None and c.get("comments_total", 0) < min_comments:
+        return "thin-thread"
+    return reason
 
 
 def _gh(path: str, paginate: bool = False):
@@ -124,13 +140,21 @@ def _pr_diff(repo: str, number: int) -> str:
     return threads._gh_text(f"repos/{repo}/pulls/{number}", accept="application/vnd.github.v3.diff")
 
 
-def _candidate(repo: str, p: dict, patch: str) -> dict:
+def _measured(patch: str) -> dict:
+    """The diff-derived candidate fields: oracle and test patches, code-only sizes, file lists."""
     src, tst = split_patch(patch)
     code = code_stats(src)
-    return {"repo": repo, "pr": p["number"], "title": p["title"], "base_commit": p["base"]["sha"], "merge_commit": p.get("merge_commit_sha"),
-            "additions": code["additions"], "deletions": code["deletions"],
-            "patch": src, "test_patch": tst, "source_files": code["files"], "non_code_files": code["non_code_files"],
-            "test_files": _DIFF_HEADER.findall(tst), "issue": None, "issue_body": None, "thread": None, "linked_prs": [], "linked_missing": []}
+    return {"additions": code["additions"], "deletions": code["deletions"], "patch": src, "test_patch": tst,
+            "source_files": code["files"], "non_code_files": code["non_code_files"], "test_files": _DIFF_HEADER.findall(tst)}
+
+
+def detail_changed_lines(detail: dict) -> int | None:
+    """additions + deletions of the whole PR as the detail payload reports them (tests and docs included): an upper bound
+    of the code-only measure the band uses; None when the payload lacks the fields."""
+    try:
+        return int(detail["additions"]) + int(detail["deletions"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 # gh unavailability is classified where gh is called; both names are part of this module's contract.
@@ -161,105 +185,153 @@ def _observed_update(observations: list[DiscoveryPRObservation], seq: int, **cha
     observations[seq] = DiscoveryPRObservation.model_validate({**observations[seq].model_dump(), **changes})
 
 
-def _merged_details(repo: str, since: str, max_prs: int, pr: int | None, observations: list[DiscoveryPRObservation]) -> list[dict]:
-    summaries = [{"number": pr}] if pr else []
-    if not pr:
-        for page in range(1, (max_prs + 99) // 100 + 1):
-            rows = _fetch(repo, f"list page {page}", lambda: threads._gh(f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"))
+class Discovery:
+    """One repository scan's in-memory state, advanced by `run`: the list pages fetched so far, the cursor over the listed
+    PRs, every observation and the retained candidates.
+
+    Business outcomes are PR decisions: not merged, before `since`, 404 (`not-found`), no linked issue, band filters. A
+    malformed or unclassifiable gh answer for one PR is a `fetch-error` observation (status=error). gh being unavailable
+    (rate limit, 5xx, network, timeout, auth) raises `DiscoveryUnavailable` out of `run` with nothing recorded for the page
+    or PR that failed: the owner waits (`RateLimited` names the reset) and calls `run` again within the same attempt, or
+    Temporal retries the attempt with a fresh `Discovery`. Error details never carry gh stderr.
+
+    Call order per merged PR, cheapest evidence first (GitHub's quota is the scarce resource): the detail (1 call) decides
+    merged/in-range; the links (1-3 calls) decide the link rejections; the detail's whole-PR line count, an upper bound of
+    the code-only measure, decides `diff-too-small` without a diff; the diff (1 call) decides the exact band; only a
+    band-passer pays for its thread (reviews, comments, issue threads). Reasons keep their names; a PR failing several
+    rules takes the cheapest one to prove, so `diff-too-small` can now precede `no-test-changes`, and a thread rule
+    (`missing-linked-issue`, `issue-not-before-pr`, `thin-thread`) can only be the reason for a PR inside the band.
+    """
+
+    def __init__(self, repo: str, since: str, *, max_prs: int = 400, min_comments: int = 4, diff_min: int = 20, diff_max: int = 600,
+                 pr: int | None = None, kind: str = "feature", observations: list[DiscoveryPRObservation] | None = None):
+        self.repo = normalize_repo(repo)
+        if max_prs < 1:
+            raise ValueError('max_prs must be positive')
+        if kind == "feature":
+            min_comments, diff_min, diff_max = FEATURE_BAND["min_comments"], FEATURE_BAND["diff_min"], FEATURE_BAND["diff_max"]
+        elif kind != "bugfix":
+            raise ValueError("kind must be feature or bugfix")
+        self.since, self.max_prs, self.pr, self.kind = since, max_prs, pr, kind
+        self.min_comments, self.diff_min, self.diff_max = min_comments, diff_min, diff_max
+        self.observations: list[DiscoveryPRObservation] = observations if observations is not None else []
+        self.summaries: list[dict] = [{"number": int(pr)}] if pr else []
+        self.listed = bool(pr)
+        self.page = 1
+        self.cursor = 0
+        self.cands: list[dict] = []
+        self.done = False
+
+    @property
+    def rejects(self) -> dict[str, int]:
+        """The legacy histogram: every recorded decision except the list-page prefilters."""
+        return obs.legacy_rejects(self.observations)
+
+    def run(self, batch: int | None = None) -> bool:
+        """Finish the listing, then decide up to `batch` more listed PRs (all of them when None); True once the scan is complete."""
+        self._list()
+        end = len(self.summaries) if batch is None else min(len(self.summaries), self.cursor + max(1, int(batch)))
+        while self.cursor < end:
+            self._decide(self.summaries[self.cursor])
+            self.cursor += 1
+        self.done = self.cursor >= len(self.summaries)
+        return self.done
+
+    def _list(self) -> None:
+        last_page = (self.max_prs + 99) // 100
+        while not self.listed:
+            page = self.page
+            rows = _fetch(self.repo, f"list page {page}",
+                          lambda: threads._gh(f"repos/{self.repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"))
             if not isinstance(rows, list):
                 raise ValueError("expected page array")
-            summaries.extend(rows)
-            if len(rows) < 100:
-                break
-    details = []
-    for summary in summaries[:max_prs]:
-        number = int(summary['number']); seq = len(observations)
-        observations.append(DiscoveryPRObservation(seq=seq, pr_number=number, pr_url=f'https://github.com/{repo}/pull/{number}',
-                                                    stages=['listed'], status='pending'))
-        if 'merged_at' in summary and (summary['merged_at'] is None or summary['merged_at'] < since):
-            _observed_update(observations, seq, status='rejected', reason='not-merged' if summary['merged_at'] is None else 'before-since')
-            continue
+            self.summaries.extend(rows)
+            if len(rows) < 100 or page >= last_page:
+                self.listed = True
+                del self.summaries[self.max_prs:]
+            else:
+                self.page = page + 1
+
+    def _update(self, seq: int, **changes) -> None:
+        _observed_update(self.observations, seq, **changes)
+
+    def _decide(self, summary: dict) -> None:
+        number = int(summary['number']); seq = len(self.observations)
+        self.observations.append(DiscoveryPRObservation(seq=seq, pr_number=number, pr_url=f'https://github.com/{self.repo}/pull/{number}',
+                                                        stages=['listed'], status='pending'))
+        if 'merged_at' in summary and (summary['merged_at'] is None or summary['merged_at'] < self.since):
+            self._update(seq, status='rejected', reason='not-merged' if summary['merged_at'] is None else 'before-since')
+            return
         try:
-            detail = _fetch(repo, f"PR {number}", lambda: threads._gh(f"repos/{repo}/pulls/{number}"))
-            if detail.get('number') != number:
-                raise ValueError('PR detail does not match listed identity')
-            if not detail.get('merged_at') or detail['merged_at'] < since:
-                _observed_update(observations, seq, status='rejected', reason='not-merged' if not detail.get('merged_at') else 'before-since')
-                continue
-            _observed_update(observations, seq, stages=['listed', 'merged-in-range'],
-                             base_commit=(detail.get('base') or {}).get('sha'), merge_commit=detail.get('merge_commit_sha'))
-            details.append({**detail, '_observation_seq': seq})
+            self._measure(number, seq)
+        except DiscoveryUnavailable:
+            del self.observations[seq:]  # nothing is decided for this PR; the owner resumes at it
+            raise
         except (subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
             if _is_not_found(error):  # the PR is gone or invisible: a business outcome of this PR, not an infrastructure failure
-                _observed_update(observations, seq, status='rejected', reason='not-found')
+                self._update(seq, status='rejected', reason='not-found')
             else:
-                _observed_update(observations, seq, status='error', reason='fetch-error', error_class=type(error).__name__)
-    return details
+                log.warning("github-repo PR %s/%s fetch failed (%s)", self.repo, number, type(error).__name__)
+                self._update(seq, status='error', reason='fetch-error', error_class=type(error).__name__)
+
+    def _measure(self, number: int, seq: int) -> None:
+        repo = self.repo
+        detail = _fetch(repo, f"PR {number}", lambda: threads._gh(f"repos/{repo}/pulls/{number}"))
+        if detail.get('number') != number:
+            raise ValueError('PR detail does not match listed identity')
+        if not detail.get('merged_at') or detail['merged_at'] < self.since:
+            self._update(seq, status='rejected', reason='not-merged' if not detail.get('merged_at') else 'before-since')
+            return
+        self._update(seq, stages=['listed', 'merged-in-range'], base_commit=(detail.get('base') or {}).get('sha'), merge_commit=detail.get('merge_commit_sha'))
+        targets = _fetch(repo, f"PR {number} links", lambda: threads.linked_targets(repo, number, threads.closing_text(detail)))
+        issues = targets["issues"]
+        self._update(seq, linked_issue_numbers=list(issues), stages=[*self.observations[seq].stages, *(['linked-issue'] if issues else [])])
+        c = {"repo": repo, "pr": number, "title": detail["title"], "base_commit": detail["base"]["sha"], "merge_commit": detail.get("merge_commit_sha"),
+             "issue": issues[0] if issues else None, "issue_body": None, "thread": None,
+             "linked_prs": targets["prs"], "linked_missing": targets["missing"], "link_kind": targets.get("link_kind"),
+             "labels": [x["name"].lower() for x in detail.get("labels") or []]}
+        reason = link_reason(c)
+        if reason is None:
+            total = detail_changed_lines(detail)
+            if total is not None and total < self.diff_min:  # the whole PR is under the floor, so its code-only part is too
+                reason = "diff-too-small"
+        if reason is None:
+            c.update(_measured(_fetch(repo, f"PR {number} diff", lambda: _pr_diff(repo, number))))
+            self._update(seq, source_changed_lines=c['additions'] + c['deletions'], source_file_count=len(c['source_files']), test_file_count=len(c['test_files']))
+            reason = size_reason(c, self.diff_min, self.diff_max) or self._feature_reason(c)
+        if reason is None:
+            c["thread"] = _fetch(repo, f"PR {number} thread", lambda: threads.fetch_pr_thread(repo, number, detail=detail, targets=targets))
+            c["issue_body"] = c["thread"]["linked_issues"][0]["body"] if c["thread"]["linked_issues"] else None
+            c["comments_total"] = (len(c["thread"]["pr_comments"]) + len(c["thread"]["review_comments"])
+                                   + sum(len(i["comments"]) for i in c["thread"]["linked_issues"]))
+            self._update(seq, comment_count=c["comments_total"])
+            reason = thread_reason(c) or ("thin-thread" if c["comments_total"] < self.min_comments else None)
+        c["discovery"] = {"kind": self.kind, "repo_only": self.pr is None, "since": self.since, "max_prs": self.max_prs}
+        c['_observation_seq'] = seq
+        if reason:
+            self._update(seq, status='rejected', reason=reason)
+        else:
+            self.cands.append(c)
+            self._update(seq, stages=[*self.observations[seq].stages, 'band-passed', 'retained'], status='retained')
+
+    def _feature_reason(self, c: dict) -> str | None:
+        if self.kind != "feature":
+            return None
+        lo, hi = FEATURE_BAND["source_files"]
+        if not lo <= len(c["source_files"]) <= hi:
+            return "feature-source-file-band"
+        if not any(any(word in label for word in FEATURE_LABEL_WORDS) for label in c["labels"]):
+            return "feature-label-missing"
+        return None
 
 
 def discover(repo: str, since: str, max_prs: int = 400, min_comments: int = 4, diff_min: int = 20, diff_max: int = 600, pr: int | None = None,
              kind: str = "feature", observations: list[DiscoveryPRObservation] | None = None) -> tuple[list[dict], dict]:
-    """Candidates and legacy reject counts; an optional sink preserves every listed PR and its measured stage.
-
-    Business outcomes are PR decisions: not merged, before `since`, 404 (`not-found`), no linked issue, band filters.
-    A malformed or unclassifiable gh answer for one PR is a `fetch-error` observation (status=error). gh being
-    unavailable (rate limit, 5xx, network, timeout, auth) raises `DiscoveryUnavailable` so the attempt is retried by
-    Temporal instead of counting PRs as rejected. Error details never carry gh stderr. Prefilter observations do not
-    change legacy histograms.
-    """
-    repo = normalize_repo(repo)
-    if max_prs < 1:
-        raise ValueError('max_prs must be positive')
-    if kind == "feature":
-        min_comments, diff_min, diff_max = FEATURE_BAND["min_comments"], FEATURE_BAND["diff_min"], FEATURE_BAND["diff_max"]
-    elif kind != "bugfix":
-        raise ValueError("kind must be feature or bugfix")
-    observed = observations if observations is not None else []
-    prs = _merged_details(repo, since, max_prs, pr, observed)
-    cands, rejects = [], Counter(obs.legacy_rejects(observed))  # list/detail-stage decisions (not-found, fetch-error) already taken
-    for p in prs:
-        seq = p['_observation_seq']
-        try:
-            targets = _fetch(repo, f"PR {p['number']} links", lambda: threads.linked_targets(repo, p["number"], threads.closing_text(p)))
-            issues = targets["issues"]
-            _observed_update(observed, seq, linked_issue_numbers=list(issues),
-                             stages=[*observed[seq].stages, *(['linked-issue'] if issues else [])])
-            c = _candidate(repo, p, _fetch(repo, f"PR {p['number']} diff", lambda: _pr_diff(repo, p["number"])))
-            c["linked_prs"], c["linked_missing"], c["link_kind"] = targets["prs"], targets["missing"], targets.get("link_kind")
-            if issues:
-                c["issue"] = issues[0]
-                c["thread"] = _fetch(repo, f"PR {p['number']} thread", lambda: threads.fetch_pr_thread(repo, p["number"]))
-                c["issue_body"] = c["thread"]["linked_issues"][0]["body"] if c["thread"]["linked_issues"] else None
-                c["comments_total"] = (len(c["thread"]["pr_comments"]) + len(c["thread"]["review_comments"])
-                                       + sum(len(i["comments"]) for i in c["thread"]["linked_issues"]))
-            _observed_update(observed, seq, source_changed_lines=c['additions']+c['deletions'], source_file_count=len(c['source_files']),
-                             test_file_count=len(c['test_files']), comment_count=c.get('comments_total'))
-        except (subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
-            if _is_not_found(error):
-                rejects["not-found"] += 1
-                _observed_update(observed, seq, status='rejected', reason='not-found')
-                continue
-            log.warning("github-repo PR %s/%s fetch failed (%s)", repo, p.get("number"), type(error).__name__)
-            rejects["fetch-error"] += 1
-            _observed_update(observed, seq, status='error', reason='fetch-error', error_class=type(error).__name__)
-            continue
-        c["labels"] = [x["name"].lower() for x in p.get("labels") or []]
-        reason = reject_reason(c, min_comments, diff_min, diff_max)
-        if not reason and kind == "feature":
-            lo, hi = FEATURE_BAND["source_files"]
-            if not lo <= len(c["source_files"]) <= hi:
-                reason = "feature-source-file-band"
-            elif not any(any(word in label for word in FEATURE_LABEL_WORDS) for label in c["labels"]):
-                reason = "feature-label-missing"
-        c["discovery"] = {"kind": kind, "repo_only": pr is None, "since": since, "max_prs": max_prs}
-        c['_observation_seq'] = seq
-        if reason:
-            rejects[reason] += 1
-            _observed_update(observed, seq, status='rejected', reason=reason)
-        else:
-            cands.append(c)
-            _observed_update(observed, seq, stages=[*observed[seq].stages, 'band-passed', 'retained'], status='retained')
-    return cands, dict(rejects)
+    """Candidates and legacy reject counts of one uninterrupted scan (`Discovery` run to completion); an optional sink
+    preserves every listed PR and its measured stage. Prefilter observations do not change legacy histograms."""
+    scan = Discovery(repo, since, max_prs=max_prs, min_comments=min_comments, diff_min=diff_min, diff_max=diff_max, pr=pr, kind=kind, observations=observations)
+    scan.run()
+    return scan.cands, scan.rejects
 
 
 def source_key_for(repo: str, band: str) -> str:
@@ -267,27 +339,41 @@ def source_key_for(repo: str, band: str) -> str:
     return f"github-repo--{normalize_repo(repo).replace('/', '__')}--{band}"
 
 
-def discover_scan(repo: str, since: str, *, max_prs: int = 400, kind: str = "feature", pr: int | None = None, max_candidates: int | None = None,
-                  source_key: str | None = None, workflow_id: str | None = None, run_id: str | None = None,
-                  scanned_at: datetime | None = None) -> tuple[list[dict], dict[str, int], obs.DiscoveryScan]:
-    """`discover` plus its immutable record: the retained candidates (capped at `max_candidates`), the legacy reject
+def begin_scan(repo: str, since: str, *, max_prs: int = 400, kind: str = "feature", pr: int | None = None) -> Discovery:
+    """A scan to advance with `Discovery.run` (the activity does so in batches between rate-limit checks)."""
+    return Discovery(repo, since, max_prs=max_prs, pr=pr, kind=kind)
+
+
+def finish_scan(scan: Discovery, *, max_candidates: int | None = None, source_key: str | None = None, workflow_id: str | None = None,
+                run_id: str | None = None, scanned_at: datetime | None = None) -> tuple[list[dict], dict[str, int], obs.DiscoveryScan]:
+    """A completed scan's immutable record: the retained candidates (capped at `max_candidates`), the legacy reject
     histogram including `max-candidates-cut`, and a `DiscoveryScan` in which every listed PR keeps its decision.
 
     A capped candidate is a recorded `max-candidates-cut` decision after band acceptance, not a vanished PR. The returned
     histogram is exactly the scan's `rejects`, so the `.rejects.json` artifact and the scan can never disagree."""
-    repo = normalize_repo(repo)
     if max_candidates is not None and max_candidates < 1:
         raise ValueError("max_candidates must be positive")
-    observations: list[DiscoveryPRObservation] = []
-    cands, _ = discover(repo, since, max_prs=max_prs, pr=pr, kind=kind, observations=observations)
-    kept = cands[: max_candidates or len(cands)]
-    observations = obs.retain_selected(observations, {c["_observation_seq"] for c in kept})
+    if not scan.done:
+        raise ValueError("discovery scan is not complete")
+    kept = scan.cands[: max_candidates or len(scan.cands)]
+    observations = obs.retain_selected(scan.observations, {c["_observation_seq"] for c in kept})
     rejects = obs.legacy_rejects(observations)
-    scan = obs.DiscoveryScan(source_key=source_key or source_key_for(repo, kind), repo=repo, band=kind, since=since, max_prs=max_prs,
-                             max_candidates=max_candidates, pr=pr, scanned_at=scanned_at or datetime.now(timezone.utc),
-                             workflow_id=workflow_id, run_id=run_id, observations=observations, funnel=obs.funnel(observations),
-                             rejects=rejects, rejects_sha256=hashlib.sha256(obs.rejects_bytes(rejects)).hexdigest())
-    return kept, rejects, scan
+    record = obs.DiscoveryScan(source_key=source_key or source_key_for(scan.repo, scan.kind), repo=scan.repo, band=scan.kind, since=scan.since,
+                               max_prs=scan.max_prs, max_candidates=max_candidates, pr=scan.pr, scanned_at=scanned_at or datetime.now(timezone.utc),
+                               workflow_id=workflow_id, run_id=run_id, observations=observations, funnel=obs.funnel(observations),
+                               rejects=rejects, rejects_sha256=hashlib.sha256(obs.rejects_bytes(rejects)).hexdigest())
+    return kept, rejects, record
+
+
+def discover_scan(repo: str, since: str, *, max_prs: int = 400, kind: str = "feature", pr: int | None = None, max_candidates: int | None = None,
+                  source_key: str | None = None, workflow_id: str | None = None, run_id: str | None = None,
+                  scanned_at: datetime | None = None) -> tuple[list[dict], dict[str, int], obs.DiscoveryScan]:
+    """`begin_scan` run to completion plus `finish_scan`: one uninterrupted scan and its immutable record."""
+    if max_candidates is not None and max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
+    scan = begin_scan(repo, since, max_prs=max_prs, kind=kind, pr=pr)
+    scan.run()
+    return finish_scan(scan, max_candidates=max_candidates, source_key=source_key, workflow_id=workflow_id, run_id=run_id, scanned_at=scanned_at)
 
 
 def build_recipe(repo: str, base_commit: str, profile: str = "python-pytest") -> dict:

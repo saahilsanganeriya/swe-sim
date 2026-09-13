@@ -107,9 +107,9 @@ def test_discovery_writes_unprobed_rows_and_reject_funnel(tmp_path, monkeypatch)
     monkeypatch.setattr(A, 'WS', ws)
     from swesim.sources import observations as obs
     seen = []
-    def discover(repo, since, kind='feature', *, observations=None, **_):
-        # discover_scan passes max_prs/pr/observations and derives the reject histogram from the observations it records
-        seen.append((repo, since, kind)); observations = observations if observations is not None else []
+    def run(self, batch=None):
+        # the activity advances a Discovery in batches; finish_scan derives the reject histogram from the observations it records
+        seen.append((self.repo, self.since, self.kind)); observations = self.observations
         cands = [{'base_commit': 'abc', 'instance_id': 'x__y-1'}, {'base_commit': 'def', 'instance_id': 'x__y-2'}]
         for i, c in enumerate(cands):
             c['_observation_seq'] = i
@@ -119,8 +119,9 @@ def test_discovery_writes_unprobed_rows_and_reject_funnel(tmp_path, monkeypatch)
             seq = len(observations)
             observations.append(obs.DiscoveryPRObservation(seq=seq, pr_number=seq + 1, pr_url=f'https://github.com/x/y/pull/{seq + 1}',
                                                            stages=['listed', 'merged-in-range', 'linked-issue'], status='rejected', reason='too-small'))
-        return cands, {'too-small': 3}
-    monkeypatch.setattr(github, 'discover', discover)
+        self.cands = cands; self.done = True; return True
+    monkeypatch.setattr(github.Discovery, 'run', run)
+    monkeypatch.setattr(A, '_github_quota', lambda: None)
     monkeypatch.setattr(github, 'candidate_to_row', lambda c: {**c, 'patch': 'large source patch stays on disk', 'fail_to_pass': []})
     monkeypatch.setattr(github, 'build_recipe', lambda *args: {'repo_dir': '/app'})
     monkeypatch.setattr(harbor_cli, 'run_task', lambda *args, **kw: pytest.fail('discovery cannot probe'))
@@ -151,15 +152,16 @@ def test_discovery_bands_and_immutable_snapshots_do_not_overwrite_history(tmp_pa
     ws = Workspace(tmp_path); monkeypatch.setattr(A, 'WS', ws)
     from swesim.sources import observations as obs
     records = {'rejects': {'too-small': 3}}
-    def fake_discover(repo, since, *args, observations=None, **kwargs):
-        observations = observations if observations is not None else []
+    def fake_run(self, batch=None):
+        observations = self.observations
         for reason, n in records['rejects'].items():   # the scan derives the histogram from recorded decisions
             for _ in range(n):
                 seq = len(observations)
                 observations.append(obs.DiscoveryPRObservation(seq=seq, pr_number=seq + 1, pr_url=f'https://github.com/x/y/pull/{seq + 1}',
                                                                stages=['listed', 'merged-in-range', 'linked-issue'], status='rejected', reason=reason))
-        return [], dict(records['rejects'])
-    monkeypatch.setattr(github, 'discover', fake_discover)
+        self.done = True; return True
+    monkeypatch.setattr(github.Discovery, 'run', fake_run)
+    monkeypatch.setattr(A, '_github_quota', lambda: None)
     first = asyncio.run(A.discover_activity({'repo': 'x/y', 'kind': 'bugfix'}))
     records['rejects'] = {'no-tests': 7}
     second = asyncio.run(A.discover_activity({'repo': 'x/y', 'kind': 'bugfix'}))

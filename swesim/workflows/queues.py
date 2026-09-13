@@ -7,6 +7,10 @@ Contract
   activity is a configuration error caught at the worker's start, never a silent fallback to a random queue.
 - `CONCURRENCY` is the per-queue default for `max_concurrent_activities`; `Settings.max_concurrent_activities`
   overrides it for one pool.
+- `DISCOVERY_CONCURRENCY` is how many GitHub discovery scans one worker instance runs at a time (the authoring
+  activities' `discover_activity` holds an `asyncio.Semaphore` of this size). The pool shares one GH_TOKEN, and
+  GitHub's secondary limit punishes concurrent bursts, so it is 1: two authoring instances mean at most two scans.
+  Cross-instance coordination (one scan per token) would need a lease in the index and is deferred.
 """
 from __future__ import annotations
 
@@ -38,6 +42,7 @@ QUEUE_OF: dict[str, str] = {
 }
 
 CONCURRENCY: dict[str, int] = {AUTHORING: 32, BUILD: 8, TRIALS: 64, CONTROL: 16}
+DISCOVERY_CONCURRENCY = 1  # GitHub scans per worker instance; see the module docstring
 
 
 class UnroutedActivity(ValueError):

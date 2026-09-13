@@ -5,10 +5,13 @@ invalid input or a business rejection. Activities raise `non_retryable(...)` for
 "candidate not kept" (and `swesim.workflows.activities` converts every `ValueError` into one); transient provider,
 Modal and GitHub failures propagate as ordinary exceptions and are retried by the class the workflow picked.
 
-- LLM   : judge, draft, approval, stakeholder-bound work; provider 429/5xx and timeouts.
-- BUILD : Modal / Harbor infrastructure (probe, compile, validate); slower backoff, fewer attempts.
-- READ  : polls and index writes; cheap to repeat.
-- ONCE  : launch. The launcher is idempotent by design, but a retry must go through `decide_launch`, never a blind relaunch.
+- LLM       : judge, draft, approval, stakeholder-bound work; provider 429/5xx and timeouts.
+- BUILD     : Modal / Harbor infrastructure (probe, compile, validate); slower backoff, fewer attempts.
+- READ      : polls and index writes; cheap to repeat.
+- ONCE      : launch. The launcher is idempotent by design, but a retry must go through `decide_launch`, never a blind relaunch.
+- DISCOVERY : GitHub discovery. The activity waits GitHub's rate limits out inside an attempt (heartbeating); an attempt
+              fails only when gh is down or the wait would outlast it, so the class starts at a minute and stretches to a
+              quarter hour over eight attempts, enough to cross an hourly quota window.
 """
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ LLM = RetryPolicy(initial_interval=timedelta(seconds=10), backoff_coefficient=2.
 BUILD = RetryPolicy(initial_interval=timedelta(seconds=30), backoff_coefficient=2.0, maximum_interval=timedelta(minutes=5), maximum_attempts=3)
 READ = RetryPolicy(initial_interval=timedelta(seconds=5), backoff_coefficient=2.0, maximum_interval=timedelta(minutes=1), maximum_attempts=5)
 ONCE = RetryPolicy(maximum_attempts=1)
+DISCOVERY = RetryPolicy(initial_interval=timedelta(seconds=60), backoff_coefficient=2.0, maximum_interval=timedelta(minutes=15), maximum_attempts=8)
 # Bookkeeping hooks (index writes, cost accounting): READ, but an activity type no worker registers is not worth
 # five attempts; "NotFoundError" is the type the SDK's worker raises for it.
 HOOK = RetryPolicy(initial_interval=timedelta(seconds=5), backoff_coefficient=2.0, maximum_interval=timedelta(minutes=1), maximum_attempts=5,

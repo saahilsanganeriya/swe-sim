@@ -149,36 +149,29 @@ def test_pages_stops_on_short_page_and_bounds_pagination(monkeypatch):
         threads.pages("repos/o/r/issues/1/comments", max_pages=2)
 
 
-def test_gh_backs_off_on_rate_limit_then_succeeds(monkeypatch):
-    state = {"n": 0}
+def test_gh_raises_rate_limited_instead_of_sleeping(monkeypatch):
+    """The gh wrapper never sleeps through GitHub's limits: the swebench caller sees `threads.RateLimited` (a
+    `DiscoveryUnavailable`) with the reset GitHub named; the activity that owns the clock decides how to wait."""
+    monkeypatch.setattr(threads.time, "sleep", lambda s: pytest.fail("the gh wrapper must not sleep"))
+    now = 1_800_000_000; monkeypatch.setattr(threads, "_now", lambda: now)
 
-    def flaky(cmd, **kw):
-        if cmd[2] == "rate_limit":  # primary limit exhausted, resets in ~5 s
-            return CompletedProcess(cmd, 0, stdout=json.dumps({"resources": {"core": {"remaining": 0, "reset": int(threads.time.time()) + 5}}}), stderr="")
-        state["n"] += 1
-        if state["n"] < 3:
-            raise CalledProcessError(1, cmd, output="", stderr="gh: API rate limit exceeded for user (HTTP 403)")
-        return CompletedProcess(cmd, 0, stdout='{"ok": true}', stderr="")
-    sleeps = []
-    monkeypatch.setattr(subprocess, "run", flaky)
-    monkeypatch.setattr(threads.time, "sleep", sleeps.append)
-    assert threads._gh("repos/o/r") == {"ok": True} and state["n"] == 3 and len(sleeps) == 2 and all(1 <= s <= 10 for s in sleeps)
-    # primary quota still available (remaining > 0): bounded exponential backoff
-    state["n"] = 0; sleeps.clear()
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: CompletedProcess(cmd, 0, stdout=json.dumps({"resources": {"core": {"remaining": 10, "reset": 0}}}), stderr="") if cmd[2] == "rate_limit" else flaky(cmd))
-    assert threads._gh("repos/o/r") == {"ok": True} and sleeps == [2.0, 4.0]
-    # secondary (burst) limit: never shorter than GitHub's one-minute guidance
-    state["n"] = 0; sleeps.clear()
+    def exhausted(cmd, **kw):
+        if cmd[2] == "rate_limit":  # primary limit exhausted, resets in 5 s
+            return CompletedProcess(cmd, 0, stdout=json.dumps({"resources": {"core": {"limit": 5000, "remaining": 0, "reset": now + 5}}}), stderr="")
+        raise CalledProcessError(1, cmd, output="", stderr="gh: API rate limit exceeded for user (HTTP 403)")
+    monkeypatch.setattr(subprocess, "run", exhausted)
+    with pytest.raises(threads.RateLimited) as exc:
+        threads.fetch_pr_thread("o/r", 5)
+    assert exc.value.reset_at == now + 5 and exc.value.remaining == 0 and exc.value.secondary is False and exc.value.kind == "rate-limit"
 
-    def secondary(cmd, **kw):
+    def secondary(cmd, **kw):  # burst limit with the quota untouched: GitHub's "wait a few minutes" case
         if cmd[2] == "rate_limit":
-            return CompletedProcess(cmd, 0, stdout=json.dumps({"resources": {"core": {"remaining": 10, "reset": 0}}}), stderr="")
-        state["n"] += 1
-        if state["n"] < 3:
-            raise CalledProcessError(1, cmd, output="", stderr="gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)")
-        return CompletedProcess(cmd, 0, stdout='{"ok": true}', stderr="")
+            return CompletedProcess(cmd, 0, stdout=json.dumps({"resources": {"core": {"limit": 5000, "remaining": 5000, "reset": now + 3000}}}), stderr="")
+        raise CalledProcessError(1, cmd, output="", stderr="gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)")
     monkeypatch.setattr(subprocess, "run", secondary)
-    assert threads._gh("repos/o/r") == {"ok": True} and sleeps == [60.0, 60.0]
+    with pytest.raises(threads.RateLimited) as exc:
+        threads._gh("repos/o/r")
+    assert exc.value.secondary is True and exc.value.remaining == 5000 and exc.value.reset_at == now + threads.SECONDARY_LIMIT_WAIT
 
 
 def test_gh_does_not_retry_other_errors(monkeypatch):

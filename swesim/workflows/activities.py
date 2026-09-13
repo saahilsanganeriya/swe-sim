@@ -31,8 +31,10 @@ import inspect
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from temporalio import activity
@@ -42,8 +44,8 @@ from swesim import roles
 from swesim.models import ID_RE, RunConfig, ScenarioSpec, trial_id
 from swesim.paths import Workspace, atomic_json
 from swesim.settings import Settings, get_settings, has_secret, secret
-from swesim.workflows import archive, batching, retries, validation
-from swesim.sources import observations
+from swesim.workflows import archive, batching, queues, retries, validation
+from swesim.sources import observations, threads
 from swesim.workflows.launchers.base import (  # noqa: F401 - re-exported
     Launcher,
     LaunchFailed,
@@ -77,6 +79,16 @@ LAUNCH_GRACE_POLLS = 6  # polls without any launch evidence before await reports
 # resolve to different ids (draft_spec.draft refuses correlated errors); the solver is never substituted.
 FALLBACK_CHAINS = roles.ROLE_CHAINS
 LAUNCH_SLOTS = asyncio.Semaphore(1)  # pilot trials launch serially per worker
+# GitHub discovery under the rate limits (discover_activity). The pool shares one GH_TOKEN; scans run one at a time per
+# worker instance (queues.DISCOVERY_CONCURRENCY), in batches of DISCOVERY_BATCH PRs between core-quota checks, and wait
+# GitHub's limits out inside the attempt with heartbeats instead of failing it.
+DISCOVERY_SLOTS = asyncio.Semaphore(queues.DISCOVERY_CONCURRENCY)
+DISCOVERY_BATCH = 10
+GH_RATE_MARGIN = 300  # core calls kept in reserve before a scan or batch starts (an env override, SWESIM_GH_RATE_MARGIN, would need a Settings field)
+RATE_WAIT_GRACE_SEC = 5.0
+RATE_WAIT_HEARTBEAT_SEC = 30.0
+SECONDARY_WAIT_INITIAL_SEC = 120.0  # a secondary (burst) limit without retry-after: this, doubling per consecutive refusal ...
+SECONDARY_WAIT_MAX_SEC = 900.0      # ... up to a quarter hour
 
 
 def configure(settings: Settings) -> None:
@@ -165,6 +177,91 @@ def _redact(text: str) -> str:
     return text
 
 
+def _clock() -> float:
+    """Wall clock (epoch seconds); a seam so tests drive the rate-limit waits with a fake clock."""
+    return time.time()
+
+
+async def _sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def _attempt_time_left() -> float | None:
+    """Seconds before this attempt's start-to-close deadline; None outside an activity or without that timeout."""
+    if not activity.in_activity():
+        return None
+    info = activity.info()
+    if info.start_to_close_timeout is None:
+        return None
+    return info.start_to_close_timeout.total_seconds() - (datetime.now(timezone.utc) - info.started_time).total_seconds()
+
+
+async def wait_for_github_rate_limit(reset_at: float, *, remaining: int | None = None, secondary: bool = False) -> float:
+    """Wait until `reset_at` + RATE_WAIT_GRACE_SEC, heartbeating every RATE_WAIT_HEARTBEAT_SEC with what is awaited,
+    instead of failing the attempt. Raises `transient` when the wait would outlast the attempt's remaining time (the
+    retry class then waits between attempts). Returns the seconds waited."""
+    until = reset_at + RATE_WAIT_GRACE_SEC
+    wait = until - _clock()
+    if wait <= 0:
+        return 0.0
+    left = _attempt_time_left()
+    if left is not None and wait > left:
+        raise retries.transient(f"GitHub rate limit lifts in {wait:.0f}s, beyond this attempt's remaining {left:.0f}s", kind="GitHubRateLimited")
+    log.warning("discovery: waiting %.0fs for GitHub's %s rate limit (core remaining=%s)", wait, "secondary" if secondary else "primary", remaining)
+    started = _clock()
+    while (pending := until - _clock()) > 0:
+        _heartbeat({"waiting_for": "github-rate-limit", "reset_at": reset_at, "remaining": remaining, "secondary": secondary})
+        await _sleep(min(RATE_WAIT_HEARTBEAT_SEC, pending))
+        if _cancelled():
+            raise asyncio.CancelledError("activity cancelled while waiting for GitHub's rate limit")
+    return _clock() - started
+
+
+def rate_limit_horizon(limited: threads.RateLimited, consecutive: int) -> float:
+    """The epoch second to resume at after `limited`: the horizon GitHub named (retry-after, or the exhausted quota's
+    reset), else SECONDARY_WAIT_INITIAL_SEC doubling per consecutive refusal up to SECONDARY_WAIT_MAX_SEC."""
+    if limited.authoritative:
+        return limited.reset_at
+    return _clock() + min(SECONDARY_WAIT_INITIAL_SEC * 2 ** consecutive, SECONDARY_WAIT_MAX_SEC)
+
+
+def _github_quota() -> tuple[int, int, float] | None:
+    """`threads.rate_limit_status()`, or None when gh cannot answer (the scan itself then classifies the outage)."""
+    try:
+        return threads.rate_limit_status()
+    except (subprocess.SubprocessError, ValueError, KeyError, TypeError, OSError):
+        return None
+
+
+async def await_github_quota(margin: int | None = None) -> None:
+    """Before a scan or a batch: with fewer than `margin` core calls left, wait for the quota's reset rather than run into it."""
+    status = await asyncio.to_thread(_github_quota)
+    if status is None:
+        return
+    remaining, _limit, reset_at = status
+    if remaining < (GH_RATE_MARGIN if margin is None else margin):
+        await wait_for_github_rate_limit(reset_at, remaining=remaining)
+
+
+async def run_discovery(scan) -> None:
+    """Advance a `github_repo.Discovery` to completion: the core quota is checked before the scan and between batches; a
+    `RateLimited` raised mid-batch is waited out (a secondary limit without a named pause: 120 s doubling to 15 min) and
+    the scan resumes at the refused page or PR. The waits happen inside this attempt and never count as Temporal attempts."""
+    await await_github_quota()
+    consecutive = 0
+    while not scan.done:
+        try:
+            await blocking(lambda: scan.run(DISCOVERY_BATCH))
+        except threads.RateLimited as limited:
+            log.warning("discovery %s: %s", getattr(scan, "repo", "?"), limited)
+            await wait_for_github_rate_limit(rate_limit_horizon(limited, consecutive), remaining=limited.remaining, secondary=limited.secondary)
+            consecutive += 1
+            continue
+        consecutive = 0
+        if not scan.done:
+            await await_github_quota()
+
+
 def _accepted_kwargs(fn, candidates: dict) -> dict:
     """Keep only keyword arguments `fn` accepts (all of them if it takes **kwargs)."""
     params = inspect.signature(fn).parameters
@@ -226,15 +323,19 @@ async def discover_activity(p: dict) -> dict:
         raise ValueError("discovery band must be bugfix or feature")
     if p.get("max_candidates") is not None and int(p["max_candidates"]) < 1:
         raise ValueError("max_candidates must be positive")
-    kwargs = _accepted_kwargs(gr.discover, {k: p[k] for k in ("since", "pr", "max_prs", "kind") if p.get(k) is not None})
+    kwargs = _accepted_kwargs(gr.begin_scan, {k: p[k] for k in ("since", "pr", "max_prs", "kind") if p.get(k) is not None})
     kwargs.setdefault("since", "2026-06-01")
     workflow_id = activity.info().workflow_id if activity.in_activity() else p.get("workflow_id", "direct")
     run_id = activity.info().workflow_run_id if activity.in_activity() else p.get("run_id")
     source_key = gr.source_key_for(repo, band)
     # Every listed PR keeps its decision in an immutable scan record (candidates/<source_key>/scans/<sha256>.json); the
-    # returned histogram already includes the max-candidates cut. gh rate limits/5xx/network raise DiscoveryTransientError.
-    cands, rejects, scan = await blocking(lambda: gr.discover_scan(repo, **kwargs, max_candidates=int(p.get("max_candidates") or 0) or None,
-                                                                   source_key=source_key, workflow_id=workflow_id if run_id else None, run_id=run_id))
+    # returned histogram already includes the max-candidates cut. GitHub's rate limits are waited out inside the attempt
+    # (`run_discovery`); gh being down (5xx, network, auth, timeout) raises DiscoveryUnavailable and the attempt is retried.
+    async with DISCOVERY_SLOTS:
+        state = gr.begin_scan(repo, **kwargs)
+        await run_discovery(state)
+        cands, rejects, scan = gr.finish_scan(state, max_candidates=int(p.get("max_candidates") or 0) or None, source_key=source_key,
+                                              workflow_id=workflow_id if run_id else None, run_id=run_id)
     rows = []
     for c in cands:
         row = gr.candidate_to_row(c); row.update(gr.build_recipe(repo, c["base_commit"])); rows.append(row)
