@@ -1,0 +1,197 @@
+"""Run stage: visible view, per-trial task materialization, run_trial with mocked Harbor and stakeholder."""
+import json, tomllib
+
+import pytest
+
+from swesim import harbor_cli
+from swesim.models import RunConfig, ScenarioSpec, minimal_spec_dict, trial_id
+from swesim.paths import Workspace
+from swesim.stages import run
+from swesim.stages.run import TrialRecord, materialize_trial_task, run_trial
+from swesim.stakeholder.view import visible_view
+
+URL = "https://swesim-stakeholder-web.modal.run"
+
+
+def test_visible_view_drops_author_only():
+    d = minimal_spec_dict(); d["ledger"].append({"id": "f09", "text": "SECRET", "kind": "interface", "provenance": "authored", "authored_rationale": "x", "discovery": "author-only"})
+    v = visible_view(ScenarioSpec.model_validate(d)); assert all(f["id"] != "f09" for f in v["facts"]) and v["brief"] == "It breaks."
+
+
+def test_visible_view_structurally_excludes_oracle_and_tests():
+    d = minimal_spec_dict()
+    d["ledger"] += [{"id": "f02", "text": "BRIEFFACT", "kind": "behavior", "provenance": "original-issue", "source_excerpt": "It", "source_url": "u", "discovery": "brief"},
+                    {"id": "f03", "text": "REVIEWFACT", "kind": "constraint", "provenance": "authored", "authored_rationale": "x", "discovery": "volunteered-at-review"},
+                    {"id": "f04", "text": "REPOFACT", "kind": "context", "provenance": "authored", "authored_rationale": "x", "discovery": "repo-derivable"},
+                    {"id": "f09", "text": "AUTHORONLY", "kind": "interface", "provenance": "authored", "authored_rationale": "x", "discovery": "author-only"}]
+    d["checks"] = [{"id": "c1", "description": "reporter script", "command": "python repro.py", "expected_observation": "ok"}]
+    spec = ScenarioSpec.model_validate(d); v = visible_view(spec)
+    assert set(v) == {"brief", "facts", "requirements", "persona", "checks", "repo_dir"}
+    assert [f["id"] for f in v["facts"]] == ["f01", "f02", "f03", "f04"] and all(set(f) == {"id", "text", "kind", "discovery"} for f in v["facts"])
+    dump = json.dumps(v)
+    assert "AUTHORONLY" not in dump and "oracle.diff" not in dump and "test.patch" not in dump and "t1" not in json.dumps(v["facts"])
+    assert v["requirements"] == [{"id": "r01", "text": "Raise ValueError"}] and v["persona"]["role"] == "maintainer" and v["repo_dir"] == "/app"
+    assert v["checks"][0]["id"] == "c1"
+
+
+def test_materialize_sets_token(tmp_path):
+    ws = Workspace(tmp_path); src = tmp_path / "task"; src.mkdir(); (src / "task.toml").write_text('[environment.env]\nSWESIM_SESSION_TOKEN = ""\nSWESIM_TRIAL_ID = ""\n')
+    out = materialize_trial_task(ws, src, "abc123", "tok")
+    t = tomllib.loads((out / "task.toml").read_text()); assert t["environment"]["env"]["SWESIM_SESSION_TOKEN"] == "tok" and t["environment"]["env"]["SWESIM_TRIAL_ID"] == "abc123"
+    assert t["metadata"]["trial_id"] == "abc123" and out == ws.root / "trials" / "abc123" / "task"
+    assert (out.stat().st_mode & 0o777) == 0o700 and ((out / "task.toml").stat().st_mode & 0o777) == 0o600
+    with pytest.raises(ValueError): materialize_trial_task(ws, src, "abc123", "tok")   # never overwrite an existing trial task
+
+
+def _compiled_task_toml(hosts):
+    return ("[task]\nname = \"swesim/x--interactive\"\n\n[metadata]\nsource = \"authored\"\ncondition = \"interactive\"\n\n"
+            "[agent]\ntimeout_sec = 2400\nuser = \"agent\"\nnetwork_mode = \"allowlist\"\nallowed_hosts = " + json.dumps(hosts) + "\n\n"
+            "[environment]\nnetwork_mode = \"allowlist\"\nallowed_hosts = " + json.dumps(hosts) + "\n\n"
+            "[environment.env]\nUV_OFFLINE = \"1\"\nSWESIM_STAKEHOLDER_URL = \"" + URL + "\"\nSWESIM_SESSION_TOKEN = \"\"\nSWESIM_TRIAL_ID = \"\"\nSWESIM_REPO_DIR = \"/app\"\n")
+
+
+@pytest.fixture
+def scene(tmp_path, monkeypatch):
+    """A validated scenario with a compiled interactive task, fake Harbor and fake stakeholder HTTP."""
+    ws = Workspace(tmp_path / "ws"); spec = ScenarioSpec.model_validate(minimal_spec_dict())
+    sdir = ws.scenario_dir(spec.id); sdir.mkdir(parents=True)
+    (sdir / "compile.json").write_text(json.dumps({"compiled_hash": "c" * 8, "image_digest": "sha256:" + "d" * 64}))
+    (sdir / "validation.json").write_text(json.dumps({"status": "valid", "spec_hash": spec.spec_hash, "compiled_hash": "c" * 8}))
+    for cond in ("interactive", "hidden"):
+        tdir = ws.task_dir(spec.id, cond); (tdir / "environment").mkdir(parents=True)
+        (tdir / "task.toml").write_text(_compiled_task_toml(["api.openai.com", "swesim-stakeholder-web.modal.run"]))
+        (tdir / "instruction.md").write_text("compiled instruction")
+    monkeypatch.setattr(run, "render_instruction", lambda spec, rc: f"INSTRUCTION {rc.condition} {rc.brief_profile}")
+    calls = {"post": [], "get": [], "run": []}
+    H = "a" * 64
+    state = {"transcript_hash": H, "frozen": True, "report": {"transcript_hash": H, "patch_sha256": "p"}, "exception": None}
+
+    def fake_post(url, body, headers):
+        calls["post"].append((url, body, headers))
+        if url.endswith("/sessions"): return {"token": "t1.tok"}
+        if url.endswith("/freeze"): return {"frozen": True, "transcript_hash": state["transcript_hash"]}
+        raise AssertionError(url)
+
+    def fake_get(url, headers):
+        calls["get"].append((url, headers))
+        return {"trial_id": url.rsplit("/", 1)[1], "events": [{"kind": "session"}, {"kind": "message", "role": "user", "exchange": "ask", "request_id": "1", "ts": 1.0, "content": "q"}],
+                "patience_start": 6, "patience_end": 5, "frozen": state["frozen"], "transcript_hash": state["transcript_hash"], "service_failure": None, "pending": None}
+
+    def fake_run(task_dir, agent, jobs_dir, job_name, model=None, agent_kwargs=None, env_provider="modal", timeout_sec=10800):
+        calls["run"].append((task_dir, agent, jobs_dir, job_name, model, timeout_sec))
+        d = jobs_dir / job_name / "trial-0"; (d / "verifier").mkdir(parents=True)
+        (d / "result.json").write_text(json.dumps({"exception_info": state["exception"]}))
+        if state["exception"] is None:
+            (d / "verifier" / "reward.json").write_text(json.dumps({"reward": 1.0, "success": 1, "outcome_code": 1}))
+            (d / "verifier" / "report.json").write_text(json.dumps(state["report"]))
+        return d
+
+    monkeypatch.setattr(run, "_post", fake_post); monkeypatch.setattr(run, "_get", fake_get)
+    monkeypatch.setattr(harbor_cli, "run_task", fake_run)
+    return ws, spec, calls, state
+
+
+def test_run_trial_interactive_end_to_end(scene):
+    ws, spec, calls, state = scene
+    rc = RunConfig(condition="interactive", model="openai/gpt-5.5")
+    rec = run_trial(ws, spec, rc, 0, URL, "secret")
+    assert isinstance(rec, TrialRecord) and rec.status == "completed" and rec.reward == {"reward": 1.0, "success": 1, "outcome_code": 1}
+    effective = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": "c" * 8, "brief_profile": "natural"})
+    tid = trial_id(spec.spec_hash, "interactive", effective.run_config_hash, 0)
+    assert rec.trial_id == tid and rec.run_config_hash == effective.run_config_hash and rec.compiled_hash == "c" * 8 and rec.brief_profile == "natural"
+    assert rec.spec_hash == spec.spec_hash and rec.model == "openai/gpt-5.5" and rec.purpose == "demonstration" and rec.scenario_id == spec.id
+    # Session creation posted the visible view with the worker secret; the freeze safety net used the token.
+    url, body, headers = calls["post"][0]
+    assert url == URL + "/sessions" and headers == {"X-Worker-Secret": "secret"} and body["trial_id"] == tid and body["condition"] == "interactive"
+    assert body["spec_hash"] == spec.spec_hash and body["run_config_hash"] == effective.run_config_hash and body["image"] == "ubuntu:24.04"
+    assert body["visible_view"]["facts"][0]["id"] == "f01" and body["stakeholder_config"]["patience_profile"]["start"] == 6
+    assert calls["post"][1][0] == URL + "/freeze" and calls["post"][1][2] == {"Authorization": "Bearer t1.tok"}
+    assert calls["get"] == [(URL + f"/transcript/{tid}", {"X-Worker-Secret": "secret"})]
+    # Materialized task: token and trial id in the env, metadata carries lineage, instruction re-rendered, provider host allowed.
+    tdir = ws.root / "trials" / tid; task = tdir / "task"
+    assert rec.task_dir == str(task) and rec.trial_dir is not None
+    tc = tomllib.loads((task / "task.toml").read_text())
+    assert tc["environment"]["env"]["SWESIM_SESSION_TOKEN"] == "t1.tok" and tc["environment"]["env"]["SWESIM_TRIAL_ID"] == tid
+    assert tc["metadata"]["trial_id"] == tid and tc["metadata"]["run_config_hash"] == effective.run_config_hash and tc["metadata"]["compiled_hash"] == "c" * 8 and tc["metadata"]["brief_profile"] == "natural"
+    assert "api.openai.com" in tc["agent"]["allowed_hosts"] and "swesim-stakeholder-web.modal.run" in tc["environment"]["allowed_hosts"]
+    assert (task / "instruction.md").read_text() == "INSTRUCTION interactive natural"
+    # Harbor was launched once on the materialized copy with the run's model.
+    assert len(calls["run"]) == 1 and calls["run"][0][0] == task and calls["run"][0][3] == tid and calls["run"][0][4] == "openai/gpt-5.5" and calls["run"][0][2] == ws.jobs_dir / "runs"
+    # Written artifacts with the frozen names.
+    for name in ("reward.json", "report.json", "transcript.json", "status.json", "record.json", "run_config.json", "spec.json"): assert (tdir / name).exists(), name
+    assert json.loads((tdir / "status.json").read_text()) == {"status": "completed", "trial_id": tid}
+    assert json.loads((tdir / "reward.json").read_text()) == rec.reward
+    report = json.loads((tdir / "report.json").read_text())
+    assert report["transcript_binding_valid"] is True and report["reviewed_equals_submitted"] is None and report["simulator_validity"] == "unadjudicated"
+    assert report["image_digest"] == "sha256:" + "d" * 64 and report["harbor_exception"] is None and "transcript_hash_mismatch" not in report
+    assert json.loads((tdir / "transcript.json").read_text())["transcript_hash"] == "a" * 64
+    record = json.loads((tdir / "record.json").read_text()); assert record["trial_id"] == tid and record["transcript"]["patience_end"] == 5
+    assert json.loads((tdir / "run_config.json").read_text())["compiled_hash"] == "c" * 8 and json.loads((tdir / "spec.json").read_text())["id"] == spec.id
+    # Idempotent: a second call returns the prior record without relaunching or re-creating a session.
+    again = run_trial(ws, spec, rc, 0, URL, "secret")
+    assert again == rec and len(calls["run"]) == 1 and len(calls["post"]) == 2
+
+
+def test_run_trial_transcript_mismatch_marks_binding_invalid(scene):
+    ws, spec, calls, state = scene
+    state["report"] = {"transcript_hash": "b" * 64}
+    rec = run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 1, URL, "secret")
+    assert rec.report["transcript_binding_valid"] is False and rec.report["training_eligible"] is False and rec.report["transcript_hash_mismatch"] is True
+    assert rec.reward["success"] == 1          # correctness scores are kept; a missing binding does not erase the code outcome
+
+
+def test_run_trial_hidden_condition_skips_stakeholder(scene):
+    ws, spec, calls, state = scene
+    rec = run_trial(ws, spec, RunConfig(condition="hidden", model="openai/gpt-5.5"), 0, URL, "secret")
+    assert rec.condition == "hidden" and calls["post"] == [] and calls["get"] == [] and rec.transcript == {}
+    assert rec.report["simulator_validity"] == "n/a" and "transcript_binding_valid" not in rec.report
+    tc = tomllib.loads((ws.root / "trials" / rec.trial_id / "task" / "task.toml").read_text())
+    assert tc["environment"]["env"]["SWESIM_SESSION_TOKEN"] == "" and tc["environment"]["env"]["SWESIM_TRIAL_ID"] == rec.trial_id
+
+
+def test_run_trial_launch_failure_and_agent_exception(scene, monkeypatch):
+    ws, spec, calls, state = scene
+    def failing(*a, **k): raise harbor_cli.HarborRunError("no trial dir")
+    monkeypatch.setattr(harbor_cli, "run_task", failing)
+    rec = run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 0, URL, "secret")
+    assert rec.status == "launch-failed" and rec.reward == {"reward": 0.0, "success": 0, "outcome_code": 7} and rec.trial_dir is None
+    assert rec.report["outcome"] == "evaluator-failure" and rec.report["transcript_binding_valid"] is False
+    assert json.loads((ws.root / "trials" / rec.trial_id / "status.json").read_text())["status"] == "launch-failed"
+    # Agent timeout recorded by Harbor: outcome code 3, reward zero, no verifier output.
+    state["exception"] = {"exception_type": "AgentTimeoutError", "exception_message": "timed out"}
+    monkeypatch.setattr(harbor_cli, "run_task", scene_run(calls, state))
+    rec2 = run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 1, URL, "secret")
+    assert rec2.status == "completed" and rec2.reward == {"reward": 0.0, "success": 0, "outcome_code": 3} and rec2.report["outcome"] == "agent-invalid-submission"
+
+
+def scene_run(calls, state):
+    def fake_run(task_dir, agent, jobs_dir, job_name, model=None, agent_kwargs=None, env_provider="modal", timeout_sec=10800):
+        calls["run"].append((task_dir, agent, jobs_dir, job_name, model, timeout_sec))
+        d = jobs_dir / job_name / "trial-0"; (d / "verifier").mkdir(parents=True)
+        (d / "result.json").write_text(json.dumps({"exception_info": state["exception"]}))
+        return d
+    return fake_run
+
+
+def test_run_trial_refuses_unvalidated_or_mismatched_builds(scene):
+    ws, spec, calls, state = scene
+    rc = RunConfig(condition="interactive", model="openai/gpt-5.5")
+    with pytest.raises(ValueError): run_trial(ws, spec, rc, 0, "https://other-host.modal.run", "secret")          # stakeholder host not compiled in
+    with pytest.raises(ValueError): run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5", solver_timeout_sec=600), 0, URL, "secret")
+    with pytest.raises(ValueError): run_trial(ws, spec, RunConfig(condition="interactive", model="mistral/x"), 0, URL, "secret")
+    sdir = ws.scenario_dir(spec.id); val = json.loads((sdir / "validation.json").read_text()); val["status"] = "invalid"
+    (sdir / "validation.json").write_text(json.dumps(val))
+    with pytest.raises(ValueError): run_trial(ws, spec, rc, 0, URL, "secret")
+    assert calls["post"] == [] and calls["run"] == []
+
+
+def test_render_instruction_uses_compile_templates(monkeypatch, tmp_path):
+    """render_instruction imports the compile stream's TEMPLATES/visible_facts lazily; here we point it at a stub template."""
+    import sys, types
+    (tmp_path / "instruction.md.j2").write_text("{{ brief }}|{{ condition }}|{{ visible_facts|length }}|{{ repo_dir }}|{{ solver_minutes }}")
+    stub = types.ModuleType("swesim.stages.compile"); stub.TEMPLATES = tmp_path
+    stub.visible_facts = lambda spec: [f for f in spec.ledger if f.discovery.value != "author-only"]
+    monkeypatch.setitem(sys.modules, "swesim.stages.compile", stub)
+    spec = ScenarioSpec.model_validate(minimal_spec_dict())
+    assert run.render_instruction(spec, RunConfig(condition="interactive", brief_profile="natural")) == "It breaks.|interactive|1|/app|40"
+    assert run.render_instruction(spec, RunConfig(condition="full")) == "It breaks.|full|1|/app|40"
