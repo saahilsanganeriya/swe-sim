@@ -69,7 +69,7 @@ def grouped_bars(rows: list[dict], *, metric: str = "pass_at_k", chart_id: str =
     conditions = [c for c in CONDITIONS if any(r["condition"] == c for r in rows)] + sorted({r["condition"] for r in rows if r["condition"] not in CONDITIONS})
     pad_l, pad_r, pad_t, pad_b = 40, 12, 18, 30
     bar_w, gap, slot_gap, plot_h = 18, 2, 24, 140
-    widths = {c: len(shown) * (bar_w + gap) + slot_gap for c in conditions}
+    widths = {c: max(100, len(shown) * (bar_w + gap) + slot_gap) for c in conditions}
     width = pad_l + sum(widths.values()) + pad_r
     height = pad_t + plot_h + pad_b
     y = lambda v: pad_t + plot_h * (1 - v / ymax)  # noqa: E731
@@ -81,7 +81,7 @@ def grouped_bars(rows: list[dict], *, metric: str = "pass_at_k", chart_id: str =
     x = pad_l
     for cond in conditions:
         parts.append(f"<text class='cat' x='{x + widths[cond] / 2:.1f}' y='{height - 10}' text-anchor='middle'>{_h(cond)}</text>")
-        bx = x + slot_gap / 2
+        bx = x + (widths[cond] - len(shown) * (bar_w + gap)) / 2
         # selective direct label: the extreme (maximum) of each condition group; the rest live in tooltip + table
         vals = [_num(r.get(metric)) for r in rows if r["condition"] == cond]
         vmax = max((v for v in vals if v is not None), default=None)
@@ -116,7 +116,7 @@ def funnel(steps: list[dict], chart_id: str = "chart-funnel") -> str:
     if not steps:
         return "<p class='empty'>No candidates yet. The funnel fills as a creation job mines, judges and probes.</p>"
     total = max((s["kept"] + s["rejected"] + s["error"] + s["pending"]) for s in steps) or 1
-    pad_l, pad_r, row_h, bar_h, gap = 92, 60, 26, 18, 2
+    pad_l, pad_r, row_h, bar_h, gap = 92, 110, 26, 18, 2
     width = pad_l + 420 + pad_r
     height = row_h * len(steps) + 8
     scale = 420 / total
@@ -177,11 +177,11 @@ def matrix(rows: list[str], cols: list[str], cell_of, *, chart_id: str = "chart-
     if not rows or not cols:
         return "<p class='empty'>No cells yet.</p>"
     pad_l, pad_t, cw, ch = 220, 70, 74, 26
-    width, height = pad_l + cw * len(cols) + 12, pad_t + ch * len(rows) + 8
+    width, height = pad_l + cw * len(cols) + 100, pad_t + ch * len(rows) + 8
     parts = [f"<svg class='chart' viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' aria-label='{_h(title)}'>"]
     for j, c in enumerate(cols):
         lab = col_label(c) if col_label else c
-        parts.append(f"<text class='cat' x='{pad_l + j * cw + cw / 2:.1f}' y='{pad_t - 8}' text-anchor='end' transform='rotate(-30 {pad_l + j * cw + cw / 2:.1f},{pad_t - 8})'>{_h(lab)}</text>")
+        parts.append(f"<text class='cat' x='{pad_l + j * cw + cw / 2:.1f}' y='{pad_t - 12}' text-anchor='start' transform='rotate(-30 {pad_l + j * cw + cw / 2:.1f},{pad_t - 12})'>{_h(lab)}</text>")
     trows = []
     for i, r in enumerate(rows):
         yy = pad_t + i * ch
@@ -193,7 +193,7 @@ def matrix(rows: list[str], cols: list[str], cell_of, *, chart_id: str = "chart-
             step = _step(v) if n else 0
             txt = (f"{v:.2f}" if v is not None else "n/a") if n else "—"
             parts.append(f"<g class='bar' tabindex='0'><title>{_h(tip)}</title><rect class='cell s{step}' x='{pad_l + j * cw}' y='{yy}' width='{cw}' height='{ch}'/>"
-                         f"<text class='cellv{' dark' if step >= 4 else ''}' x='{pad_l + j * cw + cw / 2:.1f}' y='{yy + ch - 8}' text-anchor='middle'>{_h(txt)}</text></g>")
+                         f"<text class='cellv{' dark' if step >= 5 else ''}' x='{pad_l + j * cw + cw / 2:.1f}' y='{yy + ch - 8}' text-anchor='middle'>{_h(txt)}</text></g>")
             cells.append(f"<td class='num'>{_h(txt)}" + (f" <span class='muted'>(n={n})</span>" if n else "") + "</td>")
         trows.append(f"<tr><td>{_h(r)}</td>{''.join(cells)}</tr>")
     parts.append("</svg>")

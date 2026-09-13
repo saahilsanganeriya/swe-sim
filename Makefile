@@ -49,7 +49,7 @@ STATE_BUCKET := $(PROJECT)-swesim-tfstate
 ENV_FILE_FLAGS := --env-file $(SWESIM_ENV_FILE) $(foreach f,$(EXTRA_ENV_FILES),--env-file $(f))
 
 .PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build pin-image \
-        deploy open-executions verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
+        deploy deploy-stakeholder open-executions verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
 
 check:
 	uv sync --extra dev --frozen
@@ -89,10 +89,14 @@ outputs:
 push-secrets: require-project
 	$(UV) python scripts/cloud/push_secrets.py --project $(PROJECT) $(ENV_FILE_FLAGS) --modal-toml $(MODAL_TOML)
 
-# The bucket must hold a registry before the console/verify are useful; the tracked registry.json seeds an empty bucket
-# (never overwrites), scripts/cloud/import_vm.sh replaces it with the VM record.
+# A new hosted record starts empty. The tracked legacy catalog has no artifacts in a stranger's bucket.
 seed-registry:
-	gcloud storage cp --no-clobber registry.json gs://$$($(TF) output -raw bucket)/registry.json --quiet
+	@seed=$$(mktemp); trap 'rm -f "$$seed"' EXIT; \
+	printf '{"scenarios": {}}\n' > "$$seed"; \
+	gcloud storage cp --no-clobber "$$seed" gs://$$($(TF) output -raw bucket)/registry.json --quiet
+
+deploy-stakeholder:
+	bash scripts/deploy_stakeholder.sh
 
 build: require-project
 	bash scripts/cloud/build.sh $(PROJECT) $(REGION) $(SHA)
@@ -144,7 +148,10 @@ gh-variables:
 import-bucket: require-project
 	$(TF) import -input=false module.storage.google_storage_bucket.workspace $(PROJECT)/swesim-$(PROJECT)-workspace
 
-cloud-bootstrap: require-project tf-init tfvars
+cloud-bootstrap: require-project tf-init
+	$(MAKE) open-executions
+	$(MAKE) deploy-stakeholder
+	$(MAKE) tfvars
 	state=$$($(TF) state list); \
 	if printf '%s\n' "$$state" | grep -q '^module\.run\['; then \
 	  echo "workloads already exist; preserving them during bootstrap"; \
