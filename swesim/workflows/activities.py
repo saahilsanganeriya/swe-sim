@@ -37,6 +37,7 @@ from temporalio.exceptions import ApplicationError
 
 from swesim.models import ID_RE, RunConfig, ScenarioSpec, trial_id
 from swesim.paths import Workspace, atomic_json
+from swesim.roles import ROLE_CHAINS
 from swesim.settings import Settings, get_settings, has_secret, secret
 from swesim.workflows import retries
 from swesim.workflows.launchers.base import (Launcher, LaunchFailed, TrialBindingConflict, TrialEvidence, TrialLayout,  # noqa: F401 - re-exported
@@ -54,13 +55,11 @@ HEARTBEAT_SECONDS = 30.0
 POLL_SECONDS = 10.0
 AWAIT_DEADLINE_SEC = 3 * 3600
 LAUNCH_GRACE_POLLS = 6  # polls without any launch evidence before await reports launch-failed
-# Per-role fallback chains (CLAUDE.md, unattended-run rules): the configured id is probed first, then the chain in order.
-# Judge and draft must resolve to different ids (draft_spec.draft refuses correlated errors); the solver is never substituted.
-FALLBACK_CHAINS = {
-    "judge_model": ["openai/gpt-5.5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5"],
-    "draft_model": ["anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"],
-    "stakeholder_model": ["openai/gpt-5.5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"],
-}
+# Per-role fallback chains (swesim.roles.ROLE_CHAINS, interfaces §7): the configured id is probed first, then the chain in
+# order. Only the three pipeline roles are probed here (audit and screen models belong to their own activities). Judge and
+# draft must resolve to different ids (draft_spec.draft refuses correlated errors); the solver is never substituted.
+PROBE_ROLES = ("judge_model", "draft_model", "stakeholder_model")
+FALLBACK_CHAINS = {role: list(ROLE_CHAINS[role]) for role in PROBE_ROLES}
 LAUNCH_SLOTS = asyncio.Semaphore(1)  # pilot trials launch serially per worker
 
 

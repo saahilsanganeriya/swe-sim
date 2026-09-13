@@ -546,6 +546,7 @@ def test_mine_activity_adapts_to_either_mine_signature(ws, monkeypatch):
 
 
 GPT, OPUS, SONNET, HAIKU = "openai/gpt-5.5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"
+SOL = "openai/gpt-5.6-sol"  # second link of every pipeline-role chain in swesim.roles.ROLE_CHAINS
 
 
 def _chat_failing(unavailable):
@@ -555,13 +556,19 @@ def _chat_failing(unavailable):
     return chat_json
 
 
+def test_probe_chains_are_the_three_pipeline_roles_of_role_chains():
+    from swesim.roles import ROLE_CHAINS
+    assert set(A.FALLBACK_CHAINS) == {"judge_model", "draft_model", "stakeholder_model"}          # audit/screen models are not probed here
+    assert all(A.FALLBACK_CHAINS[r] == ROLE_CHAINS[r] for r in A.FALLBACK_CHAINS)
+
+
 def test_probe_chains_gpt_unavailable_judge_becomes_opus_draft_stays_sonnet(ws, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key-value-1234")
     monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({GPT}))
     r = A.probe_models({"judge_model": GPT, "draft_model": SONNET, "models": [GPT, HAIKU]})
-    assert r["resolved"] == {"judge_model": OPUS, "draft_model": SONNET, "stakeholder_model": SONNET}
-    assert r["substitutions"] == {"judge_model": OPUS, "stakeholder_model": SONNET}
-    assert r["configured"] == {"judge_model": GPT, "draft_model": SONNET, "stakeholder_model": GPT}   # stakeholder default is the chain head
+    assert r["resolved"] == {"judge_model": OPUS, "draft_model": SONNET, "stakeholder_model": OPUS}
+    assert r["substitutions"] == {"judge_model": OPUS}
+    assert r["configured"] == {"judge_model": GPT, "draft_model": SONNET, "stakeholder_model": OPUS}   # stakeholder default is the chain head
     assert r["models"][GPT]["ok"] is False and r["models"][OPUS]["ok"] is True and r["models"][SONNET]["ok"] is True
     assert r["needs_human"] == [f"solver model {GPT} unavailable; no silent substitution"] and r["solver_unavailable"] == [GPT]
     assert any("judge_model" in n and "fell back to " + OPUS in n for n in r["notes"])
@@ -572,18 +579,18 @@ def test_probe_chains_gpt_unavailable_judge_becomes_opus_draft_stays_sonnet(ws, 
 
 
 def test_probe_chains_never_resolve_judge_and_draft_to_the_same_model(ws, monkeypatch):
-    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({GPT, OPUS}))
-    r = A.probe_models({"judge_model": GPT, "draft_model": SONNET, "models": [HAIKU]})
-    assert r["resolved"]["judge_model"] == SONNET and r["resolved"]["draft_model"] == HAIKU and r["resolved"]["stakeholder_model"] == SONNET
+    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing(set()))
+    r = A.probe_models({"judge_model": SONNET, "draft_model": SONNET, "models": [HAIKU]})
+    assert r["resolved"]["judge_model"] == SONNET and r["resolved"]["draft_model"] == SOL and r["resolved"]["stakeholder_model"] == OPUS
     assert r["resolved"]["judge_model"] != r["resolved"]["draft_model"]
-    assert any("advanced the draft chain to " + HAIKU in n for n in r["notes"]) and r["needs_human"] == [] and r["solver_unavailable"] == []
-    # draft chain exhausted: the judge chain advances instead (configured both to haiku; sonnet unavailable)
-    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({SONNET}))
-    r2 = A.probe_models({"judge_model": HAIKU, "draft_model": HAIKU, "models": [HAIKU]})
-    assert r2["resolved"]["draft_model"] == HAIKU and r2["resolved"]["judge_model"] == GPT and any("advanced the judge chain to " + GPT in n for n in r2["notes"])
+    assert any("advanced the draft chain to " + SOL in n for n in r["notes"]) and r["needs_human"] == [] and r["solver_unavailable"] == []
+    # draft chain exhausted: the judge chain advances instead (configured both to sonnet; gpt-5.6-sol unavailable)
+    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({SOL}))
+    r2 = A.probe_models({"judge_model": SONNET, "draft_model": SONNET, "models": [HAIKU]})
+    assert r2["resolved"]["draft_model"] == SONNET and r2["resolved"]["judge_model"] == OPUS and any("advanced the judge chain to " + OPUS in n for n in r2["notes"])
     # nothing distinct left: recorded for a human, never silently equal-and-proceed
-    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({GPT, OPUS, SONNET}))
-    r3 = A.probe_models({"judge_model": HAIKU, "draft_model": HAIKU, "models": [HAIKU]})
+    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({SOL, OPUS, GPT}))
+    r3 = A.probe_models({"judge_model": SONNET, "draft_model": SONNET, "models": [HAIKU]})
     assert any("no distinct model is available" in n for n in r3["needs_human"])
 
 

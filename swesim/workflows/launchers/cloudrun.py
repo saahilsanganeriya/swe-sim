@@ -15,11 +15,11 @@ Contract
   Cloud Logging, the record and launch.json are the evidence). Both tolerate NotFound: they are idempotent.
 - The Job runs `python -m swesim.workflows.activities run-trial /workspace/trials/<tid>/request.json`: the worker's
   request path re-rooted under the mount, so the worker and the Job name the same bucket object.
-- Configuration: `Settings` supplies project, region, bucket, digest and the trial env. The image reference, the service
-  account and the Cloud SQL connection name are not Settings fields yet (`SWESIM_WORKER_IMAGE`,
-  `SWESIM_WORKER_SERVICE_ACCOUNT`, `SWESIM_SQL_CONNECTION_NAME` requested from the integrator); `from_settings` reads
-  Settings attributes of those names when present, else the module constants below, and fails closed with
-  `LauncherConfigError` when the image, the service account, the project or the bucket is missing.
+- Configuration: `Settings` supplies project, region, bucket, digest, the image reference (`worker_image`), the service
+  account (`worker_service_account`) and the trial env; `from_settings` fails closed with `LauncherConfigError` when the
+  image, the service account, the project or the bucket is missing. The Cloud SQL connection name is not a Settings
+  field yet (`SWESIM_SQL_CONNECTION_NAME` requested from the integrator): `from_settings` reads a Settings attribute of
+  that name when present, else `SQL_CONNECTION_NAME` below; None means no Cloud SQL volume (a trial does not index).
 """
 from __future__ import annotations
 
@@ -44,9 +44,7 @@ EXTRA_TIMEOUT = timedelta(hours=2)
 DEFAULT_SOLVER_TIMEOUT_SEC = 2400
 CREATE_TIMEOUT_SEC = 120
 RESOURCES = {"cpu": "1", "memory": "2Gi"}  # Harbor is a client; the heavy work runs on Modal
-# Not Settings fields yet (asked of the integrator, see the stream report): read here until then.
-WORKER_IMAGE: str | None = None
-WORKER_SERVICE_ACCOUNT: str | None = None
+# Not a Settings field yet (asked of the integrator, see the stream report): read here until then.
 SQL_CONNECTION_NAME: str | None = None
 _LABEL_RE = re.compile(r"[^a-z0-9_-]")
 
@@ -104,14 +102,12 @@ class CloudRunLauncher:
 
     @classmethod
     def from_settings(cls, s: Settings, *, jobs: Any = None, executions: Any = None) -> "CloudRunLauncher":
-        image = getattr(s, "worker_image", None) or WORKER_IMAGE
-        service_account = getattr(s, "worker_service_account", None) or WORKER_SERVICE_ACCOUNT
         sql = getattr(s, "sql_connection_name", None) or SQL_CONNECTION_NAME
-        missing = [n for n, v in (("SWESIM_WORKER_IMAGE", image), ("SWESIM_WORKER_SERVICE_ACCOUNT", service_account),
+        missing = [n for n, v in (("SWESIM_WORKER_IMAGE", s.worker_image), ("SWESIM_WORKER_SERVICE_ACCOUNT", s.worker_service_account),
                                   ("SWESIM_GCP_PROJECT", s.gcp_project), ("SWESIM_BUCKET", s.bucket)) if not v]
         if missing:
             raise LauncherConfigError(f"cloudrun launcher cannot start trials without {', '.join(missing)}")
-        return cls(settings=s, image=image, service_account=service_account, sql_connection_name=sql, jobs=jobs, executions=executions)
+        return cls(settings=s, image=s.worker_image, service_account=s.worker_service_account, sql_connection_name=sql, jobs=jobs, executions=executions)
 
     def _jobs(self) -> Any:
         if self.jobs is None:
