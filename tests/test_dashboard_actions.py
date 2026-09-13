@@ -140,6 +140,20 @@ class _Client:
     async def cancel(self, wid):
         self.calls.append(("cancel", wid))
 
+    async def operator_action(self, p, request_id):
+        from swesim.workflows import operator_actions as O
+        from swesim.paths import atomic_json
+        request = {**p, 'request_id': request_id}
+        if p['action'] == 'review':
+            q = p['params']
+            target = await self.approve_candidate(q['workflow_id'], q['scenario_id'], q['spec_hash'], q['decision'], q['note']) if q.get('workflow_id') else None
+            prepared = {'request': request, 'signal_target': target, 'decided_at': '2026-09-13T00:00:00+00:00', 'worker_image_digest': None, 'origin': 'laptop'}
+            _, directory = O._request(request)
+            atomic_json(directory / 'request.json', prepared)
+        else:
+            prepared = await O.prepare_operator_action_activity(request)
+        return {**await O.commit_operator_action_activity(prepared), 'workflow_id': 'operator-' + request_id}
+
     async def approve_candidate(self, wid, sid, spec_hash, decision="approve", note=""):
         self.calls.append(("approve_candidate", wid, sid, spec_hash, decision, note))
         return f"create:{sid}"
@@ -147,7 +161,7 @@ class _Client:
 
 def _install(monkeypatch, client):
     import swesim.workflows.client as real
-    for name in ("start_create", "start_run", "list_runs", "progress", "cancel", "approve_candidate", "start_pipeline", "start_matrix", "approve"):
+    for name in ("operator_action", "start_create", "start_run", "list_runs", "progress", "cancel", "approve_candidate", "start_pipeline", "start_matrix", "approve"):
         if hasattr(client, name):
             monkeypatch.setattr(real, name, getattr(client, name), raising=False)
         else:
@@ -166,13 +180,14 @@ def run_action(c, action, params, headers=None):
     return pv, c.post(f"/api/{action}", json={"token": pv.json()["token"], "params": pv.json()["params"]}, headers=headers or {})
 
 
-def test_label_flow_preview_confirm_audit_and_rejections(site):
+def test_label_flow_preview_confirm_audit_and_rejections(site, monkeypatch):
+    _install(monkeypatch, _Client())
     c, tid = site["client"], site["done"]
     pv, res = run_action(c, "label", {"trial_id": tid, "label": "no-question", "note": "asked nothing"})
-    assert pv.status_code == 200 and pv.json()["cli"].startswith("printf") and "label.json" in pv.json()["cli"] and pv.json()["token_scope"].startswith("this console process")
+    assert pv.status_code == 200 and pv.json()["cli"].startswith("uv run swesim workflows action label") and pv.json()["token_scope"].startswith("this console process")
     assert pv.json()["what"].startswith("Record a reviewer label") and pv.json()["expires_at"].endswith("+00:00")
     assert res.status_code == 200 and res.json()["ok"] is True
-    assert json.loads((site["ws"].root / "trials" / tid / "label.json").read_text()) == {"label": "no-question", "note": "asked nothing"}
+    assert json.loads((site["ws"].root / "trials" / tid / "label.json").read_text())["label"] == "no-question"
     log = _actions_log(site)
     assert len(log) == 1 and log[0]["action"] == "label" and log[0]["result"] == "accepted" and log[0]["actor"] == "anonymous" and log[0]["target"] == tid and log[0]["confirmed"] is True
     # tampered params, wrong actor, missing token: rejected and audited, nothing written
@@ -265,8 +280,8 @@ def test_cancel_review_retry_and_rebuild_flows(site, monkeypatch):
     page = c.get(f"/review/{sid}").text
     assert "awaiting approval" in page and "data-action='review'" in page and c.get("/api/counts").json()["review_pending"] == 1
     pv, res = run_action(c, "review", {"scenario_id": sid, "spec_hash": spec_hash, "workflow_id": "create-abc", "decision": "approve", "reason": "looks right"})
-    assert pv.json()["cli"].startswith(f"uv run swesim workflows approve create-abc {sid} {spec_hash} --decision approve")
-    assert res.status_code == 200 and res.json()["via"] == "signal" and client.calls[-1] == ("approve_candidate", "create-abc", sid, spec_hash, "approve", "looks right")
+    assert pv.json()["cli"].startswith("uv run swesim workflows action review --params-json") and spec_hash in pv.json()["cli"]
+    assert res.status_code == 200 and res.json()["via"] == "control workflow" and client.calls[-1] == ("approve_candidate", "create-abc", sid, spec_hash, "approve", "looks right")
     assert json.loads((sdir / "review.json").read_text())["decision"] == "approve"
     stale, res2 = run_action(c, "review", {"scenario_id": sid, "spec_hash": "0" * 64, "workflow_id": "create-abc", "decision": "reject", "reason": "no"})
     assert res2.status_code == 409 and "changed since" in res2.json()["error"]
@@ -297,3 +312,20 @@ def test_workflow_page_offers_cancel_only_while_open_and_shows_failure_text(site
     failed = c.get("/workflows/create-9").text
     assert "data-action='cancel'" not in failed and "Failure" in failed and "judge rejected" in failed and "secret.example" not in failed and "token=abc" not in failed
     assert c.get("/api/workflows/run-1").json()["progress"]["stage"] == "trial"
+
+
+def test_hosted_actions_require_verified_identity_before_confirmation(site, monkeypatch):
+    from swesim.dashboard.app import app, settings_dep
+    from swesim.settings import get_settings
+    audits=[]
+    monkeypatch.setattr(access,'record_action',lambda reader,settings,row:audits.append(row))
+    hosted=get_settings().model_copy(update={'bucket':'hosted-record'})
+    app.dependency_overrides[settings_dep]=lambda:hosted
+    try:
+        denied=site['client'].post('/api/label/preview',json={'trial_id':site['done'],'label':'no-question'})
+        assert denied.status_code==403 and 'verified IAP' in denied.text
+        permitted=site['client'].post('/api/label/preview',json={'trial_id':site['done'],'label':'no-question'},headers=site['eval'])
+        assert permitted.status_code==200
+        assert len(audits)==1 and audits[0].result=='rejected' and audits[0].actor=='anonymous'
+    finally:
+        app.dependency_overrides.pop(settings_dep,None)

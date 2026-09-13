@@ -41,6 +41,8 @@ PATCH_BATCH = "20260913-bounded-batches"
 PATCH_SEARCH = "20260913-search-attributes"
 PATCH_DIFFICULTY = "20260913-difficulty-screen"
 PATCH_AUDIT = "20260913-automatic-audits"
+PATCH_SCORE_K = "20260913-requested-score-k"
+PATCH_FROZEN_RETRY = "20260913-frozen-candidate-retry"
 CHILDREN_PER_RUN = 100
 HOOK_MINUTES = 2
 CONTROL_MINUTES = 60                           # one Harbor control run on Modal (validate_scenario's whole set had 180)
@@ -594,6 +596,8 @@ def candidate_child_id(sid: str, version=None) -> str:
 
 def _source_key(src: dict, *, include_band: bool = False) -> str:
     kind = src.get("kind", "swebench-annotated")
+    if kind == "frozen-candidate":
+        return src["source_key"]
     if kind == "github-repo":
         if include_band:
             return f"github-repo--{_normalize_repo(src.get('repo') or '').replace('/', '__')}--{src.get('pr_kind') or 'feature'}"
@@ -901,7 +905,11 @@ async def _create_batched(self: CreateTasksWorkflow, p: dict) -> dict:
             self.state['sources'][key] = {'status': 'mining'}
             try:
                 name = 'discover_activity' if src.get('kind') == 'github-repo' else 'mine_activity'
-                mined = await act(name, {**p, **_mine_params(src)}, 30 if name == 'discover_activity' else 180)
+                if src.get('kind') == 'frozen-candidate' and _patched(PATCH_FROZEN_RETRY):
+                    name = 'read_candidate_source_activity'
+                    mined = await act(name, src, 5, retry=retries.READ)
+                else:
+                    mined = await act(name, {**p, **_mine_params(src)}, 30 if name == 'discover_activity' else 180)
                 source_key = mined.get('source_key') or mined['candidates_path'].rsplit('/', 1)[-1].removesuffix('.jsonl')
                 sources.append({'source_key': source_key, 'candidates_path': mined['candidates_path'], 'limit': src.get('max_candidates') or src.get('limit')})
                 self.state['sources'][key] = {'status': 'mined', 'candidates_path': mined['candidates_path'],
@@ -987,7 +995,7 @@ async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
         if not more_trials:
             self.scenarios[sid]['status'] = 'scoring'
             try:
-                await act('score_activity', {'scenario_id': sid}, retry=retries.READ)
+                await act('score_activity', {'scenario_id': sid, **({'k': int(p.get('metric_k') or (1 if p.get('purpose') == 'screen' else p.get('k', 1)))} if _patched(PATCH_SCORE_K) else {})}, retry=retries.READ)
                 await act('export_activity', {'scenario_id': sid}, retry=retries.READ)
                 if p.get('purpose') == 'screen' and _patched(PATCH_DIFFICULTY):
                     self.scenarios[sid]['difficulty'] = await act('difficulty_label_activity', {'scenario_id': sid, 'plan_path': prepared['plan_path']}, retry=retries.READ)

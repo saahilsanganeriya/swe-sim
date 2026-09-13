@@ -13,7 +13,7 @@ from swesim.dashboard.render import chip, code_block, dash, evaluator_switch, h,
 from swesim.stages.score import OUTCOME_NAMES, outcome_code
 from swesim.dashboard.public import project
 
-LABELS = ("unresolved", "no-question", "disclosed-not-used", "simulator-omission", "derived-without-asking")
+from swesim.workflows.operator_actions import LABELS
 # Evaluator-only meta (Codex B-P2-6). ``patience_remaining`` stays public: it is the availability signal the design intends (Codex A-P1-3 ruling).
 AUDIT_META = ("disclosed_fact_ids", "tier", "tool_calls", "delivery", "redacted_terms", "regenerated", "audit", "forbidden_terms", "withheld_sentences")
 
