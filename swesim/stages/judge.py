@@ -43,18 +43,20 @@ EXTRACTED_SOURCES = {"test-exception", "test-literal", "patch-public-name"}
 ACCEPTED_RESOLUTIONS = {"thread", "tests"}
 MIN_EVIDENCE_CHARS = 12  # after norm_text; a one-word "evidence" pins nothing
 MIN_EVIDENCE_TOKENS = 3
-DIFF_KEYWORDS = {"diff", "git", "index", "new", "file", "mode", "similarity", "dissimilarity", "rename", "copy", "deleted", "old", "binary",
-                 "files", "differ", "no", "newline", "at", "end", "of"}
+DIFF_KEYWORDS = {"diff", "git"}  # ordinary identifiers (index, new, old, file, mode, copy) may ground a gap; headers are rejected by shape below
 _PY_KEYWORDS = {k.casefold() for k in keyword.kwlist} | {k.casefold() for k in getattr(keyword, "softkwlist", [])}
-_IDENT = re.compile(r"[a-z_]\w{2,}")
+_IDENT = re.compile(r"[a-z_]\w*")
+_HEADER_LIKE = re.compile(r"^(?:diff --git |index [0-9a-f]{6,}\.\.|--- |\+\+\+ |@@ |\\ no newline|new file mode|deleted file mode|old mode|new mode|"
+                          r"similarity index|dissimilarity index|rename (?:from|to) |copy (?:from|to) |binary files )")
 _BLOCKQUOTE = re.compile(r"(?m)^[ \t]*(?:>[ \t]?)+")
 
 
 def evidence_ok(ev: str) -> bool:
     """A normalized evidence span can ground a gap only if it is >= MIN_EVIDENCE_CHARS, >= MIN_EVIDENCE_TOKENS whitespace tokens,
-    and contains at least one identifier-like token that is neither diff boilerplate nor a Python keyword (`diff --git a/`
-    or `assert not in` pin nothing)."""
-    if len(ev) < MIN_EVIDENCE_CHARS or len(ev.split()) < MIN_EVIDENCE_TOKENS:
+    is not shaped like a unified-diff header (`diff --git a/…`, `index …`, `+++ b/…`, `@@ …`), and contains at least one
+    identifier-like token (one letter suffices: `assert x == 11`) that is neither `diff`/`git` nor a Python keyword
+    (`assert not in` and `assert 11 == 11` pin nothing)."""
+    if len(ev) < MIN_EVIDENCE_CHARS or len(ev.split()) < MIN_EVIDENCE_TOKENS or _HEADER_LIKE.match(ev):
         return False
     return any(t not in DIFF_KEYWORDS and t not in _PY_KEYWORDS for t in _IDENT.findall(ev))
 

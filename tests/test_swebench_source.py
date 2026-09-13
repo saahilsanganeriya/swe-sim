@@ -444,6 +444,12 @@ def test_ground_gaps_closes_the_label_smuggle_and_boilerplate_evidence_holes():
     assert not accept({"self_contained": True, "gaps": kept})
     assert tests_resolved_facts(row, {"gaps": [{**patch_only, "resolved_by": "tests"}]}) == []                                     # and synthesizes no on-request fact
     assert not evidence_ok("diff --git a/") and not evidence_ok("assert not in") and not evidence_ok("valueerror") and evidence_ok("raise valueerror(msg) here")
+    # review v4: ordinary identifiers ground; header-shaped spans are rejected by shape, not by a keyword denylist
+    for ok in ("assert x == 11", "assert new == old", "assert index == 3", "assert out.ret == 0", "assert file.mode == copy"):
+        assert evidence_ok(ok), ok
+    for bad in ("diff --git a/x.py b/x.py", "index 1111111..2222222 100644", "+++ b/xarray/core/weighted.py", "--- a/xarray/core/weighted.py",
+                "@@ -1 +1,3 @@ def test_x():", "new file mode 100644 here", "binary files a/x and b/x differ", "assert 11 == 11", "if not in"):
+        assert not evidence_ok(bad), bad
     # two distinct decisions pinned by the same test line both survive (dedupe is on evidence + question)
     ev = "match=\"dimension 'z' not found\""
     two = [{"id": "d1", "source": "proposed", "text": "message names the dim", "evidence": ev, "question": "what message?", "resolved_by": "tests", **base},
@@ -542,8 +548,8 @@ def test_grounding_excerpt_may_span_adjacent_added_lines():
 
 
 MPL_TEST_PATCH = ("diff --git a/lib/matplotlib/tests/test_figure.py b/lib/matplotlib/tests/test_figure.py\n--- a/lib/matplotlib/tests/test_figure.py\n+++ b/lib/matplotlib/tests/test_figure.py\n"
-                  "@@ -1 +1,9 @@\n x\n+def test_subplot_mosaic_width_ratios():\n+    fig = plt.figure()\n+    fig.subplot_mosaic([[\"A\", [[\"B\"], [\"C\"]]]], width_ratios=[2, 1])\n"
-                  "+    assert fig.axes\n+def test_subplot_mosaic_height_ratios_nested():\n+    fig = plt.figure()\n+    fig.subplot_mosaic([[\"A\"], [[[\"B\", \"C\"]]]], height_ratios=[1, 3])\n"
+                  "@@ -1 +1,10 @@\n x\n+def test_subplot_mosaic_width_ratios():\n+    fig = plt.figure()\n+    fig.subplot_mosaic([[\"A\", [[\"B\"], [\"C\"]]]], width_ratios=[2, 1])\n"
+                  "+    assert fig.axes[0].get_gridspec().get_width_ratios() == [2, 1]\n+def test_subplot_mosaic_height_ratios_nested():\n+    fig = plt.figure()\n+    fig.subplot_mosaic([[\"A\"], [[[\"B\", \"C\"]]]], height_ratios=[1, 3])\n"
                   "+def test_unrelated_colorbar_label():\n+    assert plt.colorbar().ax.get_ylabel() == \"\"\n")
 MPL_F2P = ["lib/matplotlib/tests/test_figure.py::test_subplot_mosaic_width_ratios", "lib/matplotlib/tests/test_figure.py::test_subplot_mosaic_height_ratios_nested[a]",
            "lib/matplotlib/tests/test_figure.py::test_unrelated_colorbar_label"]
@@ -552,8 +558,17 @@ MPL_F2P = ["lib/matplotlib/tests/test_figure.py::test_subplot_mosaic_width_ratio
 def test_auto_link_tests_by_shared_content_words():
     from swesim.stages.draft_spec import auto_link_tests, content_words
     assert content_words("Nested subplot_mosaic layouts must apply width_ratios while nothing is None") == {"nested", "subplot", "mosaic", "layouts", "apply", "width", "ratios", "nothing"}
-    assert auto_link_tests("Nested subplot_mosaic layouts must apply width_ratios to every level", MPL_TEST_PATCH, MPL_F2P) == sorted([MPL_F2P[0], MPL_F2P[1]])   # mosaic+subplot shared with both; width+ratios with the first
-    assert auto_link_tests("Only the height_ratios of nested mosaics matter here", MPL_TEST_PATCH, MPL_F2P) == [MPL_F2P[1]]
+    # the function's own name tokens (subplot, mosaic, width, ratios, height, nested) never count and the def line is not body:
+    # only body words outside the name link, so the height test (body: figure, subplot_mosaic call, height_ratios) links nothing here
+    assert auto_link_tests("Nested subplot_mosaic layouts must apply width_ratios to every level", MPL_TEST_PATCH, MPL_F2P) == []
+    assert auto_link_tests("The gridspec width ratios of the figure follow the mosaic", MPL_TEST_PATCH, MPL_F2P) == [MPL_F2P[0]]   # gridspec + figure are body words
+    assert auto_link_tests("Only the height_ratios of nested mosaics matter here", MPL_TEST_PATCH, MPL_F2P) == []
+    assert auto_link_tests("The weighted mean operations", _row()["test_patch"], [F2P]) == [] and auto_link_tests("Some weighted operations nonexistent", _row()["test_patch"], [F2P]) == []   # name tokens only
+    assert auto_link_tests("Raise ValueError with the dimension not found message", _row()["test_patch"], [F2P]) == [F2P]                 # body words
+    sig_only = ("diff --git a/tests/test_s.py b/tests/test_s.py\n--- a/tests/test_s.py\n+++ b/tests/test_s.py\n@@ -1 +1,3 @@\n x\n"
+                "+def test_something(gridspec_holder, figure_factory):\n+    assert holder.value == 1\n")
+    assert auto_link_tests("The gridspec figure factory", sig_only, ["tests/test_s.py::test_something"]) == []                                # gridspec/figure/factory appear only in the signature
+    assert auto_link_tests("The holder value is one", sig_only, ["tests/test_s.py::test_something"]) == ["tests/test_s.py::test_something"]    # holder/value are body words
     assert auto_link_tests("The maintainer prefers a friendly wording", MPL_TEST_PATCH, MPL_F2P) == []                  # no shared content words
     assert auto_link_tests("figure figure figure", MPL_TEST_PATCH, MPL_F2P) == []                                    # one distinct shared word is not enough
     assert auto_link_tests("", MPL_TEST_PATCH, MPL_F2P) == [] and auto_link_tests("assert while return", MPL_TEST_PATCH, MPL_F2P) == []   # keywords never count
@@ -575,23 +590,26 @@ def test_on_request_facts_must_carry_f2p_tests_named_in_the_violation():
 def test_draft_lists_f2p_ids_and_auto_links_on_request_facts_before_failing(monkeypatch, tmp_path):
     from swesim.models import ScenarioSpec
     from swesim.stages import draft_spec
+    two = [F2P, "xarray/tests/test_weighted.py::test_new"]                                                            # two distinct F2P functions: the content-word rule applies
     d = _draft_llm(); d["ledger"][0].update(tests=[], text="Raise ValueError with the dimension not found message")   # shares valueerror/dimension/found with the test body
+    d["groups"] = [{"id": "g01", "weight": 1.0, "tests": two}]
     calls = _patch_llm(monkeypatch, d, _withhold_llm())
-    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    p = draft_spec.draft(_row(fail_to_pass=two), _judged(), "fake/model", tmp_path / "s")
     spec = ScenarioSpec.model_validate_json(p.read_text())
     assert next(f for f in spec.ledger if f.id == "f01").tests == [F2P]
     meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
-    assert meta["auto_linked"] == ["f01"]
+    assert meta["auto_linked"] == ["f01"] and meta["auto_linked_single_target"] is False
     draft_calls = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
     assert len(draft_calls) == 2                                                                        # correction round happened before the fallback
     assert draft_calls[0]["messages"][0]["content"].startswith("FAIL_TO_PASS ids") and F2P in draft_calls[0]["messages"][0]["content"].splitlines()[0]
     correction = draft_calls[1]["messages"][-1]["content"]
     assert "Correct these violations" in correction and "f01:" in correction and F2P in correction
-    # no shared content words: the fallback cannot link, so the draft fails as before
+    # no shared content words and two candidate functions: the fallback cannot link, so the draft fails as before
     d = _draft_llm(); d["ledger"][0].update(tests=[], text="The maintainer prefers a friendly wording")
+    d["groups"] = [{"id": "g01", "weight": 1.0, "tests": two}]
     _patch_llm(monkeypatch, d, _withhold_llm())
     with pytest.raises(ValueError, match="grounding validation after two attempts.*f01: every on-request fact must carry"):
-        draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s2")
+        draft_spec.draft(_row(fail_to_pass=two), _judged(), "fake/model", tmp_path / "s2")
     assert not (tmp_path / "s2" / "scenario.draft.json").exists()
 
 
@@ -622,8 +640,9 @@ def test_withheld_brief_has_no_excerpts(monkeypatch):
     assert result['withheld_brief'] == 'Import fails\nThe importer stops on the first row.\nWe expected the whole file to load.'
 
 
-def test_withhold_retries_once_with_violations_then_fails(monkeypatch):
-    """A selected span that does not match the issue verbatim gets one correction round, then ValueError."""
+def test_withhold_retries_once_with_violations_then_returns_zero_removals(monkeypatch):
+    """A selected span that does not match the issue verbatim gets one correction round; if every selection is still rejected,
+    zero removals is the (valid) outcome, not a failure."""
     from swesim.stages import draft_spec
     issue = 'Import fails\nThe importer stops on the first row.\nTraceback: ERROR42 raised in importer'
     attempts = []
@@ -632,9 +651,22 @@ def test_withhold_retries_once_with_violations_then_fails(monkeypatch):
         attempts.append(messages)
         return {'removed': [{'category': 'error_message', 'excerpt': 'Traceback: ERROR99 raised in importer', 'kind': 'reproduction', 'discovery': 'on-request'}]}
     monkeypatch.setattr(draft_spec, 'chat_json', not_verbatim)
-    with pytest.raises(ValueError, match="withholding failed.*not a verbatim span"):
-        draft_spec.withhold(issue, 'fake/model')
+    res = draft_spec.withhold(issue, 'fake/model')
+    assert res["removed"] == [] and res["withheld_brief"] is None and res["deleted"] == [] and res["kept"] == [(0, len(issue))]
+    assert res["stats"]["attempts"] == 2 and res["stats"]["reason"].startswith("all selections rejected") and "not a verbatim span" in res["stats"]["reason"]
     assert len(attempts) == 2 and "Correct these violations" in attempts[1][-1]["content"] and "ERROR99" in attempts[1][-1]["content"]
+    monkeypatch.setattr(draft_spec, 'chat_json', lambda *a, **k: {"removed": []})
+    res = draft_spec.withhold(issue, 'fake/model')
+    assert res["removed"] == [] and res["stats"] == {"sentences_total": 3, "sentences_removed": 0, "fraction_removed": 0.0, "duplicate_selections": 0,
+                                                     "prompt_version": "withhold-v2", "attempts": 1, "reason": "model selected no spans", "rejected_selections": []}
+    # a mix: one valid and one rejected selection -> one correction round, then the valid one proceeds and the rejection is recorded
+    mixed = {'removed': [{'category': 'error_message', 'excerpt': 'Traceback: ERROR42 raised in importer', 'kind': 'reproduction', 'discovery': 'on-request'},
+                         {'category': 'error_message', 'excerpt': 'Traceback: ERROR99 raised in importer', 'kind': 'reproduction', 'discovery': 'on-request'}]}
+    attempts.clear()
+    monkeypatch.setattr(draft_spec, 'chat_json', lambda model_id, system, messages, schema, **kw: attempts.append(messages) or mixed)
+    res = draft_spec.withhold(issue, 'fake/model')
+    assert [r["excerpt"] for r in res["removed"]] == ["Traceback: ERROR42 raised in importer"] and len(attempts) == 2
+    assert res["stats"]["attempts"] == 2 and len(res["stats"]["rejected_selections"]) == 1 and "ERROR99" in res["stats"]["rejected_selections"][0]
 
 
 WITHHOLD_ISSUE = ("Importer crashes on empty header\n"
@@ -676,7 +708,8 @@ def test_withhold_brief_is_computed_not_trusted(monkeypatch):
     res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
     assert res["withheld_brief"] == WITHHOLD_ISSUE.replace("Traceback: ERROR42 raised in parse_header\n", "")   # byte-exact: the line and its newline
     assert "break v1" not in res["withheld_brief"] and "ERROR42" not in res["withheld_brief"]
-    assert [r["excerpt"] for r in res["removed"]] == ["Traceback: ERROR42 raised in parse_header"] and res["removed"][0]["fact_text"] == res["removed"][0]["excerpt"]
+    assert [r["excerpt"] for r in res["removed"]] == ["Traceback: ERROR42 raised in parse_header"]
+    assert res["removed"][0]["fact_text"] == "Reporter's original statement: Traceback: ERROR42 raised in parse_header" and res["removed"][0]["paraphrase"] is None
     assert res["removed"][0]["selected"] == "Traceback: ERROR42 raised in parse_header" and res["stats"]["sentences_total"] == 7
 
 
@@ -695,7 +728,8 @@ def test_withhold_extends_to_sentence_boundaries_and_reconstructs(monkeypatch):
     assert res["withheld_brief"] == (WITHHOLD_ISSUE.replace("Running run_import(\"bad.csv\") stops at row 1. ", "")   # first sentence: splice, one space left
                                      .replace("Expected: an empty table and no error.\n", "")                          # whole line with its newline
                                      .replace("\nSeen on version 2.3.1 with Python 3.12.", ""))                        # last line: takes the newline before it
-    assert res["stats"] == {"sentences_total": 7, "sentences_removed": 3, "fraction_removed": 0.429, "duplicate_selections": 0, "prompt_version": "withhold-v2"}
+    assert res["stats"] == {"sentences_total": 7, "sentences_removed": 3, "fraction_removed": 0.429, "duplicate_selections": 0, "prompt_version": "withhold-v2",
+                            "attempts": 1, "reason": None, "rejected_selections": []}
 
 
 def test_withhold_preserves_code_blocks_tracebacks_and_paragraphs(monkeypatch):
@@ -733,36 +767,39 @@ def test_withhold_selection_minimums_malformed_items_duplicates_and_fact_text(mo
             attempts.append(messages)
             return {"removed": items}
         return chat
-    # a one-word selection cannot delete sentences
+    # a one-word selection cannot delete sentences; rejected twice, the outcome is zero removals
     monkeypatch.setattr(draft_spec, "chat_json", fake(_select(("reproduction", "the"))["removed"]))
-    with pytest.raises(ValueError, match="selected span too short"):
-        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert res["removed"] == [] and "selected span too short" in res["stats"]["reason"]
     # malformed selections enter the correction round instead of raising TypeError/AttributeError
     monkeypatch.setattr(draft_spec, "chat_json", fake(["just a string", {"category": "error_message", "excerpt": 42, "kind": "context", "discovery": "on-request"}, None]))
     attempts.clear()
-    with pytest.raises(ValueError, match="withholding failed.*must be an object.*excerpt must be a string"):
-        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert res["removed"] == [] and "must be an object" in res["stats"]["reason"] and "excerpt must be a string" in res["stats"]["reason"]
     assert len(attempts) == 2 and "Correct these violations" in attempts[1][-1]["content"]
     # duplicate selections of the same span collapse into one fact
     dup = _select(("error_message", "Traceback: ERROR42 raised in parse_header"), ("error_message", "ERROR42 raised in parse_header"))
     monkeypatch.setattr(draft_spec, "chat_json", fake(dup["removed"]))
     res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
     assert len(res["removed"]) == 1 and res["stats"]["duplicate_selections"] == 1 and res["stats"]["sentences_removed"] == 1
-    # fact_text: bounded, and content words must come from the span or the issue
-    ok = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
-    ok["removed"][0]["fact_text"] = "Traceback with ERROR42 raised in parse_header when the importer crashes."   # every 5+ letter word occurs in the span or issue
-    monkeypatch.setattr(draft_spec, "chat_json", fake(ok["removed"]))
-    assert draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")["removed"][0]["fact_text"] == ok["removed"][0]["fact_text"]
-    foreign = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
-    foreign["removed"][0]["fact_text"] = "The kubernetes scheduler raises ERROR42"
-    monkeypatch.setattr(draft_spec, "chat_json", fake(foreign["removed"]))
-    with pytest.raises(ValueError, match="introduces words absent.*kubernetes"):
-        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
-    long = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
-    long["removed"][0]["fact_text"] = "ERROR42 " * 60
-    monkeypatch.setattr(draft_spec, "chat_json", fake(long["removed"]))
-    with pytest.raises(ValueError, match="longer than 400"):
-        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    # the ledger text is code-owned: the verbatim span with the reporter prefix; the model's paraphrase is metadata only
+    # (live drafts pypdf-3826 / sphinx-10097 died on ordinary paraphrase verbs such as "executes", "building", "given")
+    para = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
+    para["removed"][0]["paraphrase"] = "The kubernetes scheduler executes and reproduces ERROR42 when building"
+    monkeypatch.setattr(draft_spec, "chat_json", fake(para["removed"]))
+    rec = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")["removed"][0]
+    assert rec["fact_text"] == "Reporter's original statement: Traceback: ERROR42 raised in parse_header" and rec["paraphrase"] == para["removed"][0]["paraphrase"]
+    legacy = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
+    legacy["removed"][0]["fact_text"] = "ERROR42 " * 60                                            # an old-style fact_text is just a paraphrase too, never validated
+    monkeypatch.setattr(draft_spec, "chat_json", fake(legacy["removed"]))
+    rec = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")["removed"][0]
+    assert rec["fact_text"].startswith("Reporter's original statement: Traceback") and rec["paraphrase"] == "ERROR42 " * 60
+    # a very long removed span is whitespace-normalized and cut to 400 characters with an ellipsis
+    long_issue = "Title line\n" + " ".join(["word%d" % i for i in range(120)]) + "  spaced   out\nAnother line kept."
+    monkeypatch.setattr(draft_spec, "chat_json", fake(_select(("reproduction", "word0 word1 word2 word3"))["removed"]))
+    rec = draft_spec.withhold(long_issue, "fake/model")["removed"][0]
+    assert len(rec["fact_text"]) == len("Reporter's original statement: ") + 400 and rec["fact_text"].endswith("…") and "  " not in rec["fact_text"]
+    assert draft_spec.verbatim_fact_text("  a\n\n b  ") == "Reporter's original statement: a b"
 
 
 def test_withheld_facts_pass_through_ledger_violations_with_their_span_as_corpus():
@@ -784,11 +821,12 @@ def test_withhold_caps_removed_fraction_and_protects_title(monkeypatch):
     with pytest.raises(ValueError, match="removed 5 of 7 sentences; the cap is 60%"):
         draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
     monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("location", "crashes on empty header")))
-    with pytest.raises(ValueError, match="title line cannot be withheld"):
-        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")                          # the only selection is the title: rejected twice -> zero removals
+    assert res["removed"] == [] and "title line cannot be withheld" in res["stats"]["reason"] and res["stats"]["attempts"] == 2
     monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: {"removed": []})
-    with pytest.raises(ValueError, match="no removed spans"):
-        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")["stats"]["reason"] == "model selected no spans"
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: {"removed": "not a list"})
+    assert draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")["stats"]["reason"].startswith("all selections rejected: removed must be a list")
 
 
 def test_withhold_matches_after_normalization_and_removes_every_occurrence(monkeypatch):
@@ -935,7 +973,7 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     # the brief is computed by code: title plus every sentence not selected; operations carry the exact spans and offsets
     assert spec.briefs[1].text == "Weighted mean silently ignores missing dims\nI am using xarray 0.18 on Linux.\nA small reproducer is attached below."
     assert wf["withheld-003"].source_excerpt == "Calling ds.weighted(w).mean('z') with a dim 'z' that does not exist returns a result."  # selection extended to its sentence
-    assert wf["withheld-001"].text == wf["withheld-001"].source_excerpt   # no fact_text given: the ledger text is the span itself
+    assert all(f.text == "Reporter's original statement: " + " ".join(f.source_excerpt.split()) for f in wf.values())   # ledger text is the verbatim span, code-owned
     for o, f in zip(ops, wf.values()):
         start, end = ISSUE.index(f.source_excerpt), ISSUE.index(f.source_excerpt) + len(f.source_excerpt)
         assert f"natural[{start}:{end}]" in o.rationale and repr(f.source_excerpt) in o.rationale
@@ -945,8 +983,9 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     assert tf.source_excerpt == "match=\"dimension 'z' not found\"" and "g2" in tf.authored_rationale and "resolved_by=tests" in tf.authored_rationale
     assert [f.id for f in spec.ledger] == ["f01", "f02", "f03", "f04", "tests-001", "withheld-001", "withheld-002", "withheld-003"]
     meta = json.loads((out_dir / "draft.meta.json").read_text())
-    assert meta["auto_linked"] == [] and [r["fact_id"] for r in meta["withholding"]["removed"]] == ["withheld-001", "withheld-002", "withheld-003"]
-    assert meta["withholding"]["stats"]["sentences_removed"] == 3 and meta["withholding"]["kept"]
+    assert meta["auto_linked"] == [] and [r["fact_id"] for r in meta["withholding"]["spans"]] == ["withheld-001", "withheld-002", "withheld-003"]
+    assert meta["withholding"]["removed"] == 3 and meta["withholding"]["reason"] is None and meta["withholding"]["stats"]["sentences_removed"] == 3 and meta["withholding"]["kept"]
+    assert meta["auto_linked_single_target"] is False                                              # f01 carried its own F2P link; nothing was auto-linked
     # the on-request fact linked to a FAIL_TO_PASS test survives for the approval gate
     assert any(f.discovery == "on-request" and F2P in f.tests for f in spec.ledger)
     assert [g.weight for g in spec.groups] == [1.0]
@@ -976,12 +1015,83 @@ def test_draft_structural_tests_require_alternative_correct(monkeypatch, tmp_pat
         draft_spec.draft(_row(), _judged(alternatives_accepted=False, structural_tests=True), "fake/model", tmp_path / "s2")
 
 
-def test_draft_rejects_leaky_withholding_and_empty_controls(monkeypatch, tmp_path):
+def test_draft_with_zero_removals_keeps_only_the_natural_brief(monkeypatch, tmp_path):
+    """seaborn-3190: a short issue with nothing safely removable is a valid scenario with the natural brief only."""
+    from swesim.models import ScenarioSpec
     from swesim.stages import draft_spec
-    leaky = _withhold_llm(); leaky["removed"][0]["excerpt"] = "Expected: raise TypeError."   # not a verbatim span of the issue
+    calls = _patch_llm(monkeypatch, _draft_llm(), {"removed": []})
+    p = draft_spec.draft(_row(thread={**_thread("pydata/xarray", 5362), "pr_url": None, "linked_issues": []}), _judged(), "fake/model", tmp_path / "s")   # no issue URL needed either
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert [b.profile for b in spec.briefs] == ["natural"] and spec.briefs[0].text == ISSUE
+    assert not any(f.id.startswith("withheld-") for f in spec.ledger) and not any(o.type == "withholding" for o in spec.operations)
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert meta["withholding"] == {"removed": 0, "reason": "model selected no spans", "spans": [], "kept": [[0, len(ISSUE)]],
+                                   "stats": {"sentences_total": 6, "sentences_removed": 0, "fraction_removed": 0.0, "duplicate_selections": 0,
+                                             "prompt_version": "withhold-v2", "attempts": 1, "reason": "model selected no spans", "rejected_selections": []}}
+    assert len([c for c in calls if WITHHOLD_PROMPT_MARK in c["system"]]) == 1                       # an explicit empty selection is not corrected
+
+
+def test_single_f2p_function_links_every_on_request_fact(monkeypatch, tmp_path):
+    """pytest-dev__pytest-7283: one FAIL_TO_PASS function (two parametrizations) and on-request facts without tests -> linked by code."""
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    f2p = ["testing/test_unittest.py::test_pdb_teardown_skipped[@unittest.skip]", "testing/test_unittest.py::test_pdb_teardown_skipped[@pytest.mark.skip]"]
+    assert draft_spec.f2p_functions(f2p) == {("testing/test_unittest.py", "test_pdb_teardown_skipped")}
+    tp = ("diff --git a/testing/test_unittest.py b/testing/test_unittest.py\n--- a/testing/test_unittest.py\n+++ b/testing/test_unittest.py\n"
+          "@@ -1 +1,5 @@\n x\n+@pytest.mark.parametrize(\"mark\", [\"@unittest.skip\", \"@pytest.mark.skip\"])\n+def test_pdb_teardown_skipped(pytester, mark):\n"
+          "+    with pytest.raises(ValueError, match=\"dimension 'z' not found\"):\n+        pytester.runpytest(\"--pdb\")\n")
+    row = _row(fail_to_pass=f2p, pass_to_pass=["testing/test_unittest.py::test_other"], test_patch=tp)
+    d = _draft_llm(); d["ledger"][0].update(tests=[], text="The maintainer prefers a friendly wording")      # no shared content words at all
+    d["ledger"][3]["tests"] = []
+    d["requirements"][0]["tests"] = f2p; d["groups"] = [{"id": "g01", "weight": 1.0, "tests": f2p}]
+    calls = _patch_llm(monkeypatch, d, _withhold_llm())
+    p = draft_spec.draft(row, {**_judged(), "gaps": []}, "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert next(f for f in spec.ledger if f.id == "f01").tests == f2p and next(f for f in spec.ledger if f.id == "f04").tests == f2p   # contract order kept
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert meta["auto_linked_single_target"] is True and meta["auto_linked"] == ["f01", "f04"]
+    assert len([c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]) == 1                    # linked before validation: no correction round
+    assert meta["runner"] == {"order": "definition", "order_source": "diff", "ids": [*f2p, "testing/test_unittest.py::test_other"]}   # P2P id unknown to the diff goes last
+
+
+def test_runner_ids_follow_definition_order_not_f2p_first(monkeypatch, tmp_path):
+    """scikit-learn-13584: F2P-first ordering let a polluting F2P test run before a P2P test it corrupted."""
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    a, b, c = "xarray/tests/test_weighted.py::test_weighted_operations_nonexistent_dim[{a}-b]", "xarray/tests/test_weighted.py::test_new", "xarray/tests/test_other.py::test_x"
+    # probe order is the source of truth
+    assert draft_spec.definition_order([b, a, c], [c, a, b], "") == ([c, a, b], "probe")
+    assert draft_spec.definition_order([b, a, "unknown::test_zz"], [a, b], "") == ([a, b, "unknown::test_zz"], "probe")
+    # without a probe order: the diff's def order; unknown ids keep their relative order at the end; parametrizations keep order
+    tp = _row()["test_patch"]
+    assert draft_spec.definition_order([b, a, c], None, tp) == ([a, b, c], "diff")
+    a2 = "xarray/tests/test_weighted.py::test_weighted_operations_nonexistent_dim[{c}-d]"
+    assert draft_spec.definition_order([b, a2, a], None, tp) == ([a2, a, b], "diff")
+    assert draft_spec.definition_order([c, "other::test_q"], None, tp) == ([c, "other::test_q"], "given")
+    # end to end: F2P is test_new (defined second), P2P is the first function -> the command lists the P2P id first
+    d = _draft_llm(); d["ledger"][0]["tests"] = [b]; d["ledger"][3]["tests"] = [b]; d["requirements"][0]["tests"] = [b]; d["groups"] = [{"id": "g01", "weight": 1.0, "tests": [b]}]
+    _patch_llm(monkeypatch, d, _withhold_llm())
+    row = _row(fail_to_pass=[b], pass_to_pass=[a])
+    p = draft_spec.draft(row, {**_judged(), "gaps": []}, "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert spec.contract.runner.command.endswith(shlex.quote(a) + " " + shlex.quote(b)) and spec.contract.runner.command.startswith(draft_spec.runner_prefix(row["test_python"] if row.get("test_python") else "/opt/miniconda3/envs/testbed/bin/python"))
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert meta["runner"] == {"order": "definition", "order_source": "diff", "ids": [a, b]}
+    row = _row(fail_to_pass=[b], pass_to_pass=[a], test_order=[b, a])                                # a probe order overrides the diff order
+    p = draft_spec.draft(row, {**_judged(), "gaps": []}, "fake/model", tmp_path / "s2")
+    assert json.loads((tmp_path / "s2" / "draft.meta.json").read_text())["runner"] == {"order": "definition", "order_source": "probe", "ids": [b, a]}
+
+
+def test_draft_rejects_leaky_withholding_and_empty_controls(monkeypatch, tmp_path):
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    leaky = _withhold_llm(); leaky["removed"] = [{**leaky["removed"][0], "excerpt": "Expected: raise TypeError."}]   # the only selection is not verbatim
     _patch_llm(monkeypatch, _draft_llm(), leaky)
-    with pytest.raises(ValueError, match="withholding failed"):
-        draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s1")
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s1")                                       # zero removals: natural-only scenario
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert [b.profile for b in spec.briefs] == ["natural"] and not any(f.id.startswith("withheld-") for f in spec.ledger) and not any(o.type == "withholding" for o in spec.operations)
+    meta = json.loads((tmp_path / "s1" / "draft.meta.json").read_text())
+    assert meta["withholding"]["removed"] == 0 and meta["withholding"]["reason"].startswith("all selections rejected") and meta["withholding"]["spans"] == []
     d = _draft_llm(); d["plausible_wrong"]["diff"] = ""
     _patch_llm(monkeypatch, d, _withhold_llm())
     with pytest.raises(ValueError, match="plausible-wrong"):
@@ -1169,7 +1279,9 @@ def test_draft_rejects_ungrounded_facts_after_one_correction_round(monkeypatch, 
     with pytest.raises(ValueError, match="grounding validation after two attempts.*f01"):
         draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
     draft_calls = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
-    assert len(draft_calls) == 2 and "Correct these violations" in draft_calls[1]["messages"][-1]["content"] and "f01" in draft_calls[1]["messages"][-1]["content"]
+    correction = draft_calls[1]["messages"][-1]["content"]
+    assert len(draft_calls) == 2 and "Correct these violations" in correction and "f01" in correction
+    assert "closest lines" in correction and "Please raise a  ValueError" in correction and "when the dim is missing." in correction   # difflib nearest review lines, quoted raw
     assert not (tmp_path / "s" / "scenario.draft.json").exists()
 
 
@@ -1183,11 +1295,11 @@ def test_draft_requires_distinct_judge_and_draft_models(monkeypatch, tmp_path):
 
 def test_withhold_restricts_discovery_to_on_request_or_repo_derivable(monkeypatch):
     from swesim.stages import draft_spec
-    out = {"withheld_brief": "Import fails", "removed": [{"category": "error_message", "excerpt": "ERROR42", "kind": "reproduction", "discovery": "author-only"}]}
+    out = {"withheld_brief": "Import fails", "removed": [{"category": "error_message", "excerpt": "Traceback: ERROR42 raised here", "kind": "reproduction", "discovery": "author-only"}]}
     attempts = []
     monkeypatch.setattr(draft_spec, "chat_json", lambda model_id, system, messages, schema, **kw: attempts.append(messages) or out)
-    with pytest.raises(ValueError, match="withholding failed"):
-        draft_spec.withhold("Import fails\nTraceback: ERROR42", "fake/model")
+    res = draft_spec.withhold("Import fails\nTraceback: ERROR42 raised here\nMore context here.", "fake/model")   # rejected twice -> zero removals
+    assert res["removed"] == [] and "invalid discovery" in res["stats"]["reason"]
     assert len(attempts) == 2 and "invalid discovery" in attempts[1][-1]["content"]
 
 

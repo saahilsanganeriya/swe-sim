@@ -242,23 +242,46 @@ def verifier_setup(python_version: str) -> str:
             f"RUN uv python install {python_version} && ln -s \"$(uv python find {python_version})\" {SWESIM_PYTHON} && {SWESIM_PYTHON} -I -c 'import sys; print(sys.version)'\n")
 
 
-PROBE_SCRIPT = '''import sys,json,subprocess
+def runner_prefix(interpreter: str) -> str:
+    """The trusted launcher invocation shared by the probe's exact-id stages and the scenario's `runner.command`: same
+    interpreter, same launcher, same flags, ids appended in definition order."""
+    import shlex
+    return shlex.quote(interpreter) + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} "
+
+
+# Stages: base (pristine), test (test_patch applied, whole test files), test_exact (the exact ids the grader will run, in the
+# collected definition order, same launcher), gold and gold_exact after the oracle. Grading lists exact ids, so a test that
+# changes status between the whole-file run and the exact-id run is order-dependent and is dropped from the contract.
+PROBE_SCRIPT = '''import sys,json,subprocess,shlex
 from pathlib import Path
 sys.path.insert(0,'/tests')
 from grader import GradeConfig,_run_tests
 probe=json.loads(Path('/tests/probe_config.json').read_text())
-repo=probe.get('repo_dir','/app')
-cfg=GradeConfig(Path('/tmp/a'),Path(repo),Path('/tmp/w'),{},[],[],{'kind':'pytest-ra','command':probe['command']},None,Path('/logs/verifier'),test_timeout_sec=int(probe.get('test_timeout_sec',300)))
-results={}
-for stage,patch in [('base',None),('test','/tests/test.patch'),('gold','/tests/oracle.diff')]:
-    if patch: subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','apply',patch],cwd=repo,check=True)
-    st,rc,out,error=_run_tests(cfg,Path(repo),None)
-    results[stage]={'statuses':st,'exit_code':rc,'error':error,'tail':out[-2000:]}
+repo=probe.get('repo_dir','/app'); prefix=probe.get('prefix'); max_chars=int(probe.get('max_command_chars',120000))
+def cfg_for(command): return GradeConfig(Path('/tmp/a'),Path(repo),Path('/tmp/w'),{},[],[],{'kind':'pytest-ra','command':command},None,Path('/logs/verifier'),test_timeout_sec=int(probe.get('test_timeout_sec',300)))
+def run(command,expected=None):
+    st,rc,out,error=_run_tests(cfg_for(command),Path(repo),expected)
+    return {'statuses':st,'exit_code':rc,'error':error,'tail':out[-2000:]}
+def apply(patch): subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','apply',patch],cwd=repo,check=True)
+results={'base':run(probe['command'])}
+apply('/tests/test.patch')
+results['test']=run(probe['command'])
+order=list(results['test']['statuses']); results['order']=order
+exact=(prefix or '')+' '.join(shlex.quote(t) for t in order)
+if prefix and order and len(exact)<=max_chars:
+    results['exact_command']=exact; results['test_exact']=run(exact,order)
+else:
+    results['exact_skipped']='no tests collected' if not order else ('no prefix' if not prefix else 'command exceeds argv budget')
+apply('/tests/oracle.diff')
+results['gold']=run(probe['command'])
+if 'exact_command' in results: results['gold_exact']=run(exact,order)
 Path('/logs/verifier').mkdir(parents=True,exist_ok=True)
 Path('/logs/verifier/probe.json').write_text(json.dumps(results))
 Path('/logs/verifier/reward.json').write_text(json.dumps({'reward':int(not results['gold']['error'])}))
 '''
-PROBE_TASK_TOML = '''schema_version="1.4"
+PROBE_VERIFIER_TIMEOUT_SEC = 5 * PROBE_TIMEOUT_SEC + 600  # five stages (base, test, test_exact, gold, gold_exact) may each use the budget, plus slack
+MAX_COMMAND_CHARS = 120000  # Linux MAX_ARG_STRLEN is 131072 bytes per argv element (bash -c "<command>")
+PROBE_TASK_TOML = f'''schema_version="1.4"
 [environment]
 network_mode="no-network"
 build_timeout_sec=3600
@@ -267,7 +290,7 @@ timeout_sec=60
 [verifier]
 environment_mode="separate"
 network_mode="no-network"
-timeout_sec=1200
+timeout_sec={PROBE_VERIFIER_TIMEOUT_SEC}
 [verifier.environment]
 build_timeout_sec=3600
 '''
@@ -280,14 +303,19 @@ def probe_kind(row: dict) -> str:
 
 
 def classify_probe(before: dict, after: dict) -> dict:
-    """Measured contract from per-test statuses with the hidden tests applied (`before`) and after the gold patch (`after`):
-    fail_to_pass = fail/error before and pass after; pass_to_pass = pass on both; dropped.network_or_env = not passing on
-    either side (network-dependent or environment-broken tests SWE-bench's lists still name); dropped.gold_regressions =
-    pass before, not pass after."""
-    f2p = [t for t in before if before[t] in {"failed", "error"} and after.get(t) == "passed"]
+    """Measured contract from per-test statuses with the hidden tests applied (`before`) and after the gold patch (`after`).
+    Every test lands in exactly one bucket: fail_to_pass = failed/error before and passed after; pass_to_pass = passed on
+    both; dropped.network_or_env = failed/error on both sides (network-dependent or environment-broken tests SWE-bench's
+    lists still name); dropped.gold_regressions = passed before, anything else after (a passed->xpass flip lands here too);
+    dropped.other = every remaining transition involving skipped/xfail/xpass (skipped->passed, xfail->passed, xpass->xpass,
+    failed->skipped, ...). Statuses follow parsers.reconcile: passed|failed|error|skipped|xfail|xpass."""
+    failing = {"failed", "error"}
+    f2p = [t for t in before if before[t] in failing and after.get(t) == "passed"]
     p2p = [t for t in before if before[t] == "passed" and after.get(t) == "passed"]
-    dropped = {"network_or_env": [t for t in before if before[t] != "passed" and after.get(t) != "passed"],
+    dropped = {"network_or_env": [t for t in before if before[t] in failing and after.get(t) in failing],
                "gold_regressions": [t for t in before if before[t] == "passed" and after.get(t) != "passed"]}
+    placed = set(f2p) | set(p2p) | set(dropped["network_or_env"]) | set(dropped["gold_regressions"])
+    dropped["other"] = [t for t in before if t not in placed]
     return {"fail_to_pass": f2p, "pass_to_pass": p2p, "dropped": dropped}
 
 
@@ -309,17 +337,44 @@ def _probe_defaults(row: dict) -> tuple[str, str, str, list[str]]:
 
 def _probe_record(row: dict, data: dict, *, kind: str, digest: str | None, repo_dir: str, interpreter: str, files: list[str], command: str,
                   job_dir: str, probed_at: str) -> dict:
-    """Measured lists plus the `probe` metadata block from a probe.json payload; raises on an unreliable probe."""
+    """Measured lists plus the `probe` metadata block from a probe.json payload; raises on an unreliable probe.
+
+    Grading-faithful: when the exact-id stages (`test_exact`, `gold_exact`: the grader's own command shape, ids in the
+    collected definition order) are present, the contract is derived from them, and every test whose status differs between
+    the whole-file run and the exact-id run in either stage is dropped as `order_dependent` (test pollution the grader would
+    see and the whole-file run hides). Without exact stages (older job dirs, argv budget) the whole-file statuses are used
+    and `probe.exact` says why."""
     before, after = data["test"]["statuses"], data["gold"]["statuses"]
     if data["test"].get("error") or data["gold"].get("error") or not after or set(before) != set(after):
         raise ValueError("unreliable base/gold probe; keep evidence and reject")
-    measured = classify_probe(before, after)
+    order = list(data.get("order") or before)
+    exact_note = "exact"
+    order_dependent: list[str] = []
+    if "test_exact" in data and "gold_exact" in data:
+        eb, ea = data["test_exact"]["statuses"], data["gold_exact"]["statuses"]
+        if data["test_exact"].get("error") or data["gold_exact"].get("error") or set(eb) != set(before) or set(ea) != set(after):
+            raise ValueError("unreliable exact-id probe (the grader's own command shape); keep evidence and reject")
+        order_dependent = [t for t in order if before.get(t) != eb.get(t) or after.get(t) != ea.get(t)]
+        measured = classify_probe(eb, ea)
+    else:
+        exact_note = data.get("exact_skipped") or "missing"
+        measured = classify_probe(before, after)
+    dropped = {k: [t for t in v if t not in order_dependent] for k, v in measured["dropped"].items()}
+    dropped["order_dependent"] = order_dependent
+    measured = {"fail_to_pass": [t for t in measured["fail_to_pass"] if t not in order_dependent],
+                "pass_to_pass": [t for t in measured["pass_to_pass"] if t not in order_dependent], "dropped": dropped}
     statuses = {"base": data["base"]["statuses"], "test": before, "gold": after}
+    if "test_exact" in data:
+        statuses["test_exact"], statuses["gold_exact"] = data["test_exact"]["statuses"], data["gold_exact"]["statuses"]
+    stages = [s for s in ("base", "test", "test_exact", "gold", "gold_exact") if s in data]
     probe = {"kind": kind, "image": row.get("image"), "image_digest": digest, "repo_dir": repo_dir, "test_python": interpreter, "test_files": files,
-             "command": command, "probe_dir": job_dir, "job_dir": job_dir, "stages": ["base", "test", "gold"], "probed_at": probed_at,
-             "binding": probe_binding(row), "statuses": statuses, "dropped": measured["dropped"],
+             "command": command, "probe_dir": job_dir, "job_dir": job_dir, "stages": stages, "probed_at": probed_at,
+             "binding": probe_binding(row), "statuses": statuses, "dropped": dropped, "order": order,
+             "runner": {"order": "definition", "prefix": runner_prefix(interpreter), "exact_command": data.get("exact_command"), "exact": exact_note},
+             "errors": {stage: data[stage].get("error") for stage in stages},  # base collect errors are expected; kept for audit
              "counts": {"fail_to_pass": len(measured["fail_to_pass"]), "pass_to_pass": len(measured["pass_to_pass"]),
-                        "network_or_env": len(measured["dropped"]["network_or_env"]), "gold_regressions": len(measured["dropped"]["gold_regressions"])}}
+                        "network_or_env": len(dropped["network_or_env"]), "gold_regressions": len(dropped["gold_regressions"]),
+                        "other": len(dropped["other"]), "order_dependent": len(order_dependent), "measured": len(before)}}
     if kind == "image":  # how far SWE-bench's network-era lists are from what the offline verifier can reproduce
         orig_f, orig_p = set(row.get("fail_to_pass") or []), set(row.get("pass_to_pass") or [])
         probe["swebench"] = {"fail_to_pass_not_reproduced": sorted(orig_f - set(measured["fail_to_pass"])),
@@ -345,8 +400,7 @@ def reconstruct_probe(row: dict) -> dict | None:
     data = json.loads(path.read_text())
     kind, repo_dir, interpreter, files = _probe_defaults(row)
     import shlex
-    command = ((row.get("probe") or {}).get("command")
-               or shlex.quote(interpreter) + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} " + " ".join(shlex.quote(p) for p in files))
+    command = (row.get("probe") or {}).get("command") or runner_prefix(interpreter) + " ".join(shlex.quote(p) for p in files)
     try:
         res = _probe_record(row, data, kind=kind, digest=(row.get("probe") or {}).get("image_digest"), repo_dir=repo_dir, interpreter=interpreter, files=files,
                             command=command, job_dir=str(job_dir), probed_at=datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())
@@ -398,8 +452,9 @@ def probe_tests(row: dict, ws) -> dict:
     (tests / "oracle.diff").write_text(row["patch"])
     if not files:
         raise ValueError("no python test files in test_patch to probe")
-    command = shlex.quote(interpreter) + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} " + " ".join(shlex.quote(p) for p in files)
-    atomic_json(tests / "probe_config.json", {"command": command, "repo_dir": repo_dir, "test_timeout_sec": PROBE_TIMEOUT_SEC, "kind": kind})
+    command = runner_prefix(interpreter) + " ".join(shlex.quote(p) for p in files)
+    atomic_json(tests / "probe_config.json", {"command": command, "prefix": runner_prefix(interpreter), "max_command_chars": MAX_COMMAND_CHARS,
+                                              "repo_dir": repo_dir, "test_timeout_sec": PROBE_TIMEOUT_SEC, "kind": kind})
     # The probe controller (grader import, patch application, status collection) runs under the pinned verifier interpreter,
     # exactly like test.sh runs grader.py for compiled tasks; the test subprocess itself uses `command`'s task interpreter.
     (tests / "test.sh").write_text("#!/bin/bash\nset -euo pipefail\n" + SWESIM_PYTHON + " -I /tests/probe.py\n")
