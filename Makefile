@@ -47,7 +47,7 @@ STATE_BUCKET := $(PROJECT)-swesim-tfstate
 ENV_FILE_FLAGS := --env-file $(SWESIM_ENV_FILE) $(foreach f,$(EXTRA_ENV_FILES),--env-file $(f))
 
 .PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build deploy \
-        verify-cloud migrate pull import-bucket cloud-bootstrap cloud-destroy
+        verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
 
 check:
 	uv sync --extra dev --frozen
@@ -112,6 +112,13 @@ migrate:
 
 pull:
 	bash scripts/cloud/pull.sh
+
+# Repository variables the GitHub deploy workflow reads (gh must be authenticated for this repository).
+gh-variables:
+	gh variable set GCP_PROJECT --body "$$($(TF) output -raw project)"
+	gh variable set GCP_REGION --body "$$($(TF) output -raw region)"
+	gh variable set WIF_PROVIDER --body "$$($(TF) output -raw wif_provider)"
+	gh variable set DEPLOYER_SA --body "$$($(TF) output -raw deployer_service_account)"
 
 # After a cloud-destroy without PURGE the retained bucket is unknown to a fresh state; adopt it before the next apply.
 import-bucket: require-project
