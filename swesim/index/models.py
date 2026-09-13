@@ -34,6 +34,7 @@ TrialStatus = Literal["planned", "launched", "running", "completed", "runner-err
 ExchangeRole = Literal["agent", "stakeholder", "system"]
 ExchangeKind = Literal["ask", "confirm", "review", "system"]
 WorkflowStatus = Literal["running", "completed", "failed", "cancelled", "terminated", "timed_out", "continued_as_new"]
+WorkflowLifecycleSource = Literal["workflow", "temporal", "harbor"]
 CostRole = Literal["solver", "judge", "drafter", "stakeholder", "withholder", "audit", "probe", "validation"]
 ActionResult = Literal["accepted", "rejected", "failed"]
 DiscoveryBand = Literal["bugfix", "feature"]
@@ -92,6 +93,46 @@ class CandidateRow(Provenance):
     judged_at: AwareDatetime | None
     scenario_id: str | None
     version: int | None
+    candidates_path: str | None = None
+
+
+CANDIDATE_EVENT_IDENTITY: tuple[str, ...] = ("source_key", "instance_id", "workflow_id", "run_id", "phase", "stage", "status", "gate",
+                                             "reasons", "result_status", "terminal", "scenario_id", "version", "spec_hash")
+
+
+def candidate_event_identity(fields: dict) -> str:
+    """The receipt's id: SHA256 of its decision content and workflow/run, so an activity retry lands on the same row and a
+    genuinely different decision (another run, other reasons) is another receipt. `occurred_at` is deliberately excluded."""
+    data = {key: fields.get(key) for key in CANDIDATE_EVENT_IDENTITY}
+    return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+class CandidateEventRow(Provenance):
+    """One immutable stage/decision receipt of a candidate (P1-7); table candidate_events, pk event_id.
+
+    Written by `index_candidate_event_activity` at every gate the workflows decide at (judge, probe, precheck,
+    auto-approval, human review, approval timeout, validation, registration, an infrastructure error). `terminal` says
+    the workflow stopped working on the candidate there; `project_candidates` lets the latest terminal negative receipt
+    (status rejected | error) decide the candidate's row, so a rejected candidate is never shown as kept because its
+    scenario files reached a later stage."""
+
+    event_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_key: str
+    instance_id: str
+    candidates_path: str | None = None
+    scenario_id: str | None = None
+    version: int | None = None
+    spec_hash: str | None = None
+    phase: str
+    result_status: str | None = None
+    stage: FunnelStage
+    status: CandidateStatus
+    gate: str | None = None
+    reasons: list[str] = Field(default_factory=list)
+    terminal: bool
+    occurred_at: AwareDatetime
+    workflow_id: str
+    run_id: str
 
 
 def discovery_identity(source_key: str, artifact_sha256: str, workflow_id: str | None, run_id: str | None) -> str:
@@ -213,6 +254,7 @@ class WorkflowRow(Provenance):
     task_queue: str | None
     cost_usd: Decimal | None
     search_attributes: dict
+    lifecycle_source: WorkflowLifecycleSource | None = None
 
 
 class CostRow(Provenance):

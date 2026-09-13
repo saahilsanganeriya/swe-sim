@@ -27,6 +27,7 @@ TrialFile = Literal["request.json", "launch.json", "status.json", "record.json",
 CandidateStage = Literal["mined", "judged", "probed", "probe_summary", "rejects", "status"]
 JobKind = Literal["probe", "runs", "validate"]
 Condition = Literal["full", "hidden", "interactive"]
+HistoryKind = Literal["workflows", "operator_actions", "index_rebuilds", "candidate_events", "trials", "scenarios"]
 
 SCENARIO_FILES: frozenset[str] = frozenset(ScenarioFile.__args__)
 TRIAL_FILES: frozenset[str] = frozenset(TrialFile.__args__)
@@ -156,6 +157,26 @@ class Layout(Strict):
         if not isinstance(scan_id, str) or not re.fullmatch(r"[0-9a-f]{64}", scan_id):
             raise LayoutError(f"invalid discovery scan id: {scan_id!r}")
         return self.scan_dir(source_key) / (scan_id + ".json")
+
+    def history_dir(self, kind: HistoryKind) -> Path:
+        if kind not in HistoryKind.__args__:
+            raise LayoutError(f"invalid history kind: {kind!r}")
+        return self.evidence_dir("history") / kind
+
+    def history_snapshot(self, kind: HistoryKind, identity: str, revision: str) -> Path:
+        for value in (identity, revision):
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise LayoutError("history identities and revisions must be SHA256 digests")
+        return self.history_dir(kind) / identity / (revision + ".json")
+
+    def activity_receipt(self, workflow_id: str, run_id: str, activity_id: str) -> Path:
+        import hashlib
+        identity = hashlib.sha256((workflow_id + "\0" + run_id).encode()).hexdigest()
+        event = hashlib.sha256(activity_id.encode()).hexdigest()
+        return self.evidence_dir("activity-receipts") / identity / (event + ".json")
+
+    def reconciliation_checkpoint(self) -> Path:
+        return self.evidence_dir("history") / "temporal-reconcile.json"
 
     def probe_dir(self, instance_id: str) -> Path:
         return self.root / "probes" / _segment(instance_id, "instance id")

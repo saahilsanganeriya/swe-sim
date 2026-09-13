@@ -5,9 +5,10 @@ Contract
   the truth and the laptop record is small). A directory that cannot be projected is logged and skipped, never a
   failure of the whole listing.
 - Filters, ordering, paging, the leaderboard gate and evaluator blanking behave exactly as in `IndexStore`.
-- `workflows()` reads Harbor job directories (`jobs/runs/*`), the only workflow evidence in the files.
-- `operator_actions()` reads `evidence/console/actions.jsonl`, where the console writes when the index is off.
-- `rebuilds()` is empty: there is no index to rebuild.
+- `workflows()`, `operator_actions()`, `rebuilds()` and the `candidate_events` table read the immutable row snapshots
+  under `evidence/history/` (`swesim.index.history`), the same files `IndexStore.rebuild_from_layout` reprojects;
+  workflows also fold in Harbor job directories (`jobs/runs/*`) and operator actions the console's file-mode log
+  `evidence/console/actions.jsonl`.
 """
 from __future__ import annotations
 
@@ -16,8 +17,9 @@ import logging
 from pathlib import Path
 from typing import Any, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
+from swesim.index import history as H
 from swesim.index import models as M
 from swesim.index import project as P
 from swesim.index import reports as R
@@ -42,10 +44,11 @@ TEXT_FIELDS: dict[str, tuple[str, ...]] = {
     "operator_actions": ("actor", "action", "target", "workflow_id"),
     "index_rebuilds": ("rebuild_id",),
     "exchanges": ("trial_id", "text_public", "request_id"),
+    "candidate_events": ("source_key", "instance_id", "scenario_id", "phase", "gate", "workflow_id", "run_id"),
 }
 DEFAULT_ORDER: dict[str, str] = {"scenarios": "scenario_id", "candidates": "instance_id", "trials": "started_at", "scores": "scenario_id",
                                  "workflows": "started_at", "costs": "at", "operator_actions": "at", "index_rebuilds": "started_at",
-                                 "exchanges": "seq", "discoveries": "discovered_at"}
+                                 "exchanges": "seq", "discoveries": "discovered_at", "candidate_events": "occurred_at"}
 
 
 def matches(row: BaseModel, f: BaseModel, text_fields: tuple[str, ...]) -> bool:
@@ -127,9 +130,14 @@ class FileIndexReader:
     def _candidate_rows(self, source_key: str | None = None) -> list[M.CandidateRow]:
         registry = self._registry()
         rows: list[M.CandidateRow] = []
+        try:
+            events = P.candidate_events_by_identity(self.layout, self._settings)
+        except ValueError as e:
+            log.warning("candidate receipts not projected: %s", e)
+            events = {}
         for key in ([source_key] if source_key else P.source_keys(self.layout)):
             try:
-                rows.extend(P.project_candidates(self.layout, key, registry=registry, origin=self.settings.origin))
+                rows.extend(P.project_candidates(self.layout, key, registry=registry, origin=self.settings.origin, events=events))
             except ValueError as e:
                 log.warning("candidates %s not projected: %s", key, e)
         return rows
@@ -175,22 +183,25 @@ class FileIndexReader:
             log.warning("workflow costs not projected: %s", e)
         return rows
 
-    def _action_rows(self) -> list[M.OperatorActionRow]:
-        path = self.layout.evidence_dir("console") / "actions.jsonl"
-        rows: list[M.OperatorActionRow] = []
+    def _history(self, project, *args, **kwargs) -> list:
+        """One history projection; a corrupt snapshot directory is logged and read as empty, never a console failure."""
         try:
-            lines = path.read_text().splitlines()
-        except OSError:
-            return rows
-        for i, line in enumerate(lines):
-            if not line.strip():
-                continue
-            try:
-                item = json.loads(line)
-                rows.append(M.OperatorActionRow(**{k: v for k, v in item.items() if k in M.OperatorActionRow.model_fields}))
-            except (ValueError, ValidationError, AttributeError) as e:
-                log.warning("%s line %d not an operator action: %s", path, i + 1, type(e).__name__)
-        return rows
+            return list(project(self.layout, self._settings, *args, **kwargs))
+        except ValueError as e:
+            log.warning("history not projected (%s): %s", getattr(project, "__name__", project), e)
+            return []
+
+    def _action_rows(self) -> list[M.OperatorActionRow]:
+        return self._history(H.action_rows)
+
+    def _workflow_rows(self) -> list[M.WorkflowRow]:
+        return self._history(H.workflow_rows, legacy=P.project_workflows_from_jobs(self.layout, origin=self.settings.origin))
+
+    def _rebuild_rows(self) -> list[M.IndexRebuildRow]:
+        return self._history(H.rebuild_rows)
+
+    def _candidate_event_rows(self) -> list[M.CandidateEventRow]:
+        return self._history(H.candidate_events)
 
     # ------------------------------------------------------------------ IndexReader
     def scenarios(self, f: M.ScenarioFilter) -> M.Page[M.ScenarioRow]:
@@ -250,11 +261,10 @@ class FileIndexReader:
         return R.compute_leaderboard([t for t, _ex, _c in self._trials()], self._scenario_rows(), f)
 
     def workflows(self, f: M.WorkflowFilter) -> M.Page[M.WorkflowRow]:
-        rows = P.project_workflows_from_jobs(self.layout, origin=self.settings.origin)
-        return page([r for r in rows if matches(r, f, TEXT_FIELDS["workflows"])], f, DEFAULT_ORDER["workflows"])
+        return page([r for r in self._workflow_rows() if matches(r, f, TEXT_FIELDS["workflows"])], f, DEFAULT_ORDER["workflows"])
 
     def workflow(self, workflow_id: str) -> M.WorkflowRow | None:
-        rows = [r for r in P.project_workflows_from_jobs(self.layout, origin=self.settings.origin) if r.workflow_id == workflow_id]
+        rows = [r for r in self._workflow_rows() if r.workflow_id == workflow_id]
         return max(rows, key=lambda r: r.started_at) if rows else None
 
     def costs(self, f: M.CostFilter) -> list[M.CostRow]:
@@ -299,10 +309,14 @@ class FileIndexReader:
         if name == "scores":
             return list(self._score_rows())
         if name == "workflows":
-            return list(P.project_workflows_from_jobs(self.layout, origin=self.settings.origin))
+            return list(self._workflow_rows())
         if name == "operator_actions":
             return list(self._action_rows())
-        return []  # index_rebuilds: no index
+        if name == "index_rebuilds":
+            return list(self._rebuild_rows())
+        if name == "candidate_events":
+            return list(self._candidate_event_rows())
+        return []
 
     def rebuilds(self) -> list[M.IndexRebuildRow]:
-        return []
+        return self._rebuild_rows()
