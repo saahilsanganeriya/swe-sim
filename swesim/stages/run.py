@@ -139,7 +139,8 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
             report["transcript_binding_valid"] = True
         if transcript.get("service_failure") or transcript.get("pending"):
             # A recorded model failure or a crash-left pending marker (every later request 503) is simulator evidence.
-            report["service_failure_evidence"] = transcript.get("service_failure"); report["interrupted_request"] = transcript.get("pending")
+            if transcript.get("service_failure"): report["service_failure_evidence"] = transcript["service_failure"]
+            if transcript.get("pending"): report["interrupted_request"] = transcript["pending"]
             report["training_eligible"] = False
         if bound and transcript.get("transcript_hash") and bound != transcript["transcript_hash"]:
             report["transcript_hash_mismatch"] = True

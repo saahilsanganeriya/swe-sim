@@ -170,7 +170,7 @@ def test_run_trial_pending_marker_is_simulator_evidence(scene, monkeypatch):
     rec = run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 2, URL, "secret")
     assert rec.report["transcript_binding_valid"] is True                                     # hashes still agree
     assert rec.report["training_eligible"] is False and rec.report["interrupted_request"] == {"request_id": "9", "kind": "ask"}
-    assert rec.report["service_failure_evidence"] is None and rec.reward["success"] == 1
+    assert "service_failure_evidence" not in rec.report and rec.reward["success"] == 1      # dict when present, omitted otherwise
 
 
 def test_run_trial_unexpected_exception_writes_error_status(scene, monkeypatch):
