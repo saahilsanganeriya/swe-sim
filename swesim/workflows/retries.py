@@ -35,3 +35,8 @@ def non_retryable(msg: str, *, kind: str) -> ApplicationError:
 def transient(msg: str, *, kind: str) -> ApplicationError:
     """An explicit retryable failure with a type (provider outage, infrastructure); the retry class decides how often."""
     return ApplicationError(msg, type=kind, non_retryable=False)
+
+# LLM audit backoff, but a not-yet-registered optional activity fails once and remains visibly pending.
+AUDIT = RetryPolicy(initial_interval=LLM.initial_interval, backoff_coefficient=LLM.backoff_coefficient,
+                    maximum_interval=LLM.maximum_interval, maximum_attempts=LLM.maximum_attempts,
+                    non_retryable_error_types=["NotFoundError"])

@@ -44,6 +44,55 @@ def stamped(d: dict) -> dict:
 async def workers(env, workflows, activities):
     """One Worker per swesim queue: `act()` routes each activity to its queue, so every queue needs a poller (fakes everywhere)."""
     from temporalio.worker import Worker  # noqa: PLC0415 - kept local so the offline tests import without a worker
+    from temporalio import activity
+    from swesim.workflows.search_attributes import ensure_registered
+    from temporalio.service import RPCError, RPCStatusCode
+    try:
+        await ensure_registered(env.client)
+    except RPCError as e:
+        if e.status != RPCStatusCode.UNIMPLEMENTED:
+            raise
+        pytest.skip('Temporal test server cannot register the required search attributes')
+    # Keep the established stage fakes; adapt their in-memory outputs to the new immutable-plan activity boundaries.
+    mapping = {activity._Definition.from_callable(a).name: a for a in activities}; plans = {}
+    extra = []
+    if W.RunTasksWorkflow in workflows and 'probe_models_activity' not in mapping:
+        @activity.defn(name='probe_models_activity')
+        async def probe_for_run(p): return {'resolved': {}, 'solver_unavailable': []}
+        extra.append(probe_for_run)
+    if 'plan_trials_activity' in mapping and 'prepare_trial_plan_activity' not in mapping:
+        @activity.defn(name='prepare_trial_plan_activity')
+        async def prepare_trials(p):
+            result = await mapping['plan_trials_activity'](p)
+            path = p['scenario_id']; plans[path] = result['trials']
+            return {'plan_path': path, 'total': len(plans[path])}
+        extra.append(prepare_trials)
+    if 'list_candidates_activity' in mapping and 'prepare_candidate_plan_activity' not in mapping:
+        @activity.defn(name='prepare_candidate_plan_activity')
+        async def prepare_candidates(p):
+            items = []; seen = set(); duplicates = 0
+            for source in p['sources']:
+                result = await mapping['list_candidates_activity'](source)
+                for c in result['candidates']:
+                    if c['scenario_id'] in seen:
+                        duplicates += 1
+                        continue
+                    seen.add(c['scenario_id']); items.append({**source, **c})
+            plans['candidates'] = items
+            return {'plan_path': 'candidates', 'total': len(items), 'duplicates': duplicates}
+        extra.append(prepare_candidates)
+    if extra:
+        @activity.defn(name='read_plan_page_activity')
+        async def read_page(p):
+            items = plans[p['plan_path']]; offset = p.get('offset', 0)
+            page = items[offset:offset + p['limit']]
+            return {'items': page, 'next_offset': offset + len(page), 'total': len(items)}
+        extra.append(read_page)
+    if 'checkpoint_workflow_activity' not in mapping:
+        @activity.defn(name='checkpoint_workflow_activity')
+        async def checkpoint(p): return {'checkpoint_path': '/checkpoint/' + p['run_id']}
+        extra.append(checkpoint)
+    activities = [*activities, *extra]
     async with contextlib.AsyncExitStack() as stack:
         for q in QUEUES:
             await stack.enter_async_context(Worker(env.client, task_queue=q, workflows=workflows, activities=activities))
@@ -318,10 +367,14 @@ def test_run_tasks_stops_planning_when_the_spend_cap_is_exceeded(monkeypatch):
         async def act(name, p, minutes=10, **kw):
             calls.append(name)
             if name == "spend_check_activity":
-                state["exceeded"] = state["exceeded"] or len([c for c in calls if c == "plan_trials_activity"]) >= 1
+                state["exceeded"] = state["exceeded"] or len([c for c in calls if c == "prepare_trial_plan_activity"]) >= 1
                 return {"spend_usd": 1600.0 if state["exceeded"] else 10.0, "cap_usd": p.get("cap_usd") or 1500.0, "exceeded": state["exceeded"]}
-            if name == "plan_trials_activity":
-                return {"scenario_id": p["scenario_id"], "trials": [{"trial_id": p["scenario_id"] + "-t0", "model": "m", "condition": "hidden", "attempt_index": 0}]}
+            if name == "prepare_trial_plan_activity":
+                return {"plan_path": p["scenario_id"], "total": 1}
+            if name == "read_plan_page_activity":
+                return {"items": [{"trial_id": p["plan_path"] + "-t0", "scenario_id": p["plan_path"], "model": "m", "condition": "hidden", "attempt_index": 0}], "total": 1, "next_offset": 1}
+            if name == "checkpoint_workflow_activity":
+                return {"checkpoint_path": "/checkpoint/test"}
             return {}
         async def child(fn, arg, **kw): return {"trial_id": arg["trial_id"], "status": "completed"}
         monkeypatch.setattr(W, "act", act); monkeypatch.setattr(W.workflow, "execute_child_workflow", child)
@@ -339,7 +392,7 @@ def test_run_tasks_stops_planning_when_the_spend_cap_is_exceeded(monkeypatch):
             monkeypatch.setattr(W.asyncio, "gather", real_gather)
         assert r["stopped_reason"] == "spend-cap" and r["spend"]["exceeded"] is True and r["spend"]["cap_usd"] == 1500.0
         assert r["scenarios"]["s1"]["status"] == "complete" and r["scenarios"]["s2"] == {"status": "skipped", "reason": "spend-cap", "trials": []} and r["scenarios"]["s3"]["status"] == "skipped"
-        assert calls.count("plan_trials_activity") == 1 and r["status"] == "complete-with-failures"
+        assert calls.count("prepare_trial_plan_activity") == 1 and r["status"] == "complete-with-failures"
         assert w.progress()["stopped_reason"] == "spend-cap" and w.progress()["scenarios"]["s2"]["status"] == "skipped"
         # once exceeded, later checks are not even asked (the run has stopped planning)
         assert calls.count("spend_check_activity") == 3   # at start, before s1, before s2 (exceeded); s3 short-circuits
@@ -857,8 +910,9 @@ def _run_in_env(scenario):
     from temporalio.testing import WorkflowEnvironment
     async def go():
         env = None; errors = []
-        for name, start in (("time-skipping", lambda: WorkflowEnvironment.start_time_skipping()),
-                            ("local dev server", lambda: WorkflowEnvironment.start_local(dev_server_existing_path=shutil.which("temporal"), dev_server_log_level="error"))):
+        from swesim.workflows import search_attributes as SA
+        for name, start in (("local dev server", lambda: WorkflowEnvironment.start_local(dev_server_existing_path=shutil.which("temporal"),
+                                                                                       search_attributes=[SA.key(n) for n in SA.KEYS], dev_server_log_level="error")),):
             try: env = await start(); break
             except Exception as e: errors.append(f"{name}: {type(e).__name__}: {str(e)[:120]}")
         if env is None: pytest.skip("no Temporal test server available offline: " + "; ".join(errors))
@@ -1293,7 +1347,7 @@ def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress()
             prog = await h.query(W.CreateTasksWorkflow.progress)
             assert prog["stage"] == "complete" and set(prog["candidates"]) == {"a--1", "a--2", "a--3", "a--4", "a--5", "b--1"} and prog["awaiting_approval"] == []
             c1 = prog["candidates"]["a--1"]
-            assert c1["status"] == "valid" and c1["stage"] == "done" and c1["candidate_workflow_id"] == "create:a--1" and c1["source"] in ("github-repo:x/a", "swebench-annotated:a")   # normalized keys
+            assert c1["status"] == "valid" and c1["stage"] == "done" and c1["candidate_workflow_id"] == "create:a--1" and c1["source"] in ("github-repo--x__a--feature", "A", "a")   # normalized keys
             assert ["judging", "probing", "auto-approving", "compiling", "validating", "registering"] == [s for s in c1["stages"] if s in ("judging", "probing", "auto-approving", "compiling", "validating", "registering")]
             assert "registering" not in prog["candidates"]["a--5"]["stages"] and prog["candidates"]["a--3"]["stages"] == ["judging"]
             assert prog["candidates"]["a--2"]["stages"] == ["judging", "probing"]
@@ -1390,7 +1444,9 @@ def test_env_create_tasks_hold_mode_review_queue_approve_reject_and_refused_hash
             assert r["candidates"]["h--2"] == {"scenario_id": "h--2", "instance_id": "h__2", "status": "rejected-by-human", "reasons": ["not ready"], "spec_hash": "draft-h--2"}
             assert r["candidates"]["h--1"]["status"] == "valid" and r["candidates"]["h--3"]["status"] == "valid"
             # a stale hash is refused inside the workflow (no activity round trip); the activity re-checks the hash on disk anyway
-            assert [c["spec_hash"] for c in hold["calls"]] == ["draft-h--1", "draft-h--3"] and hold["calls"][0]["note"] == "reviewed"
+            # Independent candidate activities can complete in either order; each decision stays bound to its hash.
+            by_hash = {call["spec_hash"]: call for call in hold["calls"]}
+            assert len(hold["calls"]) == 2 and set(by_hash) == {"draft-h--1", "draft-h--3"} and by_hash["draft-h--1"]["note"] == "reviewed"
             prog = await h.query(W.CreateTasksWorkflow.progress)
             assert prog["awaiting_approval"] == [] and "awaiting-approval" in prog["candidates"]["h--1"]["stages"] and "compiling" in prog["candidates"]["h--1"]["stages"]
             assert prog["candidates"]["h--1"]["stages"].index("probing") < prog["candidates"]["h--1"]["stages"].index("pre-checking")
@@ -1425,7 +1481,7 @@ def test_create_tasks_rejects_duplicate_source_keys_before_any_activity(monkeypa
         with pytest.raises(ApplicationError, match="empty"):
             await W.CreateTasksWorkflow().run({"sources": []})
         # spellings mine merges into one output file are one key (casefold, trailing slash, .git, URL forms)
-        with pytest.raises(ApplicationError, match="duplicate sources.*github-repo:x/a"):
+        with pytest.raises(ApplicationError, match="duplicate sources.*github-repo--x__a--feature"):
             await W.CreateTasksWorkflow().run({"sources": [{"kind": "github-repo", "repo": "https://github.com/X/A/"}, {"kind": "github-repo", "repo": "x/a.git"}]})
         with pytest.raises(ApplicationError, match="duplicate sources"):
             await W.CreateTasksWorkflow().run({"sources": [{"kind": "swebench-annotated", "pool": "A"}, {"kind": "swebench-annotated", "pool": "a "}]})

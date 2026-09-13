@@ -4,11 +4,13 @@ import json
 from pathlib import Path
 
 import pytest
+from test_validate import CLEAN_PROBE, GOOD, _fake_compile, _fake_harbor, _spec_ws
 
 from swesim import harbor_cli
 from swesim.models import RunConfig
-from swesim.workflows import activities as A, validation as V, workflows as W
-from test_validate import GOOD, CLEAN_PROBE, _spec_ws, _fake_compile, _fake_harbor
+from swesim.workflows import activities as A
+from swesim.workflows import validation as V
+from swesim.workflows import workflows as W
 
 
 @pytest.mark.parametrize('bad', [False, True])
@@ -16,6 +18,8 @@ def test_split_controls_match_legacy_evidence(tmp_path, monkeypatch, bad):
     ws, spec = _spec_ws(tmp_path)
     compiler = _fake_compile(tmp_path, spec)
     compiled = compiler(ws, spec, RunConfig.default('full'), 'https://example.test')
+    (ws.scenario_dir(spec.id) / 'compile.json').write_text(json.dumps({'compiled_hash': 'c' * 64, 'spec_hash': spec.spec_hash}))
+    monkeypatch.setattr(V, 'verify_compiled_artifacts', lambda *args: None)
     monkeypatch.setattr(ws.__class__, 'task_dir', lambda self, sid, cond: compiled.task_dirs[cond])
     rewards = json.loads(json.dumps(GOOD))
     if bad:
@@ -41,6 +45,8 @@ def test_split_controls_match_legacy_evidence(tmp_path, monkeypatch, bad):
 def test_one_control_failure_propagates_without_fabricated_verdict(tmp_path, monkeypatch):
     ws, spec = _spec_ws(tmp_path)
     comp = _fake_compile(tmp_path, spec)(ws, spec, RunConfig.default('full'), 'https://example.test')
+    (ws.scenario_dir(spec.id) / 'compile.json').write_text(json.dumps({'compiled_hash': 'c' * 64, 'spec_hash': spec.spec_hash}))
+    monkeypatch.setattr(V, 'verify_compiled_artifacts', lambda *args: None)
     monkeypatch.setattr(ws.__class__, 'task_dir', lambda self, sid, cond: comp.task_dirs[cond])
     def failed(*args, **kwargs):
         raise harbor_cli.HarborRunError('lost Modal acknowledgement')
@@ -90,13 +96,13 @@ def test_cancelling_trial_stops_runtime_once_without_relaunch(monkeypatch):
     w = W.TrialWorkflow()
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(w.run({'trial_id': 'a' * 24}))
-    assert names == ['launch_trial_activity', 'await_trial_activity', 'cancel_trial_activity']
+    assert names == ['launch_trial_activity', 'await_trial_activity', 'cancel_trial_activity', 'index_trial_activity']
     assert w.state['stage'] == 'cancelled'
 
 
 def test_discovery_writes_unprobed_rows_and_reject_funnel(tmp_path, monkeypatch):
-    from swesim.sources import github_repo as github
     from swesim.paths import Workspace
+    from swesim.sources import github_repo as github
     ws = Workspace(tmp_path / 'workspace')
     monkeypatch.setattr(A, 'WS', ws)
     seen = []
@@ -114,3 +120,34 @@ def test_discovery_writes_unprobed_rows_and_reject_funnel(tmp_path, monkeypatch)
     rows = [json.loads(line) for line in Path(result['candidates_path']).read_text().splitlines()]
     assert rows[0]['fail_to_pass'] == [] and rows[0]['repo_dir'] == '/app'
     assert 'patch' not in result
+
+
+def test_control_refuses_unbound_compile_before_any_harbor_launch(tmp_path, monkeypatch):
+    ws, spec = _spec_ws(tmp_path)
+    comp = _fake_compile(tmp_path, spec)(ws, spec, RunConfig.default('full'), 'https://example.test')
+    (ws.scenario_dir(spec.id) / 'compile.json').write_text(json.dumps({'compiled_hash': 'c' * 64, 'spec_hash': spec.spec_hash}))
+    monkeypatch.setattr(ws.__class__, 'task_dir', lambda self, sid, cond: comp.task_dirs[cond])
+    monkeypatch.setattr(harbor_cli, 'run_task', lambda *args, **kwargs: pytest.fail('unbound artifact reached Harbor'))
+    with pytest.raises(ValueError, match='manifest|compiler|build identity'):
+        V.run_control(ws, spec, 'nop', 'c' * 64)
+
+
+def test_discovery_bands_and_immutable_snapshots_do_not_overwrite_history(tmp_path, monkeypatch):
+    import hashlib
+
+    from swesim.paths import Workspace
+    from swesim.sources import github_repo as github
+    ws = Workspace(tmp_path); monkeypatch.setattr(A, 'WS', ws)
+    records = {'rejects': {'too-small': 3}}
+    monkeypatch.setattr(github, 'discover', lambda *args, **kwargs: ([], records['rejects']))
+    first = asyncio.run(A.discover_activity({'repo': 'x/y', 'kind': 'bugfix'}))
+    records['rejects'] = {'no-tests': 7}
+    second = asyncio.run(A.discover_activity({'repo': 'x/y', 'kind': 'bugfix'}))
+    feature = asyncio.run(A.discover_activity({'repo': 'x/y', 'kind': 'feature'}))
+    assert first['source_key'] == second['source_key'] == 'github-repo--x__y--bugfix'
+    assert feature['source_key'] == 'github-repo--x__y--feature'
+    assert first['rejects_path'] != second['rejects_path']
+    assert first['canonical_candidates_path'] != feature['canonical_candidates_path']
+    assert json.loads(Path(first['rejects_path']).read_text()) == {'too-small': 3}
+    assert hashlib.sha256(Path(first['rejects_path']).read_bytes()).hexdigest() == first['rejects_sha256']
+    assert Path(first['canonical_candidates_path']).with_suffix('.status').read_text() == 'no-valid-candidate'

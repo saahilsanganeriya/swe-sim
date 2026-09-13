@@ -40,7 +40,10 @@ async def ensure_registered(client, namespace: str | None = None) -> list[str]:
     """Register the six Keyword attributes on `client`'s namespace when they are missing; returns the names added.
     Temporal Cloud has them already (`swesim.abcde`); this is for the local dev server and the test server."""
     from temporalio.api.enums.v1 import IndexedValueType
-    from temporalio.api.operatorservice.v1 import AddSearchAttributesRequest, ListSearchAttributesRequest
+    from temporalio.api.operatorservice.v1 import (
+        AddSearchAttributesRequest,
+        ListSearchAttributesRequest,
+    )
 
     ns = namespace or client.namespace
     existing = await client.operator_service.list_search_attributes(ListSearchAttributesRequest(namespace=ns))
@@ -49,3 +52,14 @@ async def ensure_registered(client, namespace: str | None = None) -> list[str]:
         await client.operator_service.add_search_attributes(AddSearchAttributesRequest(
             namespace=ns, search_attributes={name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD for name in missing}))
     return missing
+
+
+def for_params(p: dict, status: str = 'running') -> TypedSearchAttributes:
+    """Scalar values for a child, or the sole selected value for an operator workflow."""
+    def one(singular, plural):
+        values = p.get(plural) or []
+        return p.get(singular) or (values[0] if len(values) == 1 else None)
+    config = p.get('run_config') or {}
+    return attributes(scenario_id=one('scenario_id', 'scenario_ids'), model=one('model', 'models'),
+                      condition=one('condition', 'conditions'), status=status,
+                      version=p.get('version'), purpose=p.get('purpose') or config.get('purpose'))
