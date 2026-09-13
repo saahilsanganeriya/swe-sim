@@ -3,7 +3,6 @@ through the console (create, run, cancel, review, label, retry, rebuild) with a 
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 

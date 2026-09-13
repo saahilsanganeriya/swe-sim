@@ -383,7 +383,7 @@ def test_artifact_browser_lists_sizes_previews_and_never_lists_the_task_copy(sit
     assets = c.get(f"/api/artifacts?path=scenarios/{sid}/assets", headers=site["eval"]).json()
     assert {e["name"]: e["sha256"] for e in assets["entries"]}[SENTINELS["hidden_asset"]] == "a" * 64  # sha256 from the manifest
     assert c.get(f"/api/artifacts?path=scenarios/{sid}/assets").status_code == 403
-    assert c.get("/artifacts?path=../etc").status_code == 400 and c.get("/artifacts?path=nope/nope").status_code == 200
+    assert c.get("/artifacts?path=../etc").status_code == 400 and c.get("/artifacts?path=nope/nope").status_code == 403
     dl = c.get(f"/artifacts/download?path=trials/{tid}/reward.json")
     assert dl.status_code == 200 and json.loads(dl.content)["success"] == 1 and c.get(f"/artifacts/download?path=trials/{tid}/record.json").status_code == 403
 

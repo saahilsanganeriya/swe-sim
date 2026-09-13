@@ -30,7 +30,7 @@
   --seq-100: #cde2fb; --seq-200: #9ec5f4; --seq-300: #6da7ec; --seq-400: #3987e5; --seq-500: #256abf; --seq-600: #184f95; --seq-700: #0d366b;
   --seq-ink-on-dark-step: #ffffff; --seq-ink-on-light-step: #0b0b0b;
   /* roles in the transcript */
-  --agent: #1c5cab; --stakeholder: #b8471a; --verifier: #0b7a56; --harness: #898781;
+  --agent: #1c5cab; --stakeholder: #b8471a; --verifier: #0b7a56; --harness: #6f6e69;
   --agent-wash: #e9f1fb; --stakeholder-wash: #fdeee6; --audit-wash: #fff4e8; --mark-wash: #fde9d9;
   --diff-add-wash: #e6f5e6; --diff-del-wash: #fbe6e6;
   color-scheme: light;
