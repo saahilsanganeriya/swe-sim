@@ -95,8 +95,16 @@
     setText(row, "judge", s.judge ? ("keep=" + s.judge.keep + " · rubric " + s.judge.verified_rubric_score + "/3 · complexity " + s.judge.complexity) : null);
     setText(row, "facts", s.facts);
     setText(row, "controls", (s.controls.plausible_wrong || 0) + " wrong · " + (s.controls.alternative_correct || 0) + " alt · " + (s.controls.tamper || 0) + " tamper");
-    const v = row.querySelector('[data-f="validation"]');
+    const v = row.querySelector('[data-f="validation"] .chip:not([data-f])');
     if (v) setChip(v, s.validation_status || "not validated", s.validation_status === "valid" ? "good" : s.validation_status === "invalid" ? "critical" : "pending");
+    const rv = row.querySelector('[data-f="review"]');
+    if (rv) {
+      const needed = s.approval && s.approval.review_needed, awaiting = !s.approval && s.awaiting_approval;
+      rv.classList.toggle("hidden", !(needed || awaiting));
+      rv.className = "chip warn" + (awaiting ? " pulse" : "") + ((needed || awaiting) ? "" : " hidden");
+      rv.textContent = needed ? "review needed" : awaiting ? "awaiting approval" : "";
+      rv.href = "/review/" + encodeURIComponent(s.id);
+    }
     setText(row, "runs", (s.runs.calibration || 0) + " cal · " + (s.runs.comparison || 0) + " cmp · " + (s.runs.demonstration || 0) + " demo" + (s.runs.unresolved ? " · " + s.runs.unresolved + " unresolved" : ""));
     const sc = row.querySelector('[data-f="scores"]');
     if (sc) {
@@ -147,6 +155,104 @@
     const ms = parseInt(body.dataset.pollMs || "5000", 10);
     lastUpdate = Date.now();
     setInterval(refreshOverview, ms);
+  }
+
+  /* ---------------------------------------------------------------- console: forms, jobs, review */
+  function showBanner(kind, title, lines, cli, links) {
+    const b = document.getElementById("banner");
+    if (!b) return;
+    b.replaceChildren();
+    b.className = "banner " + kind;
+    b.appendChild(el("strong", "", title));
+    (lines || []).forEach(function (t) { b.appendChild(el("div", "", t)); });
+    (links || []).forEach(function (l) { const a = el("a", "mono", l.text); a.href = l.href; const d = el("div"); d.appendChild(a); b.appendChild(d); });
+    if (cli) { b.appendChild(el("div", "muted small", "Equivalent command:")); b.appendChild(el("pre", "", cli)); }
+  }
+  function formJSON(form) {
+    const data = {};
+    new FormData(form).forEach(function (v, k) {
+      if (k in data) { if (!Array.isArray(data[k])) data[k] = [data[k]]; data[k].push(v); } else data[k] = v;
+    });
+    Array.from(form.querySelectorAll("select[multiple]")).forEach(function (s) {
+      data[s.name] = Array.from(s.selectedOptions).map(function (o) { return o.value; });
+    });
+    Array.from(form.querySelectorAll("input[type=checkbox]")).forEach(function (c) {
+      if (!(c.name in data)) data[c.name] = [];
+      else if (!Array.isArray(data[c.name])) data[c.name] = [data[c.name]];
+    });
+    return data;
+  }
+  function wireConsoleForm(form, onSuccess) {
+    const status = form.querySelector("#form-status") || document.getElementById("form-status");
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      const data = formJSON(form);
+      if (ev.submitter && ev.submitter.name) data[ev.submitter.name] = ev.submitter.value;
+      if (status) status.textContent = "starting…";
+      fetch(form.dataset.endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) })
+        .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+        .then(function (res) {
+          const j = res.body || {};
+          if (status) status.textContent = "";
+          if (res.status === 200 && j.ok) { onSuccess(j, form); return; }
+          if (res.status === 400) showBanner("warn", j.error || "Please fix the form", j.errors || (j.reasons ? ["gates: " + j.reasons.join("; ")] : []), j.cli);
+          else if (res.status === 409) showBanner("warn", j.error || "Refused", j.current_spec_hash ? ["spec hash on disk: " + j.current_spec_hash] : [], null);
+          else showBanner("error", j.error || ("request failed (" + res.status + ")"), [], j.cli);
+        })
+        .catch(function (e) { if (status) status.textContent = ""; showBanner("error", "request failed: " + e, [], null); });
+    });
+  }
+  if (page === "console") {
+    const form = document.querySelector("form.console");
+    if (form) {
+      Array.from(form.querySelectorAll("input[name=source]")).forEach(function (r) {
+        r.addEventListener("change", function () {
+          Array.from(form.querySelectorAll("[data-source]")).forEach(function (d) { d.classList.toggle("hidden", d.dataset.source !== r.value); });
+        });
+      });
+      wireConsoleForm(form, function (j) {
+        const ids = j.workflow_ids || [];
+        showBanner("ok", "Started " + ids.length + " workflow" + (ids.length === 1 ? "" : "s") + " via " + (j.via || "Temporal"), [],
+          j.cli, ids.map(function (id) { return { text: id, href: (form.dataset.jobs || "/jobs/") + encodeURIComponent(id) }; }));
+      });
+    }
+  }
+  if (page === "jobs") {
+    function fillJob(row, j) {
+      setText(row, "type", j.type);
+      setChip(row.querySelector('[data-f="status"]'), j.status, statusClass(j.status));
+      setText(row, "started", j.started_at);
+      setText(row, "summary", j.summary);
+    }
+    function refreshJobs() {
+      fetch("/api/jobs", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
+        if (!j.ok) { liveIndicator("err", "jobs unavailable: " + (j.error || "")); return; }
+        patchTable("jobs-body", "job-row", j.jobs || [], "workflow_id", fillJob, "/jobs/");
+        lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
+      }).catch(function (e) { liveIndicator("err", "refresh failed: " + e); });
+    }
+    if (document.getElementById("live")) { lastUpdate = Date.now(); setInterval(refreshJobs, parseInt(body.dataset.pollMs || "5000", 10)); }
+  }
+  if (page === "job") {
+    const btn = document.getElementById("cancel-job");
+    if (btn) btn.addEventListener("click", function () {
+      const wid = body.dataset.job;
+      if (!window.confirm("Cancel workflow " + wid + "? Running Harbor units are not killed; the workflow stops after its current step.")) return;
+      const out = document.getElementById("cancel-status");
+      fetch(btn.dataset.endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true }) })
+        .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+        .then(function (res) {
+          if (res.status === 200 && res.body.ok) { out.textContent = "cancelled"; setTimeout(function () { location.reload(); }, 800); }
+          else showBanner("error", res.body.error || "cancel failed", [], res.body.cli);
+        }).catch(function (e) { showBanner("error", "cancel failed: " + e, [], null); });
+    });
+  }
+  if (page === "review-item") {
+    const form = document.getElementById("review-form");
+    if (form) wireConsoleForm(form, function (j) {
+      showBanner("ok", (j.decision === "approve" ? "Approved" : "Rejected") + " " + j.scenario_id + " via " + (j.via || ""), [], null);
+      setTimeout(function () { location.reload(); }, 800);
+    });
   }
 
   /* ---------------------------------------------------------------- runs filters */

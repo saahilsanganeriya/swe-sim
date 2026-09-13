@@ -341,6 +341,10 @@ def scenario_entry(sdir: Path, registry: dict, candidate_refs: set[str]) -> dict
         "stages": stages, "validation_status": validation.get("status"), "validation_failures": validation.get("failures") or [],
         "image_digest": compiled.get("image_digest"), "compiled_hash": compiled.get("compiled_hash"),
         "task_dirs": compiled.get("task_dirs") or {}, "registered": entry is not None,
+        "approval": {"approved_by": approval.get("approved_by"), "review_needed": bool(approval.get("review_needed")),
+                     "approved_at": approval.get("approved_at"), "spec_hash": approval.get("spec_hash")} if approval else None,
+        "awaiting_approval": bool((sdir / "scenario.draft.json").exists() and not approval
+                                  and read_json(sdir / "review.json").get("decision") != "reject"),
         "runs": {k: len((entry or {}).get(f"{k}_runs") or []) for k in ("calibration", "comparison", "demonstration", "unresolved")},
         "scores": scores_summary(sdir), "files": files, "updated_ts": max(stamps) if stamps else None,
     }

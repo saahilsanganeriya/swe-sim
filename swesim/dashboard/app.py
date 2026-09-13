@@ -18,9 +18,9 @@ from pathlib import Path
 
 import httpx  # noqa: F401 - re-exported so tests can monkeypatch ``app.httpx.get`` (the module object is shared with data.py)
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from swesim.dashboard import data, render
+from swesim.dashboard import console, data, render, render_console
 from swesim.dashboard.data import (
     SCENARIO_FILES,
     TRIAL_RE,
@@ -264,3 +264,140 @@ def trial_file(tid: str, name: str) -> PlainTextResponse:
         raise HTTPException(404)
     media = "application/json" if name.endswith(".json") else "text/markdown; charset=utf-8"
     return PlainTextResponse(p.read_text(), media_type=media)
+
+
+# ----------------------------------------------------------------------------- operator console
+
+def _json_error(status: int, body: dict) -> JSONResponse:
+    return JSONResponse(body, status_code=status)
+
+
+def _unavailable(e: console.ConsoleUnavailable) -> JSONResponse:
+    return _json_error(502, {"ok": False, "error": str(e), "cli": e.cli})
+
+
+@app.get("/create", response_class=HTMLResponse)
+def create_form() -> HTMLResponse:
+    return HTMLResponse(render_console.create_page(console.defaults()))
+
+
+@app.post("/api/create")
+async def api_create(body: dict) -> JSONResponse:
+    params, errors = console.validate_create(body)
+    if errors:
+        return _json_error(400, {"ok": False, "errors": errors, "cli": console.cli_for_create(params)})
+    try:
+        started = await console.start_create(params)
+    except console.ConsoleUnavailable as e:
+        return _unavailable(e)
+    return JSONResponse({"ok": True, **started, "params": params, "cli": console.cli_for_create(params)})
+
+
+@app.get("/run", response_class=HTMLResponse)
+def run_form() -> HTMLResponse:
+    return HTMLResponse(render_console.run_page(console.defaults(), console.valid_registered(REGISTRY)))
+
+
+@app.post("/api/run")
+async def api_run(body: dict) -> JSONResponse:
+    params, errors = console.validate_run(body, REGISTRY)
+    if errors:
+        return _json_error(400, {"ok": False, "errors": errors, "cli": console.cli_for_run(params)})
+    try:
+        started = await console.start_run(params)
+    except console.ConsoleUnavailable as e:
+        return _unavailable(e)
+    return JSONResponse({"ok": True, **started, "params": params, "cli": console.cli_for_run(params)})
+
+
+@app.get("/jobs", response_class=HTMLResponse)
+async def jobs_page() -> HTMLResponse:
+    try:
+        jobs, error = await console.list_jobs(), None
+    except console.ConsoleUnavailable as e:
+        jobs, error = None, e
+    return HTMLResponse(render_console.jobs_page(jobs, error))
+
+
+@app.get("/api/jobs")
+async def api_jobs() -> JSONResponse:
+    try:
+        return JSONResponse({"ok": True, "jobs": await console.list_jobs(), "generated_at": iso(console.now_ts())})
+    except console.ConsoleUnavailable as e:
+        return _unavailable(e)
+
+
+def _workflow_id(wid: str) -> str:
+    if not console.WORKFLOW_ID_RE.match(wid):
+        raise HTTPException(404)
+    return wid
+
+
+@app.get("/jobs/{wid}", response_class=HTMLResponse)
+async def job_page(wid: str) -> HTMLResponse:
+    wid = _workflow_id(wid)
+    job = None
+    try:
+        job = next((j for j in await console.list_jobs() if j["workflow_id"] == wid), None)
+    except console.ConsoleUnavailable:
+        pass
+    try:
+        progress, error = await console.job_progress(wid), None
+    except console.ConsoleUnavailable as e:
+        progress, error = None, e
+    return HTMLResponse(render_console.job_page(wid, progress, error, job))
+
+
+@app.get("/api/jobs/{wid}")
+async def api_job(wid: str) -> JSONResponse:
+    wid = _workflow_id(wid)
+    try:
+        return JSONResponse({"ok": True, "workflow_id": wid, "progress": await console.job_progress(wid)})
+    except console.ConsoleUnavailable as e:
+        return _unavailable(e)
+
+
+@app.post("/api/jobs/{wid}/cancel")
+async def api_cancel(wid: str, body: dict) -> JSONResponse:
+    wid = _workflow_id(wid)
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        return _json_error(400, {"ok": False, "error": "cancellation requires confirm: true"})
+    try:
+        return JSONResponse({"ok": True, **(await console.cancel_job(wid))})
+    except console.ConsoleUnavailable as e:
+        return _unavailable(e)
+
+
+@app.get("/review", response_class=HTMLResponse)
+async def review_queue() -> HTMLResponse:
+    return HTMLResponse(render_console.review_queue_page(await console.review_queue(ROOT)))
+
+
+@app.get("/api/review")
+async def api_review_queue() -> JSONResponse:
+    return JSONResponse({"ok": True, **(await console.review_queue(ROOT))})
+
+
+@app.get("/review/{sid}", response_class=HTMLResponse)
+async def review_item(sid: str, evaluator: int = 0, workflow_id: str = "") -> HTMLResponse:
+    d = data.scenario_detail(ROOT, REGISTRY, sid, evaluator=bool(evaluator))
+    if d is None or not d["exists"]:
+        raise HTTPException(404)
+    sdir = ROOT / "scenarios" / sid
+    wid = workflow_id if workflow_id and console.WORKFLOW_ID_RE.match(workflow_id) else ""
+    if not wid:
+        try:  # is this draft held by a running creation job? then decisions go through the signal
+            wid = next((i["workflow_id"] for i in (await console.review_queue(ROOT))["items"]
+                        if i["scenario_id"] == sid and i.get("workflow_id")), "")
+        except Exception:  # noqa: BLE001 - the queue is a convenience; the page still renders
+            wid = ""
+    return HTMLResponse(render_console.review_page(d, console.draft_hash(sdir), wid or None, read_json(sdir / "approval.json"),
+                                                   read_json(sdir / "review.json")))
+
+
+@app.post("/api/review/{sid}")
+async def api_review(sid: str, body: dict) -> JSONResponse:
+    if not data.ID_RE.fullmatch(sid):
+        raise HTTPException(404)
+    status, payload = await console.decide(ROOT, REGISTRY, sid, body)
+    return JSONResponse(payload, status_code=status)

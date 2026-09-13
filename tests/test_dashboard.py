@@ -230,6 +230,279 @@ def test_agent_and_stakeholder_text_is_escaped(site):
         assert '<x onmouseover' not in page and '&lt;x onmouseover=alert(4)&gt;' in page
 
 
+# ---------------------------------------------------------------- operator console: create, run, jobs, review
+
+class _Client:
+    """Stand-in for swesim.workflows.client with the functions the orchestration stream is adding."""
+
+    def __init__(self, fail=False):
+        self.calls = []
+        self.fail = fail
+        self.progress_by_id = {}
+        self.jobs = []
+
+    async def start_create(self, params):
+        self.calls.append(('start_create', params))
+        if self.fail:
+            raise ConnectionRefusedError('temporal 7233 refused')
+        return 'create-abc'
+
+    async def start_run(self, params):
+        self.calls.append(('start_run', params))
+        return ['run-1', 'run-2'][: len(params['scenario_ids'])]
+
+    async def list_runs(self):
+        self.calls.append(('list_runs',))
+        return self.jobs
+
+    async def progress(self, wid):
+        self.calls.append(('progress', wid))
+        return self.progress_by_id.get(wid, {'stage': 'starting'})
+
+    async def cancel(self, wid):
+        self.calls.append(('cancel', wid))
+        return {'cancelled': True}
+
+    async def approve_candidate(self, wid, sid, spec_hash, decision, note):
+        self.calls.append(('approve_candidate', wid, sid, spec_hash, decision, note))
+
+
+def _install_client(monkeypatch, client):
+    import swesim.workflows.client as real
+    for name in ('start_create', 'start_run', 'list_runs', 'progress', 'cancel', 'approve_candidate', 'start_pipeline', 'start_matrix', 'approve'):
+        if hasattr(client, name):
+            monkeypatch.setattr(real, name, getattr(client, name), raising=False)
+        else:
+            monkeypatch.delattr(real, name, raising=False)
+    return real
+
+
+def test_create_form_and_api_validation_and_success(site, monkeypatch):
+    c = site['client']
+    html = c.get('/create').text
+    assert "name='source'" in html and "name='repos'" in html and "name='since'" in html and "name='max_candidates'" in html
+    assert "name='instance_ids'" in html and "name='limit'" in html and "name='max_parallel'" in html
+    assert "value='openai/gpt-5.5'" in html and "value='anthropic/claude-sonnet-5'" in html  # judge / draft prefilled from CLI defaults
+    assert "name='approval_mode'" in html and 'Auto-approve with morning review (default)' in html and 'Hold each task for my approval' in html
+    assert "<option value='auto' selected>" in html
+    for item in ('Jobs', 'Review', 'Create', 'Run'):
+        assert f'>{item}</a>' in html
+    assert 'SWESIM_WORKER_SECRET' not in html and 'stakeholder_url' not in html
+    client = _Client()
+    _install_client(monkeypatch, client)
+    monkeypatch.setenv('SWESIM_STAKEHOLDER_URL', 'https://stakeholder.example.test')
+    monkeypatch.setenv('SWESIM_WORKER_SECRET', 'never-shown')
+    bad = c.post('/api/create', json={'source': 'github-repo', 'repos': 'not a url\nhttps://github.com/py-pdf/pypdf', 'judge_model': 'x'})
+    assert bad.status_code == 400
+    errs = bad.json()['errors']
+    assert any('not a GitHub repository' in e for e in errs) and any('judge model' in e for e in errs)
+    assert c.post('/api/create', json={'source': 'github-repo', 'repos': ''}).status_code == 400
+    same = c.post('/api/create', json={'source': 'github-repo', 'repos': 'py-pdf/pypdf', 'judge_model': 'a/b', 'draft_model': 'a/b'})
+    assert same.status_code == 400 and any('must differ' in e for e in same.json()['errors'])
+    assert client.calls == []
+    ok = c.post('/api/create', json={'source': 'github-repo', 'repos': 'https://github.com/py-pdf/pypdf\npsf/requests', 'since': '2026-06-01',
+                                     'max_candidates': '2', 'approval_mode': 'signal', 'max_parallel': 2})
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body['ok'] is True and body['workflow_ids'] == ['create-abc'] and body['via'] == 'start_create'
+    sent = client.calls[-1][1]
+    assert sent['repos'] == ['https://github.com/py-pdf/pypdf', 'https://github.com/psf/requests'] and sent['approval_mode'] == 'signal'
+    assert sent['max_candidates_per_repo'] == 2 and sent['judge_model'] == 'openai/gpt-5.5' and sent['stakeholder_url'] == 'https://stakeholder.example.test'
+    assert 'stakeholder_url' not in body['params'] and 'never-shown' not in ok.text and 'stakeholder.example.test' not in ok.text
+    assert '--approval-mode signal' in body['cli'] and 'py-pdf/pypdf' in body['cli']
+    sw = c.post('/api/create', json={'source': 'swebench-annotated', 'instance_ids': 'psf__requests-1944\nbad id', 'limit': 3})
+    assert sw.status_code == 400 and any('SWE-bench instance id' in e for e in sw.json()['errors'])
+    sw = c.post('/api/create', json={'source': 'swebench-annotated', 'instance_ids': 'psf__requests-1944', 'limit': 3})
+    assert sw.status_code == 200 and client.calls[-1][1]['instance_ids'] == ['psf__requests-1944']
+    # Temporal unreachable: a clear error with the equivalent CLI command, never a silent failure
+    _install_client(monkeypatch, _Client(fail=True))
+    down = c.post('/api/create', json={'source': 'github-repo', 'repos': 'py-pdf/pypdf'})
+    assert down.status_code == 502 and 'ConnectionRefusedError' in down.json()['error'] and 'uv run swesim pipeline' in down.json()['cli']
+
+
+def test_create_falls_back_to_start_pipeline_per_repo_or_reports_missing(site, monkeypatch):
+    c = site['client']
+
+    class Legacy:
+        def __init__(self):
+            self.calls = []
+
+        async def start_pipeline(self, params):
+            self.calls.append(params)
+            return f'pipeline-{len(self.calls)}'
+
+    legacy = Legacy()
+    _install_client(monkeypatch, legacy)
+    ok = c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b\nc/d', 'approval_mode': 'auto'})
+    assert ok.status_code == 200 and ok.json()['workflow_ids'] == ['pipeline-1', 'pipeline-2'] and 'start_pipeline' in ok.json()['via']
+    assert legacy.calls[0]['repo'] == 'https://github.com/a/b' and legacy.calls[0]['approval_mode'] == 'auto' and legacy.calls[0]['models'] == ['anthropic/claude-haiku-4-5-20251001']
+    _install_client(monkeypatch, object())
+    none = c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b'})
+    assert none.status_code == 502 and 'neither start_create nor start_pipeline' in none.json()['error'] and 'uv run swesim pipeline' in none.json()['cli']
+
+
+def test_run_form_and_api(site, monkeypatch):
+    c, spec = site['client'], site['spec']
+    html = c.get('/run').text
+    assert f"<option value='{spec.id}'>" in html and "name='scenario_ids'" in html and 'multiple' in html
+    assert f"name='models' value='{HAIKU}' checked" in html and "value='anthropic/claude-sonnet-5'" in html and "name='models_extra'" in html
+    assert "name='conditions' value='interactive' checked" in html and "name='k'" in html and "name='purpose'" in html
+    assert "name='brief_profile'" in html and "name='stakeholder_model'" in html and "name='max_parallel'" in html
+    client = _Client()
+    _install_client(monkeypatch, client)
+    empty = c.post('/api/run', json={'scenario_ids': [], 'models': [HAIKU], 'conditions': ['interactive']})
+    assert empty.status_code == 400 and any('at least one registered' in e for e in empty.json()['errors'])
+    unknown = c.post('/api/run', json={'scenario_ids': ['nope-scenario'], 'models': [HAIKU], 'conditions': ['interactive']})
+    assert unknown.status_code == 400 and any('not a registered valid scenario' in e for e in unknown.json()['errors'])
+    nomodel = c.post('/api/run', json={'scenario_ids': [spec.id], 'models': [], 'conditions': ['interactive']})
+    assert nomodel.status_code == 400 and client.calls == []
+    ok = c.post('/api/run', json={'scenario_ids': [spec.id], 'models': [HAIKU], 'models_extra': 'anthropic/claude-sonnet-5, openai/gpt-5.5',
+                                  'conditions': ['hidden', 'interactive'], 'k': '3', 'purpose': 'comparison', 'brief_profile': 'withheld',
+                                  'stakeholder_model': 'openai/gpt-5.5', 'max_parallel': 2})
+    assert ok.status_code == 200 and ok.json()['workflow_ids'] == ['run-1']
+    sent = client.calls[-1][1]
+    assert sent['models'] == [HAIKU, 'anthropic/claude-sonnet-5', 'openai/gpt-5.5'] and sent['conditions'] == ['hidden', 'interactive'] and sent['k'] == 3
+    assert f'uv run swesim matrix {spec.id}' in ok.json()['cli'] and '--k 3' in ok.json()['cli']
+    # an unregistered-valid registry renders the empty state with a disabled button
+    site['ws'].registry_path.write_text(json.dumps({'scenarios': {}}))
+    page = c.get('/run').text
+    assert 'No registered valid scenarios' in page and 'disabled' in page
+
+
+def test_jobs_list_progress_and_cancel(site, monkeypatch):
+    c = site['client']
+    client = _Client()
+    client.jobs = [{'workflow_id': 'create-abc', 'type': 'pipeline', 'status': 'running', 'started_at': '2026-09-13T08:00:00Z', 'summary': {'stage': 'validating'}},
+                   {'workflow_id': 'run-1', 'type': 'matrix', 'status': 'completed', 'started_at': '2026-09-13T07:00:00Z', 'summary': '3 trials'}]
+    client.progress_by_id = {
+        'create-abc': {'stage': 'awaiting-approval', 'scenario_id': site['spec'].id, 'spec_hash': 'h' * 64,
+                       'candidates': [{'instance_id': 'psf__requests-1944', 'scenario_id': site['spec'].id, 'stage': 'awaiting-approval'},
+                                      {'instance_id': 'psf__requests-2000', 'stage': 'judging', 'detail': 'rubric 1/3'}]},
+        'run-1': {'stage': 'complete', 'trials': [{'trial_id': site['done'], 'condition': 'interactive', 'model': HAIKU, 'status': 'completed',
+                                                   'outcome': 'valid-correct', 'success': 1, 'reward': 1.0},
+                                                  {'trial_id': 'f' * 24, 'condition': 'hidden', 'model': HAIKU, 'status': 'unresolved'}]}}
+    _install_client(monkeypatch, client)
+    html = c.get('/jobs').text
+    assert "href='/jobs/create-abc'" in html and "href='/jobs/run-1'" in html and 'stage=validating' in html and '3 trials' in html
+    assert '>running</span>' in html and '>completed</span>' in html and "data-poll-ms='5000'" in html
+    api = c.get('/api/jobs').json()
+    assert api['ok'] is True and [j['workflow_id'] for j in api['jobs']] == ['create-abc', 'run-1'] and api['jobs'][0]['summary'] == 'stage=validating'
+    create = c.get('/jobs/create-abc').text
+    assert 'psf__requests-1944' in create and 'awaiting-approval' in create and f"href='/review/{site['spec'].id}'" in create and 'psf__requests-2000' in create
+    assert "id='cancel-job'" in create and "data-endpoint='/api/jobs/create-abc/cancel'" in create
+    run = c.get('/jobs/run-1').text
+    assert f"href='/trial/{site['done']}'" in run and 'valid-correct' in run and 'unresolved' in run
+    assert c.get('/api/jobs/run-1').json()['progress']['stage'] == 'complete'
+    # cancel requires an explicit confirm step
+    assert c.post('/api/jobs/create-abc/cancel', json={}).status_code == 400
+    assert c.post('/api/jobs/create-abc/cancel', json={'confirm': 'yes'}).status_code == 400
+    assert ('cancel', 'create-abc') not in client.calls
+    ok = c.post('/api/jobs/create-abc/cancel', json={'confirm': True})
+    assert ok.status_code == 200 and ok.json()['cancelled'] == 'create-abc' and ('cancel', 'create-abc') in client.calls
+    assert c.get('/jobs/bad id').status_code == 404
+    # without list_runs / progress in the client: banner with the CLI equivalent, page still renders
+    _install_client(monkeypatch, object())
+    page = c.get('/jobs')
+    assert page.status_code == 200 and 'Temporal is not reachable' in page.text and 'pipeline-progress' in page.text
+    assert c.get('/api/jobs').status_code == 502 and c.get('/jobs/create-abc').status_code == 200
+
+
+def test_review_queue_and_decisions(site, monkeypatch, tmp_path):
+    c, ws, _spec = site['client'], site['ws'], site['spec']
+    # a local draft without approval.json (fresh scenario dir) and a candidate held by a creation job
+    held = make_spec('held-scenario', withheld=True)
+    hdir = ws.scenario_dir(held.id)
+    hdir.mkdir(parents=True)
+    (hdir / 'scenario.draft.json').write_text(held.model_dump_json())
+    (hdir / 'judge.json').write_text(json.dumps({'keep': True, 'verified_rubric_score': 2, 'complexity': 3, 'gaps': []}))
+    local = make_spec('local-draft', with_author_only=True)
+    ldir = ws.scenario_dir(local.id)
+    ldir.mkdir(parents=True)
+    (ldir / 'scenario.draft.json').write_text(local.model_dump_json())
+    (ldir / 'draft.meta.json').write_text(json.dumps({'created_at': '2026-09-13T01:00:00+00:00'}))
+    client = _Client()
+    client.jobs = [{'workflow_id': 'create-abc', 'type': 'pipeline', 'status': 'running'}]
+    client.progress_by_id = {'create-abc': {'stage': 'awaiting-approval', 'scenario_id': held.id, 'spec_hash': held.spec_hash}}
+    _install_client(monkeypatch, client)
+    q = c.get('/api/review').json()
+    rows = {i['scenario_id']: i for i in q['items']}
+    assert set(rows) == {held.id, local.id}
+    assert rows[held.id]['workflow_id'] == 'create-abc' and rows[held.id]['disk_hash'] == held.spec_hash and rows[held.id]['on_disk'] is True
+    assert rows[local.id]['source'] == 'local-draft' and rows[local.id]['workflow_id'] is None
+    html = c.get('/review').text
+    assert f"href='/review/{held.id}'" in html and f"href='/review/{local.id}'" in html and 'create-abc' in html
+    # review page: briefs with removed span, ledger, controls, judge, assets, decision form carrying the disk hash and workflow id
+    page = c.get(f'/review/{held.id}').text
+    assert "<mark class='removed' title=" in page and '<h3>withheld' in page and 'withheld-001' in page and 'oracle.diff' in page
+    assert 'rubric 2/3' in page and '<h2>Assets</h2>' in page and 'test.patch' in page
+    assert f"name='spec_hash' value='{held.spec_hash}'" in page and "name='workflow_id' value='create-abc'" in page
+    assert "value='approve'" in page and "value='reject'" in page and 'awaiting approval' in page
+    lpage = c.get(f'/review/{local.id}').text
+    assert 'SECRET-AUTHOR-ONLY-NOTE' not in lpage and 'SECRET-AUTHOR-ONLY-NOTE' in c.get(f'/review/{local.id}?evaluator=1').text
+    # stale hash is refused
+    stale = c.post(f'/api/review/{held.id}', json={'decision': 'approve', 'spec_hash': 'x' * 64, 'workflow_id': 'create-abc'})
+    assert stale.status_code == 409 and stale.json()['current_spec_hash'] == held.spec_hash and client.calls[-1][0] != 'approve_candidate'
+    # approve a held candidate: the job is signalled, the decision is recorded
+    ok = c.post(f'/api/review/{held.id}', json={'decision': 'approve', 'spec_hash': held.spec_hash, 'workflow_id': 'create-abc', 'note': 'looks right'})
+    assert ok.status_code == 200 and ok.json()['via'] == 'signal'
+    assert client.calls[-1] == ('approve_candidate', 'create-abc', held.id, held.spec_hash, 'approve', 'looks right')
+    assert json.loads((hdir / 'review.json').read_text())['decision'] == 'approve'
+    # reject a local draft: recorded locally, dropped from the queue
+    rj = c.post(f'/api/review/{local.id}', json={'decision': 'reject', 'spec_hash': local.spec_hash, 'note': 'thin thread'})
+    assert rj.status_code == 200 and rj.json()['via'] == 'local review.json'
+    assert local.id not in {i['scenario_id'] for i in c.get('/api/review').json()['items']}
+    assert 'rejected' in c.get(f'/review/{local.id}').text and "value='approve' disabled" in c.get(f'/review/{local.id}').text
+    # approve a local draft through the code-owned gates (approve_scenario monkeypatched: it needs real asset files)
+    third = make_spec('third-draft')
+    tdir = ws.scenario_dir(third.id)
+    tdir.mkdir(parents=True)
+    (tdir / 'scenario.draft.json').write_text(third.model_dump_json())
+    seen = []
+
+    def fake_approve(ws_, sid):
+        seen.append((str(ws_.root), sid))
+        (tdir / 'approval.json').write_text(json.dumps({'scenario_id': sid, 'spec_hash': third.spec_hash, 'approved_by': 'human-command', 'review_needed': False}))
+        return {'approved': True, 'reasons': [], 'spec_hash': third.spec_hash}
+
+    monkeypatch.setattr(dash.console, 'local_approve', fake_approve)
+    ok = c.post(f'/api/review/{third.id}', json={'decision': 'approve', 'spec_hash': third.spec_hash})
+    assert ok.status_code == 200 and seen == [(str(ws.root), third.id)] and ok.json()['approval']['approved_by'] == 'human-command'
+    again = c.post(f'/api/review/{third.id}', json={'decision': 'approve', 'spec_hash': third.spec_hash})
+    assert again.status_code == 409 and 'already approved' in again.json()['error']
+    assert 'Read-only' in c.get(f'/review/{third.id}').text
+    assert c.post(f'/api/review/{third.id}', json={'decision': 'maybe', 'spec_hash': third.spec_hash}).status_code == 400
+    assert c.post('/api/review/no-such-draft', json={'decision': 'approve', 'spec_hash': 'x'}).status_code == 404
+    # gate rejection surfaces the reasons
+    monkeypatch.setattr(dash.console, 'local_approve', lambda ws_, sid: {'approved': False, 'reasons': ['asset mismatch assets/oracle.diff']})
+    fourth = make_spec('fourth-draft')
+    fdir = ws.scenario_dir(fourth.id)
+    fdir.mkdir(parents=True)
+    (fdir / 'scenario.draft.json').write_text(fourth.model_dump_json())
+    gated = c.post(f'/api/review/{fourth.id}', json={'decision': 'approve', 'spec_hash': fourth.spec_hash})
+    assert gated.status_code == 400 and gated.json()['reasons'] == ['asset mismatch assets/oracle.diff']
+
+
+def test_overview_review_needed_chip_and_start_cta(site, tmp_path, monkeypatch):
+    c, ws, spec = site['client'], site['ws'], site['spec']
+    (ws.scenario_dir(spec.id) / 'approval.json').write_text(json.dumps({'scenario_id': spec.id, 'spec_hash': spec.spec_hash, 'version': 1,
+                                                                        'approved_by': 'auto-validators', 'review_needed': True}))
+    html = c.get('/').text
+    assert f"href='/review/{spec.id}'" in html and '>review needed</a>' in html
+    ov = c.get('/api/overview').json()
+    assert ov['scenarios'][0]['approval'] == {'approved_by': 'auto-validators', 'review_needed': True, 'approved_at': None, 'spec_hash': spec.spec_hash}
+    assert 'Read-only' in c.get(f'/review/{spec.id}').text  # already approved: read-only review page
+    held = make_spec('held-two')
+    hdir = ws.scenario_dir(held.id)
+    hdir.mkdir(parents=True)
+    (hdir / 'scenario.draft.json').write_text(held.model_dump_json())
+    assert '>awaiting approval</a>' in c.get('/').text
+    assert 'Create tasks' not in c.get('/').text.split('<h2>Scenarios</h2>')[0]  # CTA only when the board is empty
+    monkeypatch.setattr(dash, 'ROOT', tmp_path / 'fresh')
+    monkeypatch.setattr(dash, 'REGISTRY', tmp_path / 'fresh-registry.json')
+    empty = c.get('/').text
+    assert "href='/create'" in empty and "href='/run'" in empty and 'Nothing here yet' in empty
+
+
 def test_static_assets_are_served_without_a_build_step(site):
     c = site['client']
     css = c.get('/static/app.css')

@@ -18,7 +18,8 @@ from swesim.stages.score import OUTCOME_NAMES, outcome_code
 
 TEMPORAL_UI = "http://localhost:8233"
 LABELS = ("unresolved", "no-question", "disclosed-not-used", "simulator-omission", "derived-without-asking")
-NAV = (("Overview", "/", "overview"), ("Runs", "/runs", "runs"), ("Scenarios", "/scenarios", "scenarios"))
+NAV = (("Overview", "/", "overview"), ("Runs", "/runs", "runs"), ("Scenarios", "/scenarios", "scenarios"),
+       ("Jobs", "/jobs", "jobs"), ("Review", "/review", "review"), ("Create", "/create", "create"), ("Run", "/run", "run"))
 
 
 def h(x) -> str:
@@ -108,6 +109,17 @@ def scores_line(scores: dict) -> str:
                        for g in groups)
 
 
+def review_chip(s: dict) -> str:
+    """Auto-approved tasks carry a 'review needed' chip; held drafts an 'awaiting approval' chip; both open the review page."""
+    ap = s.get("approval") or {}
+    if ap.get("review_needed"):
+        return (f"<a data-f='review' class='chip warn' href='/review/{h(s['id'])}' "
+                f"title='approved by {h(ap.get('approved_by'))}; review the frozen spec'>review needed</a>")
+    if s.get("awaiting_approval"):
+        return f"<a data-f='review' class='chip warn pulse' href='/review/{h(s['id'])}'>awaiting approval</a>"
+    return "<a data-f='review' class='chip warn hidden' href='#'></a>"
+
+
 def scenario_row(s: dict) -> str:
     judge = s.get("judge")
     judge_text = (f"keep={judge.get('keep')} · rubric {judge.get('verified_rubric_score')}/3 · complexity {judge.get('complexity')}"
@@ -122,13 +134,15 @@ def scenario_row(s: dict) -> str:
             f"<td data-f='source'>{dash(s.get('source_label'))}</td><td data-f='stages'>{stage_chips(s.get('stages') or [])}</td>"
             f"<td data-f='judge'>{dash(judge_text)}</td><td data-f='facts' class='num'>{dash(s.get('facts'))}</td>"
             f"<td data-f='controls'>{c.get('plausible_wrong', 0)} wrong · {c.get('alternative_correct', 0)} alt · {c.get('tamper', 0)} tamper</td>"
-            f"<td data-f='validation'>{chip(vs or 'not validated', 'good' if vs == 'valid' else 'critical' if vs == 'invalid' else 'pending', '; '.join(s.get('validation_failures') or []) or None)}</td>"
+            f"<td data-f='validation'>{chip(vs or 'not validated', 'good' if vs == 'valid' else 'critical' if vs == 'invalid' else 'pending', '; '.join(s.get('validation_failures') or []) or None)}"
+            f" {review_chip(s)}</td>"
             f"<td data-f='runs'>{h(runs_text)}</td><td data-f='scores'>{scores_line(s.get('scores') or {})}</td></tr>")
 
 
 SCENARIO_TEMPLATE = ("<template id='scenario-row'><tr data-id=''><td data-f='id'><a href='#'></a></td><td data-f='source'></td>"
                      "<td data-f='stages'></td><td data-f='judge'></td><td data-f='facts' class='num'></td><td data-f='controls'></td>"
-                     "<td data-f='validation'><span class='chip'></span></td><td data-f='runs'></td><td data-f='scores'></td></tr></template>")
+                     "<td data-f='validation'><span class='chip'></span> <a data-f='review' class='chip warn hidden' href='#'></a></td>"
+                     "<td data-f='runs'></td><td data-f='scores'></td></tr></template>")
 SCENARIO_HEAD = ("<tr><th>scenario</th><th>source</th><th>stages</th><th>judge</th><th class='num'>facts</th><th>controls</th>"
                  "<th>validation</th><th>runs</th><th>scores</th></tr>")
 
@@ -203,11 +217,21 @@ def trials_table(trials: list[dict]) -> str:
 
 # ----------------------------------------------------------------------------- pages
 
+def start_cta(ov: dict) -> str:
+    """Call to action when the board is empty: the console can start creation and run jobs."""
+    if ov.get("scenarios") or ov.get("trials"):
+        return ""
+    return ("<div class='card cta'><strong>Nothing here yet.</strong> Start a creation job to mine, judge, draft, validate and register tasks, "
+            "then run a matrix of attempts over them. <div class='row'><a class='button primary' href='/create'>Create tasks</a> "
+            "<a class='button' href='/run'>Run trials</a> <a class='button' href='/jobs'>Jobs</a></div></div>")
+
+
 def overview_page(ov: dict, root, registry) -> str:
     body = ["<h1>Overview</h1>",
             ("<p class='lead'>Scenarios in creation and runs in flight, from the workspace files. "
              f"Workspace <code>{h(root)}</code> · registry <code>{h(registry)}</code>.</p>"),
             tiles(ov.get("summary") or {}),
+            start_cta(ov),
             "<h2>Scenarios</h2>", scenarios_table(ov.get("scenarios") or []),
             ("<h2>Trials</h2><p class='muted small'>Every attempt directory is listed. <span class='flag'>unresolved</span> marks an attempt "
              "that ended without a verifier record; it never enters n or pass@k. Patience is live for running trials.</p>"),
@@ -492,7 +516,8 @@ def _fact(f: dict) -> str:
             f"{' · tests ' + tests if tests else ''}</span><div>{h(f.get('text'))}</div>{excerpt}</div>")
 
 
-def scenario_page(d: dict) -> str:
+def scenario_page_sections(d: dict) -> dict:
+    """The scenario page pieces (head, briefs, ledger, controls, judge, links) so the review page can reuse them."""
     b = d["board"]
     sid = b["id"]
     judge = d.get("judge") or {}
@@ -505,7 +530,7 @@ def scenario_page(d: dict) -> str:
     if not d["exists"]:
         head.append("<p class='empty'><strong>Registered, but no scenario directory in this workspace copy.</strong> Copy "
                     f"<code>workspace/scenarios/{h(sid)}/</code> here to see briefs, ledger and controls.</p>")
-        return layout(f"swesim · {sid}", "".join(head), "scenarios", "scenario")
+        return {"head": "".join(head), "briefs": "", "ledger": "", "controls": "", "judge": "", "links": "", "exists": False}
     natural = "".join(f"<mark class='removed' title='withheld from the withheld brief'>{h(seg)}</mark>" if removed else h(seg)
                       for seg, removed in d["natural_segments"])
     withheld = (f"<pre>{h(d['withheld'])}</pre>" if d.get("withheld") else
@@ -570,5 +595,12 @@ def scenario_page(d: dict) -> str:
     for cond, path in sorted(tdirs.items()):
         links.append(f"<dt>task dir · {h(cond)}</dt><dd class='mono'>{h(path)}</dd>")
     links.append("</dl><p class='small'>" + " · ".join(f"<a href='/scenario/{h(sid)}/file/{h(n)}'>{h(n)}</a>" for n in b.get("files") or []) + "</p>")
-    body = "".join(head) + briefs + "".join(ledger) + "".join(controls) + jud + "".join(links)
+    return {"head": "".join(head), "briefs": briefs, "ledger": "".join(ledger), "controls": "".join(controls), "judge": jud,
+            "links": "".join(links), "exists": True}
+
+
+def scenario_page(d: dict) -> str:
+    sid = d["board"]["id"]
+    sec = scenario_page_sections(d)
+    body = sec["head"] + sec["briefs"] + sec["ledger"] + sec["controls"] + sec["judge"] + sec["links"]
     return layout(f"swesim · {sid}", body, "scenarios", "scenario")
