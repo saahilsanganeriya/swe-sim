@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import importlib
 import inspect
 import json
+import logging
 import os
 import sys
 import time
@@ -36,8 +38,8 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from swesim.models import ID_RE, RunConfig, ScenarioSpec, trial_id
+from swesim import roles
 from swesim.paths import Workspace, atomic_json
-from swesim.roles import ROLE_CHAINS
 from swesim.settings import Settings, get_settings, has_secret, secret
 from swesim.workflows import retries
 from swesim.workflows.launchers.base import (Launcher, LaunchFailed, TrialBindingConflict, TrialEvidence, TrialLayout,  # noqa: F401 - re-exported
@@ -46,6 +48,7 @@ from swesim.workflows.launchers.base import launch_once as _launch_once
 from swesim.workflows.launchers.base import read_evidence as _read_evidence
 from swesim.workflows.launchers.systemd import UnitStateUnavailable, secret_values  # noqa: F401 - re-exported
 
+log = logging.getLogger("swesim.workflows.trials")  # launch decisions; the worker configures stdout logging at INFO
 SETTINGS: Settings = get_settings()
 WS = Workspace(SETTINGS.workspace, SETTINGS.registry_path)
 LAUNCHER: Launcher | None = None  # built from SETTINGS on first use (`launcher()`); tests assign one directly
@@ -55,11 +58,9 @@ HEARTBEAT_SECONDS = 30.0
 POLL_SECONDS = 10.0
 AWAIT_DEADLINE_SEC = 3 * 3600
 LAUNCH_GRACE_POLLS = 6  # polls without any launch evidence before await reports launch-failed
-# Per-role fallback chains (swesim.roles.ROLE_CHAINS, interfaces §7): the configured id is probed first, then the chain in
-# order. Only the three pipeline roles are probed here (audit and screen models belong to their own activities). Judge and
-# draft must resolve to different ids (draft_spec.draft refuses correlated errors); the solver is never substituted.
-PROBE_ROLES = ("judge_model", "draft_model", "stakeholder_model")
-FALLBACK_CHAINS = {role: list(ROLE_CHAINS[role]) for role in PROBE_ROLES}
+# Per-role fallback chains (interfaces §7): the configured id is probed first, then the chain in order; judge and draft must
+# resolve to different ids (draft_spec.draft refuses correlated errors); the solver is never substituted.
+FALLBACK_CHAINS = roles.ROLE_CHAINS
 LAUNCH_SLOTS = asyncio.Semaphore(1)  # pilot trials launch serially per worker
 
 
@@ -146,61 +147,26 @@ def scenario_id_for(instance_id: str) -> str:
 # ------------------------------------------------------------------ pipeline activities
 
 def probe_models(p: dict) -> dict:
-    """One tiny request per model id. Judge, draft and stakeholder resolve along FALLBACK_CHAINS (configured id first);
-    judge and draft must differ (advance the draft chain, then the judge chain, and record why); the solver is never
-    substituted. Evidence: workspace/evidence/model-probe.json with configured/resolved ids and the reasoning."""
-    from swesim import llm
-
+    """One tiny request per model id through the provider's own SDK (`roles.probe_id`; never raises, never carries a key).
+    Every role in `roles.ROLE_CHAINS` resolves along its chain, configured id first (`roles.resolve_roles`): judge and draft must
+    differ (advance the draft chain, then the judge chain, and record why); the solver is never substituted. Evidence:
+    workspace/evidence/model-probe.json with configured/resolved ids and the reasoning."""
     results: dict[str, dict] = {}
 
     def probe(model_id: str) -> bool:
         if model_id not in results:
-            try:
-                llm.chat_json(model_id, "You are a connectivity probe.", [{"role": "user", "content": 'Reply with {"ok": true}.'}],
-                              '{"ok": true}', max_tokens=20)
-                results[model_id] = {"ok": True, "error": None}
-            except Exception as e:  # provider/auth/network failures are the point of the probe
-                results[model_id] = {"ok": False, "error": _redact(f"{type(e).__name__}: {str(e)[:200]}")}
+            r = roles.probe_id(model_id)
+            results[model_id] = {"ok": r.reachable, "error": None if r.reachable else _redact(f"{r.error_class}: {r.error}"),
+                                 "latency_ms": r.latency_ms, "served_provider": r.served_provider}
         return results[model_id]["ok"]
 
-    configured = {role: p.get(role) or chain[0] for role, chain in FALLBACK_CHAINS.items()}
-
-    def candidates(role: str) -> list[str]:
-        return [configured[role]] + [m for m in FALLBACK_CHAINS[role] if m != configured[role]]
-
-    def first_available(role: str, exclude: set[str] = frozenset(), after: str | None = None) -> str | None:
-        cands = candidates(role)
-        if after in cands:
-            cands = cands[cands.index(after) + 1:]
-        return next((m for m in cands if m not in exclude and probe(m)), None)
-
-    resolved: dict[str, str] = {}; notes: list[str] = []; needs_human: list[str] = []
-    for role in FALLBACK_CHAINS:
-        chosen = first_available(role)
-        if chosen is None:
-            needs_human.append(f"{role}: {configured[role]} and its fallbacks {candidates(role)[1:]} are all unavailable")
-            chosen = configured[role]
-        elif chosen != configured[role]:
-            notes.append(f"{role}: {configured[role]} unavailable; fell back to {chosen}")
-        resolved[role] = chosen
-    if resolved["judge_model"] == resolved["draft_model"]:
-        shared = resolved["draft_model"]
-        alt = first_available("draft_model", exclude={shared}, after=shared)
-        if alt is not None:
-            notes.append(f"judge and draft both resolved to {shared}; advanced the draft chain to {alt} so their errors stay uncorrelated")
-            resolved["draft_model"] = alt
-        else:
-            alt = first_available("judge_model", exclude={shared}, after=shared)
-            if alt is not None:
-                notes.append(f"judge and draft both resolved to {shared}; draft chain exhausted, advanced the judge chain to {alt}")
-                resolved["judge_model"] = alt
-            else:
-                needs_human.append(f"judge and draft both resolve to {shared} and no distinct model is available")
+    res = roles.resolve_roles(probe, configured={role: p[role] for role in roles.ROLE_CHAINS if p.get(role)})
+    needs_human = list(res.needs_human)
     solver_unavailable = [m for m in (p.get("models") or []) if not probe(m)]
     needs_human += [f"solver model {m} unavailable; no silent substitution" for m in solver_unavailable]
-    substitutions = {role: m for role, m in resolved.items() if m != configured[role]}
-    out = {"models": results, "configured": configured, "resolved": resolved, "substitutions": substitutions, "notes": notes,
-           "needs_human": needs_human, "solver_unavailable": solver_unavailable, "chains": FALLBACK_CHAINS, "probed_at": time.time()}
+    out = {"models": results, "configured": dict(res.configured), "resolved": dict(res.roles), "substitutions": dict(res.substitutions),
+           "notes": list(res.reasoning), "needs_human": needs_human, "solver_unavailable": solver_unavailable, "chains": roles.ROLE_CHAINS,
+           "probed_at": time.time()}
     atomic_json(WS.root / "evidence" / "model-probe.json", out)
     return out
 
@@ -229,8 +195,27 @@ async def mine_activity(p: dict) -> dict:
     return {"candidates_path": str(path)}
 
 
+def record_judge_cost(row: dict, model_id: str) -> dict | None:
+    """One `judge` cost row per judged candidate (`swesim.costs.record_cost`, filed under the running workflow id; "direct" when
+    a stage command runs the judge outside Temporal). Returns the outcome; a cost-ledger problem never fails the judge."""
+    usage = (row.get("judge") or {}).get("usage")
+    if not usage:
+        return None
+    try:
+        costs = importlib.import_module("swesim.costs")
+    except ImportError:
+        return {"recorded": False, "reason": "swesim.costs is not available on this worker"}
+    workflow_id = activity.info().workflow_id if activity.in_activity() else "direct"
+    try:
+        rec = costs.record_cost(WS.layout, None, workflow_id, "judge", model_id, costs.Usage.model_validate(usage))
+    except (ValueError, OSError) as e:  # an unknown model id or an unwritable ledger is reported, not a judge failure
+        return {"recorded": False, "reason": f"{type(e).__name__}: {str(e)[:200]}"}
+    return {"recorded": True, "usd": float(rec.usd) if rec.usd is not None else None, "price_source": rec.price_source, "workflow_id": workflow_id}
+
+
 @swesim_activity
 async def judge_activity(p: dict) -> dict:
+    """Legacy whole-file judge used only by PipelineWorkflow; CandidateWorkflow judges one row at a time (`judge_one_activity`)."""
     from swesim.stages.judge import judge_candidate
 
     src = Path(p["candidates_path"]); out = src.with_suffix(".judged.jsonl"); rows = []
@@ -242,6 +227,7 @@ async def judge_activity(p: dict) -> dict:
         for line in lines:
             row = json.loads(line)
             row["judge"] = await blocking(lambda row=row: judge_candidate(row, p["judge_model"]))
+            record_judge_cost(row, p["judge_model"])
             rows.append(row)
         tmp = out.with_name(out.name + ".tmp")  # write-then-rename: a crash never leaves a truncated file that a rerun would trust
         tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
@@ -332,17 +318,19 @@ async def judge_one_activity(p: dict) -> dict:
     src = Path(p["candidates_path"]); sid = scenario_id_for(p["instance_id"])
     out = src.parent / "judged" / f"{sid}.judged.jsonl"
     if out.exists():
-        row = json.loads(out.read_text().splitlines()[0])
+        row = json.loads(out.read_text().splitlines()[0]); cost = None  # retained output: judged (and paid for) earlier
     else:
         row = next((json.loads(line) for line in src.read_text().splitlines() if line.strip() and json.loads(line).get("instance_id") == p["instance_id"]), None)
         if row is None:
             raise ApplicationError(f"candidate {p['instance_id']} not in {src}", non_retryable=True)
         row["judge"] = await blocking(lambda: judge_candidate(row, p["judge_model"]))
+        cost = record_judge_cost(row, p["judge_model"])
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_name(out.name + ".tmp"); tmp.write_text(json.dumps(row) + "\n"); os.replace(tmp, out)
     judge = row.get("judge", {})
     return {"judged_path": str(out), "instance_id": p["instance_id"], "scenario_id": sid, "keep": bool(judge.get("keep")),
-            "reasons": [] if judge.get("keep") else ["judge did not keep the candidate"], "judge_model": judge.get("model_id", p.get("judge_model"))}
+            "reasons": [] if judge.get("keep") else ["judge did not keep the candidate"], "judge_model": judge.get("model_id", p.get("judge_model")),
+            "cost": cost}
 
 
 @swesim_activity
@@ -630,7 +618,11 @@ def launch_once(p: dict) -> dict:
 @swesim_activity
 async def launch_trial_activity(p: dict) -> dict:
     async with LAUNCH_SLOTS:
-        return await blocking(lambda: launch_once(p))
+        out = await blocking(lambda: launch_once(p))
+    # One line per launch decision; the Cloud Logging metric `swesim/trial_reconcile` counts `decision=reconcile`.
+    log.info("decision=%s trial=%s launcher=%s runtime=%s launched=%s handle=%s", out["decision"], out["trial_id"], out["launcher"],
+             out.get("runtime"), out["launched"], out.get("handle"))
+    return out
 
 
 @swesim_activity
@@ -644,6 +636,7 @@ async def await_trial_activity(p: dict) -> dict:
         if ev.has_record:
             r = _read_json(d / "record.json")
             if r.get("status") is not None:
+                log.info("terminal trial=%s status=%s polls=%d runtime=%s", tid, r["status"], polls, ev.runtime_state)
                 return {"trial_id": r.get("trial_id", tid), "status": r["status"], "reward": r.get("reward", {})}
             # record.json exists but is empty/partial: the run stage writes it non-atomically, so the writer may still be
             # flushing. Fall through: keep polling while the runtime runs; report incomplete evidence once it has stopped.
@@ -721,29 +714,26 @@ async def spend_check_activity(p: dict) -> dict:
     return {**spend, "cap_usd": cap_usd, "exceeded": cap_usd is not None and spend["spend_usd"] > cap_usd}
 
 
-def _trajectory_for(record: dict, d: Path) -> dict | None:
-    """The solver's trajectory (mini-swe-agent per-step usage) for a finished trial: trials/<tid>/trajectory.json, else the first
-    *.traj.json under the Harbor trial dir the record names. None when there is none to read."""
-    candidates = [d / "trajectory.json"]
+def _solver_usage(costs, record: dict, d: Path):
+    """Usage evidence for the solver: the Harbor trial dir the record names (`costs.usage_from_trial_dir`: the agent's trajectory or
+    Harbor's agent_result), else trials/<tid>/trajectory.json. None when there is nothing to read."""
     harbor_dir = record.get("trial_dir")
-    if harbor_dir and Path(harbor_dir).is_dir():
-        candidates += sorted(Path(harbor_dir).rglob("*.traj.json"))[:1]
-    for path in candidates:
-        if path.is_file():
-            data = _read_json(path)
-            if data:
-                return data
-    return None
+    if harbor_dir and Path(harbor_dir).is_dir() and hasattr(costs, "usage_from_trial_dir"):
+        usage = costs.usage_from_trial_dir(Path(harbor_dir))
+        if usage is not None:
+            return usage
+    trajectory = _read_json(d / "trajectory.json")
+    return costs.solver_usage_from_trajectory(trajectory) if trajectory else None
 
 
 @swesim_activity
 async def record_cost_activity(p: dict) -> dict:
     """Solver cost of one finished trial into trials/<tid>/costs.json through `swesim.costs` (usage from the trajectory, price from
-    the table). Idempotent: a solver record for the trial is written once. Without `swesim.costs`, a record or a trajectory it
+    the table). Idempotent: a solver record for the trial is written once. Without `swesim.costs`, a record or usage evidence it
     reports `recorded: False` with the reason; it never fails the workflow."""
     tid = p["trial_id"]; d = trial_dir(tid)
     try:
-        from swesim import costs
+        costs = importlib.import_module("swesim.costs")  # through sys.modules: a worker without the module reports it; tests substitute one
     except ImportError:
         return {"trial_id": tid, "recorded": False, "reason": "swesim.costs is not available on this worker"}
     existing = _read_json_list(d / "costs.json")
@@ -752,11 +742,10 @@ async def record_cost_activity(p: dict) -> dict:
     record = _read_json(d / "record.json")
     if not record:
         return {"trial_id": tid, "recorded": False, "reason": "no record.json"}
-    trajectory = _trajectory_for(record, d)
-    if trajectory is None:
-        return {"trial_id": tid, "recorded": False, "reason": "no trajectory to read usage from"}
+    usage = _solver_usage(costs, record, d)
+    if usage is None:
+        return {"trial_id": tid, "recorded": False, "reason": "no trajectory or agent result to read usage from"}
     model = record.get("model") or (record.get("run_config") or {}).get("model") or p.get("model")
-    usage = costs.solver_usage_from_trajectory(trajectory)
     out = await blocking(lambda: costs.record_cost(_layout(), tid, p.get("workflow_id"), "solver", model, usage))
     usd = getattr(out, "usd", None)
     return {"trial_id": tid, "recorded": True, "model": model, "usd": float(usd) if usd is not None else None,
