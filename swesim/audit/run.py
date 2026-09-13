@@ -73,7 +73,7 @@ def read_trial_audit(layout, trial_id: str) -> R.TrialAudit | None:
 
 
 def _fresh(existing, inputs_hash: str, force: bool) -> bool:
-    return (existing is not None and not force and existing.rubric_version == R.RUBRIC_VERSION and existing.inputs_hash == inputs_hash)
+    return (existing is not None and existing.status == "completed" and not force and existing.rubric_version == R.RUBRIC_VERSION and existing.inputs_hash == inputs_hash)
 
 
 # ---------------------------------------------------------------- scenarios

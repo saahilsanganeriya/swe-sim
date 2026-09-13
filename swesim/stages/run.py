@@ -143,7 +143,11 @@ def _solver_cost(ws: Workspace, tid: str, model: str, trial_dir: Path | None, re
         return None
     if usage is None:
         return None
-    return costs.record_cost(ws, tid, None, "solver", model, usage)
+    try:
+        return costs.record_cost(ws, tid, None, "solver", model, usage, idempotency_key="solver-final")
+    except (OSError, ValueError) as error:
+        report["usage_error"] = f"cost ledger: {type(error).__name__}"
+        return None
 
 
 def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: int, stakeholder_url: str, worker_secret: str) -> TrialRecord:
@@ -238,6 +242,11 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     report["agent_config_sha256"] = agent_config_sha  # interactive scaffold config, None for other conditions/agents
     report["simulator_validity"] = "unadjudicated" if rc.condition == "interactive" else "n/a"
     cost = _solver_cost(ws, tid, rc.model, trial_dir, report)
+    if rc.condition == "interactive":
+        try:
+            report["stakeholder_cost_accounting"] = costs.record_stakeholder_usage(ws, tid, transcript, rc.stakeholder.model_id)
+        except (OSError, ValueError) as error:
+            report["stakeholder_cost_accounting"] = {"usage_complete": False, "error_type": type(error).__name__}
 
     finished_at = _now()
     rec = TrialRecord(tid, spec.id, rc.condition, attempt_index, rc.run_config_hash, str(task), str(trial_dir) if trial_dir else None,

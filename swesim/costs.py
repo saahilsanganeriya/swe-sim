@@ -19,12 +19,13 @@ Contract
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable
 from datetime import date, datetime, timezone
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Literal, TypedDict, get_args
 
 from pydantic import field_serializer
 from ulid import ULID
@@ -138,6 +139,9 @@ def cost_of(model_id: str, input_tokens: int, output_tokens: int, cached_tokens:
 
 # ------------------------------------------------------------------ usage
 
+class MissingUsage(ValueError):
+    """A recognized artifact omitted complete token measurements; try another measured source."""
+
 class Usage(Strict):
     input_tokens: int = 0
     output_tokens: int = 0
@@ -180,14 +184,16 @@ def _from_mini_swe_agent(traj: dict) -> Usage:
             continue
         extra = m.get("extra") or {}
         usage = ((extra.get("response") or {}).get("usage")) or {}
-        if not usage:
-            continue
+        if usage.get("prompt_tokens") is None or usage.get("completion_tokens") is None:
+            raise MissingUsage("native trajectory lacks token usage for an assistant response")
         calls += 1
         inp += int(usage.get("prompt_tokens") or 0)
         out += int(usage.get("completion_tokens") or 0)
         cached += int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
         generation_costs.append(usage.get("cost"))
         agent_costs.append(extra.get("cost"))
+    if calls == 0:
+        raise MissingUsage("native trajectory contains no measured model calls")
     reported = _sum_if_complete(generation_costs)
     agent = _sum_if_complete(agent_costs)
     if agent is None:
@@ -198,6 +204,8 @@ def _from_mini_swe_agent(traj: dict) -> Usage:
 
 def _from_atif(traj: dict) -> Usage:
     fm = traj.get("final_metrics") or {}
+    if fm.get("total_prompt_tokens") is None or fm.get("total_completion_tokens") is None:
+        raise MissingUsage("ATIF trajectory lacks total token measurements")
     steps = [s for s in traj.get("steps") or [] if isinstance(s, dict) and s.get("source") == "agent" and s.get("metrics")]
     cached = fm.get("total_cached_tokens")
     return Usage(input_tokens=int(fm.get("total_prompt_tokens") or 0), output_tokens=int(fm.get("total_completion_tokens") or 0),
@@ -206,6 +214,8 @@ def _from_atif(traj: dict) -> Usage:
 
 
 def _from_harbor(agent_result: dict) -> Usage:
+    if agent_result.get("n_input_tokens") is None or agent_result.get("n_output_tokens") is None:
+        raise MissingUsage("Harbor result lacks token measurements")
     cached = agent_result.get("n_cache_tokens")
     return Usage(input_tokens=int(agent_result.get("n_input_tokens") or 0), output_tokens=int(agent_result.get("n_output_tokens") or 0),
                  cached_tokens=None if cached is None else int(cached), agent_reported_cost_usd=_decimal(agent_result.get("cost_usd")))
@@ -230,13 +240,18 @@ def usage_from_trial_dir(trial_dir: Path) -> Usage | None:
         if p.exists():
             try:
                 return solver_usage_from_trajectory(json.loads(p.read_text()))
+            except MissingUsage:
+                continue
             except ValueError as e:  # includes json.JSONDecodeError: a corrupt artifact is an error, not a silent fallback
                 raise ValueError(f"unreadable agent trajectory {p}: {e}") from e
     result = trial_dir / "result.json"
     if result.exists():
         agent_result = (json.loads(result.read_text() or "null") or {}).get("agent_result")
         if isinstance(agent_result, dict) and agent_result.get("n_input_tokens") is not None:
-            return _from_harbor(agent_result)
+            try:
+                return _from_harbor(agent_result)
+            except MissingUsage:
+                return None
     return None
 
 
@@ -291,7 +306,13 @@ def usd_for(model_id: str, usage: Usage) -> tuple[Decimal | None, str]:
     return cost_of(model_id, usage.input_tokens, usage.output_tokens, usage.cached_tokens or 0)
 
 
-def record_cost(layout: Any, trial_id: str | None, workflow_id: str | None, role: str, model_id: str, usage: Usage) -> CostRecord:
+def _event_id(trial_id, workflow_id, role, model_id, key: str) -> str:
+    identity = json.dumps([trial_id, workflow_id, role, model_id, key], separators=(",", ":")).encode()
+    return str(ULID.from_bytes(hashlib.sha256(identity).digest()[:16]))
+
+
+def record_cost(layout: Any, trial_id: str | None, workflow_id: str | None, role: str, model_id: str, usage: Usage, *,
+                idempotency_key: str | None = None) -> CostRecord:
     """Append one cost record (idempotent on trial, workflow, role, model and tokens). `layout` is the storage Layout
     (`trial_dir(trial_id)`) or a `Workspace` (`root`)."""
     if role not in ROLES:
@@ -299,12 +320,19 @@ def record_cost(layout: Any, trial_id: str | None, workflow_id: str | None, role
     mid = parse_model_id(model_id)
     path = _costs_path(layout, trial_id, workflow_id)
     existing = read_costs(path)
+    event_id = None
+    if idempotency_key is not None:
+        event_id = _event_id(trial_id, workflow_id, role, model_id, idempotency_key)
     key = (trial_id, workflow_id, role, model_id, usage.input_tokens, usage.output_tokens, usage.cached_tokens)
     for rec in existing:
-        if (rec.trial_id, rec.workflow_id, rec.role, rec.model, rec.input_tokens, rec.output_tokens, rec.cached_tokens) == key:
+        if event_id is not None and rec.cost_id == event_id:
+            if (rec.input_tokens, rec.output_tokens, rec.cached_tokens) != (usage.input_tokens, usage.output_tokens, usage.cached_tokens):
+                raise ValueError("cost event already recorded with different usage")
+            return rec
+        if event_id is None and (rec.trial_id, rec.workflow_id, rec.role, rec.model, rec.input_tokens, rec.output_tokens, rec.cached_tokens) == key:
             return rec
     usd, source = usd_for(model_id, usage)
-    rec = CostRecord(cost_id=str(ULID()), trial_id=trial_id, workflow_id=workflow_id, role=role, provider=mid.provider, model=model_id,
+    rec = CostRecord(cost_id=event_id or str(ULID()), trial_id=trial_id, workflow_id=workflow_id, role=role, provider=mid.provider, model=model_id,
                      input_tokens=usage.input_tokens, output_tokens=usage.output_tokens, cached_tokens=usage.cached_tokens,
                      usd=None if usd is None else usd.quantize(USD_PLACES, rounding=ROUND_HALF_EVEN), price_source=source,
                      at=datetime.now(timezone.utc))
@@ -321,3 +349,137 @@ def total_usd(records: Iterable[CostRecord]) -> tuple[Decimal, int]:
         else:
             total += r.usd
     return total, unknown
+
+
+def record_stakeholder_usage(layout: Any, trial_id: str, transcript: dict, model_id: str | None) -> dict:
+    """Bill measured stakeholder responses once per transcript event; cached requests/refusals are free.
+
+    Unknown events remain explicit in costs.status.json and do not become invented zero-cost rows.
+    The trial runner and index repair path share this identity, independently of their own workflow context.
+    """
+    events = transcript.get('events') or []
+    def event_key(event: dict, index: int) -> str:
+        return json.dumps(['stakeholder', event.get('request_id'), event.get('seq', index)], separators=(',', ':'))
+    expected_ids = {_event_id(trial_id, None, 'stakeholder', model_id, event_key(event, i)) for i, event in enumerate(events) if isinstance(event, dict)}
+    existing = read_costs(_costs_path(layout, trial_id, None))
+    legacy = [row for row in existing if row.role == 'stakeholder' and row.cost_id not in expected_ids]
+    if legacy:
+        # An old aggregate cannot be mapped safely to individual events. Preserve it and make the unresolved
+        # coverage explicit instead of billing the same historical responses a second time.
+        status = {'measured_events': 0, 'unknown_usage_count': 0, 'usage_complete': False,
+                  'legacy_records_retained': len(legacy), 'reason': 'legacy stakeholder cost rows lack event identities'}
+        atomic_json(_costs_path(layout, trial_id, None).with_name('costs.status.json'), {'stakeholder': status})
+        return status
+    known = unknown = 0
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or event.get('kind') != 'message' or event.get('role') != 'assistant' or event.get('tier') == 'refused':
+            continue
+        raw = event.get('usage')
+        if not isinstance(raw, dict) or not model_id:
+            unknown += 1
+            continue
+        try:
+            usage = Usage.model_validate(raw)
+        except ValueError:
+            unknown += 1
+            continue
+        if not (usage.input_tokens or usage.output_tokens or usage.reported_cost_usd is not None):
+            unknown += 1
+            continue
+        key = event_key(event, index)
+        record_cost(layout, trial_id, None, 'stakeholder', model_id, usage, idempotency_key=key)
+        known += 1
+    complete = bool(transcript.get('frozen')) and not unknown and not transcript.get('fetch_error') and not transcript.get('service_failure') and not transcript.get('pending')
+    status = {'measured_events': known, 'unknown_usage_count': unknown, 'usage_complete': complete}
+    path = _costs_path(layout, trial_id, None).with_name('costs.status.json')
+    previous = json.loads(path.read_text()) if path.exists() else {}
+    atomic_json(path, {**previous, 'stakeholder': status})
+    return status
+
+
+def repair_stakeholder_costs(layout: Any, trial_id: str) -> dict | None:
+    """Backfill measured frozen transcript events into the ledger when projecting preserved trial evidence."""
+    directory = _costs_path(layout, trial_id, None).parent
+    def read(name):
+        path = directory / name
+        return json.loads(path.read_text()) if path.exists() else {}
+    record = read('record.json')
+    config = read('run_config.json') or record.get('run_config') or {}
+    if (record.get('condition') or config.get('condition')) != 'interactive':
+        return None
+    transcript = read('transcript.json') or record.get('transcript') or {}
+    return record_stakeholder_usage(layout, trial_id, transcript, (config.get('stakeholder') or {}).get('model_id'))
+
+
+def accounting_status(layout: Any) -> dict:
+    """Completeness of recorded audit/stakeholder costs, including preserved legacy audit evidence.
+
+    A partial known total is still useful; its incompleteness must be visible alongside it.
+    These are observation counts, not estimates of missing dollar amounts.
+    """
+    root = Path(getattr(getattr(layout, 'layout', layout), 'root'))
+    unknown_calls = incomplete_audits = incomplete_stakeholders = unreadable = 0
+    for group in ('scenarios', 'trials'):
+        for path in (root / group).glob('*/audit.json'):
+            try:
+                record = json.loads(path.read_text())
+                if record.get('model') is not None or record.get('status') == 'pending':
+                    incomplete_audits += not (record.get('usage_complete') is True and record.get('cost_recorded') is True)
+            except (OSError, ValueError, TypeError, AttributeError):
+                unreadable += 1
+        for path in (root / group).glob('*/audit-usage/*.json'):
+            try:
+                receipt = json.loads(path.read_text())
+                unknown_calls += receipt.get('usage') is None or receipt.get('usage_complete') is False
+            except (OSError, ValueError, TypeError, AttributeError):
+                unreadable += 1
+    for path in (root / 'trials').glob('*/costs.status.json'):
+        try:
+            for status in json.loads(path.read_text()).values():
+                unknown_calls += int(status.get('unknown_usage_count') or 0)
+                incomplete_stakeholders += status.get('usage_complete') is not True
+        except (OSError, ValueError, TypeError, AttributeError):
+            unreadable += 1
+    return {'unknown_usage_count': unknown_calls, 'incomplete_audits': incomplete_audits,
+            'incomplete_stakeholder_records': incomplete_stakeholders, 'unreadable_accounting_records': unreadable,
+            'usage_complete': not (unknown_calls or incomplete_audits or incomplete_stakeholders or unreadable)}
+
+
+class AccountingSummary(TypedDict):
+    known_usd: Decimal
+    unpriced_rows: int
+    unknown_usage_attempts: int
+    complete: bool
+    records: int
+    unreadable_cost_files: int
+
+
+def accounting_summary(layout: Any) -> AccountingSummary:
+    """Pure known-spend total and completeness across workflow/trial ledgers and unknown usage receipts."""
+    root = Path(getattr(getattr(layout, 'layout', layout), 'root'))
+    total = Decimal(0); unpriced = records = unreadable = 0
+    seen: set[str] = set()
+    for path in [*sorted((root / 'trials').glob('*/costs.json')), *sorted((root / 'costs').glob('*.json'))]:
+        try:
+            rows = json.loads(path.read_text())
+            if isinstance(rows, dict):
+                rows = rows['records']
+            if not isinstance(rows, list):
+                raise ValueError('cost ledger is not a list')
+            for index, row in enumerate(rows):
+                identity = str(row.get('cost_id') or f'{path}:{index}')
+                if identity in seen:
+                    continue
+                seen.add(identity); records += 1
+                if row.get('usd') is None:
+                    unpriced += 1
+                else:
+                    amount = Decimal(str(row['usd']))
+                    if not amount.is_finite():
+                        raise ValueError('nonfinite cost')
+                    total += amount
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, InvalidOperation):
+            unreadable += 1
+    status = accounting_status(layout)
+    return {'known_usd': total, 'unpriced_rows': unpriced, 'unknown_usage_attempts': status['unknown_usage_count'],
+            'complete': status['usage_complete'] and not (unpriced or unreadable), 'records': records, 'unreadable_cost_files': unreadable}

@@ -762,22 +762,34 @@ def spend(request: Request, reader=Depends(reader_dep), identity: Identity = Dep
     wid = request.query_params.get("workflow_id") or None
     costs = reader.costs(R.CostFilter(workflow_id=[wid] if wid else None, limit=500))
     by_run: dict[str, dict] = {}
-    for c in costs:
-        if c.workflow_id:
-            a = by_run.setdefault(c.workflow_id, {"workflow_id": c.workflow_id, "usd": Decimal(0), "records": 0})
-            a["usd"] += c.usd
+    for c in all_rows(lambda f: reader.table("costs", f), R.TableFilter(where={"workflow_id": wid} if wid else {})):
+        if c.get("workflow_id"):
+            a = by_run.setdefault(c["workflow_id"], {"workflow_id": c["workflow_id"], "usd": Decimal(0), "records": 0, "unpriced_records": 0})
+            if c.get("usd") is None:
+                a["unpriced_records"] += 1
+            else:
+                a["usd"] += Decimal(str(c["usd"]))
             a["records"] += 1
     pools_fn = getattr(reader, "worker_pools", None)
     pools = pools_fn() if callable(pools_fn) else None
     p = render.Page("Spend", "spend", "spend", crumbs=(("Spend", None),), attrs={"source": "/api/spend", "poll-ms": "10000"}, live="updated 0s ago")
-    return page(p, pages.spend_body(reader.spend(), costs, settings.spend_cap_usd, [{**v, "usd": str(v["usd"])} for v in by_run.values()], pools), reader, identity, settings)
+    return page(p, pages.spend_body(reader.spend(), costs, settings.spend_cap_usd, [{**v, "usd": str(v["usd"])} for v in by_run.values()], pools,
+                                     accounting=_spend_accounting(reader, settings)), reader, identity, settings)
+
+
+def _spend_accounting(reader, settings: Settings) -> dict:
+    from swesim.costs import accounting_status
+    status = accounting_status(access.layout_for(settings))
+    unknown = reader.table("costs", R.TableFilter(where={"usd": None}, limit=1)).total
+    return {**status, "unpriced_records": unknown, "spend_complete": status["usage_complete"] and unknown == 0}
 
 
 @app.get("/api/spend")
 def api_spend(reader=Depends(reader_dep), settings: Settings = Depends(settings_dep)) -> JSONResponse:
     rows = [_dump(s) for s in reader.spend()]
     total = sum((Decimal(str(s["usd"])) for s in rows), Decimal(0))
-    return _json(200, {"spend": rows, "tiles": {"spend_usd": float(total), "spend_text": f"${total:,.2f}"}, "cap_usd": str(settings.spend_cap_usd) if settings.spend_cap_usd is not None else None})
+    return _json(200, {"spend": rows, "accounting": _spend_accounting(reader, settings),
+                       "tiles": {"spend_usd": float(total), "spend_text": f"${total:,.2f}"}, "cap_usd": str(settings.spend_cap_usd) if settings.spend_cap_usd is not None else None})
 
 
 @app.get("/search", response_class=HTMLResponse)
