@@ -739,7 +739,7 @@ def timeline(tid: str, reader=Depends(reader_dep), layout=Depends(layout_dep), i
     exchanges = [_dump(x) if ev else {k: v for k, v in _dump(x).items() if k not in R.EVALUATOR_ONLY_KEYS} for x in reader.exchanges(tid, ev)]
     result = {"trial_id": tid, "status": t["status"], "live": t["live"], "live_transcript_error": t["live_transcript_error"], "unresolved": t["unresolved"],
                        "evaluator": ev, "timeline": rows if ev else render_episode.public_rows(rows), "report": t["report"], "reward": t["reward"], "label": t["label"],
-                       "patience": patience, "meta": t["meta"], "exchanges": exchanges, "patch": t.get("patch")}
+                       "patience": patience, "meta": t["meta"], "exchanges": exchanges, "patch": t.get("patch"), "patch_file": t.get("patch_file")}
     return _json(200, result if ev else project(result))
 
 
