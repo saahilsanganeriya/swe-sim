@@ -7,14 +7,16 @@ judge/draft metadata, task-sense reasons) are rendered only when ``identity.eval
 """
 from __future__ import annotations
 
+from swesim.dashboard import origin
 from swesim.dashboard.public import project
 
 from swesim.dashboard.render import (
-    Column, chip, dash, difficulty_chip, evaluator_switch, h, ident, kv, outcome_chip, short, table,
+    Column, chip, dash, difficulty_chip, evaluator_switch, h, ident, kv, outcome_chip, short, table, when,
 )
 
 SCENARIO_COLUMNS = (
     Column("scenario_id", "scenario", "id", href="/scenario/{scenario_id}", n=28, filterable=True),
+    Column("origin_kind", "task origin", "chip", title="source", filterable=True),
     Column("version", "v", "num"),
     Column("source", "source", "text", filterable=True),
     Column("source_ref", "ref", "mono"),
@@ -33,21 +35,26 @@ def scenario_row_view(r) -> dict:
     ts = d.get("task_sense") or {}
     d["task_sense_label"] = None if not ts else ("coherent" if ts.get("coherent") and ts.get("fair_tests") else "review_needed")
     d["difficulty_tier"] = d.get("difficulty_tier") or None
+    d["origin_kind"] = origin.badge_label(r.source)
     return project(d)
 
 
-def scenarios_table(rows, total: int, offset: int, limit: int) -> str:
+def scenarios_table(rows, total: int, offset: int, limit: int, keep=None) -> str:
     return table("scenarios", SCENARIO_COLUMNS, (scenario_row_view(r) for r in rows), key="scenario_id", source="/api/scenarios",
-                 total=total, offset=offset, limit=limit,
+                 total=total, offset=offset, limit=limit, keep=keep,
                  empty="<strong>No scenarios yet.</strong> Start a creation job on <a href='/create'>Create</a>; rows appear as drafts are written.")
 
 
-def scenarios_body(page, counts: dict) -> str:
+def scenarios_body(page, counts: dict, facet: str | None = None, query=()) -> str:
+    """``facet`` is the task-origin key (``origin.PARAM``) and ``query`` the request's (key, value) pairs, carried by the facet bar
+    and the paging links so the selection is sticky."""
+    query = list(query)
     n_valid = sum(1 for r in page.items if r.validation_status == "valid")
     labelled = sum(1 for r in page.items if r.difficulty_tier)
-    lead = (f"<p class='lead'>{page.total} scenario version(s) in the index · {n_valid} valid · {labelled} with a difficulty label. "
+    lead = (f"<p class='lead' data-count-line>{page.total} scenario version(s) · showing {h(origin.subset_text(facet))} · {n_valid} valid · {labelled} with a difficulty label. "
             "Difficulty is measured by the screen run (brief §5), never asserted from diff size.</p>")
-    return "<h1>Scenarios</h1>" + lead + scenarios_table(page.items, page.total, page.offset, page.limit)
+    return ("<h1>Scenarios</h1>" + origin.facet_bar(facet, query, "/scenarios") + lead
+            + scenarios_table(page.items, page.total, page.offset, page.limit, keep=origin.keep_query(query)))
 
 
 # ----------------------------------------------------------------------------- detail
@@ -68,7 +75,7 @@ def scenario_sections(d: dict, row, versions: list, trials_html: str, evaluator:
     src = d.get("source_ref") or ""
     src_link = f" · <a href='{h(src)}' target='_blank' rel='noopener'>source ↗</a>" if str(src).startswith("http") else ""
     env = d.get("environment") or {}
-    head = [f"<h1>{h(sid)} <span class='mono'>v{h(d.get('version'))}</span></h1>",
+    head = [f"<h1>{h(sid)} {origin.badge(d.get('source') or (row.source if row else None))} <span class='mono'>v{h(d.get('version'))}</span></h1>",
             f"<p class='lead'>{chip(row.validation_status) if row else ''} {difficulty_chip(row.difficulty_tier if row else None)} "
             f"{dash(d.get('source'))} · <span class='mono'>{dash(src)}</span>{src_link}" + ("" if d["frozen"] else " · <span class='flag'>draft (not approved yet)</span>") + "</p>"]
     if versions and len(versions) > 1:
@@ -82,14 +89,14 @@ def scenario_sections(d: dict, row, versions: list, trials_html: str, evaluator:
         ("repository", f"<span class='mono'>{dash(env.get('repo_url'))}</span> @ {ident(env.get('base_commit'), 12)}"),
         ("contract", f"{d['contract']['fail_to_pass']} fail-to-pass · {d['contract']['pass_to_pass']} pass-to-pass · {d['contract']['protected_paths']} protected path(s)"),
         ("requirements / groups / checks", f"{len(d['requirements'])} / {len(d['groups'])} / {len(d['checks'])}"),
-        ("created", f"<span class='mono'>{dash(d.get('created_at'))}</span>"),
+        ("created", when(d.get("created_at"))),
     ])
     # difficulty label (brief §5)
     diff = d.get("difficulty") or {}
     if diff:
         hid, full = diff.get("hidden") or {}, diff.get("full") or {}
         difficulty = (f"<h2>Difficulty</h2><p>{difficulty_chip(diff.get('tier'))} screen model <span class='mono'>{dash(diff.get('model'))}</span> · hidden "
-                      f"{dash(hid.get('successes'))}/{dash(hid.get('n'))} · full {dash(full.get('successes'))}/{dash(full.get('n'))} · labelled {dash(diff.get('labelled_at'))} · "
+                      f"{dash(hid.get('successes'))}/{dash(hid.get('n'))} · full {dash(full.get('successes'))}/{dash(full.get('n'))} · labelled {when(diff.get('labelled_at'))} · "
                       f"<a href='{art}/difficulty.json'>difficulty.json</a></p>")
     else:
         difficulty = ("<h2>Difficulty</h2><p class='empty'>Not screened yet. Run <em>purpose = screen</em> on <a href='/run'>Run</a> (hidden k=2, full k=1 with the screen model); "
@@ -99,7 +106,7 @@ def scenario_sections(d: dict, row, versions: list, trials_html: str, evaluator:
         sense = (f"<h2>Task sense</h2><p>{chip('coherent' if ts.get('coherent') else 'not coherent', 'good' if ts.get('coherent') else 'critical')} "
                  f"{chip('fair tests' if ts.get('fair_tests') else 'unfair tests', 'good' if ts.get('fair_tests') else 'critical')} "
                  f"{chip('plausible withholding' if ts.get('plausible_withholding') else 'implausible withholding', 'good' if ts.get('plausible_withholding') else 'serious')} "
-                 f"<span class='muted small'>audited {dash(ts.get('audited_at'))} by <span class='mono'>{dash(ts.get('model'))}</span></span></p>")
+                 f"<span class='muted small'>audited {when(ts.get('audited_at'))} by <span class='mono'>{dash(ts.get('model'))}</span></span></p>")
         if evaluator and isinstance(ts.get("reasons"), dict):
             sense += "<div data-evaluator-only><dl class='kv'>" + "".join(f"<dt>{h(k)}</dt><dd>{h(v)}</dd>" for k, v in ts["reasons"].items()) + "</dl></div>"
         if ts.get("usage_complete") is not True or ts.get("cost_recorded") is not True:

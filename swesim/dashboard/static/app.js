@@ -16,17 +16,38 @@
     return e;
   }
   function shortId(s, n) { s = String(s); return s.length <= n ? s : s.slice(0, n) + "…"; }
-  function dayClock(v) {
-    if (!v) return "—";
-    const d = new Date(v); if (isNaN(d)) return String(v);
-    const p = (x) => String(x).padStart(2, "0");
-    return p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) + " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes());
+  /* Timestamps: the server renders <time datetime="<ISO UTC>" data-local>YYYY-MM-DD HH:MM Z</time> (render.when); here every
+     time[data-local] is re-formatted in the viewer's zone (year-month-day hour:minute, 24 h, never seconds) on load and after
+     each live refresh. data-local="clock" (episode timeline) keeps the HH:MM shape. The ISO value stays in the title. */
+  const LOCAL_FMT = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  const CLOCK_FMT = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  const ZONE_FMT = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" });
+  function localTime(iso, clockOnly) {
+    const d = new Date(iso); if (isNaN(d)) return null;
+    const p = {}; (clockOnly ? CLOCK_FMT : LOCAL_FMT).formatToParts(d).forEach((x) => { p[x.type] = x.value; });
+    return clockOnly ? p.hour + ":" + p.minute : p.year + "-" + p.month + "-" + p.day + " " + p.hour + ":" + p.minute;
   }
+  function zoneName(d) { const z = ZONE_FMT.formatToParts(d).find((x) => x.type === "timeZoneName"); return z ? z.value : "local"; }
+  function timeEl(iso, clockOnly) {
+    if (!iso) return document.createTextNode("—");
+    const t = el("time", null, localTime(iso, clockOnly) || String(iso));
+    t.dateTime = iso; t.dataset.local = clockOnly ? "clock" : ""; t.title = iso + " (UTC) · shown in " + zoneName(new Date(iso));
+    return t;
+  }
+  function localizeTimes(root) {
+    (root || document).querySelectorAll("time[data-local]").forEach((t) => {
+      const txt = localTime(t.dateTime, t.dataset.local === "clock");
+      if (txt === null) return;
+      t.textContent = txt; t.title = t.dateTime + " (UTC) · shown in " + zoneName(new Date(t.dateTime));
+    });
+  }
+  localizeTimes(document);
   const STATUS = { valid: "good", completed: "good", finished: "good", done: "good", registered: "good", kept: "good", approved: "good", accepted: "good", informative: "good",
     running: "run", launched: "run", pending: "run", requested: "run", drafting: "run", compiling: "run", validating: "run", planned: "run", "awaiting-approval": "run", open: "run",
     failed: "critical", invalid: "critical", "launch-failed": "critical", "runner-error": "critical", error: "critical", "unit-failed": "critical", rejected: "critical", terminated: "critical", timed_out: "critical", broken: "critical",
     unresolved: "serious", cancelled: "serious", review_needed: "serious",
-    archived: "neutral", saturated: "neutral", continued_as_new: "neutral", unknown: "neutral", mined: "neutral" };
+    archived: "neutral", saturated: "neutral", continued_as_new: "neutral", unknown: "neutral", mined: "neutral",
+    novel: "info", "swe-bench a": "neutral", authored: "neutral" };
   const ICON = { good: "●", run: "◐", critical: "✕", serious: "◇", neutral: "○", "": "○" };
   function chip(text, kind) {
     if (text === null || text === undefined || text === "") return el("span", "muted", "—");
@@ -85,7 +106,7 @@
     if (col.kind === "id") inner = ident(v, col.n || 12, href);
     else if (col.kind === "chip") inner = chip(v);
     else if (col.kind === "model") inner = modelChip(v);
-    else if (col.kind === "time") { if (v) { inner = el("time", null, dayClock(v)); inner.dateTime = v; inner.title = v; } else inner = document.createTextNode("—"); }
+    else if (col.kind === "time") inner = timeEl(v, false);
     else if (col.kind === "metric") inner = metric(v);
     else if (col.kind === "usd") inner = usd(v);
     else if (col.kind === "bool") inner = v === null || v === undefined ? document.createTextNode("—") : chip(v ? "yes" : "no", v ? "good" : "neutral");
@@ -236,8 +257,8 @@
     const active = target.contains(document.activeElement) ? document.activeElement : null;
     const focus = active ? { figure: active.closest("figure")?.id, view: active.dataset.view, href: active.getAttribute("href") } : null;
     const nodes = [], parser = new DOMParser();
-    const allowed = new Set("div span section h2 h3 h4 p em strong figure figcaption ul li i button table caption thead tbody tr th td a svg g polyline path rect circle line text title tspan".split(" "));
-    const attributes = new Set("class id role title type tabindex href style scope colspan rowspan viewbox width height x y x1 y1 x2 y2 cx cy r rx d points text-anchor transform stroke-dasharray data-view data-chart-tabs".split(" "));
+    const allowed = new Set("div span section h2 h3 h4 p em strong figure figcaption ul li i button table caption thead tbody tr th td a svg g polyline path rect circle line text title tspan time".split(" "));
+    const attributes = new Set("class id role title type tabindex href style scope colspan rowspan viewbox width height x y x1 y1 x2 y2 cx cy r rx d points text-anchor transform stroke-dasharray data-view data-chart-tabs datetime data-local".split(" "));
     Object.values(charts).forEach((markup) => {
       const doc = parser.parseFromString(markup, "text/html");
       doc.body.querySelectorAll("*").forEach((node) => {
@@ -252,6 +273,7 @@
       Array.from(doc.body.childNodes).forEach((node) => nodes.push(document.importNode(node, true)));
     });
     target.replaceChildren(...nodes);
+    localizeTimes(target);
     target.querySelectorAll("figure[id]").forEach((fig) => {
       const state = selected.get(fig.id); if (!state) return;
       fig.querySelectorAll("[data-chart-tabs] button").forEach((button) => button.setAttribute("aria-selected", String(button.dataset.view === state.view)));
@@ -436,7 +458,7 @@
         t.timeline.filter((r) => r.actor === "agent" || r.actor === "stakeholder").filter((r) => r.kind !== "agent-step" && r.kind !== "tool_call").forEach((r) => {
           const b = el("div", "bubble " + r.actor + " " + (r.kind || ""));
           const who = el("div", "who"); who.appendChild(el("span", "badge " + r.actor, r.actor)); who.appendChild(el("span", "xtype", r.kind));
-          if (r.ts_iso) { const tm = el("time", null, r.ts_iso.slice(11, 19)); tm.dateTime = r.ts_iso; who.appendChild(tm); } else who.appendChild(el("span", "flag", "no timestamp"));
+          if (r.ts_iso) who.appendChild(timeEl(r.ts_iso, true)); else who.appendChild(el("span", "flag", "no timestamp"));
           if (r.meta && r.meta.patience_remaining !== undefined && r.meta.patience_remaining !== null) who.appendChild(el("span", "muted", "patience " + r.meta.patience_remaining));
           b.appendChild(who); b.appendChild(el("div", "text", r.text || "")); chat.appendChild(b);
         });

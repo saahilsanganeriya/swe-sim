@@ -1,7 +1,8 @@
 """swesim console: the operator surface for the whole record (FastAPI, server-rendered HTML + vanilla JS, no build step).
 
 Pages answer one question each (design spec §1): Home (what is running and what changed), Scenarios, Trials/Episode,
-Candidates, Workflows, Review, Leaderboard, Database, Artifacts, Create/Run, Spend, Search. Every list, filter, funnel
+Candidates, Workflows, Review, Leaderboard, Database, Artifacts, Create/Run, Spend, Search; Explainer explains the system
+from structured data (``render_explainer``). Every list, filter, funnel
 and score comes from the ``IndexReader`` (``access.reader_for``); the artifact browser is the one page that walks the
 filesystem through ``Layout``. Live updates poll the ``/api/*`` JSON twins of each page.
 
@@ -33,8 +34,8 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 
-from swesim.dashboard import access, actions, console, data, pages, render, render_console, render_episode, render_scenario
-from swesim.dashboard import health as health_cache, render_trends, trends
+from swesim.dashboard import access, actions, console, data, origin, pages, render, render_console, render_episode, render_scenario
+from swesim.dashboard import health as health_cache, render_explainer, render_trends, trends
 from swesim.dashboard import rows as R
 from swesim.dashboard.data import merge_timeline  # noqa: F401 - contract re-export (tests/test_contracts.py)
 from swesim.dashboard.identity import Identity, identity_from_headers
@@ -149,6 +150,26 @@ def _paging(request: Request, default_limit: int = 100) -> tuple[int, int]:
     return offset, limit
 
 
+def _pool(request: Request, lists: dict) -> str | None:
+    """The task-origin facet (``?pool=novel|swebench-a``, ``swesim.dashboard.origin``) mapped onto the ``source`` filter in
+    ``lists``; while a facet is active it overrides an explicit ``?source=``. Returns the validated facet key or None (All)."""
+    key = origin.facet_key(request.query_params.get(origin.PARAM))
+    if key:
+        lists["source"] = origin.sources_for(key)
+    return key
+
+
+def trial_views(reader, trials: list, source: str | None = None) -> list[dict]:
+    """``pages.trial_view`` for a batch, with each trial's scenario source (the task-origin badge) looked up once per batch;
+    ``source`` short-circuits the lookup when every trial is on one known scenario."""
+    trials = list(trials)
+    if source is not None or not trials:
+        return [pages.trial_view(t, source=source) for t in trials]
+    ids = sorted({t.scenario_id for t in trials if t.scenario_id})
+    sources = {s.scenario_id: s.source for s in all_rows(reader.scenarios, R.ScenarioFilter(scenario_id=ids, latest_only=True))} if ids else {}
+    return [pages.trial_view(t, source=sources.get(t.scenario_id)) for t in trials]
+
+
 def page(p: render.Page, body: str, reader, identity: Identity, settings: Settings) -> HTMLResponse:
     return HTMLResponse(render.layout(p, body, counts=counts(reader, settings), identity=identity, temporal_url=settings.workflow_url("").rsplit("/workflows/", 1)[0] if settings.workflow_url("") else None))
 
@@ -212,8 +233,8 @@ async def home_data(reader, settings: Settings) -> dict:
     total = sum((Decimal(str(s.usd)) for s in spend), Decimal(0))
     tiles = {**c, "trials_completed": completed.total, "trials_unresolved": unresolved.total, "spend_usd": float(total), "spend_text": f"${total:,.2f}"}
     funnel = [_dump(s) for s in reader.funnel()]
-    return {"tiles": tiles, "running": [pages.trial_view(t) for t in running.items],
-            "recent": [pages.trial_view(t) for t in recent.items if t.status != "running"],
+    return {"tiles": tiles, "running": trial_views(reader, running.items),
+            "recent": trial_views(reader, [t for t in recent.items if t.status != "running"]),
             "workflows": wviews[:15], "workflow_error": err, "funnel": funnel,
             "charts": {"chart-home-funnel": pages.charts.funnel(funnel, "chart-home-funnel")},
             "generated_at": datetime.now(UTC).isoformat(timespec="seconds")}
@@ -241,16 +262,20 @@ def api_counts(reader=Depends(reader_dep), settings: Settings = Depends(settings
 @app.get("/scenarios", response_class=HTMLResponse)
 def scenarios(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
     offset, limit = _paging(request, 200)
-    f = R.ScenarioFilter(**_lists(request, "validation_status", "source", "difficulty_tier"), latest_only=request.query_params.get("latest") == "1", offset=offset, limit=limit)
+    lists = _lists(request, "validation_status", "source", "difficulty_tier")
+    facet = _pool(request, lists)
+    f = R.ScenarioFilter(**lists, latest_only=request.query_params.get("latest") == "1", offset=offset, limit=limit)
     pg = reader.scenarios(f)
     p = render.Page("Scenarios", "scenarios", "scenarios", crumbs=(("Scenarios", None),))
-    return page(p, render_scenario.scenarios_body(pg, counts(reader, settings)), reader, identity, settings)
+    return page(p, render_scenario.scenarios_body(pg, counts(reader, settings), facet, request.query_params.multi_items()), reader, identity, settings)
 
 
 @app.get("/api/scenarios")
 def api_scenarios(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
     offset, limit = _paging(request, 200)
-    pg = reader.scenarios(R.ScenarioFilter(**_lists(request, "validation_status", "source", "difficulty_tier"), offset=offset, limit=limit))
+    lists = _lists(request, "validation_status", "source", "difficulty_tier")
+    _pool(request, lists)
+    pg = reader.scenarios(R.ScenarioFilter(**lists, latest_only=request.query_params.get("latest") == "1", offset=offset, limit=limit))
     return _json(200, {"items": [render_scenario.scenario_row_view(r) for r in pg.items], "total": pg.total, "offset": pg.offset, "limit": pg.limit})
 
 
@@ -273,7 +298,7 @@ def scenario(sid: str, request: Request, reader=Depends(reader_dep), layout=Depe
              "controls": [], "validation": {}, "failures": [], "probe": {}, "approval": {}, "compile": {}, "assets": {}, "hidden_assets": 0, "difficulty": {}, "audit": {}, "judge": {},
              "draft_meta": {}, "review": {}, "files": [], "dir": None}
     trials = reader.trials(R.TrialFilter(scenario_id=[sid], limit=500))
-    trials_html = render.table("scenario-trials", pages.TRIAL_COLUMNS, [pages.trial_view(t) for t in trials.items], key="trial_id",
+    trials_html = render.table("scenario-trials", pages.TRIAL_COLUMNS, trial_views(reader, trials.items, source=(row.source if row else d.get("source")) or None), key="trial_id",
                                empty="<strong>No trials on this scenario yet.</strong> Start one on <a href='/run'>Run</a>.", export=True)
     p = render.Page(f"Scenario {sid}", "scenarios", "scenario", crumbs=(("Scenarios", "/scenarios"), (sid, None)))
     return page(p, render_scenario.scenario_body(d, row, versions, trials_html, identity.evaluator), reader, identity, settings)
@@ -281,7 +306,8 @@ def scenario(sid: str, request: Request, reader=Depends(reader_dep), layout=Depe
 
 def _trial_filter(request: Request, default_limit: int = 200) -> R.TrialFilter:
     offset, limit = _paging(request, default_limit)
-    lists = _lists(request, "scenario_id", "model", "condition", "brief_profile", "status", "purpose", "origin", "trial_id")
+    lists = _lists(request, "scenario_id", "model", "condition", "brief_profile", "status", "purpose", "origin", "trial_id", "source")
+    _pool(request, lists)
     status = lists.pop("status")
     if status and "unresolved" in status:
         status = sorted(set(status) | {"runner-error", "launch-failed", "unit-failed", "cancelled"})
@@ -294,21 +320,21 @@ def _trial_filter(request: Request, default_limit: int = 200) -> R.TrialFilter:
 def trials(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
     f = _trial_filter(request)
     pg = reader.trials(f)
-    views = [pages.trial_view(t) for t in pg.items]
+    views = trial_views(reader, pg.items)
     everything = reader.trials(R.TrialFilter(limit=500)).items
     facets = {"scenario_id": sorted({t.scenario_id for t in everything}), "version": sorted({t.version for t in everything if t.version is not None}),
               "model": sorted({t.model for t in everything}), "status": sorted({t.status for t in everything} | {"unresolved"}),
               "outcome_code": sorted({t.outcome_code for t in everything if t.outcome_code is not None}), "origin": sorted({t.origin for t in everything})}
     current = {k: request.query_params.getlist(k) for k in ("scenario_id", "version", "model", "condition", "brief_profile", "status", "outcome_code", "purpose", "origin")}
-    current.update(since=request.query_params.get("since"), until=request.query_params.get("until"))
+    current.update(since=request.query_params.get("since"), until=request.query_params.get("until"), pool=origin.facet_key(request.query_params.get(origin.PARAM)))
     p = render.Page("Trials", "trials", "trials", crumbs=(("Trials", None),))
-    return page(p, pages.trials_body(pg, views, facets, current), reader, identity, settings)
+    return page(p, pages.trials_body(pg, views, facets, current, request.query_params.multi_items()), reader, identity, settings)
 
 
 @app.get("/api/trials")
 def api_trials(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
     pg = reader.trials(_trial_filter(request))
-    return _json(200, {"items": [pages.trial_view(t) for t in pg.items], "total": pg.total, "offset": pg.offset, "limit": pg.limit})
+    return _json(200, {"items": trial_views(reader, pg.items), "total": pg.total, "offset": pg.offset, "limit": pg.limit})
 
 
 @app.get("/candidates", response_class=HTMLResponse)
@@ -400,7 +426,7 @@ async def workflow(wid: str, request: Request, reader=Depends(reader_dep), ident
     if row is None and job is None and progress is None:
         raise HTTPException(404)
     children = [pages.workflow_view(_dump(w), settings) for w in reader.workflows(R.WorkflowFilter(parent_workflow_id=[wid], limit=200)).items]
-    trials = [pages.trial_view(t) for t in reader.trials(R.TrialFilter(limit=500)).items if t.workflow_id == wid]
+    trials = trial_views(reader, [t for t in reader.trials(R.TrialFilter(limit=500)).items if t.workflow_id == wid])
     p = render.Page(f"Workflow {wid}", "workflows", "workflow", crumbs=(("Workflows", "/workflows"), (wid, None)))
     if not identity.evaluator:
         row = row.model_copy(update={"params_summary": project(row.params_summary)}) if row else None
@@ -442,6 +468,7 @@ def runs_redirect() -> RedirectResponse:
 
 def _lb_filter(request: Request, reader) -> tuple[R.LeaderboardFilter, dict]:
     lists = _lists(request, "brief_profile", "source", "condition", "tier")
+    facet = _pool(request, lists)
     tiers = lists.pop("tier")
     include_sat = request.query_params.get("include_saturated") == "1"
     difficulty = request.query_params.get("difficulty_tier") or None
@@ -466,7 +493,7 @@ def _lb_filter(request: Request, reader) -> tuple[R.LeaderboardFilter, dict]:
     current = {k: v or [] for k, v in lists.items()}
     options = dict(cohort_of(t) for t in all_rows(reader.trials, R.TrialFilter(purpose=[purpose], status=["completed"])))
     current.update(tier=tiers or [], include_saturated=include_sat, purpose=purpose, difficulty_tier=[difficulty] if difficulty else [],
-                   evaluation_cohort=f.evaluation_cohort, cohort_options=sorted(options.items()), metric_k=f.metric_k)
+                   evaluation_cohort=f.evaluation_cohort, cohort_options=sorted(options.items()), metric_k=f.metric_k, pool=facet)
     return f, current
 
 
@@ -553,12 +580,14 @@ def board_views(reader, rows: list, eligible: set[str], f: R.LeaderboardFilter) 
     return views
 
 
-def leaderboard_charts(trials: list, rows: list, cohort: str | None = None) -> tuple[str, str]:
+def leaderboard_charts(trials: list, rows: list, cohort: str | None = None, sources: dict[str, str] | None = None) -> tuple[str, str]:
+    """``sources`` (scenario_id -> ScenarioRow.source) labels every matrix row with its task-origin badge."""
+    sources = sources or {}
     if cohort is None:
         parts = []
         for key, label in sorted({cohort_of(t) for t in trials}):
             matrix, chart = leaderboard_charts([t for t in trials if cohort_of(t)[0] == key],
-                                                [r for r in rows if r.evaluation_cohort == key], key)
+                                                [r for r in rows if r.evaluation_cohort == key], key, sources)
             heading = f"<h3>{render.h(label)}</h3>"
             parts.append((heading + matrix, heading + chart))
         return ("".join(p[0] for p in parts), "".join(p[1] for p in parts)) if parts else ("<p class='empty'>No eligible trials.</p>", "")
@@ -579,7 +608,9 @@ def leaderboard_charts(trials: list, rows: list, cohort: str | None = None) -> t
         matrices.append(f"<h3>{render.h(condition)} · {render.h(profile)}</h3>" + pages.charts.matrix(
             sorted(eligible), models, lambda sid, model, c=condition, p=profile: cell(sid, model, c, p),
             chart_id=f"chart-matrix-{condition}-{profile}-{cohort}", title=f"{condition} / {profile}: pass rate per scenario × model",
-            col_label=lambda m: m.split("/")[-1][:18]))
+            col_label=lambda m: m.split("/")[-1][:18],
+            row_label=lambda sid: f"{sid} · {origin.badge_label(sources.get(sid))}" if sources.get(sid) else sid,
+            row_html=lambda sid: f"<a href='/scenario/{render.h(sid)}'>{render.h(sid)}</a> {origin.badge(sources.get(sid))}"))
     matrix_html = "".join(matrices) or "<p class='empty'>No eligible scenario has completed trials for this purpose.</p>"
     chart_rows = [{"model": r.model, "condition": r.condition, "pass_rate": float(r.pass_rate) if r.pass_rate is not None else None, "n": r.n} for r in rows]
     chart_html = pages.charts.grouped_bars(chart_rows, metric="pass_rate", chart_id="chart-lb-" + cohort, title="pass rate per model per condition")
@@ -591,6 +622,9 @@ def leaderboard(request: Request, reader=Depends(reader_dep), identity: Identity
     f, current = _lb_filter(request, reader)
     rows = reader.leaderboard(f)
     gate = leaderboard_gate(reader, f.include_saturated)
+    sources = {g["scenario_id"]: g["source"] for g in gate}
+    if f.source:  # the task-origin facet (or an explicit source filter): the gate table and its hero count show the same subset as the board
+        gate = [g for g in gate if g["source"] in f.source]
     trials = board_trials(reader, f)
     eligible = {t.scenario_id for t in trials}
     saturated_views: list[dict] = []
@@ -605,20 +639,21 @@ def leaderboard(request: Request, reader=Depends(reader_dep), identity: Identity
         want = getattr(f, key)
         if want:
             trials = [t for t in trials if getattr(t, key) in want]
-    matrix_html, chart_html = leaderboard_charts(trials, rows)
+    matrix_html, chart_html = leaderboard_charts(trials, rows, sources=sources)
     p = render.Page("Leaderboard", "leaderboard", "leaderboard", crumbs=(("Leaderboard", None),),
                     attrs={"source": "/api/leaderboard?" + str(request.query_params), "chart-target": "leaderboard-charts", "poll-ms": "10000"}, live="updated 0s ago")
-    return page(p, pages.leaderboard_body(views, gate, current, matrix_html, chart_html, saturated_views), reader, identity, settings)
+    return page(p, pages.leaderboard_body(views, gate, current, matrix_html, chart_html, saturated_views, request.query_params.multi_items()), reader, identity, settings)
 
 
 @app.get("/leaderboard/evidence", response_class=HTMLResponse)
 def leaderboard_evidence(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
-    f, _ = _lb_filter(request, reader)
+    f, current = _lb_filter(request, reader)
     selected = board_trials(reader, f)
     offset, limit = _paging(request)
-    body = (f"<h1>Leaderboard evidence</h1><p class='lead'>{len(selected)} admitted attempts in the selected evaluation cohort.</p>"
-            + render.table("leaderboard-evidence", pages.TRIAL_COLUMNS, [pages.trial_view(t) for t in selected[offset:offset + limit]],
-                           key="trial_id", total=len(selected), offset=offset, limit=limit, empty="No admitted attempts match this cell."))
+    body = (f"<h1>Leaderboard evidence</h1><p class='lead' data-count-line>{len(selected)} admitted attempts in the selected evaluation cohort · showing {render.h(origin.subset_text(current.get('pool')))}.</p>"
+            + render.table("leaderboard-evidence", pages.TRIAL_COLUMNS, trial_views(reader, selected[offset:offset + limit]),
+                           key="trial_id", total=len(selected), offset=offset, limit=limit, keep=origin.keep_query(request.query_params.multi_items()),
+                           empty="No admitted attempts match this cell."))
     return page(render.Page("Leaderboard evidence", "leaderboard", "leaderboard-evidence", crumbs=(("Leaderboard", "/leaderboard"), ("Evidence", None))), body, reader, identity, settings)
 
 
@@ -626,11 +661,14 @@ def leaderboard_evidence(request: Request, reader=Depends(reader_dep), identity:
 def api_leaderboard(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
     f, _ = _lb_filter(request, reader)
     gate = leaderboard_gate(reader, f.include_saturated)
+    sources = {g["scenario_id"]: g["source"] for g in gate}
+    if f.source:
+        gate = [g for g in gate if g["source"] in f.source]
     trials = board_trials(reader, f)
     eligible = {t.scenario_id for t in trials}
     rows = reader.leaderboard(f)
     views = board_views(reader, rows, eligible, f)
-    matrix, chart = leaderboard_charts(trials, rows)
+    matrix, chart = leaderboard_charts(trials, rows, sources=sources)
     return _json(200, {"items": views, "gate": gate, "charts": {"matrix": "<h2>Per-scenario matrix</h2>" + matrix,
                                                               "pass": "<h2>Pass rate by condition</h2>" + chart},
                        "fragments": {"leaderboard-comparison": {"table": pages.leaderboard_comparison(views)}}})
@@ -680,9 +718,16 @@ def trend_evidence(request: Request, reader=Depends(reader_dep), identity: Ident
     offset, limit = _paging(request)
     body = (f"<h1>Trend evidence</h1><p class='lead'>{len(selected)} admitted {render.h(f.purpose)} attempts completed through {through.isoformat()} UTC. "
             "These are the supporting records for the selected cumulative measurement.</p>"
-            + render.table("trend-evidence", pages.TRIAL_COLUMNS, [pages.trial_view(t) for t in selected[offset:offset + limit]], key="trial_id",
+            + render.table("trend-evidence", pages.TRIAL_COLUMNS, trial_views(reader, selected[offset:offset + limit]), key="trial_id",
                            total=len(selected), offset=offset, limit=limit, empty="No admitted trials match this measurement."))
     return page(render.Page("Trend evidence", "trends", "trend-evidence", crumbs=(("Trends", "/trends"), ("Evidence", None))), body, reader, identity, settings)
+
+
+@app.get("/explainer", response_class=HTMLResponse)
+def explainer_page(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    """The system explained from structured data (render_explainer.SECTIONS); static, identical for every identity."""
+    p = render.Page("Explainer", "explainer", "explainer", crumbs=(("Explainer", None),))
+    return page(p, render_explainer.body(), reader, identity, settings)
 
 
 @app.get("/health", response_class=HTMLResponse)
@@ -721,7 +766,10 @@ def episode(tid: str, reader=Depends(reader_dep), layout=Depends(layout_dep), id
     if not identity.evaluator:
         t = {**t, "report": project(t["report"]), "reward": project(t["reward"]), "status": project(t["status"])}
     row = reader.trial(tid)
-    body = render_episode.episode_body(t, row, _timeline_rows(t), lambda tt, name: data.resolve_trial_file(layout, tt, name), identity.evaluator)
+    sid = t["meta"].get("scenario_id")
+    srow = reader.scenario(sid) if sid and access.ID_RE.fullmatch(str(sid)) else None
+    body = render_episode.episode_body(t, row, _timeline_rows(t), lambda tt, name: data.resolve_trial_file(layout, tt, name), identity.evaluator,
+                                       extras={"scenario_source": srow.source if srow else None})
     p = render.Page(f"Episode {tid}", "trials", "episode", crumbs=(("Trials", "/trials"), (tid, None)),
                     attrs={"trial": tid, "live": "true" if t["live"] else "false", "poll-ms": "3000"}, live="live" if t["live"] else None)
     return page(p, body, reader, identity, settings)

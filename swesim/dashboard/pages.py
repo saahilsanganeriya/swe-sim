@@ -12,13 +12,13 @@ import os
 from decimal import Decimal
 from pathlib import Path
 
-from swesim.dashboard import charts
+from swesim.dashboard import charts, origin
 from swesim.index import reports
 from swesim.dashboard.public import project
 from urllib.parse import urlencode
 from swesim.stages.score import OUTCOME_NAMES
 from swesim.dashboard.render import (
-    Column, chip, code_block, dash, difficulty_chip, fmt_usd, h, hero, ident, kv, model_chip, table, tier_of, tile, tiles,
+    Column, chip, code_block, dash, difficulty_chip, fmt_usd, h, hero, ident, kv, model_chip, table, tier_of, tile, tiles, when,
 )
 
 # ----------------------------------------------------------------------------- columns
@@ -26,6 +26,7 @@ from swesim.dashboard.render import (
 TRIAL_COLUMNS = (
     Column("trial_id", "trial", "id", href="/trial/{trial_id}"),
     Column("scenario_id", "scenario", "text", href="/scenario/{scenario_id}", filterable=True),
+    Column("origin_kind", "task origin", "chip", title="scenario_source", filterable=True),
     Column("version", "v", "num"),
     Column("model", "model", "model", filterable=True),
     Column("condition", "condition", "text", filterable=True),
@@ -57,6 +58,7 @@ WORKFLOW_COLUMNS = (
 CANDIDATE_COLUMNS = (
     Column("instance_id", "candidate", "mono", filterable=True),
     Column("source_key", "source key", "text", filterable=True),
+    Column("origin_kind", "task origin", "chip", title="source", filterable=True),
     Column("repo", "repo", "text"),
     Column("pr_kind", "band", "text"),
     Column("stage", "stage", "chip", filterable=True),
@@ -69,9 +71,12 @@ CANDIDATE_COLUMNS = (
 )
 
 
-def trial_view(r) -> dict:
-    """A TrialRow as the table/JSON row: adds the outcome name (score.OUTCOME_NAMES) and a hover detail."""
+def trial_view(r, source: str | None = None) -> dict:
+    """A TrialRow as the table/JSON row: adds the outcome name (score.OUTCOME_NAMES), a hover detail and, from the scenario's
+    ``source`` (a TrialRow does not carry it; ``app.trial_views`` looks it up), the task-origin badge."""
     d = r.model_dump(mode="json")
+    d["scenario_source"] = source
+    d["origin_kind"] = origin.badge_label(source)
     d["outcome"] = OUTCOME_NAMES.get(r.outcome_code) if r.outcome_code is not None else None
     d["outcome_detail"] = f"outcome code {r.outcome_code}" if r.outcome_code is not None else None
     if not d["outcome"] and r.status not in ("completed", "running", "launched", "planned"):
@@ -150,8 +155,12 @@ def _filter_select(name: str, values: list, current: list | None, label: str) ->
     return f"<label>{h(label)}<select name='{h(name)}'><option value=''>all</option>{opts}</select></label>"
 
 
-def trials_body(page, views: list[dict], facets: dict, current: dict) -> str:
-    form = ["<form class='toolbar' method='get' action='/trials'>",
+def trials_body(page, views: list[dict], facets: dict, current: dict, query=()) -> str:
+    """``current['pool']`` is the task-origin facet; ``query`` the request's (key, value) pairs, carried by the facet bar, the
+    filter form and the paging links."""
+    query = list(query)
+    facet = current.get("pool")
+    form = ["<form class='toolbar' method='get' action='/trials'>", origin.hidden_input(facet),
             _filter_select("scenario_id", facets["scenario_id"], current.get("scenario_id"), "scenario"),
             _filter_select("version", facets["version"], current.get("version"), "version"),
             _filter_select("model", facets["model"], current.get("model"), "model"),
@@ -165,9 +174,10 @@ def trials_body(page, views: list[dict], facets: dict, current: dict) -> str:
             f"<label>until<input type='date' name='until' value='{h(current.get('until') or '')}'></label>",
             "<button type='submit' class='button'>Filter</button> <a class='button' href='/trials'>Reset</a></form>"]
     body = ["<h1>Trials</h1><p class='lead'>Every trial record and every planned, launched, unresolved or launch-failed attempt. Unresolved attempts never enter n or pass@k.</p>",
-            "".join(form),
+            origin.facet_bar(facet, query, "/trials"), "".join(form),
+            f"<p class='muted small' data-count-line>{page.total} attempt(s) match · showing {h(origin.subset_text(facet))}</p>",
             table("trials", TRIAL_COLUMNS, views, key="trial_id", total=page.total, offset=page.offset, limit=page.limit, source="/api/trials",
-                  empty="<strong>No trials match.</strong> Reset the filters, or start a run on <a href='/run'>Run</a>.")]
+                  keep=origin.keep_query(query), empty="<strong>No trials match.</strong> Reset the filters, or start a run on <a href='/run'>Run</a>.")]
     return "".join(body)
 
 
@@ -240,23 +250,33 @@ def decision_views(discovery: dict | None) -> list[dict]:
 
 def candidates_body(page, views: list[dict], funnel_steps: list[dict], hist: dict[str, int], source_keys: list[str], current_key: str | None,
                     funnels: list[dict] | None = None, current: dict | None = None) -> str:
-    sel = "".join(f"<option value='{h(k)}'{' selected' if k == current_key else ''}>{h(k)}</option>" for k in source_keys)
+    grouped_keys = {key: [k for k in source_keys if origin.of_source_key(k).key == key] for key, _label in origin.CANDIDATE_HEADINGS}
+    sel = "".join(f"<optgroup label='{h(label)}'>" + "".join(f"<option value='{h(k)}'{' selected' if k == current_key else ''}>{h(k)}</option>" for k in grouped_keys[key]) + "</optgroup>"
+                  for key, label in origin.CANDIDATE_HEADINGS if grouped_keys[key])
+    funnel_rows = list(funnels or [])
+    funnel_tables = []
+    for key, label in origin.CANDIDATE_HEADINGS:
+        mine = [r for r in funnel_rows if origin.of_source_key(r.get("source_key")).key == key]
+        what = "repository scan" if key == "novel" else "SWE-bench pool A scan"
+        funnel_tables.append(f"<h3>{h(label)} <span class='muted small'>{len(mine)} source{'s' if len(mine) != 1 else ''}</span></h3>"
+                             + table(f"source-funnels-{key}", SOURCE_FUNNEL_COLUMNS, mine, key="source_key", export=bool(mine),
+                                     empty=f"<strong>No {h(what)} recorded.</strong> A creation job's discovery step writes <code>candidates/&lt;key&gt;.rejects.json</code> "
+                                           "and <code>candidates/&lt;key&gt;/scans/&lt;sha256&gt;.json</code>."))
     body = ["<h1>Candidates</h1><p class='lead'>Where the creation funnel loses candidates, and why. Every listed PR of a source scan keeps its decision: "
             "discovery-time rejects (not merged, no linked issue, diff size, thread depth) and the later candidate gates are projected from the index.</p>",
             f"<form class='toolbar' method='get' action='/candidates'><label>source key<select name='source_key'><option value=''>all sources</option>{sel}</select></label>"
             "<button type='submit' class='button'>Filter</button></form>",
             "<h2>Source funnels</h2><p class='muted small'>PRs listed → merged in range → linked issue → band filters → retained (= mined) → judged → probed → drafted → approved → compiled "
             "→ validated → registered, per source, from its newest scan. Discovery counts are decisions per source scan; overlapping sources can include the same PR. "
-            "Dashes in the discovery stages mean the scan predates per-PR records.</p>",
-            table("source-funnels", SOURCE_FUNNEL_COLUMNS, funnels or [], key="source_key",
-                  empty="<strong>No discovery recorded.</strong> A creation job's discovery step writes <code>candidates/&lt;key&gt;.rejects.json</code> and <code>candidates/&lt;key&gt;/scans/&lt;sha256&gt;.json</code>."),
+            "Dashes in the discovery stages mean the scan predates per-PR records. Sources are grouped by task origin: repositories (novel tasks) and SWE-bench pool A.</p>",
+            *funnel_tables,
             "<div class='side-by-side' id='candidate-charts' data-live-charts>", charts.funnel(funnel_steps, "chart-funnel"),
             charts.hbars(list(hist.items()), "chart-rejects", "rejects by gate"), "</div>"]
     if current_key:
         decisions = decision_views(current)
         body.append(f"<h2>Every PR decision · <code>{h(current_key)}</code></h2>")
         if current and current.get("scan_path"):
-            body.append(kv([("scanned", h(str(current.get("discovered_at") or "—"))), ("PRs listed", h(str((current.get("funnel") or {}).get("listed", len(decisions))))),
+            body.append(kv([("scanned", when(current.get("discovered_at"))), ("PRs listed", h(str((current.get("funnel") or {}).get("listed", len(decisions))))),
                             ("scan record", f"<a href='/artifacts?path={h(current['scan_path'])}'><code>{h(current['scan_path'])}</code></a>"),
                             ("sha256", f"<code>{h(current.get('scan_sha256'))}</code>"),
                             ("workflow", ident(current.get("workflow_id"), 24, "/workflows/" + str(current.get("workflow_id"))) if current.get("workflow_id") else "—")]))
@@ -275,6 +295,7 @@ def candidates_body(page, views: list[dict], funnel_steps: list[dict], hist: dic
 def candidate_view(r) -> dict:
     d = r.model_dump(mode="json")
     d["retry"] = "retry…" if r.status in ("rejected", "error") else None
+    d["origin_kind"] = origin.badge_label(r.source)
     return d
 
 
@@ -294,8 +315,8 @@ def workflow_body(wid: str, row, job: dict | None, progress: dict | None, error:
     st = (row.status if row else (job or {}).get("status")) or "unknown"
     url = settings.workflow_url(wid, (row.run_id if row else (job or {}).get("run_id")))
     body = [f"<h1>Workflow {ident(wid, 40)}</h1>",
-            f"<p class='lead'>{chip(st)} {dash((row.type if row else (job or {}).get('type')))} · started {dash(row.started_at.isoformat() if row and row.started_at else (job or {}).get('started_at'))}"
-            + (f" · closed {dash(row.closed_at.isoformat() if row and row.closed_at else (job or {}).get('closed_at'))}" if (row and row.closed_at) or (job or {}).get("closed_at") else "")
+            f"<p class='lead'>{chip(st)} {dash((row.type if row else (job or {}).get('type')))} · started {when(row.started_at if row and row.started_at else (job or {}).get('started_at'))}"
+            + (f" · closed {when(row.closed_at if row and row.closed_at else (job or {}).get('closed_at'))}" if (row and row.closed_at) or (job or {}).get("closed_at") else "")
             + (f" · <a class='ext' href='{h(url)}' target='_blank' rel='noopener'>event history in Temporal ↗</a>" if url else " · <span class='muted'>no Temporal UI configured</span>") + "</p>",
             "<div id='banner' class='banner hidden' role='status'></div>"]
     failure = (row.failure if row else None) or (job or {}).get("failure")
@@ -358,13 +379,17 @@ def cohort_select(current: dict) -> str:
     return f"<label>Evaluation cohort<select name='evaluation_cohort'>{options}</select></label>"
 
 
-def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_html: str, chart_html: str, saturated_views: list[dict]) -> str:
+def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_html: str, chart_html: str, saturated_views: list[dict], query=()) -> str:
+    """``current['pool']`` is the task-origin facet: the header names the subset shown; ``gate`` is already restricted to it."""
+    query = list(query)
+    facet = current.get("pool")
+    subset = origin.subset_text(facet)
     eligible = [g for g in gate if g["eligible"]]
-    checks = "".join(f"<tr><td><a href='/scenario/{h(g['scenario_id'])}'>{h(g['scenario_id'])}</a> <span class='mono muted'>v{h(g['version'])}</span></td><td>{chip(g['validation_status'])}</td>"
+    checks = "".join(f"<tr><td><a href='/scenario/{h(g['scenario_id'])}'>{h(g['scenario_id'])}</a> {origin.badge(g.get('source'))} <span class='mono muted'>v{h(g['version'])}</span></td><td>{chip(g['validation_status'])}</td>"
                      f"<td>{difficulty_chip(g['difficulty_tier'])}</td>"
                      f"<td>{chip('coherent + fair', 'good') if g['checks']['task_sense'] else chip('not audited' if not g['task_sense'] else 'fails audit', 'neutral' if not g['task_sense'] else 'critical')}</td>"
                      f"<td>{chip('on board', 'good') if g['eligible'] else chip('excluded', 'neutral')}</td></tr>" for g in gate)
-    form = ("<form class='toolbar' method='get' action='/leaderboard'>"
+    form = ("<form class='toolbar' method='get' action='/leaderboard'>" + origin.hidden_input(facet)
             + cohort_select(current)
             + _filter_select("metric_k", list(range(1, 11)), [current.get("metric_k")] if current.get("metric_k") else [], "estimator k (default: recorded)")
             + _filter_select("purpose", ["comparison", "calibration", "demonstration", "screen"], [current.get("purpose") or "comparison"], "purpose (never pooled)")
@@ -375,10 +400,13 @@ def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_
             + _filter_select("condition", ["full", "hidden", "interactive"], current.get("condition"), "condition")
             + f"<label class='inline'><input type='checkbox' name='include_saturated' value='1'{' checked' if current.get('include_saturated') else ''}> include saturated scenarios</label>"
             "<button type='submit' class='button'>Apply</button> <a class='button' href='/leaderboard'>Reset</a></form>")
-    body = ["<h1>Leaderboard</h1><p class='lead'>How do models compare on informative tasks? Only scenarios that are valid, labelled <em>informative</em> by the difficulty screen and "
+    body = [f"<h1>Leaderboard <span class='muted' data-subset>· {h(subset)}</span></h1>",
+            origin.facet_bar(facet, query, "/leaderboard"),
+            f"<p class='lead'>How do models compare on informative tasks? This board shows <strong>{h(subset)}</strong>: the per-model cells, the per-scenario matrix and the gate below "
+            "are restricted to that subset. Only scenarios that are valid, labelled <em>informative</em> by the difficulty screen and "
             "pass the task-sense audit (coherent, fair tests) enter the board; saturated scenarios are excluded by default; broken never appear. Nothing is shown without n; "
             "purposes are never pooled.</p>",
-            hero(f"{len(eligible)} / {len(gate)}", "scenarios on the board (eligible / current versions)", "/scenarios"), form,
+            hero(f"{len(eligible)} / {len(gate)}", f"scenarios on the board (eligible / current versions · {subset})", "/scenarios" + (f"?{origin.PARAM}={facet}" if facet else "")), form,
             "<p><a class='button' href='/trends'>Historical trends…</a></p>",
             "<div id='leaderboard-comparison' data-live-fragment>", leaderboard_comparison(views), "</div><h2>Scores and interaction details</h2>",
             table("leaderboard", LB_COLUMNS, views, key="key", total=len(views), source="/api/leaderboard", empty="<strong>No cells with n ≥ 1 on eligible scenarios.</strong> The gate table below says why each scenario is excluded; "
@@ -423,8 +451,8 @@ def leaderboard_comparison(views: list[dict]) -> str:
 def db_index_body(tables: list[str], counts: dict[str, int], rebuilds: list, index_enabled: bool) -> str:
     rows = "".join(f"<tr><td><a href='/db/{h(t)}'>{h(t)}</a></td><td class='num'>{h(counts.get(t, '—'))}</td><td><a class='button small' href='/api/db/{h(t)}.csv'>CSV</a></td></tr>" for t in tables)
     last = rebuilds[-1] if rebuilds else None
-    reb = (f"<p>Last index rebuild <span class='mono'>{h(last.rebuild_id)}</span> started {h(last.started_at.isoformat())}"
-           + (f", finished {h(last.finished_at.isoformat())}" if last.finished_at else " (running)") + f" · counts {h(json.dumps(last.counts))}"
+    reb = (f"<p>Last index rebuild <span class='mono'>{h(last.rebuild_id)}</span> started {when(last.started_at)}"
+           + (f", finished {when(last.finished_at)}" if last.finished_at else " (running)") + f" · counts {h(json.dumps(last.counts))}"
            + (f"<details><summary>diff against the files</summary><pre class='code'>{h(json.dumps(last.diff, indent=2))}</pre></details>" if last.diff else "") + "</p>") if last else \
         ("<p class='muted'>No rebuild recorded" + (" (the index is disabled: rows are projected from the files on each request)." if not index_enabled else ".") + "</p>")
     action = ("<div class='card'><strong>Rebuild the index from the files</strong> <span class='muted small'>Projects every record file into rows and reports the diff against the previous rows.</span>"
@@ -435,8 +463,15 @@ def db_index_body(tables: list[str], counts: dict[str, int], rebuilds: list, ind
             + f"<div class='table-wrap'><table><thead><tr><th>table</th><th class='num'>rows</th><th>export</th></tr></thead><tbody>{rows}</tbody></table></div>" + action)
 
 
+def _db_kind(c: str, first: dict | None) -> str:
+    if c == "at" or c.endswith("_at"):  # every timestamp column of the index (interfaces §2) is named this way
+        return "time"
+    v = (first or {}).get(c)
+    return "num" if isinstance(v, (int, float)) and not isinstance(v, bool) else "text"
+
+
 def db_table_body(name: str, page, columns: list[str], where: dict, q: str | None, order_by: str | None) -> str:
-    cols = tuple(Column(c, c, "num" if page.items and isinstance(page.items[0].get(c), (int, float)) and not isinstance(page.items[0].get(c), bool) else "text", filterable=False) for c in columns)
+    cols = tuple(Column(c, c, _db_kind(c, page.items[0] if page.items else None), filterable=False) for c in columns)
     rows = []
     for r in page.items:
         rows.append({c: (json.dumps(v, default=str) if isinstance(v, (dict, list)) else v) for c, v in r.items()})
@@ -662,7 +697,7 @@ def search_body(q: str, hits: dict) -> str:
     if not q:
         body.append("<p class='empty'>Type a scenario id, trial id, workflow id or model id in the search box.</p>")
         return "".join(body)
-    sections = (("Scenarios", hits.get("scenarios") or [], lambda s: f"<a href='/scenario/{h(s.scenario_id)}'>{h(s.scenario_id)}</a> v{h(s.version)} {chip(s.validation_status)}"),
+    sections = (("Scenarios", hits.get("scenarios") or [], lambda s: f"<a href='/scenario/{h(s.scenario_id)}'>{h(s.scenario_id)}</a> {origin.badge(s.source)} v{h(s.version)} {chip(s.validation_status)}"),
                 ("Trials", hits.get("trials") or [], lambda t: f"<a class='mono' href='/trial/{h(t.trial_id)}'>{h(t.trial_id)}</a> · {h(t.scenario_id)} · {h(t.condition)} · {model_chip(t.model)} {chip(t.status)}"),
                 ("Workflows", hits.get("workflows") or [], lambda w: f"<a class='mono' href='/workflows/{h(w['workflow_id'])}'>{h(w['workflow_id'])}</a> · {h(w.get('type'))} {chip(w.get('status'))}"),
                 ("Models", hits.get("models") or [], lambda m: f"{model_chip(m)} · <a href='/trials?model={h(m)}'>trials</a> · <a href='/leaderboard'>leaderboard</a>"))

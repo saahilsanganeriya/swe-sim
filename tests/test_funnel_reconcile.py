@@ -213,8 +213,8 @@ def test_file_reader_funnel_and_json_shape(record, tmp_path):
 class _Vocabulary(HTMLParser):
     """The element/attribute vocabulary `app.js` `patchCharts` accepts when it swaps a live chart."""
 
-    ALLOWED_TAGS = set("div span section h2 h3 h4 p em strong figure figcaption ul li i button table caption thead tbody tr th td a svg g polyline path rect circle line text title tspan".split())
-    ALLOWED_ATTRS = set("class id role title type tabindex href style scope colspan rowspan viewbox width height x y x1 y1 x2 y2 cx cy r rx d points text-anchor transform stroke-dasharray data-view data-chart-tabs".split())
+    ALLOWED_TAGS = set("div span section h2 h3 h4 p em strong figure figcaption ul li i button table caption thead tbody tr th td a svg g polyline path rect circle line text title tspan time".split())
+    ALLOWED_ATTRS = set("class id role title type tabindex href style scope colspan rowspan viewbox width height x y x1 y1 x2 y2 cx cy r rx d points text-anchor transform stroke-dasharray data-view data-chart-tabs datetime data-local".split())
 
     def __init__(self) -> None:
         super().__init__()

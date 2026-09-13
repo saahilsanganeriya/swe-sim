@@ -9,6 +9,10 @@ Contract
   when those modules import (a stream not merged yet must not keep the worker from starting). An activity with no
   queue is a configuration error and stops the worker at startup (`queues.UnroutedActivity`).
 - Concurrency per queue is `Settings.max_concurrent_activities` when set, else `queues.CONCURRENCY[queue]`.
+- Heartbeats are throttled to at most `HEARTBEAT_THROTTLE` (5 s). Activity cancellation reaches an activity only in a
+  heartbeat response, and the SDK's default throttle under `act()`'s two-minute heartbeat timeout is 60 s: without this an
+  operator's cancel could go unseen by a running stage for a minute (and a launch thread that finished first would not be
+  cancelled at all).
 - Configuration comes from `Settings` only; the startup line names the connection mode, the queues, the launcher and
   the worker image digest, never a secret. A pool that polls `swesim-trials` builds its launcher at startup so a
   misconfigured launcher (no image, no service account) fails the deploy instead of the first trial. The pool that
@@ -21,6 +25,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+from datetime import timedelta
 from typing import Callable
 
 from temporalio import activity
@@ -39,6 +44,7 @@ from swesim.workflows.operator_actions import OperatorActionWorkflow
 WORKFLOWS = [OperatorActionWorkflow, TrialWorkflow, RunMatrixWorkflow, PipelineWorkflow, CandidateWorkflow, CreateTasksWorkflow, RunTasksWorkflow]
 # Activity modules other streams own; each is optional until its stream is merged.
 OPTIONAL_ACTIVITY_MODULES = ("swesim.index.activities", "swesim.audit.activities", "swesim.workflows.operator_actions")
+HEARTBEAT_THROTTLE = timedelta(seconds=5)  # bounds how long an activity cancellation can go unseen (see the contract)
 
 
 def activity_name(fn: Callable) -> str:
@@ -81,10 +87,15 @@ def startup_line(settings: Settings) -> str:
             f"workspace={settings.workspace} origin={settings.origin} worker_image_digest={settings.worker_image_digest or '-'}")
 
 
+def worker_options(settings: Settings, queue: str) -> dict:
+    """The per-queue `Worker` keyword options: concurrency and the heartbeat throttle."""
+    return {"max_concurrent_activities": concurrency(settings, queue), "max_heartbeat_throttle_interval": HEARTBEAT_THROTTLE}
+
+
 def build_workers(client: Client, settings: Settings) -> list[Worker]:
     candidates = registered_activities()
-    return [Worker(client, task_queue=q, workflows=WORKFLOWS, activities=activities_for_queue(q, candidates),
-                   max_concurrent_activities=concurrency(settings, q)) for q in settings.task_queues]
+    return [Worker(client, task_queue=q, workflows=WORKFLOWS, activities=activities_for_queue(q, candidates), **worker_options(settings, q))
+            for q in settings.task_queues]
 
 
 def configure_logging() -> None:

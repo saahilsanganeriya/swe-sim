@@ -50,7 +50,12 @@ REVIEW_PREFIX = "Review this agent-supplied diff; it is not verified against the
 CONFIRM_PREFIX = ("The agent describes the behavior change it made or intends to make. Say whether it matches what you asked for "
                   "and which requirement still seems unmet, in your own words; do not name code.\n")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_OPTION = re.compile(r"(?<![A-Za-z0-9])\(([a-eA-E])\)|\b[Oo]ption\s+\(?([a-eA-E])\)?(?![A-Za-z0-9])")
+# Implementation-option markers. Lettered: ``(a)``..``(e)`` / ``option b``. Numbered: ``(2)``, ``2.``, ``2)`` / ``option 2``. A numeral
+# counts only in marker position, so ordinary numerals are not picks: nothing alphanumeric, ``.``, ``/`` or ``-`` directly before the
+# digit or directly after its ``.``/``)`` (``Python 3.12``, ``0/1``, ``1-2``, ``v2.``, ``1.5x``, ``$1.99`` never match).
+_LETTER_MARKER = r"(?<![A-Za-z0-9])\(({L})\)|\b[Oo]ption\s+\(?({L})\)?(?![A-Za-z0-9])"
+_NUMBER_MARKER = r"(?<![A-Za-z0-9])\(({N})\)|(?<![\w./-])({N})[.)](?![\w./-])|\b[Oo]ption\s+\(?({N})\)?(?![\w./-])"
+_OPTION = re.compile(_LETTER_MARKER.format(L="[a-eA-E]") + "|" + _NUMBER_MARKER.format(N="[1-9]"))
 # confirm-behavior input that is code rather than a description (A-P1-4). Statement shapes, not words: `def f(`, `class K:`,
 # `import a.b`/`import a, b as c`, `from x import y`; prose such as "import errors are gone" or "a class of inputs" passes.
 _CODE_STATEMENT = re.compile(r"^\s*(?:(?:async\s+)?def\s+\w+\s*\(|class\s+\w+\s*[:(]|import\s+[\w.]+(?:\s*,\s*[\w.]+)*(?:\s+as\s+\w+)?\s*$"
@@ -82,17 +87,24 @@ def looks_like_code(text: str) -> str | None:
 
 # -- reply filter ---------------------------------------------------------------------------------------------------
 def option_markers(text: str) -> list[str]:
-    """Implementation-option markers such as ``(a)`` or ``option B``, normalized to ``(a)``..``(e)``."""
-    return sorted({f"({(m.group(1) or m.group(2)).lower()})" for m in _OPTION.finditer(text)})
+    """Implementation-option markers such as ``(a)``, ``option B``, ``2.``, ``2)`` or ``option 2``, normalized to ``(a)``..``(e)``
+    and ``(1)``..``(9)`` so a pick in one surface form meets the offer made in another."""
+    return sorted({f"({next(g for g in m.groups() if g).lower()})" for m in _OPTION.finditer(text)})
+
+
+def _marker_pattern(mark: str) -> re.Pattern:
+    """Every surface form of one option marker: ``(b)`` / ``option b``; ``(2)`` / ``2.`` / ``2)`` / ``option 2``."""
+    if mark.isdigit():
+        return re.compile(_NUMBER_MARKER.format(N=mark))
+    return re.compile(_LETTER_MARKER.format(L=mark), re.IGNORECASE)
 
 
 def term_pattern(term: str) -> re.Pattern:
     """Identifiers match as whole tokens (``Series`` does not hit ``TimeSeries``); an identifier ending in ``_`` is a
-    prefix (``test_`` hits ``test_foo``); option markers ``(a)`` also match ``option a``; anything else (``_setup(``,
-    ``tests/``) matches as a literal substring."""
-    if len(term) == 3 and term[0] == "(" and term[2] == ")" and term[1] in "abcde":
-        letter = term[1]
-        return re.compile(rf"(?<![A-Za-z0-9])\({letter}\)|\b[Oo]ption\s+\(?{letter}\)?(?![A-Za-z0-9])", re.IGNORECASE)
+    prefix (``test_`` hits ``test_foo``); option markers ``(a)`` / ``(2)`` match every surface form of that pick (``option a``;
+    ``2.``, ``2)``, ``option 2``); anything else (``_setup(``, ``tests/``) matches as a literal substring."""
+    if len(term) == 3 and term[0] == "(" and term[2] == ")" and (term[1] in "abcde" or term[1] in "123456789"):
+        return _marker_pattern(term[1])
     if _IDENT.match(term):
         left = r"(?<![A-Za-z0-9_])"; right = "" if term.endswith("_") else r"(?![A-Za-z0-9_])"
         return re.compile(left + re.escape(term) + right)

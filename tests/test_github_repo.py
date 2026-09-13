@@ -691,3 +691,38 @@ def test_mine_github_repo_drops_probe_without_f2p(monkeypatch, tmp_path):
     monkeypatch.setattr(gr, "probe_tests", lambda row, ws: {"fail_to_pass": [], "pass_to_pass": ["t::a"], "dockerfile": "FROM x\n", "probe_dir": "/j", "test_python": "/usr/local/bin/python"})
     out = mine_github_repo(Workspace(tmp_path / "ws"), "o/r")
     assert out.read_text() == "" and json.loads(out.with_suffix(".rejects.json").read_text()) == {"no-f2p-after-probe": 1}
+
+
+def test_probe_tests_takes_a_fresh_attempt_after_an_abandoned_probe_job(monkeypatch, tmp_path):
+    """P2-17 (python-poetry__poetry-10941 on the hosted stack): a worker-pool roll left the probe's job dir without a result and
+    the retry refused to run into it. The retry now runs attempt-1 next to the abandoned dir, keeps the lineage, and continues."""
+    from swesim import harbor_cli
+    from swesim.paths import Workspace
+    ws = Workspace(tmp_path / "ws")
+    probe = {"base": {"statuses": {}, "exit_code": 4, "error": "no tests", "tail": ""},
+             "test": {"statuses": {"tests/test_stream.py::test_new": "failed", "tests/test_stream.py::test_old": "passed"}, "exit_code": 1, "error": None, "tail": ""},
+             "gold": {"statuses": {"tests/test_stream.py::test_new": "passed", "tests/test_stream.py::test_old": "passed"}, "exit_code": 0, "error": None, "tail": ""}}
+    vsrc = tmp_path / "verifier"; vsrc.mkdir(exist_ok=True)
+    for n in ("grader.py", "policy.py", "parsers.py", "run_pytest.py"): (vsrc / n).write_text(f"# {n}\n")
+    monkeypatch.setattr(gr, "_compile_imports", lambda: (lambda image: "sha256:" + "e" * 64, vsrc))
+    monkeypatch.setattr(harbor_cli, "harbor_executable", lambda: "/bin/harbor")
+    launched = []
+
+    def fake_harbor(cmd, capture_output, text, timeout, env):  # the real run_task launches; Harbor writes the verifier's probe.json
+        jobs = Path(cmd[cmd.index("--jobs-dir") + 1]); job = cmd[cmd.index("--job-name") + 1]; launched.append(job)
+        cfg = json.loads((Path(cmd[cmd.index("-p") + 1]) / "tests" / "probe_config.json").read_text())
+        td = jobs / job / "trial-1"; (td / "verifier").mkdir(parents=True)
+        (td / "verifier" / "probe.json").write_text(json.dumps({"binding": cfg["binding"], "test_user": cfg["test_user"], **probe})); (td / "result.json").write_text("{}")
+        return CompletedProcess(cmd, 0, stdout="", stderr="")
+    monkeypatch.setattr(harbor_cli.subprocess, "run", fake_harbor)
+    row = _probe_row(); job_name = "o--r-42--" + gr.probe_binding(row)[:16]; jobs = ws.jobs_dir / "probe"
+    abandoned = jobs / job_name / "trial-0" / "agent"; abandoned.mkdir(parents=True)  # the interrupted first attempt, no result.json
+    out = gr.probe_tests(row, ws)
+    assert launched == [job_name + "--attempt-1"]
+    assert out["probe_dir"] == str(jobs / (job_name + "--attempt-1") / "trial-1") and out["fail_to_pass"] == ["tests/test_stream.py::test_new"]
+    lineage = json.loads(harbor_cli.lineage_path(jobs, job_name).read_text())
+    assert [(e["attempt"], e["previous_dir"], e["job_dir"]) for e in lineage["attempts"]] == [(1, str(jobs / job_name), str(jobs / (job_name + "--attempt-1")))]
+    assert abandoned.is_dir() and not (jobs / job_name / "trial-0" / "result.json").exists()  # the abandoned dir is untouched
+    # the measurement is reused afterwards: no third directory, no launch
+    monkeypatch.setattr(harbor_cli.subprocess, "run", lambda *a, **k: pytest.fail("a terminal probe result is reused"))
+    assert gr.probe_tests(_probe_row(), ws)["probe_dir"] == out["probe_dir"]

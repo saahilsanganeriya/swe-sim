@@ -8,8 +8,9 @@ from __future__ import annotations
 import json
 import re
 
-from swesim.dashboard.data import REFUSAL_PREFIX, clock, EVALUATOR_TRIAL_FILES
-from swesim.dashboard.render import chip, code_block, dash, evaluator_switch, h, ident, kv, meter, model_chip, outcome_chip, short
+from swesim.dashboard import origin
+from swesim.dashboard.data import REFUSAL_PREFIX, EVALUATOR_TRIAL_FILES
+from swesim.dashboard.render import chip, code_block, dash, evaluator_switch, h, ident, kv, meter, model_chip, outcome_chip, short, when
 from swesim.stages.score import OUTCOME_NAMES, outcome_code
 from swesim.dashboard.public import project
 
@@ -49,10 +50,9 @@ def chat_bubbles(rows: list[dict], live: bool, evaluator: bool, audit_by_seq: di
         role = ("refusal" if refusal else "review request" if kind == "review" and r["actor"] == "agent" else "review" if kind == "review"
                 else "describes behaviour" if kind == "confirm" and r["actor"] == "agent" else "confirms / denies" if kind == "confirm"
                 else "question" if r["actor"] == "agent" else "reply")
-        when = (f"<time datetime='{h(r['ts_iso'])}' title='{h(r['ts_iso'])}'>{h(clock(r['ts']))}</time>" if r.get("ts") is not None
-                else "<span class='flag' title='no timestamp'>no timestamp</span>")
+        stamp = when(r["ts_iso"], clock_only=True) if r.get("ts") is not None else "<span class='flag' title='no timestamp'>no timestamp</span>"
         patience = f"<span class='muted' title='patience remaining after this reply'>patience {h(m.get('patience_remaining'))}</span>" if m.get("patience_remaining") is not None else ""
-        head = f"<div class='who'><span class='badge {h(r['actor'])}'>{h(r['actor'])}</span><span class='xtype'>{h(kind)}</span><span>{h(role)}</span>{when}{patience}</div>"
+        head = f"<div class='who'><span class='badge {h(r['actor'])}'>{h(r['actor'])}</span><span class='xtype'>{h(kind)}</span><span>{h(role)}</span>{stamp}{patience}</div>"
         text = str(r.get("text") or "")
         if kind == "review" and r["actor"] == "agent":
             files = _files_from_diff(text)
@@ -105,9 +105,9 @@ def _call_text(call) -> str:
 
 def timeline_row(r: dict, evaluator: bool) -> str:
     actor, kind, meta = r["actor"], r["kind"], r.get("meta") or {}
-    when = (f"<time datetime='{h(r['ts_iso'])}' title='{h(r['ts_iso'])}'>{h(clock(r['ts']))}</time>" if r["ts"] is not None
-            else "<span class='flag' title='This row has no timestamp; its position is not chronological evidence.'>no timestamp</span>")
-    head = f"<div class='hdr'>{when} <span class='badge {h(actor)}'>{h(actor)}</span><span class='xtype'>{h(kind)}</span></div>"
+    stamp = (when(r["ts_iso"], clock_only=True) if r["ts"] is not None
+             else "<span class='flag' title='This row has no timestamp; its position is not chronological evidence.'>no timestamp</span>")
+    head = f"<div class='hdr'>{stamp} <span class='badge {h(actor)}'>{h(actor)}</span><span class='xtype'>{h(kind)}</span></div>"
     if kind == "agent-step":
         body = f"<div class='txt'>{h(r['text'])}</div>"
         calls = meta.get("tool_calls") or []
@@ -193,7 +193,9 @@ def files_section(t: dict, tid: str, resolve, evaluator: bool) -> str:
 
 
 def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extras: dict | None = None) -> str:
+    """``extras['scenario_source']`` (the scenario row's source, looked up by app.py) puts the task-origin badge in the header."""
     m, tid = t["meta"], t["trial_id"]
+    src = (extras or {}).get("scenario_source")
     rows = rows if evaluator else public_rows(rows)
     st = (row.status if row else None) or t["status"].get("status") or ("completed" if t["record"] else "unknown")
     live = bool(t["live"])
@@ -205,7 +207,7 @@ def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extra
             if isinstance(item, dict) and "seq" in item:
                 by_seq[item["seq"]] = item
     left = [f"<h1>Episode {ident(tid, 24)}</h1>",
-            (f"<p class='lead'>{chip(st)} <a href='/scenario/{h(m.get('scenario_id'))}'>{dash(m.get('scenario_id'))}</a> · {dash(m.get('condition'))} · brief {dash(m.get('brief_profile'))} · "
+            (f"<p class='lead'>{chip(st)} <a href='/scenario/{h(m.get('scenario_id'))}'>{dash(m.get('scenario_id'))}</a>{' ' + origin.badge(src) if src else ''} · {dash(m.get('condition'))} · brief {dash(m.get('brief_profile'))} · "
              f"{model_chip(m.get('model'))} · {dash(m.get('purpose'))} · attempt {dash(m.get('attempt_index'))}"
              + (f" · stakeholder <span class='mono'>{h(m.get('stakeholder_model'))}</span>" if m.get("stakeholder_model") else "") + "</p>")]
     if t["unresolved"] and not live:
@@ -228,8 +230,12 @@ def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extra
     if any(r.get("no_timestamp") for r in rows):
         tl += "<p class='muted small'>Rows marked <span class='flag'>no timestamp</span> are listed last; their position is not chronological evidence.</p>"
     left.append(f"<section data-tab-panel='timeline' id='panel-timeline' role='tabpanel' aria-labelledby='tab-timeline' class='timeline hidden'>{tl}</section>")
-    brief = (f"<details open><summary class='muted small'>instruction.md as the agent saw it</summary><pre class='code'>{h(t['instruction'])}</pre></details>"
-             if t["instruction"] else "<p class='empty'>Instruction not materialised yet; it appears when the trial task is prepared.</p>")
+    from_compiled = t.get("instruction_source") == "compiled-task"
+    ins_label = ("instruction.md from the compiled task <span class='muted'>(the per-trial copy is not mirrored; identical content minus the session token)</span>"
+                 if from_compiled else "instruction.md as the agent saw it")
+    brief = (f"<details open><summary class='muted small'{' data-instruction-source=compiled-task' if from_compiled else ''}>{ins_label}</summary><pre class='code'>{h(t['instruction'])}</pre></details>"
+             if t["instruction"] else "<p class='empty'>Instruction not materialised yet; it appears when the trial task is prepared "
+                                      "(neither the per-trial task copy nor the compiled task's <code>instruction.md</code> is in this workspace).</p>")
     patch_file = t.get("patch_file") or "verifier/patch.diff"
     legacy = " · <span class='flag small' title='pre-2026-09-13 artifact name; the grader now writes verifier/submission.diff'>legacy patch.diff</span>" if patch_file.endswith("patch.diff") else ""
     patch = (f"<details><summary class='muted small'>submitted patch ({len(_files_from_diff(t['patch']))} file(s)) · <code>{h(patch_file)}</code>{legacy}</summary>"
@@ -242,7 +248,7 @@ def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extra
                                    for c in costs if isinstance(c, dict)]) + f"<p class='small'><a href='/trial/{h(tid)}/file/costs.json'>costs.json</a></p>"
     lineage = kv([("spec hash", ident(m.get("spec_hash"), 16, f"/scenario/{h(m.get('scenario_id'))}")), ("run config hash", ident(m.get("run_config_hash"), 16, f"/trial/{h(tid)}/file/run_config.json")),
                   ("compiled hash", ident(m.get("compiled_hash"), 16)), ("image digest", ident(m.get("image_digest"), 23)),
-                  ("started", f"<span class='mono'>{dash(m.get('started_at'))}</span>"), ("finished", f"<span class='mono'>{dash(m.get('finished_at'))}</span>"),
+                  ("started", when(m.get("started_at"))), ("finished", when(m.get("finished_at"))),
                   ("origin / launcher", f"{dash(row.origin if row else None)} / {dash(row.launcher if row else None)}" + (f" · <span class='mono'>{h(row.job_name)}</span>" if row and row.job_name else "")),
                   ("workflow", f"<a class='mono' href='/workflows/{h(row.workflow_id)}'>{h(row.workflow_id)}</a>" if row and row.workflow_id else "—")])
     right = ["<div class='panel card'><h2>Brief</h2>", brief, "<h2>Patch</h2><div id='submitted-patch'>", patch, "</div><h2>Verifier</h2><div id='verifier-result'>", verifier_section(t, tid), "</div>", cost, "<h2>Lineage</h2>", lineage,

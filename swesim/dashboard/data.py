@@ -6,6 +6,11 @@ Contract
   trajectory, report, reward, instruction) or one scenario (spec, validation, approval, compile, judge, difficulty,
   audit), through the ``Layout`` paths.
 - Every reader is defensive: a missing or malformed file is an empty state, never a 500.
+- Recorded paths (``record.json``'s ``trial_dir`` / ``task_dir``) are absolute on the machine that produced them (the VM
+  writes ``/opt/swesim/workspace/...``); ``local_path`` re-roots them onto this workspace by the rule of
+  ``scripts/verify.sh local()`` (the part after the first ``/workspace/``), and every artifact lookup goes through it.
+- The per-trial task copy (``trials/<tid>/task/``) carries the session token and is not mirrored to the bucket; when it
+  is absent the episode page shows the compiled task's ``instruction.md`` (``Layout.task_dir``), labelled as such.
 - ``fetch_live_transcript`` contacts the stakeholder service for a running trial with ``Settings.stakeholder_url`` and the
   worker secret read at the point of use (``swesim.settings.secret``); errors degrade to a type name, never a URL or secret.
 """
@@ -21,6 +26,7 @@ import httpx
 
 from swesim.settings import MissingSecret, Settings, secret
 from swesim.stages.score import OUTCOME_NAMES, normalize_record, outcome_code, unresolved_attempt
+from swesim.storage.layout import LayoutError
 
 TRIAL_RE = re.compile(r"^[a-f0-9]{24}$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
@@ -83,7 +89,8 @@ def iso(ts: float | None) -> str | None:
 
 
 def clock(ts: float | None) -> str:
-    return datetime.fromtimestamp(ts, UTC).strftime("%H:%M:%S") if ts is not None else "no timestamp"
+    """HH:MM UTC, no seconds (the console shows minutes; the ISO value stays in the element's title)."""
+    return datetime.fromtimestamp(ts, UTC).strftime("%H:%M") if ts is not None else "no timestamp"
 
 
 # ----------------------------------------------------------------------------- live transcript
@@ -146,6 +153,40 @@ def _contained(layout, path: Path) -> bool:
         current = current.parent
     return True
 
+WORKSPACE_MARKER = "/workspace/"
+
+
+def local_path(layout, recorded) -> Path | None:
+    """A recorded artifact path as it exists in this workspace (the rule of ``scripts/verify.sh local()``): the recorded path
+    itself when it lies inside the workspace and exists; otherwise the part after the first ``/workspace/`` joined onto
+    ``layout.root``. None when the value is empty, carries no ``/workspace/`` segment, or would escape the workspace."""
+    if not recorded:
+        return None
+    p = Path(str(recorded))
+    if p.is_absolute() and _contained(layout, p) and p.exists():
+        return p
+    s = p.as_posix()
+    i = s.find(WORKSPACE_MARKER)
+    if i < 0:
+        return None
+    rel = s[i + len(WORKSPACE_MARKER):]
+    if not rel:
+        return None
+    q = layout.root / rel
+    return q if _contained(layout, q) else None
+
+
+def compiled_instruction(layout, scenario_id, condition) -> Path | None:
+    """The compiled task's ``instruction.md`` (mirrored to the bucket; the per-trial copy is not): identical to what the agent saw minus the session token."""
+    if not scenario_id or not condition:
+        return None
+    try:
+        p = layout.task_dir(str(scenario_id), str(condition)) / "instruction.md"
+    except (LayoutError, ValueError):
+        return None
+    return p if _contained(layout, p) and p.is_file() else None
+
+
 def _row(ts, seq, actor, kind, text, meta) -> dict:
     return {"ts": ts, "ts_iso": iso(ts), "no_timestamp": ts is None, "seq": seq, "actor": actor, "kind": kind, "text": text, "meta": meta}
 
@@ -185,8 +226,9 @@ def merge_timeline(traj: dict, transcript: dict, report: dict | None = None, rew
 
 
 def _trajectory(layout, tid: str, record: dict) -> dict:
-    if record.get("trial_dir") and _contained(layout, Path(record["trial_dir"])):
-        traj = read_json(Path(record["trial_dir"]) / "agent" / "trajectory.json")
+    trial_dir = local_path(layout, record.get("trial_dir"))
+    if trial_dir is not None:
+        traj = read_json(trial_dir / "agent" / "trajectory.json")
         if traj:
             return traj
     found = sorted((layout.jobs_dir("runs") / tid).glob("*/agent/trajectory.json"))
@@ -216,9 +258,14 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
     report = record.get("report") or read_json(d / "report.json")
     reward = record.get("reward") or read_json(d / "reward.json")
     traj = _trajectory(layout, tid, record)
-    ins = next((p for p in (d / "task" / "instruction.md", Path(record["task_dir"]) / "instruction.md" if record.get("task_dir") else None)
-                if p is not None and _contained(layout, p) and p.exists()), None)
     u = unresolved or {}
+    task_dir = local_path(layout, record.get("task_dir"))
+    ins, ins_source = next(((p, "trial") for p in (d / "task" / "instruction.md", task_dir / "instruction.md" if task_dir is not None else None)
+                            if p is not None and _contained(layout, p) and p.is_file()), (None, None))
+    if ins is None:  # the per-trial task copy is not mirrored (session token): the compiled task's instruction is the same text minus the token
+        ins = compiled_instruction(layout, record.get("scenario_id") or request.get("scenario_id") or u.get("scenario_id"),
+                                   record.get("condition") or request.get("condition") or u.get("condition"))
+        ins_source = "compiled-task" if ins is not None else None
     meta = {
         "scenario_id": record.get("scenario_id") or request.get("scenario_id") or u.get("scenario_id"),
         "condition": record.get("condition") or request.get("condition") or u.get("condition"),
@@ -234,9 +281,10 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
         "started_at": status.get("started_at") or record.get("started_at"), "finished_at": status.get("finished_at") or record.get("finished_at"),
     }
     patch, patch_file = None, None
-    if record.get("trial_dir"):
+    trial_dir = local_path(layout, record.get("trial_dir"))
+    if trial_dir is not None:
         for name in PATCH_FILES:  # the grader's submission.diff first; the legacy patch.diff only when no submission.diff exists
-            p = Path(record["trial_dir"]) / TRIAL_FILES[name][1]
+            p = trial_dir / TRIAL_FILES[name][1]
             if _contained(layout, p) and p.is_file():
                 try:
                     patch, patch_file = p.read_text(errors="replace"), TRIAL_FILES[name][1]
@@ -246,7 +294,8 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
     return {"trial_id": tid, "dir": d, "status": {**{k: v for k, v in meta.items() if k in ("started_at", "finished_at") and v}, **status},
             "record": record, "request": request, "live": live, "unresolved": unresolved, "live_transcript_error": live_error,
             "transcript": transcript or {}, "report": report or {}, "reward": reward or {}, "trajectory": traj,
-            "instruction": ins.read_text() if ins else None, "label": read_json(d / "label.json", default=None) or None, "meta": meta,
+            "instruction": ins.read_text(errors="replace") if ins else None, "instruction_source": ins_source,
+            "label": read_json(d / "label.json", default=None) or None, "meta": meta,
             "patience": patience_of(transcript or {}, rc), "files": list(TRIAL_FILES), "patch": patch, "patch_file": patch_file,
             "costs": read_json(d / "costs.json", default=[]), "audit": read_json(d / "audit.json")}
 
@@ -256,9 +305,9 @@ def resolve_trial_file(layout, t: dict, name: str) -> Path | None:
     if base == "trial":
         path = t["dir"] / rel
         return path if _contained(layout, path) else None
-    trial_dir = t["meta"].get("trial_dir")
-    if trial_dir:
-        path = Path(trial_dir) / rel
+    trial_dir = local_path(layout, t["meta"].get("trial_dir"))
+    if trial_dir is not None:
+        path = trial_dir / rel
         return path if _contained(layout, path) else None
     found = sorted((layout.jobs_dir("runs") / t["trial_id"]).glob(f"*/{rel}"))
     return found[0] if len(found) == 1 and _contained(layout, found[0]) else None
