@@ -112,7 +112,9 @@ curl -s http://127.0.0.1:8080/ | head -c 200
 Deployment record **[placeholder]**: VM name, zone, machine type, image, deployed commit, `setup.sh` completion time,
 `systemd-analyze --user verify` output, `systemctl --user is-active` output.
 
-## Laptop-off acceptance test (measured 2026-09-13)
+## Laptop-off acceptance test (procedure + evidence placeholder)
+
+### Measured 2026-09-13 (laptop-off)
 
 Evidence file: `workspace/evidence/ops.json` (assembled by `workspace/evidence/assemble_ops.py` from the VM artifacts mirrored
 under `workspace/evidence/vm/`; checked by `scripts/verify.sh 8`).
@@ -134,7 +136,100 @@ judge → probe → auto-approve → compile → validate for `mwaskom__seaborn-
 `invalid` because the LLM-authored plausible-wrong control did not apply; that defect was fixed the same night (draft-time
 `git apply --check` of every control) and the history is kept in `vm/workspace/evidence/create-history.json`.
 
-## Worker restart test (measured 2026-09-13)
+
+Goal (M8): the pipeline progresses with the laptop closed, and a worker restart leaves exactly one launch and one terminal
+trial record. Evidence file: `workspace/evidence/ops.json` (schema below; checked by `scripts/verify.sh 8`).
+
+Start the pipeline **on the VM** (the CLI loads `/etc/swesim/env` through python-dotenv; `SWESIM_STAKEHOLDER_URL` comes from it):
+
+```bash
+gcloud compute ssh swesim-worker --project "$GCP_PROJECT" --zone "$GCP_ZONE"
+cd /opt/swesim
+export SWESIM_ENV_FILE=/etc/swesim/env          # a path, not a secret
+uv run --frozen --offline swesim pipeline --source github-repo --repo https://github.com/py-pdf/pypdf \
+  --judge-model "$JUDGE_MODEL" --draft-model "$DRAFT_MODEL" --model "$SOLVER_MODEL"
+# prints the workflow id, e.g. pipeline-3f2a...; keep it:
+WORKFLOW_ID=pipeline-...
+```
+
+Approval is unattended by default (`approval_mode=auto`): `auto_approve_activity` runs the code-owned gates and the
+pipeline continues; `approval.json` records `approved_by: auto-validators, review_needed: true`. On a withholding leak the
+workflow re-drafts once, then moves to the next judged candidate (bounded by `max_candidates_tried`, default 3). The leak
+trigger is structured: a rejection with `gate: "withholding-leak"`, or, as a fallback on the reason text, any reason that
+starts with `withholding` or contains `leak` or `withheld` (the approve stage's `withheld brief still contains excerpt of
+<fact>`). Every other rejection reason (judge, load-bearing fact, controls, assets) goes straight to the next candidate.
+
+The workflow result carries `tried`, `completed`, `rejected`, `invalid` counts. Top-level status is `complete` when at least
+one scenario completed, `complete-with-failures` when none did, `no-valid-candidate` when the judge kept nothing, and
+`awaiting-approval-timeout` in signal mode. A scenario whose solver model failed the probe is registered but launches no
+trial (`complete-no-trials`, with `solver_unavailable` and `needs_human`); the solver is never substituted silently.
+
+Supervised mode (`--approval-mode signal`, not used overnight): the workflow parks at stage `awaiting-approval` for up to
+24 h. Find the pending scenario id from the `progress` query, approve on the VM, then send the signal with the frozen hash:
+
+```bash
+uv run --frozen --offline python -c 'import asyncio,sys; from swesim.workflows.client import progress; print(asyncio.run(progress(sys.argv[1])))' "$WORKFLOW_ID"
+SCENARIO_ID=...
+uv run --frozen --offline swesim approve "$SCENARIO_ID"
+SWESIM_HASH=$(uv run --frozen --offline python -c 'import json,sys; print(json.load(open("workspace/scenarios/"+sys.argv[1]+"/approval.json"))["spec_hash"])' "$SCENARIO_ID")
+uv run --frozen --offline swesim approve-signal "$WORKFLOW_ID" "$SCENARIO_ID" "$SWESIM_HASH"
+```
+
+Close the laptop for at least 20 minutes. Reconnect, re-open the tunnel, and collect evidence on the VM:
+
+```bash
+cd /opt/swesim
+temporal --address 127.0.0.1:7233 workflow show --workflow-id "$WORKFLOW_ID" --output json > workspace/evidence/pipeline-history.json
+temporal --address 127.0.0.1:7233 workflow describe --workflow-id "$WORKFLOW_ID"
+ls workspace/trials/*/record.json workspace/exports/*.episode.json
+```
+
+The history must show activity completions with timestamps inside the laptop-off window (`mine_activity` ... `validate_activity`
+... child `TrialWorkflow` ... `export_activity`). A trial's `record.json` has `status: completed`; its export is under
+`workspace/exports/<trial_id>.episode.json`.
+
+`ops.json` shape (values come from the inspected artifacts; write it with the snippet below after both tests):
+
+```json
+{"provider": "gce",
+ "laptop_off": {"passed": true, "workflow_id": "pipeline-...", "history_path": "workspace/evidence/pipeline-history.json",
+                "record_path": "workspace/trials/<trial_id>/record.json", "export_path": "workspace/exports/<trial_id>.episode.json"},
+ "worker_restart": {"passed": true, "trial_id": "<trial_id>", "unit": "swesim-trial-<trial_id>",
+                    "journal_path": "workspace/evidence/swesim-trial-<trial_id>.journal.txt", "launch_count": 1,
+                    "record_path": "workspace/trials/<trial_id>/record.json"}}
+```
+
+```bash
+uv run --frozen --offline python - "$WORKFLOW_ID" "$TRIAL_ID" <<'PY'
+import json, sys
+from pathlib import Path
+wid, tid = sys.argv[1], sys.argv[2]
+record = Path(f"workspace/trials/{tid}/record.json"); export = Path(f"workspace/exports/{tid}.episode.json")
+journal = Path(f"workspace/evidence/swesim-trial-{tid}.journal.txt"); launch = json.loads(Path(f"workspace/trials/{tid}/launch.json").read_text())
+assert json.loads(record.read_text())["status"] == "completed" and export.is_file() and journal.stat().st_size > 0
+assert launch["phase"] == "acknowledged" and launch["returncode"] == 0
+launch_count = journal.read_text().count("Started swesim-trial-")   # systemd >= 250 logs "Started <unit>.service - <description>."
+ops = {"provider": "gce",
+       "laptop_off": {"passed": True, "workflow_id": wid, "history_path": "workspace/evidence/pipeline-history.json", "record_path": str(record), "export_path": str(export)},
+       "worker_restart": {"passed": launch_count == 1, "trial_id": tid, "unit": f"swesim-trial-{tid}", "journal_path": str(journal), "launch_count": launch_count, "record_path": str(record)}}
+Path("workspace/evidence/ops.json").write_text(json.dumps(ops, indent=2)); print(json.dumps(ops, indent=2))
+PY
+```
+
+Evidence **[placeholder]**:
+
+| item | value |
+|---|---|
+| workflow id | |
+| laptop closed from / to (local time) | |
+| first and last activity completion inside the window (from history) | |
+| trial id, record status, reward | |
+| export path | |
+| `ops.json` written at | |
+
+## Worker restart test
+
+### Measured 2026-09-13 (worker restart)
 
 | item | value |
 |---|---|
@@ -143,6 +238,45 @@ judge → probe → auto-approve → compile → validate for `mwaskom__seaborn-
 | worker restart | `systemctl --user restart swesim-worker` at 03:26:04Z while the unit was `active running`; MainPID 5096 → 5647 |
 | result | unit finished `active exited`; `journalctl --user -u swesim-trial-26f3304d9caedfe10cd75ebf` contains exactly one `Started swesim-trial-` line; one `record.json` (`completed`, reward 1.0); the restarted worker's await activity reconciled and ingested it |
 | artifacts | `vm/workspace/evidence/swesim-trial-26f3304d9caedfe10cd75ebf.journal.txt`, `vm/workspace/trials/26f3304d9caedfe10cd75ebf/{launch,record,report}.json`, `vm/workspace/evidence/run-history.json` |
+
+How the launch count is read (systemd >= 250 logs `Started <unit>.service - <description>.`):
+
+```bash
+journalctl --user -u swesim-trial-26f3304d9caedfe10cd75ebf --no-pager > workspace/evidence/swesim-trial-26f3304d9caedfe10cd75ebf.journal.txt
+grep -c 'Started swesim-trial-' workspace/evidence/swesim-trial-26f3304d9caedfe10cd75ebf.journal.txt   # 1
+```
+
+
+Run while a trial unit is active (the solver is running on Modal). Restart **only** the worker; never the trial unit.
+
+```bash
+systemctl --user list-units 'swesim-trial-*' --all --no-pager      # note the unit and its MainPID
+systemctl --user show swesim-trial-$TRIAL_ID -p MainPID -p ActiveState -p SubState
+systemctl --user restart swesim-worker
+sleep 5
+systemctl --user show swesim-trial-$TRIAL_ID -p MainPID -p ActiveState -p SubState   # same MainPID, still active/running
+journalctl --user -u swesim-worker -n 30 --no-pager                  # worker reconnected; await_trial_activity resumed (heartbeat timeout -> retry, read-only)
+```
+
+After the trial finishes:
+
+```bash
+UNIT=swesim-trial-$TRIAL_ID
+journalctl --user -u "$UNIT" --no-pager > workspace/evidence/$UNIT.journal.txt
+grep -c 'Started swesim-trial-' workspace/evidence/$UNIT.journal.txt                   # must be 1 (systemd >= 250: "Started swesim-trial-<id>.service - swesim trial ...")
+cat workspace/trials/$TRIAL_ID/launch.json                                             # phase acknowledged, returncode 0, one file
+temporal --address 127.0.0.1:7233 workflow show --workflow-id "$TRIAL_ID" --output json \
+  | python3 -c 'import json,sys; ev=json.load(sys.stdin)["events"]; print(sum(1 for e in ev if e.get("activityTaskScheduledEventAttributes",{}).get("activityType",{}).get("name")=="launch_trial_activity"))'   # must be 1
+ls workspace/trials/$TRIAL_ID/{record,reward,report,transcript,status}.json
+```
+
+Expected: one `launch_trial_activity` scheduled in the trial workflow's history, one `Started` line in the unit journal,
+one `record.json`. A missing result after the restart is a failure and is recorded here as such; the same solver is never
+restarted to manufacture recovery evidence. If the unit is gone without a record (VM reboot), the attempt is reported as
+`unresolved` by `await_trial_activity` and stays unresolved; see "Manual retry lineage".
+
+Evidence **[placeholder]**: trial id, unit, MainPID before/after, worker restart timestamp, journal path, launch count,
+record status.
 
 ## Model probe and fallbacks
 
@@ -201,7 +335,6 @@ Design residuals (present before any cloud run):
 Measured failures **[placeholder]** (each entry: date/time, stage, artifact path, what was observed, resolution or "unresolved"):
 
 - 
-
 
 ### Measured failures during the first unattended run (2026-09-12/13)
 

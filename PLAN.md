@@ -14,7 +14,7 @@ cloud execution required to produce evidence is an explicit implementation step.
 - [x] **M7 Pipeline and dataset** — Task 12 then Task 11: both scenarios registered with frozen evidence; actual attempts in full/hidden/interactive and hidden runs on both natural/withheld profiles for one scenario; reproducible score tables and exports; Temporal approval/hash, model-specific trial IDs and launch/poll logic tested; explicit integration test included.
 - [x] **M8 Cloud independence** — Task 13: GCE persistent Temporal server/worker and detached trial units; saved evidence of pipeline progress with laptop closed, plus worker restart yielding one launch and one terminal trial record.
 - [x] **M9 Viewing** — Task 14: runs page, episode timeline, near-live stakeholder chat and completed agent trajectory; dashboard tests pass.
-- [ ] **M10 Reviewable delivery** — Tasks 15–16: tracked complete example and sanitized run with submitted patch; README, grading, architecture and operations docs; complete offline suite and `verify.sh 10` pass; commit pushed.
+- [x] **M10 Reviewable delivery** — Tasks 15–16: tracked complete example and sanitized run with submitted patch; README, grading, architecture and operations docs; complete offline suite and `verify.sh 10` pass; commit pushed.
 
 Execution order when sequential: 1–10, **12 before 11**, then 14, 13, 15–16. See the working model below for the parallel form. Task 12 is needed before
 Temporal calls register/score/export. Run one tier first; additional repeats
