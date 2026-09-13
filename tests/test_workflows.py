@@ -598,20 +598,77 @@ def test_mine_activity_adapts_to_either_mine_signature(ws, monkeypatch):
     assert r["candidates_path"].endswith("github-repo--x.jsonl") and seen["pr"] == 12 and seen["since"] == "2026-07-01"
 
 
-def test_probe_models_substitutes_judge_and_draft_but_never_solver(ws, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key-value-1234")
+GPT, OPUS, SONNET, HAIKU = "openai/gpt-5.5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"
+
+
+def _chat_failing(unavailable):
     def chat_json(model_id, system, messages, schema_hint, temperature=0.0, max_tokens=4000):
-        if model_id.startswith("openai/"): raise RuntimeError("401 unauthorized for key fake-openai-key-value-1234")
+        if model_id in unavailable: raise RuntimeError(f"401 unauthorized for {model_id} with key fake-openai-key-value-1234")
         return {"ok": True}
-    monkeypatch.setattr("swesim.llm.chat_json", chat_json)
-    r = A.probe_models({"judge_model": "openai/gpt-5.5", "draft_model": "anthropic/claude-sonnet-5", "models": ["openai/gpt-5.5", "anthropic/claude-haiku-4-5-20251001"]})
-    assert r["substitutions"] == {"judge_model": A.FALLBACK_MODEL}
-    assert r["models"]["openai/gpt-5.5"]["ok"] is False and r["models"]["anthropic/claude-sonnet-5"]["ok"] is True
-    assert r["needs_human"] == ["solver model openai/gpt-5.5 unavailable; no silent substitution"]
-    assert r["solver_unavailable"] == ["openai/gpt-5.5"]
-    err = r["models"]["openai/gpt-5.5"]["error"]
+    return chat_json
+
+
+def test_probe_chains_gpt_unavailable_judge_becomes_opus_draft_stays_sonnet(ws, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key-value-1234")
+    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({GPT}))
+    r = A.probe_models({"judge_model": GPT, "draft_model": SONNET, "models": [GPT, HAIKU]})
+    assert r["resolved"] == {"judge_model": OPUS, "draft_model": SONNET, "stakeholder_model": SONNET}
+    assert r["substitutions"] == {"judge_model": OPUS, "stakeholder_model": SONNET}
+    assert r["configured"] == {"judge_model": GPT, "draft_model": SONNET, "stakeholder_model": GPT}   # stakeholder default is the chain head
+    assert r["models"][GPT]["ok"] is False and r["models"][OPUS]["ok"] is True and r["models"][SONNET]["ok"] is True
+    assert r["needs_human"] == [f"solver model {GPT} unavailable; no silent substitution"] and r["solver_unavailable"] == [GPT]
+    assert any("judge_model" in n and "fell back to " + OPUS in n for n in r["notes"])
+    err = r["models"][GPT]["error"]
     assert "fake-openai-key-value-1234" not in err and "[redacted:OPENAI_API_KEY]" in err   # provider error text is redacted
-    assert json.loads((ws.root / "evidence" / "model-probe.json").read_text())["substitutions"] == {"judge_model": A.FALLBACK_MODEL}
+    saved = json.loads((ws.root / "evidence" / "model-probe.json").read_text())
+    assert saved["resolved"] == r["resolved"] and saved["chains"] == A.FALLBACK_CHAINS and saved["notes"] == r["notes"]
+
+
+def test_probe_chains_never_resolve_judge_and_draft_to_the_same_model(ws, monkeypatch):
+    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({GPT, OPUS}))
+    r = A.probe_models({"judge_model": GPT, "draft_model": SONNET, "models": [HAIKU]})
+    assert r["resolved"]["judge_model"] == SONNET and r["resolved"]["draft_model"] == HAIKU and r["resolved"]["stakeholder_model"] == SONNET
+    assert r["resolved"]["judge_model"] != r["resolved"]["draft_model"]
+    assert any("advanced the draft chain to " + HAIKU in n for n in r["notes"]) and r["needs_human"] == [] and r["solver_unavailable"] == []
+    # draft chain exhausted: the judge chain advances instead (configured both to haiku; sonnet unavailable)
+    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({SONNET}))
+    r2 = A.probe_models({"judge_model": HAIKU, "draft_model": HAIKU, "models": [HAIKU]})
+    assert r2["resolved"]["draft_model"] == HAIKU and r2["resolved"]["judge_model"] == GPT and any("advanced the judge chain to " + GPT in n for n in r2["notes"])
+    # nothing distinct left: recorded for a human, never silently equal-and-proceed
+    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({GPT, OPUS, SONNET}))
+    r3 = A.probe_models({"judge_model": HAIKU, "draft_model": HAIKU, "models": [HAIKU]})
+    assert any("no distinct model is available" in n for n in r3["needs_human"])
+
+
+def test_plan_trials_carries_resolved_stakeholder_model_into_run_config(ws):
+    spec = frozen_scenario(ws)
+    base = {"scenario_id": spec.id, "models": [HAIKU], "conditions": ["interactive", "hidden"], "k": 2, "stakeholder_url": "https://s"}
+    plain = A.plan_trials(base)["trials"]
+    with_sh = A.plan_trials({**base, "stakeholder_model": SONNET})["trials"]
+    assert [t["run_config"]["stakeholder"]["model_id"] for t in plain] == [RunConfig.default("full").stakeholder.model_id] * 4
+    for t in with_sh:
+        rc = RunConfig.model_validate(t["run_config"])
+        assert rc.stakeholder.model_id == SONNET and t["stakeholder_model"] == SONNET
+        assert t["run_config_hash"] == rc.run_config_hash and t["trial_id"] == trial_id(spec.spec_hash, t["condition"], rc.run_config_hash, t["attempt_index"])
+    assert {t["run_config_hash"] for t in with_sh}.isdisjoint({t["run_config_hash"] for t in plain})   # the stakeholder model is part of the hash
+    assert {t["trial_id"] for t in with_sh}.isdisjoint({t["trial_id"] for t in plain})
+
+
+def test_resolved_models_reach_judge_draft_and_plan_trials(monkeypatch):
+    async def scenario():
+        seen = {}
+        async def act(name, p, minutes=10):
+            if name == "probe_models_activity":
+                return {"resolved": {"judge_model": OPUS, "draft_model": SONNET, "stakeholder_model": SONNET}, "substitutions": {"judge_model": OPUS, "stakeholder_model": SONNET}, "needs_human": []}
+            if name in ("judge_activity", "draft_activity", "plan_trials_activity"): seen[name] = {k: p.get(k) for k in ("judge_model", "draft_model", "stakeholder_model")}
+            if name == "auto_approve_activity": return {"approved": True, "spec_hash": "h", "reasons": []}
+            return dict(BIG)
+        monkeypatch.setattr(W, "act", act)
+        r = await W.PipelineWorkflow().run({"judge_model": GPT, "draft_model": SONNET, "models": [HAIKU]})
+        expected = {"judge_model": OPUS, "draft_model": SONNET, "stakeholder_model": SONNET}
+        assert seen["judge_activity"] == expected and seen["draft_activity"] == expected and seen["plan_trials_activity"] == expected
+        assert r["status"] == "complete"
+    asyncio.run(scenario())
 
 
 def test_execute_trial_request_writes_runner_error_on_spec_mismatch(ws, monkeypatch):

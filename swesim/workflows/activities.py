@@ -42,7 +42,13 @@ HEARTBEAT_SECONDS = 30.0
 POLL_SECONDS = float(os.environ.get("SWESIM_TRIAL_POLL_SEC", "10"))
 AWAIT_DEADLINE_SEC = 3 * 3600
 LAUNCH_GRACE_POLLS = 6  # polls without any launch evidence before await reports launch-failed
-FALLBACK_MODEL = "anthropic/claude-sonnet-5"
+# Per-role fallback chains (CLAUDE.md, unattended-run rules): the configured id is probed first, then the chain in order.
+# Judge and draft must resolve to different ids (draft_spec.draft refuses correlated errors); the solver is never substituted.
+FALLBACK_CHAINS = {
+    "judge_model": ["openai/gpt-5.5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5"],
+    "draft_model": ["anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"],
+    "stakeholder_model": ["openai/gpt-5.5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"],
+}
 RUNNING_STATES = {"active", "activating", "reloading", "deactivating"}
 SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
 LAUNCH_SLOTS = asyncio.Semaphore(1)  # pilot trials launch serially per worker
@@ -120,16 +126,11 @@ def scenario_id_for(instance_id: str) -> str:
 # ------------------------------------------------------------------ pipeline activities
 
 def probe_models(p: dict) -> dict:
-    """One tiny request per configured model id. Judge/draft/stakeholder fall back to FALLBACK_MODEL;
-    the solver is never substituted silently. Evidence: workspace/evidence/model-probe.json."""
+    """One tiny request per model id. Judge, draft and stakeholder resolve along FALLBACK_CHAINS (configured id first);
+    judge and draft must differ (advance the draft chain, then the judge chain, and record why); the solver is never
+    substituted. Evidence: workspace/evidence/model-probe.json with configured/resolved ids and the reasoning."""
     from swesim import llm
 
-    roles: dict[str, set[str]] = {}
-    for role in ("judge_model", "draft_model", "stakeholder_model"):
-        if p.get(role):
-            roles.setdefault(p[role], set()).add(role)
-    for m in p.get("models", []) or []:
-        roles.setdefault(m, set()).add("solver")
     results: dict[str, dict] = {}
 
     def probe(model_id: str) -> bool:
@@ -142,21 +143,44 @@ def probe_models(p: dict) -> dict:
                 results[model_id] = {"ok": False, "error": _redact(f"{type(e).__name__}: {str(e)[:200]}")}
         return results[model_id]["ok"]
 
-    substitutions: dict[str, str] = {}
-    needs_human: list[str] = []
-    solver_unavailable: list[str] = []
-    for model_id, model_roles in roles.items():
-        if probe(model_id):
-            continue
-        for role in sorted(model_roles):
-            if role == "solver":
-                solver_unavailable.append(model_id)
-                needs_human.append(f"solver model {model_id} unavailable; no silent substitution")
-            elif probe(FALLBACK_MODEL):
-                substitutions[role] = FALLBACK_MODEL
+    configured = {role: p.get(role) or chain[0] for role, chain in FALLBACK_CHAINS.items()}
+
+    def candidates(role: str) -> list[str]:
+        return [configured[role]] + [m for m in FALLBACK_CHAINS[role] if m != configured[role]]
+
+    def first_available(role: str, exclude: set[str] = frozenset(), after: str | None = None) -> str | None:
+        cands = candidates(role)
+        if after in cands:
+            cands = cands[cands.index(after) + 1:]
+        return next((m for m in cands if m not in exclude and probe(m)), None)
+
+    resolved: dict[str, str] = {}; notes: list[str] = []; needs_human: list[str] = []
+    for role in FALLBACK_CHAINS:
+        chosen = first_available(role)
+        if chosen is None:
+            needs_human.append(f"{role}: {configured[role]} and its fallbacks {candidates(role)[1:]} are all unavailable")
+            chosen = configured[role]
+        elif chosen != configured[role]:
+            notes.append(f"{role}: {configured[role]} unavailable; fell back to {chosen}")
+        resolved[role] = chosen
+    if resolved["judge_model"] == resolved["draft_model"]:
+        shared = resolved["draft_model"]
+        alt = first_available("draft_model", exclude={shared}, after=shared)
+        if alt is not None:
+            notes.append(f"judge and draft both resolved to {shared}; advanced the draft chain to {alt} so their errors stay uncorrelated")
+            resolved["draft_model"] = alt
+        else:
+            alt = first_available("judge_model", exclude={shared}, after=shared)
+            if alt is not None:
+                notes.append(f"judge and draft both resolved to {shared}; draft chain exhausted, advanced the judge chain to {alt}")
+                resolved["judge_model"] = alt
             else:
-                needs_human.append(f"{role} {model_id} and fallback {FALLBACK_MODEL} both unavailable")
-    out = {"models": results, "substitutions": substitutions, "needs_human": needs_human, "solver_unavailable": solver_unavailable, "probed_at": time.time()}
+                needs_human.append(f"judge and draft both resolve to {shared} and no distinct model is available")
+    solver_unavailable = [m for m in (p.get("models") or []) if not probe(m)]
+    needs_human += [f"solver model {m} unavailable; no silent substitution" for m in solver_unavailable]
+    substitutions = {role: m for role, m in resolved.items() if m != configured[role]}
+    out = {"models": results, "configured": configured, "resolved": resolved, "substitutions": substitutions, "notes": notes,
+           "needs_human": needs_human, "solver_unavailable": solver_unavailable, "chains": FALLBACK_CHAINS, "probed_at": time.time()}
     atomic_json(WS.root / "evidence" / "model-probe.json", out)
     return out
 
@@ -274,17 +298,21 @@ def plan_trials(p: dict) -> dict:
     """Precompute trial requests with the actual per-model RunConfig; trial ids are the workflow ids."""
     spec = _spec(p["scenario_id"]); comp = json.loads((WS.scenario_dir(spec.id) / "compile.json").read_text()); trials = []
     offset = int(p.get("attempt_offset", 0))  # manual retries use fresh attempt indices, never the same trial id
+    stakeholder_model = p.get("stakeholder_model")  # the probe's resolved stakeholder id; part of every trial's RunConfig and hash
     for cond in p.get("conditions", ["interactive"]):
         for model in p["models"]:
             for i in range(offset, offset + p.get("k", 1)):
                 profile = p.get("brief_profile", "withheld")
                 if cond == "full" or not any(b.profile == profile for b in spec.briefs):
                     profile = "natural"
-                rc = RunConfig(condition=cond, model=model, compiled_hash=comp["compiled_hash"], purpose=p.get("purpose", "demonstration"), brief_profile=profile)
+                kwargs = dict(condition=cond, model=model, compiled_hash=comp["compiled_hash"], purpose=p.get("purpose", "demonstration"), brief_profile=profile)
+                if stakeholder_model:
+                    kwargs["stakeholder"] = {"model_id": stakeholder_model}
+                rc = RunConfig(**kwargs)
                 tid = trial_id(spec.spec_hash, cond, rc.run_config_hash, i)
                 trials.append(dict(trial_id=tid, scenario_id=spec.id, spec_hash=spec.spec_hash, condition=cond, model=model,
-                                   run_config=rc.model_dump(mode="json"), run_config_hash=rc.run_config_hash, attempt_index=i,
-                                   stakeholder_url=p["stakeholder_url"]))
+                                   stakeholder_model=rc.stakeholder.model_id, run_config=rc.model_dump(mode="json"),
+                                   run_config_hash=rc.run_config_hash, attempt_index=i, stakeholder_url=p["stakeholder_url"]))
     if len({t["trial_id"] for t in trials}) != len(trials):
         raise ValueError("duplicate matrix entries")
     return {"scenario_id": spec.id, "trials": trials}

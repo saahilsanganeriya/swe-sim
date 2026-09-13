@@ -98,8 +98,10 @@ class PipelineWorkflow:
             raise ApplicationError(f"approval_mode must be one of {sorted(APPROVAL_MODES)}", non_retryable=True)
         self.state = {"stage": "probing-models"}
         probe = await act("probe_models_activity", p, 5)
-        p = {**p, **(probe.get("substitutions") or {})}
-        self.state = {"stage": "mining", "substitutions": probe.get("substitutions") or {}, "needs_human": probe.get("needs_human") or []}
+        # Resolved judge/draft/stakeholder ids flow to every later activity (judge, draft, plan_trials -> RunConfig.stakeholder).
+        p = {**p, **(probe.get("substitutions") or {}), **(probe.get("resolved") or {})}
+        self.state = {"stage": "mining", "resolved": probe.get("resolved") or {}, "substitutions": probe.get("substitutions") or {},
+                      "notes": probe.get("notes") or [], "needs_human": probe.get("needs_human") or []}
         mined = await act("mine_activity", p, 180)
         self.state = {"stage": "judging", **mined}
         judged = await act("judge_activity", {**p, **mined}, 60)
