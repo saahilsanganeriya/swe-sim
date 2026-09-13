@@ -209,9 +209,15 @@ def test_discover_records_fetch_failures_instead_of_aborting(monkeypatch):
     routes = _routes(); del routes[("repos/o/r/pulls/42", "diff")]
     monkeypatch.setattr(subprocess, "run", FakeGH(routes))
     cands, rejects = gr.discover("o/r", since="2026-06-01", max_prs=150, kind="feature")
-    assert cands == [] and rejects["fetch-error"] == 1
-    # a non-404 failure while classifying a closing link is infrastructure (fetch-error), a 404 is data (linked-target-missing)
+    assert cands == [] and rejects["not-found"] == 1 and "fetch-error" not in rejects   # a 404 is this PR's answer, not infrastructure
+    # a 5xx while classifying a closing link is gh being unavailable: the attempt fails (Temporal retries), no PR is counted
     routes = _routes(); routes["repos/o/r/issues/40"] = Exception("gh: HTTP 502 Bad Gateway")
+    monkeypatch.setattr(subprocess, "run", FakeGH(routes))
+    with pytest.raises(gr.DiscoveryUnavailable) as exc:
+        gr.discover("o/r", since="2026-06-01", max_prs=150, kind="feature")
+    assert exc.value.kind == "server-error"
+    # an unclassifiable gh failure for one PR stays a fetch-error observation, and a 404 on the issue is data (linked-target-missing)
+    routes = _routes(); routes["repos/o/r/issues/40"] = Exception("gh: something unexpected happened")
     monkeypatch.setattr(subprocess, "run", FakeGH(routes))
     cands, rejects = gr.discover("o/r", since="2026-06-01", max_prs=150, kind="feature")
     assert cands == [] and rejects["fetch-error"] == 1 and "linked-target-missing" not in rejects

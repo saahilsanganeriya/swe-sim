@@ -20,6 +20,11 @@ MAX_RATE_LIMIT_SLEEP = 3600.0
 SECONDARY_LIMIT_MIN_SLEEP = 60.0  # GitHub asks for at least a minute after a secondary (burst) limit
 _RATE_LIMIT = re.compile(r"rate limit|HTTP 429|abuse detection", re.I)
 _SECONDARY = re.compile(r"secondary|abuse detection", re.I)
+_SERVER_ERROR = re.compile(r"HTTP 5\d\d", re.I)
+_AUTH_ERROR = re.compile(r"HTTP 40[13]\b|bad credentials|authentication|not logged in|gh auth login", re.I)
+_NOT_FOUND = re.compile(r"HTTP 404\b|Not Found", re.I)
+_NETWORK = re.compile(r"error connecting|connection (?:refused|reset)|dial tcp|tls handshake|could not resolve|no such host|network is unreachable"
+                      r"|i/o timeout|timed? ?out|unexpected EOF|temporary failure|server misbehaving|broken pipe", re.I)
 _LINK = re.compile(r"(?:[Ff]ix(?:es|ed)?|[Cc]los(?:es|ed)?|[Rr]esolves?)\s*:?\s*#(\d+)")
 # Weaker evidence, used only when no closing keyword and no timeline cross-reference names a real issue: a plain
 # `#N`, `GH-N` or full issue URL in the PR title/body. Recorded as link_kind="mention" so ranking can prefer stronger links.
@@ -53,6 +58,27 @@ def _gh_text(path: str, accept: str | None = None) -> str:
                 continue
             raise
     raise RuntimeError("unreachable")
+
+
+def unavailable_kind(error: BaseException) -> str | None:
+    """Why `gh api` could not answer (rate-limit after the waits above, server-error, network, timeout, auth), or None when
+    the failure is an answer about the resource (404, 422, malformed payload) or an unknown gh failure."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "timeout"
+    if not isinstance(error, subprocess.CalledProcessError):
+        return None
+    stderr = str(error.stderr or "")
+    if _RATE_LIMIT.search(stderr):
+        return "rate-limit"
+    if _SERVER_ERROR.search(stderr):
+        return "server-error"
+    if _NOT_FOUND.search(stderr):
+        return None
+    if _AUTH_ERROR.search(stderr):
+        return "auth"
+    if _NETWORK.search(stderr) or not stderr.strip():  # gh prints nothing useful when the process itself failed to reach the API
+        return "network"
+    return None
 
 
 def _gh(path: str):
@@ -191,6 +217,8 @@ def fetch_pr_thread(repo: str, pr: int) -> dict:
         try:
             out["linked_issues"].append(fetch_issue_thread(repo, n, issue=targets["payloads"].get(n)))
         except (subprocess.CalledProcessError, ValueError) as e:
+            if unavailable_kind(e) is not None:
+                raise  # gh unavailable: the caller's attempt fails and is retried; a swallowed error would become a false "missing linked issue"
             out.setdefault("fetch_errors", []).append({"issue": n, "error": str(e)})
     for n in targets["missing"]:
         out.setdefault("fetch_errors", []).append({"issue": n, "error": "closing keyword names a number this repo's issues endpoint cannot serve"})

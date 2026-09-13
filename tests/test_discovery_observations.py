@@ -27,7 +27,7 @@ def test_full_discovery_observations_include_prefilters_links_bands_and_reject_i
 
 def test_fetch_failure_is_an_error_observation_not_a_rejected_task(monkeypatch):
     routes=_routes()
-    routes['repos/o/r/pulls/42']=subprocess.CalledProcessError(1,['gh','api'],stderr='HTTP 500 secret detail')
+    routes['repos/o/r/pulls/42']=RuntimeError('gh: unexpected answer, secret detail')  # unclassifiable: neither an answer nor unavailability
     monkeypatch.setattr(subprocess,'run',FakeGH(routes))
     observations=[]
     G.discover('o/r',since='2026-06-01',max_prs=150,kind='feature',observations=observations)
