@@ -424,10 +424,10 @@ def test_calibrate_reports_agreement_at_threshold(monkeypatch):
 
 def test_withheld_brief_has_no_excerpts(monkeypatch):
     from swesim.stages import draft_spec
-    issue = 'Import fails\nThe importer stops on the first row.\nTraceback: ERROR42\nrun_import("bad.csv")\nWe expected the whole file to load.'
+    issue = 'Import fails\nThe importer stops on the first row.\nTraceback: ERROR42 raised in importer\nrun_import("bad.csv") crashes at once\nWe expected the whole file to load.'
     monkeypatch.setattr(draft_spec, 'chat_json', lambda *a, **k: {'withheld_brief': 'Import fails',
-        'removed': [{'category': 'error_message', 'excerpt': 'ERROR42', 'kind': 'reproduction', 'discovery': 'on-request'},
-                    {'category': 'reproduction', 'excerpt': 'run_import("bad.csv")', 'kind': 'reproduction', 'discovery': 'on-request'}]})
+        'removed': [{'category': 'error_message', 'excerpt': 'ERROR42 raised in importer', 'kind': 'reproduction', 'discovery': 'on-request'},
+                    {'category': 'reproduction', 'excerpt': 'run_import("bad.csv") crashes at once', 'kind': 'reproduction', 'discovery': 'on-request'}]})
     result = draft_spec.withhold(issue, 'fake/model')
     assert all(x['excerpt'] not in result['withheld_brief'] for x in result['removed'])
     assert result['withheld_brief'] == 'Import fails\nThe importer stops on the first row.\nWe expected the whole file to load.'
@@ -436,12 +436,12 @@ def test_withheld_brief_has_no_excerpts(monkeypatch):
 def test_withhold_retries_once_with_violations_then_fails(monkeypatch):
     """A selected span that does not match the issue verbatim gets one correction round, then ValueError."""
     from swesim.stages import draft_spec
-    issue = 'Import fails\nThe importer stops on the first row.\nTraceback: ERROR42'
+    issue = 'Import fails\nThe importer stops on the first row.\nTraceback: ERROR42 raised in importer'
     attempts = []
 
     def not_verbatim(model_id, system, messages, schema, **kw):
         attempts.append(messages)
-        return {'removed': [{'category': 'error_message', 'excerpt': 'Traceback: ERROR99', 'kind': 'reproduction', 'discovery': 'on-request'}]}
+        return {'removed': [{'category': 'error_message', 'excerpt': 'Traceback: ERROR99 raised in importer', 'kind': 'reproduction', 'discovery': 'on-request'}]}
     monkeypatch.setattr(draft_spec, 'chat_json', not_verbatim)
     with pytest.raises(ValueError, match="withholding failed.*not a verbatim span"):
         draft_spec.withhold(issue, 'fake/model')
@@ -450,55 +450,147 @@ def test_withhold_retries_once_with_violations_then_fails(monkeypatch):
 
 WITHHOLD_ISSUE = ("Importer crashes on empty header\n"
                   "Running run_import(\"bad.csv\") stops at row 1. The importer must stay compatible with v1 files.\n"
-                  "Traceback: ERROR42\n"
+                  "Traceback: ERROR42 raised in parse_header\n"
                   "> quoted from the mailing list: the expected result is an empty table\n"
                   "Expected: an empty table and no error.\n"
                   "Seen on version 2.3.1 with Python 3.12.")
+CODE_ISSUE = ("Parser drops the last row\n"
+              "When the file has no trailing newline the final row disappears. I expected all rows to be kept, e.g. three rows in the sample below.\n"
+              "\n"
+              "```python\n"
+              "from importer import run_import\n"
+              "\n"
+              "rows = run_import(\"bad.csv\")\n"
+              "    # indented comment\n"
+              "```\n"
+              "\n"
+              "Traceback (most recent call last):\n"
+              "  File \"importer.py\", line 12, in run_import\n"
+              "    raise ParseError(\"row 3 truncated\")\n"
+              "ParseError: row 3 truncated\n"
+              "\n"
+              "Seen with importer 2.3.1 on Python 3.12.\n")
 
 
 def _select(*items):
-    return {"removed": [{"category": c, "excerpt": e, "kind": "context", "discovery": "on-request", "fact_text": f"fact about {c}"} for c, e in items]}
+    """Model selections without fact_text: the ledger text then defaults to the removed span itself."""
+    return {"removed": [{"category": c, "excerpt": e, "kind": "context", "discovery": "on-request"} for c, e in items]}
 
 
 def test_withhold_brief_is_computed_not_trusted(monkeypatch):
     """The model's own brief is ignored: it cannot add a requirement or silently delete an unlisted sentence."""
     from swesim.stages import draft_spec
-    hostile = _select(("error_message", "Traceback: ERROR42"))
+    hostile = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
     hostile["withheld_brief"] = ("Importer crashes on empty header\nThe importer must break v1 files.\n"
                                  "Running run_import(\"bad.csv\") stops at row 1.")      # adds a contradictory requirement, drops the compatibility and expectation sentences
     monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: hostile)
     res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
-    assert res["withheld_brief"] == ("Importer crashes on empty header\n"
-                                     "Running run_import(\"bad.csv\") stops at row 1. The importer must stay compatible with v1 files.\n"
-                                     "> quoted from the mailing list: the expected result is an empty table\n"
-                                     "Expected: an empty table and no error.\n"
-                                     "Seen on version 2.3.1 with Python 3.12.")
+    assert res["withheld_brief"] == WITHHOLD_ISSUE.replace("Traceback: ERROR42 raised in parse_header\n", "")   # byte-exact: the line and its newline
     assert "break v1" not in res["withheld_brief"] and "ERROR42" not in res["withheld_brief"]
-    assert [r["excerpt"] for r in res["removed"]] == ["Traceback: ERROR42"] and res["removed"][0]["fact_text"] == "fact about error_message"
-    assert res["removed"][0]["selected"] == "Traceback: ERROR42" and res["stats"]["sentences_total"] == 7
+    assert [r["excerpt"] for r in res["removed"]] == ["Traceback: ERROR42 raised in parse_header"] and res["removed"][0]["fact_text"] == res["removed"][0]["excerpt"]
+    assert res["removed"][0]["selected"] == "Traceback: ERROR42 raised in parse_header" and res["stats"]["sentences_total"] == 7
 
 
 def test_withhold_extends_to_sentence_boundaries_and_reconstructs(monkeypatch):
     from swesim.stages import draft_spec
-    sel = _select(("expected_output", "empty table and no error"), ("version", "2.3.1"), ("reproduction", "stops at row 1"))
+    sel = _select(("expected_output", "empty table and no error"), ("version", "version 2.3.1 with Python"), ("reproduction", "stops at row 1"))
     monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: sel)
     res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
     assert [r["excerpt"] for r in res["removed"]] == ["Expected: an empty table and no error.", "Seen on version 2.3.1 with Python 3.12.",
                                                        "Running run_import(\"bad.csv\") stops at row 1."]
-    assert "The importer must stay compatible with v1 files." in res["withheld_brief"]           # the other sentence on that line survives
     assert all(WITHHOLD_ISSUE[r["start"]:r["end"]] == r["excerpt"] for r in res["removed"])
-    removed_ranges = [(o["start"], o["end"]) for r in res["removed"] for o in r["occurrences"]]
-    ranges = sorted(removed_ranges + res["kept"])
-    assert "".join(WITHHOLD_ISSUE[a:b] for a, b in ranges) == WITHHOLD_ISSUE                       # kept pieces + removed spans partition the natural issue
-    kept_text = "".join(WITHHOLD_ISSUE[a:b] for a, b in res["kept"])
-    assert " ".join(res["withheld_brief"].split()) == " ".join(kept_text.split())                  # brief == natural minus the spans, modulo whitespace
-    assert res["stats"] == {"sentences_total": 7, "sentences_removed": 3, "fraction_removed": 0.429, "prompt_version": "withhold-v2"}
+    ranges = sorted(res["deleted"] + res["kept"])
+    assert "".join(WITHHOLD_ISSUE[a:b] for a, b in ranges) == WITHHOLD_ISSUE                       # kept pieces + deleted ranges partition the natural issue
+    assert all(any(a <= o["start"] and o["end"] <= b for a, b in res["deleted"]) for r in res["removed"] for o in r["occurrences"])
+    assert res["withheld_brief"] == "".join(WITHHOLD_ISSUE[a:b] for a, b in res["kept"])          # the brief IS the kept text, byte for byte
+    assert res["withheld_brief"] == (WITHHOLD_ISSUE.replace("Running run_import(\"bad.csv\") stops at row 1. ", "")   # first sentence: splice, one space left
+                                     .replace("Expected: an empty table and no error.\n", "")                          # whole line with its newline
+                                     .replace("\nSeen on version 2.3.1 with Python 3.12.", ""))                        # last line: takes the newline before it
+    assert res["stats"] == {"sentences_total": 7, "sentences_removed": 3, "fraction_removed": 0.429, "duplicate_selections": 0, "prompt_version": "withhold-v2"}
+
+
+def test_withhold_preserves_code_blocks_tracebacks_and_paragraphs(monkeypatch):
+    from swesim.stages import draft_spec
+    sel = _select(("expected_output", "I expected all rows to be kept"), ("version", "importer 2.3.1 on Python 3.12"))
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: sel)
+    res = draft_spec.withhold(CODE_ISSUE, "fake/model")
+    expected = CODE_ISSUE.replace(" I expected all rows to be kept, e.g. three rows in the sample below.", "").replace("Seen with importer 2.3.1 on Python 3.12.\n", "")
+    assert res["withheld_brief"] == expected
+    assert "```python\nfrom importer import run_import\n\nrows = run_import(\"bad.csv\")\n    # indented comment\n```\n" in res["withheld_brief"]   # fence, blank line, indentation intact
+    assert "Traceback (most recent call last):\n  File \"importer.py\", line 12, in run_import\n    raise ParseError(\"row 3 truncated\")\nParseError: row 3 truncated\n" in res["withheld_brief"]
+    assert "disappears.\n\n```python" in res["withheld_brief"]                                     # paragraph break kept, no trailing space after the splice
+    assert res["removed"][0]["excerpt"] == "I expected all rows to be kept, e.g. three rows in the sample below."   # "e.g." does not end a sentence
+    # a deleted line between two blank lines takes one blank line with it, so paragraphs keep a single separator
+    issue = "T\nFirst paragraph here.\n\nMiddle paragraph to remove.\n\nLast paragraph here.\n"
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("reproduction", "Middle paragraph to remove")))
+    assert draft_spec.withhold(issue, "fake/model")["withheld_brief"] == "T\nFirst paragraph here.\n\nLast paragraph here.\n"
+    # mid-line splices: middle sentence leaves one space; last sentence leaves no trailing space
+    issue = "T\nA sentence here. Another middle one. Final sentence here.\nOne more line to keep.\nAnd another kept line."
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("reproduction", "Another middle one")))
+    assert draft_spec.withhold(issue, "fake/model")["withheld_brief"] == "T\nA sentence here. Final sentence here.\nOne more line to keep.\nAnd another kept line."
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("reproduction", "Final sentence here")))
+    assert draft_spec.withhold(issue, "fake/model")["withheld_brief"] == "T\nA sentence here. Another middle one.\nOne more line to keep.\nAnd another kept line."
+    # deleting the last two lines of an issue without a trailing newline leaves none behind either
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("reproduction", "One more line to keep"), ("reproduction", "And another kept line")))
+    assert draft_spec.withhold(issue, "fake/model")["withheld_brief"] == "T\nA sentence here. Another middle one. Final sentence here."
+
+
+def test_withhold_selection_minimums_malformed_items_duplicates_and_fact_text(monkeypatch):
+    from swesim.stages import draft_spec
+    attempts = []
+
+    def fake(items):
+        def chat(model_id, system, messages, schema, **kw):
+            attempts.append(messages)
+            return {"removed": items}
+        return chat
+    # a one-word selection cannot delete sentences
+    monkeypatch.setattr(draft_spec, "chat_json", fake(_select(("reproduction", "the"))["removed"]))
+    with pytest.raises(ValueError, match="selected span too short"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    # malformed selections enter the correction round instead of raising TypeError/AttributeError
+    monkeypatch.setattr(draft_spec, "chat_json", fake(["just a string", {"category": "error_message", "excerpt": 42, "kind": "context", "discovery": "on-request"}, None]))
+    attempts.clear()
+    with pytest.raises(ValueError, match="withholding failed.*must be an object.*excerpt must be a string"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert len(attempts) == 2 and "Correct these violations" in attempts[1][-1]["content"]
+    # duplicate selections of the same span collapse into one fact
+    dup = _select(("error_message", "Traceback: ERROR42 raised in parse_header"), ("error_message", "ERROR42 raised in parse_header"))
+    monkeypatch.setattr(draft_spec, "chat_json", fake(dup["removed"]))
+    res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert len(res["removed"]) == 1 and res["stats"]["duplicate_selections"] == 1 and res["stats"]["sentences_removed"] == 1
+    # fact_text: bounded, and content words must come from the span or the issue
+    ok = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
+    ok["removed"][0]["fact_text"] = "Traceback with ERROR42 raised in parse_header when the importer crashes."   # every 5+ letter word occurs in the span or issue
+    monkeypatch.setattr(draft_spec, "chat_json", fake(ok["removed"]))
+    assert draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")["removed"][0]["fact_text"] == ok["removed"][0]["fact_text"]
+    foreign = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
+    foreign["removed"][0]["fact_text"] = "The kubernetes scheduler raises ERROR42"
+    monkeypatch.setattr(draft_spec, "chat_json", fake(foreign["removed"]))
+    with pytest.raises(ValueError, match="introduces words absent.*kubernetes"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    long = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
+    long["removed"][0]["fact_text"] = "ERROR42 " * 60
+    monkeypatch.setattr(draft_spec, "chat_json", fake(long["removed"]))
+    with pytest.raises(ValueError, match="longer than 400"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+
+
+def test_withheld_facts_pass_through_ledger_violations_with_their_span_as_corpus():
+    from swesim.stages.draft_spec import ledger_violations
+    fact = {"id": "withheld-001", "text": "Traceback shows no error at all.", "kind": "reproduction", "provenance": "original-issue",
+            "source_excerpt": "Traceback shows no error at all.", "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": []}
+    kw = {"corpus_by_fact": {"withheld-001": fact["source_excerpt"]}, "allow_reserved": True, "require_f2p_link": False}
+    assert ledger_violations({"ledger": [fact]}, _row(), **kw) == []
+    assert any("reserved" in v for v in ledger_violations({"ledger": [fact]}, _row(), corpus_by_fact=kw["corpus_by_fact"], require_f2p_link=False))
+    assert any("source_url" in v for v in ledger_violations({"ledger": [{**fact, "source_url": "https://github.com/other/repo/issues/1"}]}, _row(), **kw))
+    assert any("removed span" in v for v in ledger_violations({"ledger": [fact]}, _row(), corpus_by_fact={"withheld-001": "a different span entirely"}, allow_reserved=True, require_f2p_link=False))
 
 
 def test_withhold_caps_removed_fraction_and_protects_title(monkeypatch):
     from swesim.stages import draft_spec
-    too_much = _select(("reproduction", "stops at row 1"), ("error_message", "Traceback: ERROR42"), ("expected_output", "an empty table and no error"),
-                       ("version", "Python 3.12"), ("location", "quoted from the mailing list"))
+    too_much = _select(("reproduction", "stops at row 1"), ("error_message", "Traceback: ERROR42 raised in parse_header"), ("expected_output", "an empty table and no error"),
+                       ("version", "with Python 3.12"), ("location", "quoted from the mailing list"))
     monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: too_much)
     with pytest.raises(ValueError, match="removed 5 of 7 sentences; the cap is 60%"):
         draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
@@ -587,7 +679,7 @@ def _withhold_llm():
     return {"withheld_brief": "Weighted mean silently ignores missing dims\nCalling a weighted reduction with a missing dim returns a result.",
             "removed": [{"category": "expected_output", "excerpt": "Expected: raise ValueError.", "kind": "behavior", "discovery": "on-request"},
                         {"category": "error_message", "excerpt": "Traceback shows no error at all.", "kind": "reproduction", "discovery": "on-request"},
-                        {"category": "location", "excerpt": "ds.weighted(w).mean('z')", "kind": "context", "discovery": "on-request"}]}
+                        {"category": "location", "excerpt": "Calling ds.weighted(w).mean('z') with a dim", "kind": "context", "discovery": "on-request"}]}
 
 
 def _patch_llm(monkeypatch, draft_out, withhold_out):
@@ -643,6 +735,7 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     # the brief is computed by code: title plus every sentence not selected; operations carry the exact spans and offsets
     assert spec.briefs[1].text == "Weighted mean silently ignores missing dims\nI am using xarray 0.18 on Linux.\nA small reproducer is attached below."
     assert wf["withheld-003"].source_excerpt == "Calling ds.weighted(w).mean('z') with a dim 'z' that does not exist returns a result."  # selection extended to its sentence
+    assert wf["withheld-001"].text == wf["withheld-001"].source_excerpt   # no fact_text given: the ledger text is the span itself
     for o, f in zip(ops, wf.values()):
         start, end = ISSUE.index(f.source_excerpt), ISSUE.index(f.source_excerpt) + len(f.source_excerpt)
         assert f"natural[{start}:{end}]" in o.rationale and repr(f.source_excerpt) in o.rationale

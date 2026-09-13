@@ -71,11 +71,15 @@ WITHHOLD_SCHEMA = ('{"removed":[{"category":"reproduction|error_message|expected
                    '"excerpt":"verbatim contiguous span copied from the issue","fact_text":"one sentence stating the withheld fact",'
                    '"kind":"reproduction|context|behavior|interface|constraint","discovery":"on-request|repo-derivable"}]}')
 WITHHOLD_PROMPT = ("Select spans of this issue to withhold from the agent, by category. Do not rewrite the issue and do not return a brief: "
-                   "code deletes the sentence or line containing each selected span and keeps everything else verbatim. Each excerpt must be a "
-                   "verbatim contiguous span copied from the issue. Never select the first line (the title); keep a recognizable symptom and a "
-                   "desired outcome; select at most about half of the sentences. File locations and explicit fix proposals are repo-derivable; "
-                   "expected behaviour, error text, versions and reproductions the maintainer can supply are on-request.")
+                   "code deletes the sentence or line containing each selected span and keeps everything else byte for byte. Each excerpt must be a "
+                   "verbatim contiguous span copied from the issue, at least three words long. fact_text restates the removed span for the "
+                   "maintainer's ledger: every word of five or more letters in it must occur in the span or in the issue, or simply copy the span. "
+                   "Never select the first line (the title); keep a recognizable symptom and a desired outcome; select at most about half of the "
+                   "sentences. File locations and explicit fix proposals are repo-derivable; expected behaviour, error text, versions and "
+                   "reproductions the maintainer can supply are on-request.")
+MAX_FACT_TEXT_CHARS = 400
 _SENTENCE_END = re.compile(r"[.!?]+[\"')\]]*(?=\s|$)")
+_ABBREV = re.compile(r"(?i)(?:^|[\s(\[])(?:e\.g|i\.e|etc|vs|cf|viz)$")  # a terminator ending one of these is not a sentence end
 
 
 def _title_range(natural_issue: str) -> tuple[int, int]:
@@ -101,7 +105,7 @@ def _segments(text: str) -> list[tuple[int, int]]:
     segs, pos = [], 0
     for line in text.splitlines(keepends=True):
         content = line.rstrip("\r\n")
-        starts = [0] + [m.end() for m in _SENTENCE_END.finditer(content)]
+        starts = [0] + [m.end() for m in _SENTENCE_END.finditer(content) if not _ABBREV.search(content[:m.start()])]
         for a, b in zip(starts, starts[1:] + [len(content)]):
             piece = content[a:b]
             if piece.strip():
@@ -166,27 +170,61 @@ def _merge(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return out
 
 
-def _tidy(text: str, title: str) -> str:
-    """Join of the kept pieces with normalized whitespace: runs collapsed, blank lines dropped (a deleted line leaves no
-    hole), the title line verbatim."""
-    lines: list[str] = []
-    for raw in text.splitlines():
-        if raw.strip():
-            lines.append(title if title and raw.strip() == title else " ".join(raw.split()))
-    return "\n".join(lines)
+def _deletion_range(text: str, a: int, b: int) -> tuple[int, int]:
+    """The range actually deleted for a stripped span [a, b): whole lines with their newline when the span covers all the
+    text of the lines it touches (plus one adjoining blank line when the deleted line sat between two blank lines, so
+    paragraphs keep a single separator); otherwise a mid-line splice that leaves exactly one separating space. Everything
+    outside the returned range is preserved byte for byte."""
+    ls = text.rfind("\n", 0, a) + 1
+    le = text.find("\n", b)
+    if le < 0:
+        le = len(text)
+    if not text[ls:a].strip() and not text[b:le].strip():
+        start, end = ls, (le + 1 if le < len(text) else le)
+        if le >= len(text) and ls > 0:  # last line without a trailing newline: take the newline before it instead
+            start = ls - 1
+        if text[max(0, ls - 2):ls] == "\n\n" and text[end:end + 1] == "\n":
+            end += 1
+        return start, end
+    e = b
+    while e < le and text[e] in " \t":
+        e += 1
+    if e < le:  # text follows on the same line: drop the trailing spaces, keep the one before the span
+        return a, e
+    s = a
+    while s > ls and text[s - 1] in " \t":  # span ends the line: drop the spaces before it
+        s -= 1
+    return s, b
+
+
+def _fact_text_violation(fact_text: str, span: str, natural: str) -> str | None:
+    """The ledger text of a withheld fact is model prose: bound it and forbid content words absent from the span/issue."""
+    if not fact_text.strip():
+        return "fact_text is empty"
+    if len(fact_text) > MAX_FACT_TEXT_CHARS:
+        return f"fact_text longer than {MAX_FACT_TEXT_CHARS} characters"
+    allowed = _norm(span) + " " + _norm(natural)
+    foreign = sorted({t for t in re.findall(r"[^\W_]+", _norm(fact_text)) if len(t) >= 5 and t not in allowed})
+    if foreign:
+        return f"fact_text introduces words absent from the removed span and the issue: {foreign[:5]}"
+    return None
 
 
 def withhold(natural_issue: str, model_id: str) -> dict:
     """Category-targeted withholding where the model only SELECTS spans and code performs the deletion.
 
-    Each selected excerpt must match the natural issue verbatim (after `_norm`); it is extended to whole sentence/line
-    boundaries and every occurrence is deleted. The withheld brief is exactly the natural issue minus the deleted spans,
-    joined with normalized whitespace, so no text can be added and nothing undeclared can disappear. The title line is
-    never deletable, at most `MAX_REMOVED_FRACTION` of the sentence segments may go, at least one removal is required,
-    and every removed span must be absent from the brief. Violations get one correction round, then ValueError.
+    Each selected excerpt (at least MIN_EXCERPT_CHARS / MIN_EXCERPT_TOKENS after `_norm`) must match the natural issue
+    verbatim (after `_norm`); it is extended to whole sentence/line boundaries and every occurrence is deleted. Deletion
+    is line-aware (`_deletion_range`): whole lines go with their newline, mid-line deletions splice with one space, and
+    every other byte of the natural issue is preserved, so code blocks, tracebacks and paragraph breaks survive and no text
+    can be added or disappear undeclared. The title line is never deletable, at most `MAX_REMOVED_FRACTION` of the
+    sentence segments may go, at least one removal is required, duplicate selections collapse, `fact_text` is bounded and
+    may not introduce content words absent from the span/issue, and every removed span must be absent from the brief.
+    Malformed selections and violations get one correction round, then ValueError.
 
     Returns {"withheld_brief", "removed": [{category, kind, discovery, fact_text, selected, excerpt, start, end,
-    occurrences}], "kept": [(start, end)], "stats": {...}}; `natural[start:end] == excerpt` for every removal."""
+    occurrences}], "deleted": [(start, end)], "kept": [(start, end)], "stats": {...}}; `natural[start:end] == excerpt`
+    for every removal, kept + deleted partition the natural text, and the brief is the kept text byte for byte."""
     messages = [{"role": "user", "content": natural_issue}]
     title_a, title_b = _title_range(natural_issue)
     title = natural_issue[title_a:title_b]
@@ -194,18 +232,32 @@ def withhold(natural_issue: str, model_id: str) -> dict:
     bad: list[str] = []
     for _attempt in range(2):
         out = chat_json(model_id, WITHHOLD_PROMPT, messages, WITHHOLD_SCHEMA, max_tokens=5000)
-        bad, removed, ranges = [], [], []
-        items = out.get("removed") or []
-        if not items:
+        bad, removed, ranges, seen_ranges, duplicates = [], [], [], set(), 0
+        items = (out.get("removed") if isinstance(out, dict) else None) or []
+        if not isinstance(items, list) or not items:
             bad.append("no removed spans")
+            items = []
         for item in items:
-            selected = item.get("excerpt") or ""
+            if not isinstance(item, dict):
+                bad.append(f"selection must be an object with category/excerpt/kind/discovery: {str(item)[:60]!r}")
+                continue
             if item.get("category") not in WITHHOLD_CATEGORIES:
                 bad.append(f"invalid category {item.get('category')!r}")
             if item.get("kind") not in WITHHOLD_KINDS:
                 bad.append(f"invalid kind {item.get('kind')!r}")
             if item.get("discovery") not in WITHHOLD_DISCOVERY:
                 bad.append(f"invalid discovery {item.get('discovery')!r}; use on-request or repo-derivable")
+            selected, fact_text = item.get("excerpt"), item.get("fact_text")
+            if not isinstance(selected, str):
+                bad.append(f"excerpt must be a string, got {type(selected).__name__}")
+                continue
+            if fact_text is not None and not isinstance(fact_text, str):
+                bad.append(f"fact_text must be a string, got {type(fact_text).__name__}")
+                fact_text = None
+            needle = _norm(selected)
+            if len(needle) < MIN_EXCERPT_CHARS or len(needle.split()) < MIN_EXCERPT_TOKENS:
+                bad.append(f"selected span too short (need >= {MIN_EXCERPT_CHARS} chars and >= {MIN_EXCERPT_TOKENS} words): {selected!r}")
+                continue
             spans = _find_spans(natural_issue, selected)
             if not spans:
                 bad.append(f"excerpt is not a verbatim span of the issue: {selected!r}")
@@ -214,32 +266,46 @@ def withhold(natural_issue: str, model_id: str) -> dict:
             if any(a < title_b and b > title_a for a, b in extended):
                 bad.append(f"the title line cannot be withheld: {selected!r}")
                 continue
+            if extended[0] in seen_ranges:
+                duplicates += 1
+                continue
+            seen_ranges.add(extended[0])
             ranges.extend(extended)
             a, b = extended[0]
+            span = natural_issue[a:b]
+            text = (fact_text or "").strip() or span
+            problem = _fact_text_violation(text, span, natural_issue)
+            if problem:
+                bad.append(f"{problem} (span {selected!r})")
+                continue
             removed.append({"category": item.get("category"), "kind": item.get("kind"), "discovery": item.get("discovery"),
-                            "fact_text": (item.get("fact_text") or "").strip() or natural_issue[a:b], "selected": selected,
-                            "excerpt": natural_issue[a:b], "start": a, "end": b, "occurrences": [{"start": x, "end": y} for x, y in extended]})
+                            "fact_text": text, "selected": selected, "excerpt": span, "start": a, "end": b,
+                            "occurrences": [{"start": x, "end": y} for x, y in extended]})
         merged = _merge(ranges)
         removed_segs = sum(1 for s in segs if any(a <= s[0] and s[1] <= b for a, b in merged))
         if segs and removed_segs / len(segs) > MAX_REMOVED_FRACTION:
             bad.append(f"removed {removed_segs} of {len(segs)} sentences; the cap is {int(MAX_REMOVED_FRACTION * 100)}%")
+        deleted = _merge([_deletion_range(natural_issue, a, b) for a, b in merged])
+        if deleted and deleted[-1][1] == len(natural_issue) and not natural_issue.endswith("\n") and natural_issue[deleted[-1][0] - 1:deleted[-1][0]] == "\n":
+            deleted[-1] = (deleted[-1][0] - 1, deleted[-1][1])  # the natural has no trailing newline: the brief must not gain one
         kept, pos = [], 0
-        for a, b in merged:
+        for a, b in deleted:
             if a > pos:
                 kept.append((pos, a))
             pos = b
         if pos < len(natural_issue):
             kept.append((pos, len(natural_issue)))
-        brief = _tidy("".join(natural_issue[a:b] for a, b in kept), title)
+        brief = "".join(natural_issue[a:b] for a, b in kept)
         if title and title not in brief:
             bad.append("missing title")
         for r in removed:
             if r["excerpt"].casefold() in brief.casefold():
                 bad.append(f"removed span still visible in the brief: {r['excerpt']!r}")
         if not bad:
-            return {"withheld_brief": brief, "removed": removed, "kept": kept,
+            return {"withheld_brief": brief, "removed": removed, "deleted": deleted, "kept": kept,
                     "stats": {"sentences_total": len(segs), "sentences_removed": removed_segs,
-                              "fraction_removed": round(removed_segs / max(1, len(segs)), 3), "prompt_version": WITHHOLD_PROMPT_VERSION}}
+                              "fraction_removed": round(removed_segs / max(1, len(segs)), 3), "duplicate_selections": duplicates,
+                              "prompt_version": WITHHOLD_PROMPT_VERSION}}
         messages.append({"role": "assistant", "content": json.dumps(out)})
         messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(bad)})
     raise ValueError("withholding failed validation after two attempts: " + "; ".join(bad))
@@ -275,32 +341,36 @@ def _corpora(row: dict) -> dict[str, str]:
             "authored": _norm("\n".join([row.get("test_patch") or "", row.get("patch") or ""]))}
 
 
-def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None) -> list[str]:
-    """Code-owned grounding of LLM-authored facts. Every fact must quote a verbatim span (after normalization) of the text
-    its provenance names (`authored` = the merged tests/patch) and cite a URL under the repository; and at least one
-    on-request fact (in the model ledger or in `extra_facts`, the code-synthesized ones) must link a FAIL_TO_PASS test,
-    otherwise interaction is not load-bearing and approval would fail anyway."""
+def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None, *, corpus_by_fact: dict[str, str] | None = None,
+                      allow_reserved: bool = False, require_f2p_link: bool = True) -> list[str]:
+    """Code-owned grounding of ledger facts. Every fact must quote a verbatim span (after normalization) of the text its
+    provenance names (`authored` = the merged tests/patch; `corpus_by_fact[id]` overrides the corpus, used for the withheld
+    facts whose corpus is their own removed span) and cite a URL under the repository; and, unless `require_f2p_link` is
+    off, at least one on-request fact (in the model ledger or in `extra_facts`, the code-synthesized ones) must link a
+    FAIL_TO_PASS test, otherwise interaction is not load-bearing and approval would fail anyway. Reserved id prefixes are
+    violations for model output (`allow_reserved=False`) and permitted for code-generated facts."""
     corpora = _corpora(row)
     url_prefix = f"https://github.com/{row['repo']}/".casefold()
     bad = []
     ledger = d.get("ledger") or []
     for f in ledger:
         fid, prov = f.get("id", "?"), f.get("provenance")
-        if str(fid).startswith(RESERVED_FACT_PREFIXES):
+        if not allow_reserved and str(fid).startswith(RESERVED_FACT_PREFIXES):
             bad.append(f"{fid}: fact ids starting with {RESERVED_FACT_PREFIXES} are reserved for code-generated facts")
         if prov not in corpora:
             bad.append(f"{fid}: unknown provenance {prov!r}")
             continue
+        corpus = _norm(corpus_by_fact[fid]) if corpus_by_fact and fid in corpus_by_fact else corpora[prov]
         excerpt = _norm(f.get("source_excerpt"))
-        where = "merged tests/patch" if prov == "authored" else f"{prov} text"
+        where = "removed span" if corpus_by_fact and fid in corpus_by_fact else ("merged tests/patch" if prov == "authored" else f"{prov} text")
         if len(excerpt) < MIN_EXCERPT_CHARS or len(excerpt.split()) < MIN_EXCERPT_TOKENS:
             bad.append(f"{fid}: source_excerpt too short to ground a fact (need >= {MIN_EXCERPT_CHARS} chars and >= {MIN_EXCERPT_TOKENS} words): {excerpt!r}")
-        elif excerpt not in corpora[prov]:
+        elif excerpt not in corpus:
             bad.append(f"{fid}: source_excerpt is not a verbatim span of the {where}: {excerpt[:80]!r}")
         if not (f.get("source_url") or "").casefold().startswith(url_prefix):
             bad.append(f"{fid}: source_url must be under https://github.com/{row['repo']}/")
     f2p = set(row.get("fail_to_pass") or [])
-    if not any(f.get("discovery") == "on-request" and set(f.get("tests") or []) & f2p for f in [*ledger, *(extra_facts or [])]):
+    if require_f2p_link and not any(f.get("discovery") == "on-request" and set(f.get("tests") or []) & f2p for f in [*ledger, *(extra_facts or [])]):
         bad.append("no on-request fact links a FAIL_TO_PASS test id (interaction would not be load-bearing)")
     return bad
 
@@ -465,18 +535,25 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     issue_url = next((i["issue_url"] for i in thread.get("linked_issues") or []), thread.get("pr_url"))
     if not issue_url:
         raise ValueError("withheld facts need source URL")
+    withheld_facts = []
     for i, item in enumerate(withheld["removed"]):
         fid = f"withheld-{i + 1:03d}"
         if any(f.get("id") == fid for f in spec["ledger"]):
             raise ValueError("reserved withholding fact id")
         discovery = "repo-derivable" if item["category"] in REPO_DERIVABLE_CATEGORIES else item["discovery"]
-        spec["ledger"].append({"id": fid, "text": item["fact_text"], "kind": item["kind"], "provenance": "original-issue",
+        withheld_facts.append({"id": fid, "text": item["fact_text"], "kind": item["kind"], "provenance": "original-issue",
                                "source_excerpt": item["excerpt"], "source_url": issue_url, "discovery": discovery, "tests": []})
         # Operation is frozen at {type, target, rationale}: the exact span and its offsets in the natural text ride in the rationale
         # (machine-readable copy in draft.meta.json under "withholding").
         offsets = ", ".join(f"natural[{o['start']}:{o['end']}]" for o in item["occurrences"])
         spec["operations"].append({"type": "withholding", "target": fid,
                                    "rationale": f"Removed category: {item['category']}; {offsets} = {item['excerpt']!r}"})
+    # The withheld facts go through the same grounding gate as every other fact, with their own removed span as corpus.
+    bad = ledger_violations({"ledger": withheld_facts}, row, corpus_by_fact={f["id"]: f["source_excerpt"] for f in withheld_facts},
+                            allow_reserved=True, require_f2p_link=False)
+    if bad:
+        raise ValueError("withheld facts failed grounding: " + "; ".join(bad))
+    spec["ledger"].extend(withheld_facts)
 
     from swesim.models import ScenarioSpec
     parsed = ScenarioSpec.model_validate(spec)
