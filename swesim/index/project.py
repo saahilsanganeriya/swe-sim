@@ -470,7 +470,10 @@ def project_trial(layout: Layout, trial_id: str, *, origin: str | None = None, n
     run_id = _first(rec, request, launch, key="run_id")
     row_origin = _first(rec, launch, request, key="origin", allowed=ORIGINS) or origin
     stakeholder = _dict(rc.get("stakeholder"))
+    # Money and tokens: costs.json (every role) when it has records, else the record's own solver account.
     costs, tokens_in, tokens_out, cost_usd = project_costs(trial_id, d / "costs.json", origin=row_origin, now=now, workflow_id=workflow_id)
+    if not costs:
+        cost_usd, tokens_in, tokens_out = dec(rec.get("cost_usd")), _int(rec.get("input_tokens")), _int(rec.get("output_tokens"))
     started = aware(status_file.get("started_at")) or aware(rec.get("started_at")) or aware(launch.get("started_at"))
     finished = aware(status_file.get("finished_at")) or aware(rec.get("finished_at"))
     row = M.TrialRow(
@@ -527,10 +530,10 @@ def project_exchanges(trial_id: str, transcript: dict, audit: dict | None = None
 
 def project_costs(trial_id: str, path: Path, *, origin: str, now: datetime | None = None, workflow_id: str | None = None
                   ) -> tuple[list[M.CostRow], int | None, int | None, Decimal | None]:
-    """(priced cost rows, input tokens, output tokens, usd) from `costs.json`, a list of CostRecord dicts.
-    Tokens are summed over every record; `usd` over the priced ones. A record whose price is unknown (`usd` null,
-    `price_source` "unknown") is not a `costs` row because the column is not nullable; its tokens still count.
-    A file that is not a list of records raises `ProjectionError`."""
+    """(cost rows, input tokens, output tokens, usd) from `costs.json`, a list of CostRecord dicts. Tokens are summed
+    over every record; `usd` over the priced ones (None when no record is priced). A record whose price is unknown
+    (`usd` null, `price_source` says why) is a row with `usd` None. A file that is not a list of records raises
+    `ProjectionError`; an absent file gives `([], None, None, None)`."""
     now = now or M.utcnow()
     if not path.exists():
         return [], None, None, None
@@ -541,30 +544,35 @@ def project_costs(trial_id: str, path: Path, *, origin: str, now: datetime | Non
     tokens_in = tokens_out = 0
     usd_total: Decimal | None = None
     for i, item in enumerate(data):
-        if not isinstance(item, dict):
-            raise ProjectionError(f"{path}[{i}]: not a cost record")
-        tokens_in += _int(item.get("input_tokens")) or 0
-        tokens_out += _int(item.get("output_tokens")) or 0
-        if item.get("usd") is None:
-            continue
-        fields = {k: v for k, v in item.items() if k in M.CostRow.model_fields}
-        fields.setdefault("trial_id", trial_id)
-        fields["origin"] = _origin(fields.get("origin")) or origin
-        fields.setdefault("workflow_id", workflow_id)
-        fields.setdefault("created_at", now)
-        fields["updated_at"] = now
-        try:
-            row = M.CostRow(**fields)
-        except ValidationError as e:
-            raise ProjectionError(f"{path}[{i}]: {e.error_count()} invalid field(s): {[err['loc'] for err in e.errors()]}") from e
+        row = _cost_row(item, path, i, origin=origin, now=now, trial_id=trial_id, workflow_id=workflow_id)
         rows.append(row)
-        usd_total = (usd_total or Decimal(0)) + row.usd
+        tokens_in += row.input_tokens
+        tokens_out += row.output_tokens
+        if row.usd is not None:
+            usd_total = (usd_total or Decimal(0)) + row.usd
     return rows, tokens_in, tokens_out, usd_total
 
 
+def _cost_row(item: Any, path: Path, i: int, *, origin: str, now: datetime, trial_id: str | None = None, workflow_id: str | None = None) -> M.CostRow:
+    if not isinstance(item, dict):
+        raise ProjectionError(f"{path}[{i}]: not a cost record")
+    fields = {k: v for k, v in item.items() if k in M.CostRow.model_fields}
+    if trial_id is not None:
+        fields.setdefault("trial_id", trial_id)
+    if fields.get("workflow_id") is None and workflow_id is not None:
+        fields["workflow_id"] = workflow_id
+    fields["origin"] = _origin(fields.get("origin")) or origin
+    fields.setdefault("created_at", now)
+    fields["updated_at"] = now
+    try:
+        return M.CostRow(**fields)
+    except ValidationError as e:
+        raise ProjectionError(f"{path}[{i}]: {e.error_count()} invalid field(s): {[err['loc'] for err in e.errors()]}") from e
+
+
 def project_workflow_costs(layout: Layout, *, origin: str | None = None, now: datetime | None = None) -> list[M.CostRow]:
-    """Priced cost records of workflows without a trial (`root/costs/<workflow_id>.json`, written by
-    `swesim.costs.record_cost`). A file that is not a list of records raises `ProjectionError`."""
+    """Cost records of workflows without a trial (`Layout.workflow_costs_path`, written by `swesim.costs.record_cost`).
+    A file that is not a list of records raises `ProjectionError`."""
     origin = _default_origin(origin)
     now = now or M.utcnow()
     cdir = layout.costs_dir()
@@ -576,20 +584,7 @@ def project_workflow_costs(layout: Layout, *, origin: str | None = None, now: da
         data = read_json(path)
         if not isinstance(data, list):
             raise ProjectionError(f"{path}: costs file must be a list of cost records")
-        for i, item in enumerate(data):
-            if not isinstance(item, dict):
-                raise ProjectionError(f"{path}[{i}]: not a cost record")
-            if item.get("usd") is None:
-                continue
-            fields = {k: v for k, v in item.items() if k in M.CostRow.model_fields}
-            fields["origin"] = _origin(fields.get("origin")) or origin
-            fields.setdefault("workflow_id", workflow_id)
-            fields.setdefault("created_at", now)
-            fields["updated_at"] = now
-            try:
-                rows.append(M.CostRow(**fields))
-            except ValidationError as e:
-                raise ProjectionError(f"{path}[{i}]: {e.error_count()} invalid field(s): {[err['loc'] for err in e.errors()]}") from e
+        rows.extend(_cost_row(item, path, i, origin=origin, now=now, workflow_id=workflow_id) for i, item in enumerate(data))
     return rows
 
 

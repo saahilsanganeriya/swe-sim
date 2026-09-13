@@ -2,7 +2,7 @@
 
 Revision ID: 0001_index_v1
 Revises: 
-Create Date: 2026-09-13 08:31:16.939711+00:00
+Create Date: 2026-09-13 09:10:05.867706+00:00
 
 """
 from __future__ import annotations
@@ -55,7 +55,7 @@ def upgrade() -> None:
     sa.Column('input_tokens', sa.Integer(), nullable=False),
     sa.Column('output_tokens', sa.Integer(), nullable=False),
     sa.Column('cached_tokens', sa.Integer(), nullable=True),
-    sa.Column('usd', sa.Numeric(precision=12, scale=6), nullable=False),
+    sa.Column('usd', sa.Numeric(precision=12, scale=6), nullable=True),
     sa.Column('price_source', sa.Text(), nullable=False),
     sa.Column('at', sa.TIMESTAMP(timezone=True), nullable=False),
     sa.Column('created_at', sa.TIMESTAMP(timezone=True), nullable=False),

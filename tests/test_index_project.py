@@ -94,6 +94,10 @@ def build_record(tmp_path: Path) -> Record:
     events = ask_events(T0 + 6, "Which exception should be raised?", "ValueError.", ["f01"], 5) + review_events(T0 + 30, 3) + confirm_events(T0 + 20, 4)
     tids["done"] = write_trial(ws, spec, events=events, label={"label": "valid", "note": "looks right"})
     tids["wrong"] = write_trial(ws, spec, attempt=1, outcome_code=2, success=0, reward=0.0)
+    for name, extra in (("done", {"cost_usd": "0.009", "input_tokens": 999, "output_tokens": 99, "price_source": "anthropic-2026-09"}),
+                        ("wrong", {"cost_usd": 0.004, "input_tokens": 400, "output_tokens": 40, "price_source": "anthropic-2026-09"})):
+        rec_path = ws.root / "trials" / tids[name] / "record.json"  # the run stage's own solver account (models stream)
+        rec_path.write_text(json.dumps({**json.loads(rec_path.read_text()), **extra}))
     tids["infra"] = write_trial(ws, spec, attempt=2, outcome_code=7, success=0, reward=0.0)
     tids["full"] = write_trial(ws, spec, condition="full", purpose="comparison")
     tids["runner-error"] = write_unresolved(ws, spec, kind="runner-error", attempt=3)
@@ -266,7 +270,7 @@ def test_completed_trial_projects_row_exchanges_and_costs(record: Record):
     assert row.integrity_signal_count == 0 and row.questions_asked == 1 and row.confirmations == 1 and row.asked_before_implementing is True
     assert row.started_at == datetime(2026, 9, 13, 9, 59, tzinfo=UTC) and row.finished_at == datetime(2026, 9, 13, 10, 5, tzinfo=UTC)
     assert row.launcher is None and row.job_name is None
-    assert row.cost_usd == Decimal("0.03") and row.input_tokens == 1510 and row.output_tokens == 251  # tokens include the unpriced record
+    assert row.cost_usd == Decimal("0.03") and row.input_tokens == 1510 and row.output_tokens == 251  # costs.json (every role) wins over the record's solver account
     default_stakeholder = StakeholderConfig()  # the RunConfig the fixture ran with carries the current defaults
     assert row.stakeholder_model == default_stakeholder.model_id and row.stakeholder_prompt_version == default_stakeholder.prompt_version
     assert row.origin == "laptop"
@@ -277,15 +281,17 @@ def test_completed_trial_projects_row_exchanges_and_costs(record: Record):
     assert by_seq[0].audit["specific"] is True and by_seq[1].audit["targeted"] is True and by_seq[2].audit is None
     assert (by_seq[2].exchange, by_seq[3].exchange, by_seq[4].exchange, by_seq[5].exchange) == ("review", "review", "confirm", "confirm")
     assert by_seq[5].regenerated is True and by_seq[5].redacted_terms == ["t1"] and by_seq[1].ts == P.aware(T0 + 8) and by_seq[0].patience_after is None
-    assert [c.role for c in costs] == ["solver", "stakeholder"] and all(c.trial_id == tid for c in costs)
+    assert [c.role for c in costs] == ["solver", "stakeholder", "judge"] and all(c.trial_id == tid for c in costs)
     assert costs[1].usd == Decimal("0.02") and isinstance(costs[1].usd, Decimal) and costs[1].at == datetime(2026, 9, 13, 10, 2, tzinfo=UTC)
+    assert costs[2].usd is None and costs[2].price_source == "unknown"  # an unknown price is a row, never a zero
     public = R.blank_exchange(by_seq[5])
     assert (public.disclosed_fact_ids, public.redacted_terms, public.regenerated, public.audit) == ([], [], None, None) and public.text_public == "Yes."
 
 
 def test_other_outcomes_and_conditions(record: Record):
-    wrong, _e, _c = P.project_trial(record.layout, record.tids["wrong"], origin="laptop")
-    assert (wrong.outcome_code, wrong.success, wrong.reward, wrong.questions_asked, wrong.cost_usd) == (2, False, Decimal(0), 0, None)
+    wrong, _e, wrong_costs = P.project_trial(record.layout, record.tids["wrong"], origin="laptop")
+    assert (wrong.outcome_code, wrong.success, wrong.reward, wrong.questions_asked) == (2, False, Decimal(0), 0)
+    assert wrong_costs == [] and (wrong.cost_usd, wrong.input_tokens, wrong.output_tokens) == (Decimal("0.004"), 400, 40)  # no costs.json: the record's account
     infra, _e, _c = P.project_trial(record.layout, record.tids["infra"], origin="laptop")
     assert infra.outcome_code == 7 and infra.status == "completed"
     full, exchanges, _c = P.project_trial(record.layout, record.tids["full"], origin="laptop")
@@ -319,7 +325,8 @@ def test_attempts_without_a_record_get_a_status_from_the_evidence(record: Record
 
 def test_workflow_costs_come_from_the_costs_directory(record: Record, tmp_path: Path):
     rows = P.project_workflow_costs(record.layout, origin="laptop")
-    assert [(r.cost_id, r.workflow_id, r.trial_id, r.usd) for r in rows] == [("01J8Z0000000000000000JUDG1", "create-1", None, Decimal("0.005"))]
+    assert [(r.cost_id, r.workflow_id, r.trial_id, r.usd) for r in rows] == [("01J8Z0000000000000000JUDG1", "create-1", None, Decimal("0.005")),
+                                                                            ("01J8Z0000000000000000JUDG2", "create-1", None, None)]
     assert P.project_workflow_costs(Layout(root=tmp_path), origin="laptop") == []
     bad = Layout(root=tmp_path)
     (tmp_path / "costs").mkdir()
@@ -371,7 +378,7 @@ def test_leaderboard_gate(record: Record, registry: dict):
     cell = board[0]
     assert (cell.model, cell.condition, cell.brief_profile, cell.n, cell.scenarios, cell.success_count) == (HAIKU, "interactive", "withheld", 2, 1, 1)
     assert cell.pass_rate == Decimal("0.5") and cell.mean_reward == Decimal("0.5") and cell.questions_asked == 1 and cell.confirmations == 1
-    assert cell.cost_usd == Decimal("0.03") and cell.cost_per_success == Decimal("0.03")
+    assert cell.cost_usd == Decimal("0.034") and cell.cost_per_success == Decimal("0.034")  # done (costs.json) + wrong (record account)
     with_saturated = R.compute_leaderboard(trials, scenarios, M.LeaderboardFilter(purpose="calibration", include_saturated=True))
     assert (with_saturated[0].n, with_saturated[0].scenarios) == (3, 2)
     assert R.compute_leaderboard(trials, scenarios, M.LeaderboardFilter(purpose="comparison"))[0].condition == "full"

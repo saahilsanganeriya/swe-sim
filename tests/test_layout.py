@@ -66,6 +66,9 @@ def test_candidate_probe_evidence_and_job_paths(layout: Layout):
     assert layout.evidence_dir("cloudrun") == root / "evidence" / "cloudrun"
     with pytest.raises(LayoutError):
         layout.evidence_dir("../x")
+    assert layout.model_probe_path() == root / "evidence" / "model-probe.json"
+    from swesim.storage.layout import EVIDENCE_KINDS
+    assert "model-probe" not in EVIDENCE_KINDS and {"cloudrun", "cloud", "sweep", "console", "audit"} <= set(EVIDENCE_KINDS)
     assert layout.calibration_path("openai/gpt-5.5", date(2026, 9, 13)) == root / "calibration" / "openai--gpt-5.5" / "2026-09-13.json"
     for kind in ("probe", "runs", "validate"):
         assert layout.jobs_dir(kind) == root / "jobs" / kind

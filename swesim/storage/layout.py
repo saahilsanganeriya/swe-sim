@@ -33,7 +33,7 @@ TRIAL_FILES: frozenset[str] = frozenset(TrialFile.__args__)
 CANDIDATE_STAGES: frozenset[str] = frozenset(CandidateStage.__args__)
 JOB_KINDS: frozenset[str] = frozenset(JobKind.__args__)
 CONDITIONS: tuple[str, ...] = Condition.__args__
-EVIDENCE_KINDS: tuple[str, ...] = ("cloudrun", "cloud", "sweep", "console", "audit", "model-probe")
+EVIDENCE_KINDS: tuple[str, ...] = ("cloudrun", "cloud", "sweep", "console", "audit")  # directories; the model probe is one file
 
 TRIAL_ID_RE = re.compile(r"^[0-9a-f]{24}$")
 # One path segment: no separators, no `.`/`..`, the characters the pipeline uses for keys, instance ids and evidence kinds.
@@ -143,6 +143,10 @@ class Layout(Strict):
     # ------------------------------------------------------------------ evidence, calibration, jobs
     def evidence_dir(self, kind: str) -> Path:
         return self.root / "evidence" / _segment(kind, "evidence kind")
+
+    def model_probe_path(self) -> Path:
+        """The resolved model roles (`probe_models_activity`): one file, `root/evidence/model-probe.json`."""
+        return self.root / "evidence" / "model-probe.json"
 
     def calibration_path(self, judge_model: str, day: date) -> Path:
         if not isinstance(day, date):

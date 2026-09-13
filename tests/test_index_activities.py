@@ -81,12 +81,12 @@ def test_disabled_index_never_raises(disabled: Settings):
 def test_trial_activity_indexes_row_exchanges_and_costs_idempotently(enabled: Settings, record: Record):
     tid = record.tids["done"]
     first = run(IA.index_trial_activity, {"trial_id": tid})
-    assert first == {"indexed": True, "rows": 1 + 6 + 2, "status": "completed"}
+    assert first == {"indexed": True, "rows": 1 + 6 + 3, "status": "completed"}
     assert run(IA.index_trial_activity, {"trial_id": tid}) == first
     store = IA.store_for(enabled)
     row = store.trial(tid)
     assert row is not None and row.origin == "cloudrun" and row.cost_usd == Decimal("0.03") and store.trials(M.TrialFilter()).total == 1
-    assert len(store.exchanges(tid, evaluator=True)) == 6 and len(store.costs(M.CostFilter(trial_id=[tid]))) == 2
+    assert len(store.exchanges(tid, evaluator=True)) == 6 and len(store.costs(M.CostFilter(trial_id=[tid]))) == 3
     assert run(IA.index_trial_activity, {"trial_id": record.tids["launch-only"]})["status"] == "unresolved"
     with pytest.raises(ApplicationError) as e:
         run(IA.index_trial_activity, {"trial_id": "0" * 24})

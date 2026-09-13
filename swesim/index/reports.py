@@ -112,7 +112,7 @@ def cost_totals(costs: Iterable[M.CostRow]) -> list[tuple[str, str, int, int, in
         t[0] += 1
         t[1] += c.input_tokens
         t[2] += c.output_tokens
-        t[3] += c.usd
+        t[3] += c.usd if c.usd is not None else Decimal(0)  # an unknown price adds nothing to the ledger; the row stays visible
     out = [(p, m, t[0], t[1], t[2], t[3]) for (p, m), t in totals.items()]
     out.sort(key=lambda r: (-r[5], r[0], r[1]))
     return out
