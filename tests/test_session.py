@@ -316,6 +316,46 @@ def test_option_picks_are_filtered_like_identifiers():
     assert r3.redaction_count == 0 and "(a)" in r3.reply
 
 
+def test_numbered_option_picks_are_detected_and_ordinary_numerals_are_not():
+    """Agents also number their options ("1.", "2)", "option 2"); the no-pick rule is code-enforced for those forms too, while
+    ordinary numerals (versions, fractions, ranges, prices, times) are never read as picks."""
+    from swesim.stakeholder.session import option_markers, redact, term_pattern
+    offered = "Which do you prefer?\n1. change Color.default_scale\n2) change Property.default_scale\n3. cast in ContinuousBase._setup."
+    assert option_markers(offered) == ["(1)", "(2)", "(3)"]
+    assert option_markers("Options: (1) X, (2) Y, or option 3") == ["(1)", "(2)", "(3)"]
+    assert option_markers("Go with option 2, or Option (3).") == ["(2)", "(3)"]
+    assert option_markers("Either (a) or 2) — your call") == ["(2)", "(a)"]
+    # picks in replies normalize to the same markers whatever the surface form
+    assert option_markers("I'd go with 2.") == ["(2)"] and option_markers("Option 1 please") == ["(1)"] and option_markers("(3), definitely") == ["(3)"]
+    # ordinary numerals are not picks
+    for text in ("Python 3.12 is required", "the values act like 0/1", "they act like 0/1.", "between 1-2 seconds", "v2. is out", "release 3.12.",
+                 "1.5x faster", "at 3:30", "it costs $1.99", "step1.", "Option 3.12 of the spec", "see figure 2-3", "1/2 of the cases", "10. items"):
+        assert option_markers(text) == [], text
+    # term patterns for numbered markers cover every surface form of that pick and nothing else
+    two = term_pattern("(2)")
+    assert two.search("I'd take 2) here") and two.search("option 2") and two.search("go with (2)") and two.search("pick 2.")
+    assert not two.search("Python 2.7") and not two.search("(a)") and not two.search("12.") and not two.search("2/3") and not term_pattern("(3)").search("option 2")
+    text, withheld = redact("Go with 2. The values should act like 0/1 on a continuous scale.", ["(2)"])
+    assert text == "[withheld] The values should act like 0/1 on a continuous scale." and withheld == ["Go with 2."]
+    # end to end: numbered options offered, the model picks one and names code -> regenerated, then the pick sentence is withheld
+    view = {**VIEW, "forbidden_terms": ["Color", "Property", "ContinuousBase", "default_scale", "_setup("]}
+    pick = "Option 2, change Property.default_scale. Boolean color values should act like 0/1 on a continuous scale; other properties must not change."
+    s = Session("t1", view, cfg(start=6, terse_below=0)); llm = SeqLLM(pick, pick)
+    r = asyncio.run(s.ask("q1", offered, llm))
+    assert llm.calls == 2 and r.regenerated is True
+    assert r.reply == "[withheld] Boolean color values should act like 0/1 on a continuous scale; other properties must not change."
+    assert r.redacted_terms == ["(2)", "Property", "default_scale"] and option_markers(r.reply) == []
+    # a reply that is only a numbered pick becomes a single [withheld]; "3." at the end of the sentence is that pick
+    s2 = Session("t2", view, cfg()); r2 = asyncio.run(s2.ask("q1", offered, SeqLLM("I'd go with 3.")))
+    assert r2.reply == "[withheld]" and r2.redacted_terms == ["(3)"]
+    # ordinary numerals in a reply to a numbered offer are left alone
+    s3 = Session("t3", view, cfg()); r3 = asyncio.run(s3.ask("q1", offered, SeqLLM("Boolean values should act like 0/1; we run Python 3.12 and 1.5x the load.")))
+    assert r3.redaction_count == 0 and "Python 3.12" in r3.reply
+    # without numbered options in the agent's message, "2." in a reply is ordinary text
+    s4 = Session("t4", view, cfg()); r4 = asyncio.run(s4.ask("q1", "What exactly is wrong?", SeqLLM("It fails on step 2. The error is silent.")))
+    assert r4.redaction_count == 0 and "step 2." in r4.reply
+
+
 def _behavior_cfg(**patience):
     """A StakeholderConfig in behavior mode. Built without validation while models.py still pins review_mode to 'diff-only'."""
     from swesim.models import PatienceProfile

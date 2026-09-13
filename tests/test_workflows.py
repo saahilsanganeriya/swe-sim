@@ -506,6 +506,51 @@ def test_operator_workflows_write_running_first_and_a_terminal_row_on_every_exit
     asyncio.run(scenario())
 
 
+def test_operator_workflows_record_the_resolved_models_after_the_probe(monkeypatch):
+    """The Workflows page shows the models actually used: once probe_models resolves the roles, a second `running` row carries
+    `resolved_models` and `substitutions` and its role keys name the resolved ids (behind PATCH_RESOLVED; pre-patch executions
+    replay without it)."""
+    from types import SimpleNamespace
+    async def scenario():
+        calls = []
+        probe = {"resolved": {"judge_model": "openai/gpt-5.5", "draft_model": "anthropic/claude-sonnet-5", "stakeholder_model": "openai/gpt-5.5"},
+                 "substitutions": {"judge_model": "openai/gpt-5.5"}, "notes": ["judge j unavailable"], "needs_human": [], "solver_unavailable": ["m"]}
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "probe_models_activity": return probe
+            if name == "frontier_gate_activity": return {"allowed": True, "scenario_ids": list(p.get("scenario_ids") or []), "reasons": []}
+            if name == "prepare_candidate_plan_activity": raise RuntimeError("stopped after the probe for the test")
+            return {}
+        monkeypatch.setattr(W, "act", act)
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="run-1", run_id="r1", workflow_type="RunTasksWorkflow"))
+        run_params = {"scenario_ids": ["s1"], "models": ["m"], "judge_model": "j", "stakeholder_url": "https://s"}
+        r = await W.RunTasksWorkflow().run(run_params)
+        assert r["stopped_reason"] == "model-unavailable"
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert [x["status"] for x in rows] == ["running", "running", "completed"]
+        assert "resolved_models" not in rows[0]["params_summary"] and rows[0]["params_summary"]["judge_model"] == "j"
+        assert rows[1]["params_summary"]["resolved_models"] == probe["resolved"] and rows[1]["params_summary"]["substitutions"] == probe["substitutions"]
+        assert rows[1]["params_summary"]["judge_model"] == "openai/gpt-5.5" and rows[1]["params_summary"]["models"] == ["m"]
+        names = [n for n, _ in calls]
+        assert names.index("probe_models_activity") < names.index("index_workflow_activity", names.index("probe_models_activity"))
+        # CreateTasksWorkflow: the same row after its probe, before any mining
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="create-1", run_id="r1", workflow_type="CreateTasksWorkflow"))
+        calls.clear()
+        with pytest.raises(RuntimeError, match="stopped after the probe"):
+            await W.CreateTasksWorkflow().run({"sources": [{"kind": "swebench-annotated", "pool": "A"}], "judge_model": "j", "draft_model": "d"})
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert [x["status"] for x in rows] == ["running", "running", "failed"]
+        assert rows[1]["params_summary"]["resolved_models"] == probe["resolved"] and rows[1]["params_summary"]["draft_model"] == "anthropic/claude-sonnet-5"
+        names = [n for n, _ in calls]
+        assert names.index("probe_models_activity") < names.index("index_workflow_activity", names.index("probe_models_activity")) < names.index("mine_activity")
+        # executions started before the patch replay without the extra row
+        monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_RESOLVED)
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="run-1", run_id="r1", workflow_type="RunTasksWorkflow"))
+        calls.clear(); await W.RunTasksWorkflow().run(run_params)
+        assert [p["status"] for n, p in calls if n == "index_workflow_activity"] == ["running", "completed"]
+    asyncio.run(scenario())
+
+
 def test_candidate_hooks_carry_source_key_and_scenario_and_tolerate_failure(monkeypatch):
     from types import SimpleNamespace
     async def scenario():
@@ -1247,6 +1292,21 @@ def _run_in_env(scenario):
     asyncio.run(go())
 
 
+def test_env_built_workers_carry_the_heartbeat_throttle_and_concurrency():
+    """`build_workers` hands every production Worker the five-second heartbeat throttle and the per-queue concurrency."""
+    from datetime import timedelta
+    from swesim.settings import Settings
+    from swesim.workflows import worker as WK
+    async def scenario(env):
+        s = Settings.from_env({"SWESIM_ENV_FILE": "/nonexistent/.env"})
+        built = WK.build_workers(env.client, s)
+        assert [w.task_queue for w in built] == list(s.task_queues) and len(built) == len(QUEUES)
+        for w in built:
+            assert w.config()["max_heartbeat_throttle_interval"] == timedelta(seconds=5)
+            assert w.config()["max_concurrent_activities"] == WK.concurrency(s, w.task_queue)
+    _run_in_env(scenario)
+
+
 def test_env_trial_workflow_rejects_duplicate_id_and_launches_once():
     from temporalio import activity
     from temporalio.exceptions import WorkflowAlreadyStartedError
@@ -1351,6 +1411,11 @@ def test_worker_registers_all_workflows_and_partitions_activities_by_queue(monke
     s = Settings.from_env({"SWESIM_TASK_QUEUE": "swesim-build,swesim-control", "SWESIM_WORKER_IMAGE_DIGEST": "sha256:abc", "TEMPORAL_API_KEY": "tmprl_x",
                            "SWESIM_ENV_FILE": "/nonexistent/.env"})
     assert WK.concurrency(s, Q.BUILD) == 8 and WK.concurrency(s.model_copy(update={"max_concurrent_activities": 3}), Q.BUILD) == 3
+    # heartbeats are throttled to five seconds so an operator's cancel reaches a running stage within seconds, not the SDK's 60 s
+    from datetime import timedelta
+    assert WK.HEARTBEAT_THROTTLE == timedelta(seconds=5)
+    assert WK.worker_options(s, Q.BUILD) == {"max_concurrent_activities": 8, "max_heartbeat_throttle_interval": timedelta(seconds=5)}
+    assert WK.worker_options(s.model_copy(update={"max_concurrent_activities": 3}), Q.CONTROL)["max_concurrent_activities"] == 3
     line = WK.startup_line(s)
     assert "queues=swesim-build,swesim-control" in line and "worker_image_digest=sha256:abc" in line and "tmprl_x" not in line
     # the control pool migrates the index at startup when it is enabled; other pools and a disabled index skip; a missing entry point is reported
