@@ -39,6 +39,7 @@ def test_screen_plan_and_activity_use_exact_trial_ids_and_current_build(tmp_path
     planned = A.plan_trials({'scenario_id': spec.id, 'purpose': 'screen', 'stakeholder_url': 'https://example.test', 'k': 99, 'conditions': ['interactive']})
     assert [t['condition'] for t in planned['trials']] == ['hidden', 'hidden', 'full']
     for i, t in enumerate(planned['trials']):
+        assert t['version'] == spec.version
         assert RunConfig.model_validate(t['run_config']).purpose == 'screen'
         record = {**t, 'purpose': 'screen', 'compiled_hash': 'c' * 64, 'status': 'completed',
                   'reward': {'success': 0 if i == 0 else 1, 'reward': 0.0 if i == 0 else 1.0, 'outcome_code': 2 if i == 0 else 1}}

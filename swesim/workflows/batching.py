@@ -62,7 +62,8 @@ def trial_plan(ws: Workspace, path: Path, trials: list[dict]) -> dict:
             raise ValueError(f'workflow plan already binds trial {tid} to a different request')
         atomic_json(request_path, request)
         items.append({**{k: request[k] for k in ('trial_id', 'scenario_id', 'model', 'condition', 'attempt_index')},
-                      'purpose': request['run_config']['purpose'], 'audit_model': request.get('audit_model'), 'request_path': str(request_path)})
+                      'version': request.get('version'), 'purpose': request['run_config']['purpose'],
+                      'audit_model': request.get('audit_model'), 'request_path': str(request_path)})
     return write_plan(path, items)
 
 

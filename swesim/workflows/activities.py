@@ -687,7 +687,7 @@ def plan_trials(p: dict) -> dict:
                 from swesim.stages.run import scaffold_identity
                 rc = RunConfig.model_validate({**rc.model_dump(), "agent_config": scaffold_identity(WS.task_dir(spec.id, cond), rc)})
                 tid = trial_id(spec.spec_hash, cond, rc.run_config_hash, i)
-                trials.append({"trial_id": tid, "scenario_id": spec.id, "spec_hash": spec.spec_hash, "condition": cond, "model": model,
+                trials.append({"trial_id": tid, "scenario_id": spec.id, "version": spec.version, "spec_hash": spec.spec_hash, "condition": cond, "model": model,
                                    "stakeholder_model": rc.stakeholder.model_id, "run_config": rc.model_dump(mode="json"),
                                    "run_config_hash": rc.run_config_hash, "attempt_index": i, "stakeholder_url": p["stakeholder_url"]})
     if len({t["trial_id"] for t in trials}) != len(trials):
