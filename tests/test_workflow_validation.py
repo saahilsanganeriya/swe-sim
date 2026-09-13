@@ -105,10 +105,21 @@ def test_discovery_writes_unprobed_rows_and_reject_funnel(tmp_path, monkeypatch)
     from swesim.sources import github_repo as github
     ws = Workspace(tmp_path / 'workspace')
     monkeypatch.setattr(A, 'WS', ws)
+    from swesim.sources import observations as obs
     seen = []
-    def discover(repo, since, kind='feature'):
-        seen.append((repo, since, kind))
-        return [{'base_commit': 'abc', 'instance_id': 'x__y-1'}, {'base_commit': 'def', 'instance_id': 'x__y-2'}], {'too-small': 3}
+    def discover(repo, since, kind='feature', *, observations=None, **_):
+        # discover_scan passes max_prs/pr/observations and derives the reject histogram from the observations it records
+        seen.append((repo, since, kind)); observations = observations if observations is not None else []
+        cands = [{'base_commit': 'abc', 'instance_id': 'x__y-1'}, {'base_commit': 'def', 'instance_id': 'x__y-2'}]
+        for i, c in enumerate(cands):
+            c['_observation_seq'] = i
+            observations.append(obs.DiscoveryPRObservation(seq=i, pr_number=i + 1, pr_url=f'https://github.com/x/y/pull/{i + 1}',
+                                                           stages=['listed', 'merged-in-range', 'linked-issue', 'band-passed', 'retained'], status='retained'))
+        for _ in range(3):
+            seq = len(observations)
+            observations.append(obs.DiscoveryPRObservation(seq=seq, pr_number=seq + 1, pr_url=f'https://github.com/x/y/pull/{seq + 1}',
+                                                           stages=['listed', 'merged-in-range', 'linked-issue'], status='rejected', reason='too-small'))
+        return cands, {'too-small': 3}
     monkeypatch.setattr(github, 'discover', discover)
     monkeypatch.setattr(github, 'candidate_to_row', lambda c: {**c, 'patch': 'large source patch stays on disk', 'fail_to_pass': []})
     monkeypatch.setattr(github, 'build_recipe', lambda *args: {'repo_dir': '/app'})
@@ -138,8 +149,17 @@ def test_discovery_bands_and_immutable_snapshots_do_not_overwrite_history(tmp_pa
     from swesim.paths import Workspace
     from swesim.sources import github_repo as github
     ws = Workspace(tmp_path); monkeypatch.setattr(A, 'WS', ws)
+    from swesim.sources import observations as obs
     records = {'rejects': {'too-small': 3}}
-    monkeypatch.setattr(github, 'discover', lambda *args, **kwargs: ([], records['rejects']))
+    def fake_discover(repo, since, *args, observations=None, **kwargs):
+        observations = observations if observations is not None else []
+        for reason, n in records['rejects'].items():   # the scan derives the histogram from recorded decisions
+            for _ in range(n):
+                seq = len(observations)
+                observations.append(obs.DiscoveryPRObservation(seq=seq, pr_number=seq + 1, pr_url=f'https://github.com/x/y/pull/{seq + 1}',
+                                                               stages=['listed', 'merged-in-range', 'linked-issue'], status='rejected', reason=reason))
+        return [], dict(records['rejects'])
+    monkeypatch.setattr(github, 'discover', fake_discover)
     first = asyncio.run(A.discover_activity({'repo': 'x/y', 'kind': 'bugfix'}))
     records['rejects'] = {'no-tests': 7}
     second = asyncio.run(A.discover_activity({'repo': 'x/y', 'kind': 'bugfix'}))
