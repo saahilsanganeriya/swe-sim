@@ -424,6 +424,7 @@ def test_llm_helpers(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
     assert llm._secret("ANTHROPIC_API_KEY") == "env-key"
     with pytest.raises(llm.LLMError, match="OPENAI_API_KEY"): llm._secret("OPENAI_API_KEY")
-    assert llm._openai_kwargs("gpt-5.5", 0.0, 100) == {"response_format": {"type": "json_object"}, "max_completion_tokens": 100}
+    kw = llm._openai_kwargs("gpt-5.5", 0.0, 100)   # reasoning model: no temperature, headroom for reasoning tokens, bounded effort
+    assert kw == {"response_format": {"type": "json_object"}, "max_completion_tokens": 100 + llm.OPENAI_REASONING_HEADROOM, "reasoning_effort": "low"}
     assert llm._openai_kwargs("gpt-4.1", 0.0, 100)["temperature"] == 0.0
     assert "temperature" not in llm._openai_kwargs("o3", 0.2, 100) and "temperature" not in llm._openai_kwargs("gpt-4.1", None, 100)
