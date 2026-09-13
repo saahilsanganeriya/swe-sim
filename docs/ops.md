@@ -2,7 +2,7 @@
 
 This is the evidence ledger, not the setup procedure. Use [setup](setup.md), [the runbook](runbook.md), and [architecture](architecture.md) for current operation. Dates are UTC unless labelled otherwise. Historical VM demonstrations remain separate from Cloud Run acceptance.
 
-The user reprioritized completion to **all code and a properly hosted website over the preserved record**. New task discovery and experiments are deferred. The website checks below remain required; experimental rows are retained as deferred work, not as blockers to providing a verified website URL.
+On 2026-09-13 the user first reprioritized completion to **all code and a properly hosted website over the preserved record**, then (ledger entry labelled 11:55 PDT) un-deferred the hosted smoke: the goal is a running pipeline to iterate on task generation, reward and tuning; cost and infrastructure polish are not priorities. The measured smoke is in [Hosted smoke (2026-09-13)](#hosted-smoke-2026-09-13); everything the finishing streams did not finish is in [Deferred from the 2026-09-13 finishing run](#deferred-from-the-2026-09-13-finishing-run). The website checks below remain required.
 
 ## Hosted takeover — 2026-09-13
 
@@ -60,6 +60,46 @@ A second fresh remote clone of `1fb1530b66066c17b832c9e4cffe73f1b0ffe262`, again
 
 No cloud bootstrap, deployment or trial was executed from that fresh clone. The operator is responsible for the separate idempotent `cloud-bootstrap` acceptance and authenticated browser checks.
 
+## Hosted smoke (2026-09-13)
+
+The first workflows ever started in the Temporal Cloud namespace `swesim.abcde`, and the deploys around them. Times are UTC from the evidence file names; the ledger's PDT labels are not repeated here. Nothing in this section is a graded outcome.
+
+### Deploys
+
+| Commit | What happened | Evidence |
+|---|---|---|
+| `1976af3` | `make deploy` stopped at the open-executions guard before building: `swesim workflows open-types` tried `127.0.0.1:7233` (connection refused), so the guard could not list the Cloud namespace. The guard's report file is empty. | `workspace/evidence/cloud/deploy-1976af3.log`, `open-types-20260913T182145Z.txt` (0 bytes) |
+| `609f923` (`609f923557ca0807e1e90cde0114057f77fce027`) | Guard: `# No open workflows`. Cloud Build `ae494b42-bf9e-4306-8f8b-7af7b168fb6b` SUCCESS (2M13S, started 18:22:38Z). Pinned `worker@sha256:f2b265054b9ea61d442957945d94ad89ee544e4683475ee41a85889bb8f425fc`. Terraform `Plan: 0 to add, 6 to change, 0 to destroy` (image `c095bcb8…` → `f2b26505…` on the four pools, the console and the maintenance Job); `Apply complete! Resources: 0 added, 6 changed, 0 destroyed`. Migration execution `swesim-index-maintenance-nzrvm` completed successfully. `verify_cloud` `result: OK`: Temporal api-key on `us-central1.gcp.api.temporal.io:7233` / `swesim.abcde` with pollers (`swesim-authoring` activity 2 / workflow 2, `swesim-build` activity 2, `swesim-control` activity 1, `swesim-trials` activity 1), IAP 302 to `accounts.google.com`, four pools and the console Ready on the pinned image, `registry.json` in the bucket. Notes: no `swesim-trial-*` Jobs yet; index status skipped (no Cloud SQL socket on the laptop). | `deploy-609f923.log`, `open-types-20260913T182230Z.txt`, `terraform-apply-20260913T182558Z.txt`, `verify_cloud-20260913T183003Z.txt`, `iap-headers-20260913T183003Z.txt` |
+| `40c84d3` | Guard stopped the deploy: `CreateTasksWorkflow 1` open (the swebench creation below). | `deploy-40c84d3.log`, `open-types-20260913T183755Z.txt` |
+| `1ca70a6` (`1ca70a66d142210bb25b4a6edf3744e204bcad30`) | Started with `OVERRIDE_OPEN_EXECUTIONS=1` (the guard's report carries the override line). Ledger ruling: every command-sequence change since the running image (frontier gate, lifecycle rows, requested-score-k, frozen retry) is behind `workflow.patched` markers and the open workflow is a `CreateTasksWorkflow` whose remaining commands are unchanged in shape; cost if wrong: one non-determinism failure on that workflow, which would be re-run. Cloud Build `31c3a7b9-91c9-49ac-ae43-a1fc4cb60509` was still running when this section was written (18:42Z). Record its digest, apply summary, migration execution and verify result here when it finishes. | `deploy-1ca70a6.log`, `open-types-20260913T184221Z.txt` |
+
+The deploy of `609f923` is the newest verified deploy in this ledger. The image digest of a later deploy is not known until its log carries `pinned …@sha256:…` and `verify_cloud … result: OK`.
+
+### Creation workflows
+
+| Workflow id | Request | Observed | Evidence |
+|---|---|---|---|
+| `create-fa2489a292574fd19ba88796c0c18087` | `swebench:A:pytest-dev__pytest-7283`, auto approval | Started 18:31Z. Open at 18:37:55Z and 18:42:21Z (the guard listings). Ledger entry labelled 13:25: blocked on the missing `gh` binary too (`swebench_annotated.candidates` → `threads.fetch_pr_thread`); `mine_activity` at attempt 3 under the LLM retry class. Plan recorded there: once an image built from main ≥ `238fb33` is deployed, cancel it and resubmit. | `workspace/evidence/smoke/create-swebench-pytest-7283.log` (the id), `open-types-20260913T183755Z.txt`, `open-types-20260913T184221Z.txt` |
+| `create-3b1513db47894549a189f678343774b9` | `https://github.com/encode/httpx`, band `bugfix`, max 3, auto approval | Started 18:31Z. Errored in discovery: `FileNotFoundError: 'gh'` — the worker image had no GitHub CLI. Fixed by commit `1555810` (`Dockerfile.worker` installs gh 2.100.0, checksum-verified; validated in a throwaway amd64 container per the ledger). Resubmission pending the deploy of that image. | `workspace/evidence/smoke/create-httpx.log` (the id), `Dockerfile.worker`, commit `1555810` |
+
+No `RunTasksWorkflow`, trial Job or graded outcome exists on the hosted stack at the time of writing (`verify_cloud-20260913T183003Z.txt`: `NOTE no swesim-trial-* Jobs yet`).
+
+Lesson recorded for the image: the worker image must carry every binary the stages shell out to (`git`, `gh`); a `gh --version` check inside the image belongs in `verify_cloud` (deferred, infra list below).
+
+### Model-role fallbacks in force
+
+The overnight probe (`workspace/evidence/model-probe.json`, probed 2026-09-13 08:37Z) reached all 25 ids with no substitutions. After the Anthropic workspace API usage limit ("regain access 2026-10-01" in the operator's account) the takeover probe (`workspace/evidence/model-probe-takeover.json`, 16:24Z) recorded `anthropic/claude-opus-5` and `anthropic/claude-sonnet-5` as unreachable (HTTP 400 `invalid_request_error`; the provider text is redacted in the file) and resolved:
+
+| Role | Configured (`swesim/roles.py` `ROLE_CHAINS` head) | Resolved | Reasoning line in the file |
+|---|---|---|---|
+| judge | `anthropic/claude-opus-5` | `openai/gpt-5.5` | fell back to `openai/gpt-5.6-sol`, then "judge and draft both resolved to openai/gpt-5.6-sol; draft chain exhausted, advanced the judge chain to openai/gpt-5.5" |
+| draft | `anthropic/claude-sonnet-5` | `openai/gpt-5.6-sol` | "anthropic/claude-sonnet-5 unavailable; fell back to openai/gpt-5.6-sol" |
+| stakeholder | `anthropic/claude-opus-5` | `openai/gpt-5.6-sol` | "anthropic/claude-opus-5 unavailable; fell back to openai/gpt-5.6-sol" |
+| audit | `anthropic/claude-opus-5` | `openai/gpt-5.6-sol` | same |
+| screen | `openrouter/deepseek/deepseek-v3.2` | unchanged | — |
+
+Hosted workflows re-probe in `probe_models_activity` and write their own resolution to `evidence/model-probe.json` in the bucket; the laptop files above are the operator's probes, not the workers'. The judge remains `anthropic/claude-opus-5` by the user's directive (see [grading](grading.md#judge-calibration)); today's runs used `openai/gpt-5.5` because of the limit. The solver is never substituted.
+
 ## Preserved record inventory
 
 A read-only inventory on 2026-09-13 found **50 trial records**, including **19 whose spec hash matches the current registered version-2 spec**, and 50 episode exports. The current subset contains 13 correct and 6 incorrect outcomes. There are 3 registered version-2 scenarios; their contracts contain respectively 1/84, 6/3 and 2/95 FAIL_TO_PASS/PASS_TO_PASS tests for seaborn, sklearn and pypdf.
@@ -75,9 +115,9 @@ New projects now seed an empty registry rather than copying a catalog whose arti
 | Required evidence | Status in this ledger | Exact next check |
 |---|---|---|
 | Complete record import | Pending | Import command finishes; compare bucket registry/scenario/trial objects and SQL row counts; inspect skipped records |
-| Current release image and schema | Pending after each new deploy | Record build id, full digest, maintenance execution and migrated head revision |
-| Hosted task creation | Deferred | When experiments resume, a `CreateTasksWorkflow` reaches an honest terminal result and a task passes controls |
-| Hosted graded run | Deferred | A future `RunTasksWorkflow` produces frozen trial/config/spec, reward/report, and transcript binding |
+| Current release image and schema | `609f923`: build `ae494b42…`, digest `f2b26505…`, execution `swesim-index-maintenance-nzrvm` ([Hosted smoke](#hosted-smoke-2026-09-13)); `1ca70a6` in progress | Record build id, full digest, maintenance execution and migrated head revision (`0004_history` is the single Alembic head on main) after each deploy |
+| Hosted task creation | Started 18:31Z; both creations blocked on the missing `gh` binary; resubmission pending the `1555810` image ([Hosted smoke](#hosted-smoke-2026-09-13)) | A `CreateTasksWorkflow` reaches an honest terminal result and a task passes controls |
+| Hosted graded run | Not started (planned: `run-tasks` hidden k=1 on `openrouter/deepseek/deepseek-v3.2` once a task registers) | A `RunTasksWorkflow` produces frozen trial/config/spec, reward/report, and transcript binding |
 | Launch-once and cleanup | Deferred experiment | Persist one Job/execution identity per new trial and cleanup evidence |
 | Worker-pool restart | Deferred experiment | Restart a pool during a future trial; show the same runtime resumed and exactly one execution |
 | IAP identity enforcement | Redirect measured; browser roles pending | Allowed account enters, denied account fails, ordinary allowed account cannot see evaluator material |
@@ -88,6 +128,51 @@ New projects now seed an empty registry rather than copying a catalog whose arti
 | Full acceptance scripts | Pending for final record | `scripts/verify.sh 10` and hosted verification against the final integrated image and record |
 
 Do not replace a pending item with a planned command or a unit-test result. Add workflow/trial ids, timestamps and artifact paths when it is observed.
+
+## Deferred from the 2026-09-13 finishing run
+
+Compiled from the five finishing reports (`.superpowers/sdd/2026-09-13-hosted-pipeline/reports/{frontier-2,history-2,website-2,costs-2,infra-2}.md`) and the ledger. Each line: what — why it was deferred — where it goes. "Direction" means the user's 11:55 PDT essentials-only ruling relayed by the integrator.
+
+Frontier and launcher (`frontier-2.md`):
+
+- Planned/launched/running trial rows (review P1-4) — cross-stream contract with storage; not required to iterate — `prepare_trial_plan_activity` upserts `planned`; `TrialWorkflow` hooks `index_trial_activity` with `status` after the launch acknowledgement; `await_trial_activity` refreshes `running`; storage's `index_trial` accepts `status` + `request`/`request_path` (payload shape in the report's concern 4).
+- `reconcile_workflows_activity` + `swesim workflows reconcile` (P1-6, second half) — needs a Temporal connection to test beyond fakes; lifecycle rows already remove the common stale-`running` cases — `client.py:reconcile_workflows()` describing every `running` row and upserting the Temporal-observed status with `lifecycle_source="temporal"`; CONTROL activity; CLI command.
+- Request bounds, per-run spend cap, fail-closed spend check (P2-16) — changes env-test semantics for uncapped dev runs; the frontier cap-in-force part shipped — `swesim/workflows/bounds.py` checked in `client.start_run/start_create` and at the top of both operator workflows; `spend_check_activity` reports min(run, global); `_spend_exceeded` returns `stopped_reason="spend-unknown"` on an unreadable ledger.
+- `validation.run_control` transient classification (P2-17) — validation is not on the iteration path — Harbor infrastructure exceptions → `retries.transient(kind="HarborInfrastructure")` with a fresh `<job>--attempt-<n>` directory (max 3); `assemble_validation` treats an infrastructure-class directory as "nothing measured".
+- Console surfaces `admission.reasons`, `include_saturated` and a per-run `spend_cap_usd` input (concern 3) — UI completeness — `dashboard/console.py:validate_run` and the Run form; progress query `stopped_reason == "frontier-gate"`.
+- Timing flake `tests/test_workflow_batching.py::test_threaded_launch_finishes_before_cancellation_stops_runtime` (concern 1) — pre-existing, not in the narrowed scope — give the fake launch activity a short heartbeat timeout or assert on the cancel receipt.
+
+History, registry and provenance (`history-2.md`):
+
+- Storage half of the live trial rows (item 4, P1-4) — only useful together with the launcher call sites above — `swesim/index/activities.py:index_trial` builds a row from `request`/`request_path` when no terminal files exist, never regressing a terminal row; `WorkflowStatus.unknown` for reconciled, not-retained executions.
+- Provenance fields `worker_image_digest, origin, workflow_id, run_id` on `TrialRecord`, `approval.json`, `compile.json`, `validation.json` (item 5, P2-11) — three of the four writers are other streams' files — `launchers/base.py:launch_once`, `stages/compile.py`, `workflows/validation.py` / `stages/validate.py`, `stages/run.py:TrialRecord`; projections already prefer file provenance when present.
+- `reconcile_workflow_rows(store, temporal_listing)` writer (item 6, P1-6) — only the reconciler function and its caller remain (schema column, `choose_workflow` precedence and the activity payload field are in place) — `swesim/index/history.py` + the CONTROL activity above.
+- `CandidateWorkflow` does not yet call `index_candidate_event_activity` (concern C2, exact call sites and payload in the report) — dispatched separately as the `finish/receipts` stream (ledger entry labelled 13:20); not merged when this list was written — `swesim/workflows/workflows.py`.
+
+Website, discovery and integrity (`website-2.md`):
+
+- SQL half of the scan record: `DiscoveryRow.funnel/decisions/scan_path/scan_sha256` + migration `0005_discovery_integrity` (item 2) — direction; the file-backed Candidates page is enough to iterate; the migration's parent `0004_history` was not on main at the time — `swesim/index/{models,schema,project}.py`, a new Alembic revision with `down_revision="0004_history"`; head expectations in `tests/test_index_{schema,cli,store}.py`.
+- §7 integrity views on the leaderboard (item 4): per-model `integrity_signal_count` distribution with flagged-trial links, protected-config touch detector, small-patch-vs-oracle heuristic, useful-question-rate columns, interactive-audit completeness badge — direction; measurement surface — `swesim/index/reports.py`, `LeaderboardRow`, `pages.leaderboard_body`.
+- Facets without the first-500 subsets (item 6) — direction; UI completeness — `app.py:/trials` facets and the `limit=500` candidate lookup.
+- Authenticated-page screenshots in both modes into `workspace/evidence/console/finish/` (item 7) — direction; needs the console running locally over the file reader — command in the report.
+- Discovery retry policy (concern 3): `DiscoveryUnavailable` is retried under the default `retries.LLM` policy (4 attempts, 10s→2m); an `auth` failure (401/403) is retried too — decide `retries.READ`/dedicated policy and fail-fast on `kind == "auth"` — `swesim/workflows/activities.py:discover_activity`.
+- Legacy `mine_github_repo` (`swesim/stages/mine.py`, debug-only) now propagates `DiscoveryUnavailable` instead of counting `fetch-error` (concern 4) — behaviour change in an unowned file; acceptable for a debug stage — note only.
+- Hosted Candidates page lists `candidates/*/scans/` on the GCS mount per request (concern 5) — fine for tens of sources — the SQL half above or a TTL cache like `data._live_cache`.
+
+Costs (`costs-2.md`, no deferred scope; follow-ups named in its concerns):
+
+- Separate "served by" cell for `price_source` values such as `openrouter-generation (served by DeepInfra)` — optional readability — `swesim/dashboard/pages.py` cost table via `costs.served_providers_of` / `costs.price_source_key`.
+- `record_cost_activity` passes no `idempotency_key` while `stages/run.py:_solver_cost` passes `"solver-final"` — both idempotent today; aligning gives one `cost_id` per trial — `swesim/workflows/activities.py:record_cost_activity`.
+- Surface `accounting_summary()['complete']` next to every spend figure — handoff item — website/history owner.
+- OpenRouter `provider.order` pinning — a RunConfig-relevant request-body knob inside the agent container that cannot be verified offline — `swesim/stages/run.py` once a smoke trial can confirm the served provider changes.
+
+Infra (`infra-2.md`):
+
+- File/SQL parity through a read-only maintenance Job `swesim-parity` (item 3, P2-13) — direction; also needs `scripts/cloud/parity_report.py` copied into `Dockerfile.worker` and excepted in `.dockerignore` — `infra/modules/run/main.tf` next to `index_maintenance`, `scripts/cloud/verify_cloud.sh` check 8; report to `evidence/cloud/parity-<UTC>.json`.
+- Cloud Build trigger on push to main (item 5a, P3-18) — direction — `google_cloudbuild_trigger` in `infra/modules/registry/main.tf` (or a `build` module) with `cloudbuild_repository` / `cloudbuild_trigger_enabled` variables; the trigger builds only, rolling stays with `make deploy`.
+- Selective open-executions check (item 5b, P3-18) — direction — `scripts/cloud/open_executions.py` mapping changed files in `<running sha>..<new sha>` to `@workflow.defn` types, conservative fallback to all types.
+- Alert on the reconcile metric > 1 in 10 minutes (item 5c, P3-18) — direction; a fresh user metric is not queryable for a few minutes after creation (needs a second apply) — `google_monitoring_alert_policy` in `infra/modules/logging/main.tf`.
+- `verify_cloud` runs `gh --version` (and the other shelled-out binaries) inside the image — lesson from the smoke above — `scripts/cloud/verify_cloud.sh`.
 
 ## Historical VM evidence
 
