@@ -95,16 +95,161 @@ def site(tmp_path, monkeypatch):
     monkeypatch.delenv('SWESIM_WORKER_SECRET', raising=False)
     monkeypatch.setenv('SWESIM_ENV_FILE', str(tmp_path / 'absent.env'))  # never load the real env file in tests
     monkeypatch.setattr(dash.httpx, 'get', lambda *a, **k: pytest.fail('network call for a finished trial'))
+    monkeypatch.setattr(dash.data, '_live_cache', {})
     return {'ws': ws, 'spec': spec, 'done': done, 'wrong': wrong, 'full': full, 'running': running, 'client': TestClient(app)}
+
+
+# ---------------------------------------------------------------- redesign: overview API, runs, scenario, empty states, XSS, static
+
+def test_api_overview_shape_and_live_patience_with_cache(site, monkeypatch):
+    c, tid = site['client'], site['running']
+    ov = c.get('/api/overview').json()
+    assert set(ov) == {'generated_at', 'now', 'summary', 'scenarios', 'trials'}
+    assert ov['summary']['scenarios'] == 1 and ov['summary']['trials'] == 4 and ov['summary']['running'] == 1 and ov['summary']['finished'] == 3
+    s = ov['scenarios'][0]
+    assert s['id'] == site['spec'].id and [x['stage'] for x in s['stages']] == ['candidate', 'judged', 'drafted', 'approved', 'compiled', 'validated', 'registered']
+    assert {x['stage']: x['state'] for x in s['stages']}['validated'] == 'done' and {x['stage']: x['state'] for x in s['stages']}['registered'] == 'done'
+    assert {x['stage']: x['state'] for x in s['stages']}['judged'] == 'pending' and s['source_label'].startswith('authored')
+    assert s['facts'] == 2 and s['controls'] == {'oracle': 'oracle.diff', 'plausible_wrong': 1, 'alternative_correct': 0, 'tamper': 1}
+    assert s['scores']['groups'] and s['validation_status'] == 'valid' and s['registered'] is True
+    running = next(t for t in ov['trials'] if t['trial_id'] == tid)
+    assert running['running'] is True and running['status'] == 'running' and running['elapsed_s'] is None  # no started_at in that fixture
+    assert running['patience_start'] == 6 and running['live_error'] == 'SWESIM_STAKEHOLDER_URL not configured'
+    done = next(t for t in ov['trials'] if t['trial_id'] == site['done'])
+    assert done['outcome'] == 'valid-correct' and done['reward'] == 1.0 and done['elapsed_s'] == 360.0 and done['patience_end'] == 3
+    assert done['questions'] == 1 and done['reviews'] == 1 and done['label'] == 'unresolved'
+    # live patience for running trials comes from the stakeholder service, at most once per trial per cache TTL
+    # (errors are cached too, so a dead stakeholder cannot slow every poll; clear the "not configured" entry first)
+    dash.data._live_cache.clear()
+    calls = []
+
+    class Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {'events': ask_events(T0, 'q?', 'a.', ['f01'], 4), 'patience_start': 6, 'patience_end': 4}
+
+    monkeypatch.setattr(dash.httpx, 'get', lambda url, headers=None, timeout=None, **k: (calls.append(url), Resp())[1])
+    monkeypatch.setenv('SWESIM_STAKEHOLDER_URL', 'https://stakeholder.example.test')
+    monkeypatch.setenv('SWESIM_WORKER_SECRET', 'secret-value')
+    running = next(t for t in c.get('/api/overview').json()['trials'] if t['trial_id'] == tid)
+    assert running['patience_end'] == 4 and running['questions'] == 1 and running['live_error'] is None
+    assert calls == [f'https://stakeholder.example.test/transcript/{tid}']
+    c.get('/api/overview')
+    assert len(calls) == 1  # cached
+    assert 'secret-value' not in json.dumps(c.get('/api/overview').json())
+    assert c.get('/').status_code == 200 and len(calls) == 1  # the page itself never blocks on the stakeholder
+
+
+def test_runs_page_has_filters_chart_and_score_table(site):
+    html = site['client'].get('/runs').text
+    for f in ('scenario', 'condition', 'model', 'status'):
+        assert f"data-filter='{f}'" in html
+    assert "<option value='interactive'>" in html and f"<option value='{HAIKU}'>" in html and "<option value='running'>" in html
+    assert '<svg class=' in html and 'aria-label=' in html and 'pass@k' in html and 'pass^k' in html
+    assert "<g class='bar s1'" in html or "<g class='bar na'" in html  # one series: bars or n/a markers, no legend box
+    assert "class='legend'" not in html
+    for tid in (site['done'], site['wrong'], site['full'], site['running']):
+        assert f'data-id=\'{tid}\'' in html and f"href='/trial/{tid}'" in html
+    assert 'unknown-config' in html  # the running fixture has a partial run_config: attributable, unresolved, no run config hash
+
+
+def test_scenario_page_briefs_ledger_controls_and_evaluator_toggle(tmp_path, monkeypatch):
+    spec = make_spec(with_author_only=True, withheld=True)
+    ws = make_workspace(tmp_path, spec)
+    (ws.scenario_dir(spec.id) / 'judge.json').write_text(json.dumps({'keep': True, 'verified_rubric_score': 2, 'complexity': 3,
+                                                                     'test_behavioralness': 4, 'self_contained': True,
+                                                                     'alternatives_accepted': False, 'model_id': 'openai/gpt-5.5',
+                                                                     'rationale': 'Underspecified error type.',
+                                                                     'gaps': [{'category': 'behavior', 'text': 'Which exception?', 'consequential': True,
+                                                                               'derivable_from_repo': False, 'resolved_by': 'thread'}]}))
+    monkeypatch.setattr(dash, 'ROOT', ws.root)
+    monkeypatch.setattr(dash, 'REGISTRY', ws.registry_path)
+    monkeypatch.setenv('SWESIM_ENV_FILE', str(tmp_path / 'absent.env'))
+    c = TestClient(app)
+    r = c.get(f'/scenario/{spec.id}')
+    assert r.status_code == 200
+    html = r.text
+    assert '<h3>natural' in html and '<h3>withheld' in html
+    assert "<mark class='removed'" in html and 'Traceback: SECRET_ERROR raised in loader</mark>' in html
+    assert html.count("<mark class='removed' title=") == 1 and 'Import fails\nSteps: run `pkg load`.' in html  # one removed span; withheld brief verbatim
+    assert 'withholding' in html and 'Removed category: reproduction' in html
+    assert '<h3>on-request' in html and 'withheld-001' in html and 'f01' in html
+    assert 'SECRET-AUTHOR-ONLY-NOTE' not in html and 'author-only facts hidden (1)' in html  # off by default: not even in the DOM
+    on = c.get(f'/scenario/{spec.id}?evaluator=1').text
+    assert 'SECRET-AUTHOR-ONLY-NOTE' in on and '<h3>author-only' in on and 'evaluator-only' in on
+    # controls joined with validation results; the fixture validation only ran nop
+    assert 'oracle.diff' in html and 'keyerror' in html and 'root-conftest' in html and 'incorrect-exploit' in html
+    assert 'as expected' in html and 'not run' in html and 'valid</span>' in html
+    # judge verdict and gaps
+    assert 'rubric 2/3' in html and 'Which exception?' in html and 'Underspecified error type.' in html
+    # stage chips and links
+    for stage in ('candidate', 'judged', 'drafted', 'approved', 'compiled', 'validated', 'registered'):
+        assert f'>{stage}</span>' in html
+    assert f"href='/scenario/{spec.id}/file/validation.json'" in html
+    assert c.get(f'/scenario/{spec.id}/file/validation.json').json()['status'] == 'valid'
+    assert c.get(f'/scenario/{spec.id}/file/passwd').status_code == 404
+    assert c.get('/scenario/no-such-scenario').status_code == 404 and c.get('/scenario/BAD').status_code == 404
+    assert c.get('/scenarios').status_code == 200 and spec.id in c.get('/scenarios').text
+
+
+def test_empty_workspace_renders_empty_states(tmp_path, monkeypatch):
+    monkeypatch.setattr(dash, 'ROOT', tmp_path / 'empty-workspace')
+    monkeypatch.setattr(dash, 'REGISTRY', tmp_path / 'registry.json')
+    c = TestClient(app)
+    home = c.get('/')
+    assert home.status_code == 200 and 'No scenarios yet' in home.text and 'No trials yet' in home.text and 'swesim draft' in home.text
+    runs = c.get('/runs')
+    assert runs.status_code == 200 and 'No trials yet' in runs.text and 'No scores yet' in runs.text
+    assert c.get('/scenarios').status_code == 200 and 'No scenarios yet' in c.get('/scenarios').text
+    ov = c.get('/api/overview').json()
+    assert ov['scenarios'] == [] and ov['trials'] == [] and ov['summary'] == {'scenarios': 0, 'valid': 0, 'trials': 0, 'running': 0,
+                                                                              'finished': 0, 'unresolved': 0, 'succeeded': 0}
+    assert c.get('/trial/' + 'a' * 24).status_code == 404
+
+
+def test_agent_and_stakeholder_text_is_escaped(site):
+    c, ws, spec = site['client'], site['ws'], site['spec']
+    evil_q = '<script>alert(1)</script> which exception?'
+    evil_a = '<img src=x onerror=alert(2)> ValueError.'
+    tid = write_trial(ws, spec, attempt=3, events=ask_events(T0 + 6, evil_q, evil_a, ['f01'], 5))
+    (ws.root / 'trials' / tid / 'task' / 'instruction.md').write_text('# Task <b>bold</b>\n\n<script>alert(3)</script>')
+    html = c.get(f'/trial/{tid}').text
+    for raw in ('<script>alert(1)</script>', '<img src=x onerror=alert(2)>', '<b>bold</b>', '<script>alert(3)</script>'):
+        assert raw not in html
+    assert '&lt;script&gt;alert(1)&lt;/script&gt;' in html and '&lt;img src=x onerror=alert(2)&gt;' in html and '&lt;b&gt;bold&lt;/b&gt;' in html
+    body = c.get(f'/api/trial/{tid}/timeline').json()
+    assert any(r['text'] == evil_q for r in body['timeline'])  # JSON carries the data verbatim; escaping happens at render time
+    # a hostile scenario id in request.json reaches the boards escaped
+    rdir = ws.root / 'trials' / ('cd' * 12)
+    rdir.mkdir()
+    (rdir / 'request.json').write_text(json.dumps({'trial_id': 'cd' * 12, 'scenario_id': '<x onmouseover=alert(4)>', 'condition': 'full', 'model': HAIKU}))
+    for path in ('/', '/runs'):
+        page = c.get(path).text
+        assert '<x onmouseover' not in page and '&lt;x onmouseover=alert(4)&gt;' in page
+
+
+def test_static_assets_are_served_without_a_build_step(site):
+    c = site['client']
+    css = c.get('/static/app.css')
+    assert css.status_code == 200 and css.headers['content-type'].startswith('text/css') and '--surface' in css.text and 'prefers-color-scheme: dark' in css.text
+    js = c.get('/static/app.js')
+    assert js.status_code == 200 and js.headers['content-type'].startswith('text/javascript') and '/api/overview' in js.text and 'textContent' in js.text
+    assert 'innerHTML' not in js.text  # values are inserted as text nodes only
+    assert c.get('/static/app.py').status_code == 404 and c.get('/static/nope').status_code == 404
+    home = c.get('/').text
+    assert "href='/static/app.css'" in home and "src='/static/app.js'" in home and 'http://localhost:8233' in home
+    assert "aria-current=\"page\"" in home and 'Runs' in home and 'Scenarios' in home
 
 
 def test_runs_page_lists_scenarios_scores_and_trials(site):
     r = site['client'].get('/')
     assert r.status_code == 200 and 'text/html' in r.headers['content-type']
     html = r.text
-    assert 'swesim runs' in html and site['spec'].id in html and 'valid' in html
+    assert 'swesim' in html and 'Overview' in html and site['spec'].id in html and 'valid' in html
     for tid in (site['done'], site['wrong'], site['full'], site['running']):
-        assert f'href="/trial/{tid}"' in html
+        assert f"href='/trial/{tid}'" in html
     assert 'running' in html and 'valid-correct' in html and 'valid-incorrect' in html and HAIKU in html
     assert 'calibration' in html and 'comparison' in html
     assert 'n/a' in html  # n_valid (2) < k (3): pass@k is null, shown as unavailable, never a reduced k
@@ -123,7 +268,7 @@ def test_episode_page_renders_conversation_and_outcome(site):
     assert '3 / 6' in html  # patience end / start
     assert 'valid-correct' in html and 'g01' in html and 't1' in html and 'interactive' in html and 'withheld' in html
     assert 'unadjudicated' in html and 'diff-only' in html  # reviewed_equals_submitted null is explained, not hidden
-    assert f'href="/trial/{tid}/file/trajectory.json"' in html and f'href="/trial/{tid}/file/verifier-report.json"' in html
+    assert f"href='/trial/{tid}/file/trajectory.json'" in html and f"href='/trial/{tid}/file/verifier-report.json'" in html
     assert 'name="label"' in html and 'selected' in html and 'first look' in html
     assert 'setInterval' not in html  # finished: no polling
     assert 'SECRET-AUTHOR-ONLY-NOTE' not in html
@@ -175,7 +320,8 @@ def test_timeline_live_transcript_only_when_running(site, monkeypatch):
     assert [x['text'] for x in body['timeline'] if x['actor'] in ('agent', 'stakeholder')] == ['Live question?', 'Live answer.']
     assert 'worker-secret-value' not in json.dumps(body)
     page = site['client'].get(f'/trial/{tid}')
-    assert page.status_code == 200 and 'setInterval' in page.text and 'running' in page.text and 'Live answer.' in page.text
+    assert page.status_code == 200 and "data-live='true'" in page.text and 'running' in page.text and 'Live answer.' in page.text
+    assert 'agent is working' in page.text and 'setInterval' not in page.text  # behaviour lives in /static/app.js, never inline
     assert '5 / 6' in page.text and 'worker-secret-value' not in page.text
     # finished trials never trigger a live fetch, even with the env set
     calls.clear()
@@ -273,9 +419,12 @@ def test_runs_page_tolerates_malformed_scores_files(site):
                                                    'garbage': 'not a group'}))
     r = c.get('/')
     assert r.status_code == 200
-    assert r.text.count('unreadable scores.json') == 2 and 'mixed-scenario' in r.text and 'valid-correct 1' in r.text
+    assert r.text.count('unreadable scores.json') == 2 and 'mixed-scenario' in r.text
     for tid in (site['done'], site['wrong'], site['full'], site['running']):
-        assert f'href="/trial/{tid}"' in r.text  # the trials table still renders
+        assert f"href='/trial/{tid}'" in r.text  # the trials table still renders
+    runs = c.get('/runs')
+    assert runs.status_code == 200 and runs.text.count('unreadable scores.json') == 2 and 'valid-correct 1' in runs.text
+    assert c.get('/api/overview').status_code == 200
 
 
 def test_unresolved_attempts_are_flagged_on_runs_table_and_render_an_episode_page(site):
@@ -286,15 +435,17 @@ def test_unresolved_attempts_are_flagged_on_runs_table_and_render_an_episode_pag
     score_scenario(ws, spec.id, k=3)
     html = c.get('/').text
     for tid in (err, rerr, req):
-        assert f'href="/trial/{tid}"' in html
+        assert f"href='/trial/{tid}'" in html
     assert html.count('>unresolved</span>') >= 3 and 'RuntimeError' in html and 'HarborRunError' in html
-    assert 'runner-error' in html and 'requested' in html and 'attempts (unresolved)' in html
+    assert 'runner-error' in html and 'requested' in html
+    runs = c.get('/runs').text
+    assert 'attempts (unresolved)' in runs and runs.count('>unresolved</span>') >= 3
     for tid in (site['done'], site['wrong'], site['full']):  # finished trials are not flagged
-        row = html[html.index(f'href="/trial/{tid}"'):]
+        row = html[html.index(f"href='/trial/{tid}'"):]
         assert '>unresolved</span>' not in row[:row.index('</tr>')]
     page = c.get(f'/trial/{rerr}').text
     assert 'Unresolved attempt' in page and 'HarborRunError' in page and 'runner-error.json' in page and spec.id in page
-    assert f'href="/trial/{rerr}/file/runner-error.json"' in page and f'href="/trial/{rerr}/file/launch.json"' in page
+    assert f"href='/trial/{rerr}/file/runner-error.json'" in page and f"href='/trial/{rerr}/file/launch.json'" in page
     assert c.get(f'/trial/{rerr}/file/runner-error.json').json()['type'] == 'HarborRunError'
     err_page = c.get(f'/trial/{err}').text
     assert 'Unresolved attempt' in err_page and 'RuntimeError' in err_page and 'status.json' in err_page and 'setInterval' not in err_page
