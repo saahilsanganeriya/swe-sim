@@ -1,0 +1,20 @@
+[Unit]
+Description=swesim Temporal worker (launches one transient unit per trial; never owns a Harbor process)
+After=swesim-temporal.service
+Wants=swesim-temporal.service
+
+[Service]
+WorkingDirectory=/opt/swesim
+EnvironmentFile=/etc/swesim/env
+Environment=PATH=/opt/swesim/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=SWESIM_WORKSPACE=/opt/swesim/workspace
+Environment=SWESIM_ENV_FILE=/etc/swesim/env
+Environment=TEMPORAL_ADDRESS=127.0.0.1:7233
+Environment=SWESIM_TRIAL_LAUNCHER=systemd
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/swesim/.venv/bin/python -m swesim.workflows.worker
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
