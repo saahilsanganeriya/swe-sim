@@ -108,3 +108,14 @@ def test_attributes_builds_typed_pairs_and_skips_unset_values():
 
 def test_upsert_status_outside_a_workflow_is_a_noop():
     SA.upsert_status("completed")  # direct tests run workflow bodies as plain coroutines; nothing to upsert into
+
+
+def test_worker_executor_is_sized_to_the_activity_concurrency(tmp_path):
+    """A 1-vCPU instance gets cpu_count+4 executor threads by default; with 32 concurrent activities a bare to_thread
+    queues behind them and misses its heartbeat window (measured 2026-09-13). The pool must cover every activity."""
+    from swesim import settings as S
+    from swesim.workflows import worker as W
+    s = S.Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env"), "SWESIM_TASK_QUEUE": "swesim-authoring"})
+    assert W.executor_size(s) >= W.concurrency(s, "swesim-authoring") + 8
+    s_all = S.Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env")})
+    assert W.executor_size(s_all) >= sum(W.concurrency(s_all, q) for q in s_all.task_queues)
