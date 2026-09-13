@@ -40,6 +40,8 @@ Environment on the pools/console follows interfaces §9 exactly (`SWESIM_WORKSPA
 | `region` | `us-central1` | Region for everything |
 | `image` | `""` → `<artifact_repo>/worker:latest` | Digest reference the pools/console run; `make deploy` passes the digest |
 | `iap_members` | `[]` | IAM members allowed through IAP (`user:...`, `group:...`) |
+| `iap_programmatic_clients` | `[]` | Opt-in, **organization OAuth clients only**: client IDs whose tokens IAP accepts for programmatic console requests. IAP rejects any client not owned by a project of this project's organization ("not in the same organization as resource"), so the run module refuses such clients at plan time; Google's public clients (`32555940559…`, `764086051850-…`) never pass. Set `SWESIM_IAP_PROGRAMMATIC_CLIENTS` in the env file (comma-separated) and re-run `make tfvars`; clearing it clears the key. |
+| `iap_programmatic_client_projects` | `[]` | Project numbers in the same organization whose OAuth clients may appear above besides this project's own |
 | `evaluators` | `[]` | Emails that see evaluator-only material (`SWESIM_EVALUATORS`) |
 | `temporal_address`, `temporal_namespace` | `""` | Temporal Cloud endpoint and namespace (non-secret) |
 | `stakeholder_url` | `""` | Stakeholder service base URL (Modal) |

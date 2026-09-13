@@ -93,7 +93,9 @@ module "run" {
   iap_audience             = local.iap_audience
   iap_members              = var.iap_members
   iap_programmatic_clients = var.iap_programmatic_clients
-  iap_resource_name        = "projects/${data.google_project.current.number}/iap_web/cloud_run-${var.region}/services/${local.console_name}"
+  iap_client_projects      = var.iap_programmatic_client_projects
+  project_number           = local.project_number
+  iap_resource_name        = "projects/${local.project_number}/iap_web/cloud_run-${var.region}/services/${local.console_name}"
   evaluators               = var.evaluators
   spend_cap_usd            = var.spend_cap_usd
   stakeholder_url          = var.stakeholder_url

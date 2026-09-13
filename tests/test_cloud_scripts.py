@@ -171,11 +171,19 @@ def test_build_tfvars_has_the_terraform_inputs_and_no_secret(tmp_path: Path):
         "temporal_address": "region.gcp.api.temporal.io:7233", "temporal_namespace": "ns.abcde",
         "stakeholder_url": "https://stakeholder.example",
         "iap_members": ["user:op@example.com"], "evaluators": ["op@example.com"],
-        "iap_programmatic_clients": [],
         "github_repository": "acme/swesim",
     }
     assert not (set(doc) & SECRET_NAMES)
     assert "should-never-appear" not in str(doc) and "nor-this" not in str(doc)
+
+
+def test_iap_programmatic_clients_are_an_explicit_opt_in():
+    """Absent or empty -> no key at all (a cleared env file clears the tfvars); set -> the list, for Terraform to vet."""
+    base = dict(account="op@example.com", repo_url=None, project="p", region="r")
+    assert "iap_programmatic_clients" not in tfvars_from_env.build_tfvars({}, **base)
+    assert "iap_programmatic_clients" not in tfvars_from_env.build_tfvars({"SWESIM_IAP_PROGRAMMATIC_CLIENTS": " , "}, **base)
+    doc = tfvars_from_env.build_tfvars({"SWESIM_IAP_PROGRAMMATIC_CLIENTS": "123-abc.apps.googleusercontent.com, 456-def.apps.googleusercontent.com"}, **base)
+    assert doc["iap_programmatic_clients"] == ["123-abc.apps.googleusercontent.com", "456-def.apps.googleusercontent.com"]
 
 
 def test_build_tfvars_spend_cap_only_when_set_and_project_required():
