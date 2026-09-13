@@ -235,6 +235,8 @@ def test_auto_rejection_for_withholding_leak_redrafts_once_then_moves_on(monkeyp
     (["judge did not accept (no non-derivable gap)"], None, False),
     (["controls incomplete"], None, False),
     (["controls incomplete"], "withholding-leak", True),                 # structured gate wins over the text
+    (["fact f05 is outside the contract: names behaviour only a PASS_TO_PASS test carries"], None, True),   # fact-scope gate (2026-09-13)
+    (["controls incomplete"], "fact-scope", True),
 ])
 def test_redraft_trigger_is_structured(monkeypatch, reasons, gate, redraft):
     # Fix round 1, Minor 7.
@@ -2538,3 +2540,16 @@ def test_frontier_gate_records_an_operator_override_and_planning_honours_it(ws):
     with pytest.raises(ValueError): C.override_request("  ")
     assert W.frontier_override_of({"frontier_override": override}) == override and W.frontier_override_of({"frontier_override": {"actor": "a"}}) is None
     assert W.frontier_override_of({"frontier_override": "yes"}) is None and W.frontier_override_of({}) is None
+
+
+def test_fact_scope_rejection_redrafts_once_behind_its_patch(monkeypatch):
+    """The `fact-scope` approval gate (2026-09-13) rejects a draft whose stakeholder-visible fact reaches beyond the contract with
+    reasons "fact <id> is outside the contract: ..."; like a withholding leak it is the drafter's to fix, so it triggers the single
+    re-draft (the drafter receives `reject_reasons`) before the next candidate; executions started before the patch keep the
+    leak-only rule."""
+    scoped = {"approved": False, "spec_hash": "h", "reasons": ["fact f05 is outside the contract: names behaviour only a PASS_TO_PASS test carries"]}
+    assert W._leak_rejection(scoped) is True and W._leak_rejection({"approved": False, "reasons": ["controls incomplete"], "gate": "fact-scope"}) is True
+    assert W._redraftable_reason("Fact f01 is outside the contract: x") and W._redraftable_reason("withheld brief still contains excerpt of f01")
+    assert not W._redraftable_reason("judge rejected") and not W._redraftable_reason("facts must be grounded")
+    monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_FACT_SCOPE)
+    assert W._leak_rejection(scoped) is False and W._leak_rejection({"approved": False, "reasons": ["withheld brief still contains excerpt of f01"]}) is True

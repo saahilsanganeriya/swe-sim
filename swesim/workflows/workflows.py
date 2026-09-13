@@ -50,6 +50,7 @@ PATCH_RECEIPTS = "20260913-candidate-receipts"      # index_candidate_event_acti
 PATCH_RESOLVED = "20260913-resolved-models"         # operator workflows: a second running row after the probe with the resolved roles
 PATCH_LIVE_TRIALS = "20260913-live-trial-rows"      # TrialWorkflow: a `launched` trial row right after the launch acknowledgement (P1-4)
 PATCH_OVERRIDE = "20260913-frontier-override"       # RunTasksWorkflow: a recorded operator override proceeds past a refused frontier gate
+PATCH_FACT_SCOPE = "20260913-fact-scope-redraft"    # draft_and_auto_approve: a fact-scope rejection triggers the single re-draft like a leak
 CHILDREN_PER_RUN = 100
 HOOK_MINUTES = 2
 CONTROL_MINUTES = 60                           # one Harbor control run on Modal (validate_scenario's whole set had 180)
@@ -61,6 +62,7 @@ CREATE_APPROVAL_MODES = {"auto", "hold"}
 # a reason starting with "withholding", or containing "leak" or "withheld" (the approve stage's "withheld brief still
 # contains excerpt of <fact>"). Anything else (judge, load-bearing, controls, assets) moves to the next candidate.
 LEAK_GATE = "withholding-leak"
+FACT_SCOPE_GATE = "fact-scope"  # approve.py (2026-09-13): a stakeholder-visible fact reaching beyond the contract; the drafter can rescope it
 REJECT_DUP = WorkflowIDReusePolicy.REJECT_DUPLICATE
 # Candidate children: a terminal outcome (valid/invalid/rejected/not-reproducible/...) completes the child, so the id
 # `create:<scenario_id>` is consumed and a later CreateTasksWorkflow records `duplicate-rejected`. An infrastructure
@@ -79,8 +81,25 @@ def _is_leak_reason(reason) -> bool:
     return r.startswith("withholding") or "leak" in r or "withheld" in r
 
 
+def _is_fact_scope_reason(reason) -> bool:
+    """The `fact-scope` gate's wording: "fact <id> is outside the contract: ..."."""
+    r = str(reason).strip().lower()
+    return r.startswith("fact ") and "outside the contract" in r
+
+
+def _redraftable_reason(reason) -> bool:
+    """A rejection the drafter can fix in the single re-draft (it receives `reject_reasons`): a withholding leak, or — behind
+    PATCH_FACT_SCOPE — a stakeholder-visible fact reaching beyond the contract."""
+    return _is_leak_reason(reason) or (_patched(PATCH_FACT_SCOPE) and _is_fact_scope_reason(reason))
+
+
 def _leak_rejection(approved: dict) -> bool:
-    return approved.get("gate") == LEAK_GATE or any(_is_leak_reason(r) for r in approved.get("reasons", []) or [])
+    """Whether an auto-approval rejection earns the one re-draft: the structured gate or the reasons' text name a withholding leak,
+    or (PATCH_FACT_SCOPE) the fact-scope gate."""
+    reasons = approved.get("reasons", []) or []
+    if approved.get("gate") == LEAK_GATE or any(_is_leak_reason(r) for r in reasons):
+        return True
+    return bool(_patched(PATCH_FACT_SCOPE) and (approved.get("gate") == FACT_SCOPE_GATE or any(_is_fact_scope_reason(r) for r in reasons)))
 
 
 def _patched(name: str) -> bool:
