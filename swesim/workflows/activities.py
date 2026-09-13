@@ -673,6 +673,98 @@ async def await_trial_activity(p: dict) -> dict:
         await asyncio.sleep(POLL_SECONDS)
 
 
+# ------------------------------------------------------------------ bookkeeping (CONTROL queue): cost ledger and the spend cap
+
+def _read_json_list(path: Path) -> list:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else list(data.get("records", [])) if isinstance(data, dict) else []
+
+
+def recorded_spend(settings: Settings, ws: Workspace) -> dict:
+    """Total recorded USD: the index's ledger when it is enabled and readable, else the sum of `usd` over trials/*/costs.json.
+    Records without a price (`usd` None: unknown model) are counted, never guessed."""
+    if settings.index_enabled:
+        try:
+            from swesim.index.store import IndexStore
+            store = IndexStore.from_settings(settings)
+            if store is not None and hasattr(store, "spend"):
+                rows = store.spend()
+                return {"spend_usd": float(sum(float(r.usd) for r in rows if r.usd is not None)), "source": "index", "records": int(sum(getattr(r, "records", 1) for r in rows)), "unpriced_records": 0}
+        except Exception as e:  # noqa: BLE001 - an unreadable index falls back to the files; the reason is reported, not hidden
+            fallback = f"files (index unreadable: {type(e).__name__}: {str(e)[:120]})"
+        else:
+            fallback = "files (index has no spend ledger yet)"
+    else:
+        fallback = "files"
+    total = 0.0; records = 0; unpriced = 0
+    for path in sorted((ws.root / "trials").glob("*/costs.json")):
+        for rec in _read_json_list(path):
+            records += 1
+            if rec.get("usd") is None:
+                unpriced += 1
+            else:
+                total += float(rec["usd"])
+    return {"spend_usd": total, "source": fallback, "records": records, "unpriced_records": unpriced}
+
+
+@swesim_activity
+async def spend_check_activity(p: dict) -> dict:
+    """Recorded spend against the cap: {"spend_usd", "cap_usd", "exceeded", ...}. The cap is `p["cap_usd"]` when given, else
+    `Settings.spend_cap_usd`; no cap means never exceeded (the operator enforces the budget by hand)."""
+    cap = p.get("cap_usd", None)
+    cap = SETTINGS.spend_cap_usd if cap is None else cap
+    spend = await blocking(lambda: recorded_spend(SETTINGS, WS))
+    cap_usd = float(cap) if cap is not None else None
+    return {**spend, "cap_usd": cap_usd, "exceeded": cap_usd is not None and spend["spend_usd"] > cap_usd}
+
+
+def _trajectory_for(record: dict, d: Path) -> dict | None:
+    """The solver's trajectory (mini-swe-agent per-step usage) for a finished trial: trials/<tid>/trajectory.json, else the first
+    *.traj.json under the Harbor trial dir the record names. None when there is none to read."""
+    candidates = [d / "trajectory.json"]
+    harbor_dir = record.get("trial_dir")
+    if harbor_dir and Path(harbor_dir).is_dir():
+        candidates += sorted(Path(harbor_dir).rglob("*.traj.json"))[:1]
+    for path in candidates:
+        if path.is_file():
+            data = _read_json(path)
+            if data:
+                return data
+    return None
+
+
+@swesim_activity
+async def record_cost_activity(p: dict) -> dict:
+    """Solver cost of one finished trial into trials/<tid>/costs.json through `swesim.costs` (usage from the trajectory, price from
+    the table). Idempotent: a solver record for the trial is written once. Without `swesim.costs`, a record or a trajectory it
+    reports `recorded: False` with the reason; it never fails the workflow."""
+    tid = p["trial_id"]; d = trial_dir(tid)
+    try:
+        from swesim import costs
+    except ImportError:
+        return {"trial_id": tid, "recorded": False, "reason": "swesim.costs is not available on this worker"}
+    existing = _read_json_list(d / "costs.json")
+    if any(r.get("role") == "solver" for r in existing):
+        return {"trial_id": tid, "recorded": False, "reason": "solver cost already recorded", "records": len(existing)}
+    record = _read_json(d / "record.json")
+    if not record:
+        return {"trial_id": tid, "recorded": False, "reason": "no record.json"}
+    trajectory = _trajectory_for(record, d)
+    if trajectory is None:
+        return {"trial_id": tid, "recorded": False, "reason": "no trajectory to read usage from"}
+    model = record.get("model") or (record.get("run_config") or {}).get("model") or p.get("model")
+    usage = costs.solver_usage_from_trajectory(trajectory)
+    out = await blocking(lambda: costs.record_cost(_layout(), tid, p.get("workflow_id"), "solver", model, usage))
+    usd = getattr(out, "usd", None)
+    return {"trial_id": tid, "recorded": True, "model": model, "usd": float(usd) if usd is not None else None,
+            "price_source": getattr(out, "price_source", None), "records": len(existing) + 1}
+
+
+# ------------------------------------------------------------------ trial runtime housekeeping
+
 CLEANUP_DECISIONS = ("ingest", "runner-error", "launch-failed")  # terminal evidence exists; the runtime resource is no longer the evidence
 
 
@@ -744,7 +836,7 @@ ALL = [probe_models_activity, mine_activity, judge_activity, list_candidates_act
        scenario_version_activity, archive_scenario_activity, draft_activity,
        auto_approve_activity, precheck_draft_activity, human_approve_activity, verify_approval_activity, compile_activity,
        validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity, cancel_trial_activity,
-       cleanup_trial_activity, score_activity, export_activity]
+       cleanup_trial_activity, score_activity, export_activity, spend_check_activity, record_cost_activity]
 
 if __name__ == "__main__":
     raise SystemExit(main())
