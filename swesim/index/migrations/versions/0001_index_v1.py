@@ -2,7 +2,7 @@
 
 Revision ID: 0001_index_v1
 Revises: 
-Create Date: 2026-09-13 09:10:05.867706+00:00
+Create Date: 2026-09-13 09:15:58.848006+00:00
 
 """
 from __future__ import annotations
@@ -210,9 +210,9 @@ def upgrade() -> None:
     sa.Column('origin', sa.Text(), nullable=False),
     sa.PrimaryKeyConstraint('trial_id')
     )
+    op.create_index('ix_trials_lineage', 'trials', ['spec_hash', 'condition', 'brief_profile', 'model', 'run_config_hash'], unique=False)
     op.create_index('ix_trials_model', 'trials', ['model'], unique=False)
     op.create_index('ix_trials_scenario_id', 'trials', ['scenario_id'], unique=False)
-    op.create_index('ix_trials_spec_hash_condition_brief_profile_model_run_config_hash', 'trials', ['spec_hash', 'condition', 'brief_profile', 'model', 'run_config_hash'], unique=False)
     op.create_index('ix_trials_started_at', 'trials', ['started_at'], unique=False)
     op.create_index('ix_trials_status', 'trials', ['status'], unique=False)
     op.create_table('workflows',
@@ -248,9 +248,9 @@ def downgrade() -> None:
     op.drop_table('workflows')
     op.drop_index('ix_trials_status', table_name='trials')
     op.drop_index('ix_trials_started_at', table_name='trials')
-    op.drop_index('ix_trials_spec_hash_condition_brief_profile_model_run_config_hash', table_name='trials')
     op.drop_index('ix_trials_scenario_id', table_name='trials')
     op.drop_index('ix_trials_model', table_name='trials')
+    op.drop_index('ix_trials_lineage', table_name='trials')
     op.drop_table('trials')
     op.drop_index('ix_scores_scenario_id', table_name='scores')
     op.drop_table('scores')
