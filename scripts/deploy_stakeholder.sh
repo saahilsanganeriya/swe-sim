@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import modal
 from dotenv import dotenv_values
-keys = dotenv_values(os.environ.get('SWESIM_ENV_FILE', str(Path.home() / 'Documents/.env')))
+keys = dotenv_values(os.environ.get('SWESIM_ENV_FILE', '.env'))
 required = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'SWESIM_WORKER_SECRET']
 missing = [k for k in required if not keys.get(k)]
 if missing: raise SystemExit('Set these keys once in the ignored env file (values not shown): ' + ', '.join(missing))
