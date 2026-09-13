@@ -7,6 +7,7 @@ transcript and binds its hash to the collector receipt recorded in the grader re
 """
 from __future__ import annotations
 
+import hashlib
 import json, shutil, tomllib, urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -113,6 +114,14 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     try:
         # Pin the pre-baked agent version so Harbor's offline `uv tool install` request matches the baked receipt.
         agent_kwargs = {"version": rc.agent_version} if rc.agent == "mini-swe-agent" and rc.agent_version else None
+        # Interactive condition: layer the swesim scaffold config (the packaged mini-swe-agent workflow never lists asking the
+        # stakeholder as a step, and 10 of 10 pilot trials under it asked nothing). Harbor reads the host path and ships it.
+        agent_config_sha = None
+        if rc.agent == "mini-swe-agent" and rc.condition == "interactive":
+            src = Path(__file__).resolve().parent.parent / "templates" / "mini_swe_agent.interactive.yaml"
+            dst = task / "agent_config.yaml"; dst.write_bytes(src.read_bytes())
+            agent_config_sha = hashlib.sha256(dst.read_bytes()).hexdigest()
+            agent_kwargs = {**(agent_kwargs or {}), "config_file": str(dst)}
         trial_dir = harbor_cli.run_task(task, rc.agent, ws.jobs_dir / "runs", tid, model=rc.model, agent_kwargs=agent_kwargs,
                                         timeout_sec=rc.solver_timeout_sec + 7200)
         reward = harbor_cli.read_reward(trial_dir); report = harbor_cli.read_report(trial_dir)
@@ -149,6 +158,7 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
             report["transcript_hash_mismatch"] = True
     report["reviewed_equals_submitted"] = None
     report["image_digest"] = comp.get("image_digest")
+    report["agent_config_sha256"] = agent_config_sha  # interactive scaffold config, None for other conditions/agents
     report["simulator_validity"] = "unadjudicated" if rc.condition == "interactive" else "n/a"
 
     finished_at = _now()

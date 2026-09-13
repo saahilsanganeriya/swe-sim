@@ -242,3 +242,26 @@ def test_render_instruction_uses_compile_templates(monkeypatch, tmp_path):
     spec = ScenarioSpec.model_validate(minimal_spec_dict())
     assert run.render_instruction(spec, RunConfig(condition="interactive", brief_profile="natural")) == "It breaks.|interactive|1|/app|40"
     assert run.render_instruction(spec, RunConfig(condition="full")) == "It breaks.|full|1|/app|40"
+
+
+def test_interactive_runs_layer_the_stakeholder_scaffold_config(scene, monkeypatch):
+    """The packaged mini-swe-agent workflow never lists asking the stakeholder (10 of 10 pilot trials asked nothing), so
+    interactive trials ship the swesim scaffold config through Harbor's `config_file` kwarg and record its sha256; other
+    conditions and agents do not."""
+    import hashlib
+    from pathlib import Path
+    ws, spec, calls, state = scene
+    seen = []
+    orig = harbor_cli.run_task
+    def spy(task_dir, agent, jobs_dir, job_name, model=None, agent_kwargs=None, env_provider="modal", timeout_sec=10800):
+        seen.append(dict(agent_kwargs or {})); return orig(task_dir, agent, jobs_dir, job_name, model=model, agent_kwargs=agent_kwargs, timeout_sec=timeout_sec)
+    monkeypatch.setattr(harbor_cli, "run_task", spy)
+    tpl = Path(run.__file__).resolve().parent.parent / "templates" / "mini_swe_agent.interactive.yaml"
+    assert "ask-user" in tpl.read_text() and "{{task}}" in tpl.read_text()
+    rec = run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 0, URL, "secret")
+    kw = seen[-1]; cfg = Path(kw["config_file"])
+    assert kw["version"] == "2.4.6" and cfg.name == "agent_config.yaml" and cfg.read_bytes() == tpl.read_bytes()
+    assert cfg.parent == ws.root / "trials" / rec.trial_id / "task"
+    assert rec.report["agent_config_sha256"] == hashlib.sha256(tpl.read_bytes()).hexdigest()
+    rec2 = run_trial(ws, spec, RunConfig(condition="hidden", model="openai/gpt-5.5"), 0, URL, "secret")
+    assert "config_file" not in seen[-1] and rec2.report["agent_config_sha256"] is None
