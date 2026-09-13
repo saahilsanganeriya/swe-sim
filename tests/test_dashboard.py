@@ -472,8 +472,8 @@ def test_create_form_and_api_validation_and_success(site, monkeypatch):
     body = ok.json()
     assert body['ok'] is True and body['workflow_ids'] == ['create-abc'] and body['via'].startswith('start_create')
     sent = client.calls[-1][1]  # CreateTasksWorkflow params: sources list, models, approval mode, parallelism, server-side stakeholder URL
-    assert sent['sources'] == [{'kind': 'github-repo', 'repo': 'https://github.com/py-pdf/pypdf', 'since': '2026-06-01', 'max_candidates': 2},
-                               {'kind': 'github-repo', 'repo': 'https://github.com/psf/requests', 'since': '2026-06-01', 'max_candidates': 2}]
+    assert sent['sources'] == [{'kind': 'github-repo', 'repo': 'https://github.com/py-pdf/pypdf', 'since': '2026-06-01', 'max_candidates': 2, 'pr_kind': 'bugfix'},
+                               {'kind': 'github-repo', 'repo': 'https://github.com/psf/requests', 'since': '2026-06-01', 'max_candidates': 2, 'pr_kind': 'bugfix'}]
     assert sent['approval_mode'] == 'hold' and sent['max_parallel'] == 2 and sent['judge_model'] == 'openai/gpt-5.5'
     assert sent['stakeholder_url'] == 'https://stakeholder.example.test' and set(sent) == {'sources', 'judge_model', 'draft_model', 'max_parallel', 'approval_mode', 'stakeholder_url'}
     assert 'stakeholder_url' not in body['params'] and 'never-shown' not in ok.text and 'stakeholder.example.test' not in ok.text

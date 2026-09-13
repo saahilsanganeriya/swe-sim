@@ -426,6 +426,7 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
            judge_model: str = typer.Option(JUDGE_MODEL_DEFAULT), draft_model: str = typer.Option(DRAFT_MODEL_DEFAULT),
            since: str = typer.Option("2026-06-01"), max_candidates: int = typer.Option(20), max_parallel: int = typer.Option(8),
            approval_mode: str = typer.Option("auto", help="auto | hold (review queue; approve with `swesim workflows approve`)"),
+           pr_kind: str = typer.Option("bugfix", help="GitHub source band: bugfix (diff 20-600 lines, >=4 comments; the band that produced pypdf-3826) | feature (200-1500 lines, >=8 comments, feature label)"),
            rebuild: bool = typer.Option(False, "--rebuild", help="Re-create scenarios that already exist as a new version: archive the previous "
                                         "version's files under archive/v<n>/, then re-draft, compile, validate and register (judge rows and probes are kept)"),
            stakeholder_url: str = typer.Option("", envvar="SWESIM_STAKEHOLDER_URL")) -> None:
@@ -438,9 +439,11 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
             _, pool, *ids = s.split(":", 2)
             sources.append({"kind": "swebench-annotated", "pool": pool or "A", "limit": max_candidates, **({"instance_ids": ids[0].split(",")} if ids else {})})
         else:
-            sources.append({"kind": "github-repo", "repo": s, "since": since, "max_candidates": max_candidates})
+            sources.append({"kind": "github-repo", "repo": s, "since": since, "max_candidates": max_candidates, "pr_kind": pr_kind})
     params = {"sources": sources, "judge_model": judge_model, "draft_model": draft_model, "max_parallel": max_parallel,
               "approval_mode": approval_mode, "stakeholder_url": _stakeholder_url(stakeholder_url)}
+    if pr_kind not in ("bugfix", "feature"):
+        typer.echo("--pr-kind must be bugfix or feature", err=True); raise typer.Exit(code=2)
     if rebuild:
         params["rebuild"] = True
     typer.echo(asyncio.run(start_create(params)))

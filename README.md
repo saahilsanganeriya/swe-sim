@@ -80,7 +80,7 @@ Then `approve --auto`, `compile`, `validate`, `register`, `run`, `score`, `expor
 These commands talk to Temporal at `TEMPORAL_ADDRESS` (default `localhost:7233`), on the VM or through the tunnel.
 
 ```bash
-uv run swesim create --source https://github.com/py-pdf/pypdf --source swebench:A --approval-mode auto --max-candidates 20 --max-parallel 8
+uv run swesim create --source https://github.com/py-pdf/pypdf --source swebench:A --pr-kind bugfix --approval-mode auto --max-candidates 20 --max-parallel 8
 uv run swesim workflows list create                    # create | candidate | run | pipeline | matrix | trial | all
 uv run swesim workflows progress create-<hex>
 uv run swesim workflows approve create-<hex> <scenario_id> <spec_hash> --decision approve --note "..."

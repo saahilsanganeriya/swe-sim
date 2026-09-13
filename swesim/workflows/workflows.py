@@ -340,7 +340,8 @@ class CandidateWorkflow:
 
 def _mine_params(src: dict) -> dict:
     if src.get("kind") == "github-repo":
-        out = {"source": "github-repo", "repo": src["repo"], "since": src.get("since"), "max_candidates": src.get("max_candidates"), "pr": src.get("pr")}
+        out = {"source": "github-repo", "repo": src["repo"], "since": src.get("since"), "max_candidates": src.get("max_candidates"), "pr": src.get("pr"),
+               "kind": src.get("pr_kind")}  # discovery band; github_repo.discover defaults to "feature" when absent
     else:
         out = {"source": "swebench-annotated", "pool": src.get("pool", "A"), "instance_ids": src.get("instance_ids"), "limit": src.get("limit")}
     return {k: v for k, v in out.items() if v is not None}

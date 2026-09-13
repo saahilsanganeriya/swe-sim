@@ -539,6 +539,9 @@ def plan_trials(p: dict) -> dict:
                 if stakeholder_model:
                     kwargs["stakeholder"] = {"model_id": stakeholder_model}
                 rc = RunConfig(**kwargs)
+                # Same scaffold identity as run_trial, from the same compiled task, or the planned id never matches the record.
+                from swesim.stages.run import scaffold_identity
+                rc = RunConfig.model_validate({**rc.model_dump(), "agent_config": scaffold_identity(WS.task_dir(spec.id, cond), rc)})
                 tid = trial_id(spec.spec_hash, cond, rc.run_config_hash, i)
                 trials.append(dict(trial_id=tid, scenario_id=spec.id, spec_hash=spec.spec_hash, condition=cond, model=model,
                                    stakeholder_model=rc.stakeholder.model_id, run_config=rc.model_dump(mode="json"),

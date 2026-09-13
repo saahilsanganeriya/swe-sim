@@ -108,6 +108,9 @@ def _model(value, name: str, errors: list[str], default: str) -> str:
 
 # ----------------------------------------------------------------------------- validation
 
+PR_KINDS = ("bugfix", "feature")  # github_repo.discover bands; bugfix is the one that produced a valid scenario
+
+
 def validate_create(body: dict) -> tuple[dict, list[str]]:
     d = defaults()
     errors: list[str] = []
@@ -139,11 +142,14 @@ def validate_create(body: dict) -> tuple[dict, list[str]]:
     draft = _model(body.get("draft_model"), "draft model", errors, d["draft_model"])
     if judge == draft:
         errors.append("judge and draft models must differ (the judge must not grade its own drafts)")
+    pr_kind = str(body.get("pr_kind") or "bugfix")
+    if pr_kind not in PR_KINDS:
+        errors.append("pr_kind must be bugfix or feature")
     approval_mode = str(body.get("approval_mode") or "auto")
     if approval_mode not in dict(APPROVAL_MODES):
         errors.append("approval_mode must be auto or hold")
     params = {
-        "source": source, "repos": repos, "since": since,
+        "source": source, "repos": repos, "since": since, "pr_kind": pr_kind,
         "max_candidates_per_repo": _int(body.get("max_candidates"), "max candidates per repo", 1, 50, errors, d["max_candidates"]),
         "instance_ids": instance_ids, "limit": _int(body.get("limit"), "limit", 1, 200, errors, d["limit"]),
         "judge_model": judge, "draft_model": draft, "model": d["solver_model"],
@@ -166,7 +172,7 @@ def _flag(value) -> bool:
 def create_sources(p: dict) -> list[dict]:
     """The ``sources`` list CreateTasksWorkflow expects (same shape as ``swesim create --source``)."""
     if p["source"] == "github-repo":
-        return [{"kind": "github-repo", "repo": r, "since": p["since"], "max_candidates": p["max_candidates_per_repo"]} for r in p["repos"]]
+        return [{"kind": "github-repo", "repo": r, "since": p["since"], "max_candidates": p["max_candidates_per_repo"], "pr_kind": p.get("pr_kind", "bugfix")} for r in p["repos"]]
     src = {"kind": "swebench-annotated", "pool": "A", "limit": p["limit"]}
     if p["instance_ids"]:
         src["instance_ids"] = list(p["instance_ids"])
@@ -233,7 +239,7 @@ def cli_for_create(p: dict) -> str:
             f"--max-parallel {_q(p['max_parallel'])}" + (" --rebuild" if p.get("rebuild") else ""))
     if p["source"] == "github-repo":
         srcs = "".join(f" --source {_q(r)}" for r in p["repos"]) or " --source <repo-url>"
-        return f"uv run swesim create{srcs} --since {_q(p['since'])} --max-candidates {_q(p['max_candidates_per_repo'])} {base}"
+        return f"uv run swesim create{srcs} --since {_q(p['since'])} --max-candidates {_q(p['max_candidates_per_repo'])} --pr-kind {_q(p.get('pr_kind', 'bugfix'))} {base}"
     pool = "swebench:A" + (":" + ",".join(p["instance_ids"]) if p["instance_ids"] else "")
     return f"uv run swesim create --source {_q(pool)} --max-candidates {_q(p['limit'])} {base}"
 

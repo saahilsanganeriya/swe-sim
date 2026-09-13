@@ -51,7 +51,9 @@ def create_page(d: dict) -> str:
             ("<div data-source='github-repo'><label for='repos'>Repository URLs, one per line</label>"
              "<textarea id='repos' name='repos' rows='4' placeholder='https://github.com/py-pdf/pypdf'></textarea>"
              f"<div class='row'><label for='since'>merged since<input id='since' name='since' type='date' value='{h(d['since'])}'></label>"
-             f"<label for='max_candidates'>max candidates per repo<input id='max_candidates' name='max_candidates' type='number' min='1' max='50' value='{h(d['max_candidates'])}'></label></div></div>"),
+             f"<label for='max_candidates'>max candidates per repo<input id='max_candidates' name='max_candidates' type='number' min='1' max='50' value='{h(d['max_candidates'])}'></label>"
+             "<label for='pr_kind'>PR band<select id='pr_kind' name='pr_kind'><option value='bugfix' selected>bugfix (20–600 diff lines, ≥4 comments)</option>"
+             "<option value='feature'>feature (200–1500 lines, ≥8 comments, feature label)</option></select></label></div></div>"),
             ("<div data-source='swebench-annotated' class='hidden'><label for='instance_ids'>Instance ids (optional, one per line; empty = whole pool)</label>"
              "<textarea id='instance_ids' name='instance_ids' rows='3' placeholder='psf__requests-1944'></textarea>"
              f"<label for='limit'>limit<input id='limit' name='limit' type='number' min='1' max='200' value='{h(d['limit'])}'></label></div>"),

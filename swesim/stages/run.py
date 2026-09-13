@@ -61,6 +61,17 @@ def _get(url: str, headers: dict) -> dict:
     with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=HTTP_TIMEOUT) as r: return json.load(r)
 
 
+def scaffold_identity(compiled_task_dir: Path, rc: RunConfig) -> str:
+    """Agent-scaffold part of the run identity. A compiled interactive mini-swe-agent task carries agent_config.yaml (bound by
+    compiled_hash); its digest enters RunConfig.agent_config so scaffold and default-agent trials never share a group. The
+    Temporal planner and run_trial MUST agree on this, or the planned trial id differs from the recorded one and every
+    interactive trial ends "unresolved" (seaborn-3190 v2, 2026-09-13)."""
+    cfg = compiled_task_dir / "agent_config.yaml"
+    if rc.agent == "mini-swe-agent" and rc.condition == "interactive" and cfg.exists():
+        return "mini-swe-agent.interactive:" + hashlib.sha256(cfg.read_bytes()).hexdigest()[:16]
+    return ""
+
+
 def render_instruction(spec: ScenarioSpec, rc: RunConfig, compiled_task_dir: Path | None = None) -> str:
     """Instruction for the effective brief profile, read from the COMPILED task (bound by compiled_hash), never re-rendered
     from live templates. Falls back to the condition's default instruction.md when the profile file is absent."""
@@ -86,9 +97,7 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     compiled = ws.task_dir(spec.id, rc.condition)
     # The agent scaffold is part of the run identity: a compiled interactive task carries agent_config.yaml (bound by
     # compiled_hash) and its identity enters RunConfig.agent_config, so scaffold and default-agent trials never share a group.
-    agent_config = ""
-    if rc.agent == "mini-swe-agent" and rc.condition == "interactive" and (compiled / "agent_config.yaml").exists():
-        agent_config = "mini-swe-agent.interactive:" + hashlib.sha256((compiled / "agent_config.yaml").read_bytes()).hexdigest()[:16]
+    agent_config = scaffold_identity(compiled, rc)
     rc = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": comp["compiled_hash"], "brief_profile": profile, "agent_config": agent_config})
     tid = make_trial_id(spec.spec_hash, rc.condition, rc.run_config_hash, attempt_index)
     tdir = ws.root / "trials" / tid; prior = tdir / "record.json"

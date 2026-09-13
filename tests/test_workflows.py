@@ -1546,3 +1546,55 @@ def test_connect_kwargs_local_api_key_and_mtls(tmp_path):
     assert kw["tls"].client_cert == b"CERT" and kw["tls"].client_private_key == b"KEY" and "api_key" not in kw
     assert C.describe_connection({"TEMPORAL_TLS_CERT": str(cert), "TEMPORAL_TLS_KEY": str(key)}).endswith("auth=mtls")
     assert C.describe_connection({}).endswith("auth=plain")
+
+
+def test_plan_trials_uses_the_same_scaffold_identity_as_run_trial(ws):
+    """Interactive mini-swe-agent trials carry the compiled agent_config.yaml digest in RunConfig.agent_config. The planner and
+    run_trial must derive it identically, or the planned trial id never matches the recorded one (every interactive trial
+    ended "unresolved" on 2026-09-13 before this test)."""
+    import hashlib
+    from swesim.stages.run import scaffold_identity
+    spec = frozen_scenario(ws)
+    task = ws.task_dir(spec.id, "interactive"); task.mkdir(parents=True, exist_ok=True)
+    (task / "agent_config.yaml").write_text("agent:\n  instance_template: scaffold\n")
+    digest = hashlib.sha256((task / "agent_config.yaml").read_bytes()).hexdigest()[:16]
+    trials = A.plan_trials({"scenario_id": spec.id, "models": [HAIKU], "conditions": ["interactive", "hidden"], "k": 1, "stakeholder_url": "https://s"})["trials"]
+    by_cond = {t["condition"]: t for t in trials}
+    assert by_cond["interactive"]["run_config"]["agent_config"] == f"mini-swe-agent.interactive:{digest}"
+    assert by_cond["hidden"]["run_config"]["agent_config"] == ""
+    for t in trials:
+        rc = RunConfig.model_validate(t["run_config"])
+        assert rc.agent_config == scaffold_identity(ws.task_dir(spec.id, t["condition"]), rc)
+        assert t["trial_id"] == trial_id(spec.spec_hash, t["condition"], rc.run_config_hash, t["attempt_index"])
+    # without a scaffold file the identity is empty and the id is the pre-scaffold one
+    (task / "agent_config.yaml").unlink()
+    plain = A.plan_trials({"scenario_id": spec.id, "models": [HAIKU], "conditions": ["interactive"], "k": 1, "stakeholder_url": "https://s"})["trials"][0]
+    assert plain["run_config"]["agent_config"] == "" and plain["trial_id"] != by_cond["interactive"]["trial_id"]
+
+
+def test_create_pr_kind_reaches_the_mine_activity_params(monkeypatch):
+    """The GitHub source has two discovery bands (github_repo.discover: bugfix 20-600 diff lines, feature 200-1500 + label). The
+    Temporal path used to drop the band and fall back to `feature`, which rejected the PR that produced pypdf-3826 as
+    diff-too-small on a rebuild (2026-09-13). CLI and console carry `pr_kind`; _mine_params maps it to the activity's `kind`."""
+    from typer.testing import CliRunner
+    from swesim import cli as CLI
+    from swesim.workflows import workflows as W
+    from swesim.dashboard import console
+    captured = []
+    async def fake_start(params): captured.append(params); return "create-fake"
+    monkeypatch.setattr("swesim.workflows.client.start_create", fake_start)
+    runner = CliRunner()
+    r = runner.invoke(CLI.app, ["create", "--source", "https://github.com/x/y", "--stakeholder-url", "https://s"])
+    assert r.exit_code == 0 and captured[-1]["sources"][0]["pr_kind"] == "bugfix"                       # default: the proven band
+    r = runner.invoke(CLI.app, ["create", "--source", "https://github.com/x/y", "--pr-kind", "feature", "--stakeholder-url", "https://s"])
+    assert r.exit_code == 0 and captured[-1]["sources"][0]["pr_kind"] == "feature"
+    assert runner.invoke(CLI.app, ["create", "--source", "https://github.com/x/y", "--pr-kind", "docs", "--stakeholder-url", "https://s"]).exit_code == 2
+    assert W._mine_params(captured[-1]["sources"][0])["kind"] == "feature"
+    assert "kind" not in W._mine_params({"kind": "github-repo", "repo": "https://github.com/x/y"})     # absent -> discover's own default
+    body = {"source": "github-repo", "repos": "https://github.com/x/y", "judge_model": "openai/gpt-5.5", "draft_model": "anthropic/claude-sonnet-5"}
+    params, errors = console.validate_create(body)
+    assert errors == [] and params["pr_kind"] == "bugfix" and console.create_sources(params)[0]["pr_kind"] == "bugfix"
+    assert "--pr-kind bugfix" in console.cli_for_create(params)
+    params, errors = console.validate_create({**body, "pr_kind": "feature"})
+    assert errors == [] and console.create_sources(params)[0]["pr_kind"] == "feature"
+    assert console.validate_create({**body, "pr_kind": "docs"})[1] == ["pr_kind must be bugfix or feature"]
