@@ -2,8 +2,13 @@
 funnel, leaderboard, spend and evaluator blanking.
 
 Contract
-- `funnel_steps`: cumulative funnel. A candidate at stage S counts as `kept` at every earlier stage and by its
-  `status` at S. Discovery-time rejects (PRs filtered before a candidate row exists) have no id and are not rows.
+- `funnel` (alias `funnel_steps`): the creation funnel over candidate rows, one entity per candidate *version*: the row's
+  current version plus each of its `earlier_versions`. A candidate mined by two source keys (a legacy file and a frozen
+  plan, a per-instance probe file) is one entity, identified by its scenario id (`scenario_id_for(instance_id)`), and
+  the furthest stage wins. An entity at stage S `entered` every stage up to S, was `kept` at every stage before S and is
+  counted by its status at S; `kept` at S itself only at the last stage. Invariant: `entered[n+1] == kept[n]` and
+  `entered == kept + rejected + error + pending + superseded` at every stage. Discovery-time rejects (PRs filtered
+  before a candidate row exists) have no id and are not rows.
 - `compute_leaderboard`: the gate of interfaces §9.1. A trial counts only when its scenario version is
   `validation_status == "valid"`, `difficulty_tier == "informative"` (or `saturated` when asked; `broken` never) and
   `task_sense.coherent and task_sense.fair_tests`; the trial is `completed` with an agent-attributable outcome
@@ -19,6 +24,7 @@ from decimal import ROUND_HALF_EVEN, Decimal
 
 from swesim.index import models as M
 from swesim.index.cohorts import cohort_of
+from swesim.index.project import scenario_id_for
 
 AGENT_OUTCOMES: frozenset[int] = frozenset({1, 2, 3, 4})
 _Q6 = Decimal("0.000001")
@@ -50,18 +56,70 @@ def reject_histogram(discoveries: Iterable[M.DiscoveryRow], candidates: Iterable
     return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
-def funnel_steps(rows: Iterable[M.CandidateRow]) -> list[M.FunnelStep]:
-    order = M.FUNNEL_ORDER
-    position = {s: i for i, s in enumerate(order)}
-    counts = {s: {"kept": 0, "rejected": 0, "error": 0, "pending": 0} for s in order}
+STATUS_RANK: dict[str, int] = {"kept": 5, "superseded": 4, "pending": 3, "error": 2, "rejected": 1}
+_POSITION: dict[str, int] = {s: i for i, s in enumerate(M.FUNNEL_ORDER)}
+_LAST = len(M.FUNNEL_ORDER) - 1
+
+
+def funnel_identity(row: M.CandidateRow) -> str:
+    """The candidate's scenario id (the drafter's rule on its instance id), the same whichever source key mined it."""
+    return row.scenario_id or scenario_id_for(row.instance_id) or row.instance_id
+
+
+def funnel_entities(rows: Iterable[M.CandidateRow]) -> dict[tuple[str, int | None], tuple[int, str]]:
+    """(identity, version) -> (stage index, status): every candidate version once. A stage outside the funnel order
+    (`failed`) counts at the first stage; `kept` before the last stage never advanced and reads `pending`. Duplicates
+    (two source keys, a row without a version beside one with) fold into the furthest stage, then the most advanced status."""
+    found: dict[tuple[str, int | None], tuple[int, str]] = {}
+
+    def add(identity: str, version: int | None, stage: str, status: str) -> None:
+        i = _POSITION.get(stage, 0)
+        if status == "kept" and i < _LAST or status not in STATUS_RANK:
+            status = "pending"
+        key = (identity, version)
+        if key not in found or (i, STATUS_RANK[status]) > (found[key][0], STATUS_RANK[found[key][1]]):
+            found[key] = (i, status)
+
     for r in rows:
-        i = position.get(r.stage)
-        if i is None:
-            continue
-        for s in order[:i]:
-            counts[s]["kept"] += 1
-        counts[r.stage][r.status] += 1
-    return [M.FunnelStep(stage=s, **counts[s]) for s in order]
+        identity = funnel_identity(r)
+        add(identity, r.version, r.stage, r.status)
+        for ev in r.earlier_versions or []:
+            if isinstance(ev, dict) and isinstance(ev.get("version"), int) and not isinstance(ev["version"], bool):
+                add(identity, ev["version"], str(ev.get("stage")), str(ev.get("status")))
+    # a version-less observation of an identity that has versioned ones is the same candidate, not another
+    unknown = [key for key in found if key[1] is None and any(k[0] == key[0] and k[1] is not None for k in found)]
+    for identity, _none in unknown:
+        latest = max(v for (idn, v) in found if idn == identity and v is not None)
+        stage, status = found.pop((identity, None))
+        add(identity, latest, M.FUNNEL_ORDER[stage], status)
+    return found
+
+
+def _label(identity: str, version: int | None) -> str:
+    return f"{identity}@v{version}" if version is not None else identity
+
+
+def funnel(rows: Iterable[M.CandidateRow]) -> list[M.FunnelStep]:
+    entities = funnel_entities(rows)
+    steps: list[M.FunnelStep] = []
+    for i, stage in enumerate(M.FUNNEL_ORDER):
+        counts = {"kept": 0, "rejected": 0, "error": 0, "pending": 0, "superseded": 0}
+        ids: list[str] = []
+        entered = 0
+        for (identity, version), (j, status) in entities.items():
+            if j < i:
+                continue
+            entered += 1
+            if j > i or status == "kept":
+                counts["kept"] += 1
+                ids.append(_label(identity, version))
+            else:
+                counts[status] += 1
+        steps.append(M.FunnelStep(stage=stage, entered=entered, ids=sorted(ids), **counts))
+    return steps
+
+
+funnel_steps = funnel
 
 
 def gate_passes(s: M.ScenarioRow, include_saturated: bool = False) -> bool:

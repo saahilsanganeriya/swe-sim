@@ -135,11 +135,11 @@ def test_migration_creates_the_metadata_exactly_and_is_idempotent(tmp_path: Path
     insp = sa.inspect(store.engine)
     assert set(S.TABLES) <= set(insp.get_table_names()) and "alembic_version" in insp.get_table_names()
     with store.engine.connect() as conn:
-        assert conn.execute(sa.text("select version_num from alembic_version")).scalar_one() == "0004_history"
+        assert conn.execute(sa.text("select version_num from alembic_version")).scalar_one() == "0005_funnel_versions"
         diff = compare_metadata(MigrationContext.configure(conn), S.metadata)
     assert diff == [], diff
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == ["0004_history"]
+    assert script.get_heads() == ["0005_funnel_versions"]
 
 
 def test_discovery_migration_preserves_existing_v1_rows(tmp_path: Path):

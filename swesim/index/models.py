@@ -27,7 +27,7 @@ from swesim.storage.layout import Condition, SEGMENT_RE
 ValidationStatus = Literal["drafting", "approved", "compiling", "validating", "valid", "invalid", "rejected", "archived"]
 DifficultyTier = Literal["saturated", "informative", "broken"]
 FunnelStage = Literal["mined", "judged", "probed", "drafted", "approved", "compiled", "validated", "registered", "rejected", "failed"]
-CandidateStatus = Literal["kept", "rejected", "error", "pending"]
+CandidateStatus = Literal["kept", "rejected", "error", "pending", "superseded"]
 BriefProfile = Literal["natural", "withheld"]
 Purpose = Literal["calibration", "comparison", "demonstration", "screen"]
 TrialStatus = Literal["planned", "launched", "running", "completed", "runner-error", "launch-failed", "unit-failed", "unresolved", "cancelled"]
@@ -78,7 +78,14 @@ class ScenarioRow(Provenance):
 
 
 class CandidateRow(Provenance):
-    """table candidates, pk (instance_id, source_key)"""
+    """table candidates, pk (instance_id, source_key); one row per candidate of a source, describing its current version.
+
+    `stage`/`status` is the terminal decision at the last stage the current version reached: `kept` only at the last
+    stage (registered); `rejected` (gate + reasons) or `error` at a gate; `pending` when it was kept at this stage and
+    never advanced (`reasons[0]` says why: not-selected | cap-cut | workflow-stopped | in-progress | unknown).
+    `earlier_versions` lists the archived versions of the same candidate (`archive/v<n>/`), each
+    `{version, stage, status, gate, reasons}` with `status == "superseded"` unless that version was itself rejected or
+    errored; the funnel counts each version once (`swesim.index.reports.funnel`)."""
 
     instance_id: str
     source_key: str
@@ -94,6 +101,7 @@ class CandidateRow(Provenance):
     scenario_id: str | None
     version: int | None
     candidates_path: str | None = None
+    earlier_versions: list[dict] | None = None
 
 
 CANDIDATE_EVENT_IDENTITY: tuple[str, ...] = ("source_key", "instance_id", "workflow_id", "run_id", "phase", "stage", "status", "gate",
@@ -418,11 +426,20 @@ class TableFilter(PageFilter):
 
 
 class FunnelStep(Strict):
+    """One stage of the creation funnel (`swesim.index.reports.funnel`): `entered` candidate versions reached this stage;
+    `kept` advanced to the next one (at the last stage: are registered); the rest stopped here as `rejected`, `error`,
+    `pending` (kept, never advanced) or `superseded` (a later version replaced it). `entered == kept + rejected + error
+    + pending + superseded`, and the next stage's `entered` equals this stage's `kept`. `ids` names the kept candidates
+    (`<scenario_id>@v<version>`), so the last stage lists the registered scenarios."""
+
     stage: FunnelStage
     kept: int
     rejected: int
     error: int
     pending: int
+    superseded: int = 0
+    entered: int = 0
+    ids: list[str] = Field(default_factory=list)
 
 
 class LeaderboardRow(Strict):

@@ -130,7 +130,9 @@ def home_body(data: dict, settings) -> str:
                       empty="<strong>Nothing is running.</strong> Start a run on <a href='/run'>Run</a>; rows appear here within 5 s of launch.", export=False))
     body.append("<div class='side-by-side'><div><h2>Recent workflows</h2>" + table("workflows", tuple(c for c in WORKFLOW_COLUMNS if c.key in ("workflow_id", "status", "temporal")), data["workflows"], key="execution_key",
                                                                                   empty="<strong>No workflows listed.</strong> " + h(data.get("workflow_error") or "Start one on Create or Run."), export=False)
-                + "</div><div><h2>Creation funnel</h2><div id='home-charts' data-live-charts>" + charts.funnel(data["funnel"], "chart-home-funnel") + "</div></div></div>")
+                + "</div><div><h2>Creation funnel</h2><p class='muted small'>Every candidate version ends in one state at the last stage it reached; "
+                "kept at a stage means it entered the next. Rows and reasons: <a href='/candidates'>Candidates</a>.</p>"
+                "<div id='home-charts' data-live-charts>" + charts.funnel(data["funnel"], "chart-home-funnel") + "</div></div></div>")
     body.append("<h2>Recently finished</h2>")
     body.append(table("recent", TRIAL_COLUMNS, data["recent"], key="trial_id", empty="<strong>No finished trials yet.</strong>", export=False))
     body.append(health_panel())
@@ -214,14 +216,15 @@ def source_funnels(latest: dict[str, dict], candidates, keys: list[str] | None =
     candidates reached each stage.
 
     A source without a scan record (discovery before scans were written) shows dashes for the discovery stages; its
-    rejects histogram still counts. Candidate stage counts are `kept + rejected + error + pending` at each stage."""
+    rejects histogram still counts. Candidate stage counts are the candidate versions that `entered` each stage
+    (`reports.funnel`: kept + rejected + error + pending + superseded)."""
     rows = list(candidates)
     keys = sorted(keys) if keys is not None else sorted({*latest, *(r.source_key for r in rows)})
     out = []
     for key in keys:
         disc = latest.get(key) or {}
         mine = [r for r in rows if r.source_key == key]
-        reached = {s.stage: s.kept + s.rejected + s.error + s.pending for s in reports.funnel_steps(mine)}
+        reached = {s.stage: s.entered for s in reports.funnel(mine)}
         funnel = disc.get("funnel") or {}
         decisions = disc.get("decisions") or []
         source, _, slug = key.partition("--")

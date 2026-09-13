@@ -116,7 +116,7 @@ STATUS_KIND = {
     # serious (needs a look, not a failure)
     "unresolved": "serious", "cancelled": "serious", "review_needed": "serious",
     # neutral
-    "archived": "neutral", "saturated": "neutral", "continued_as_new": "neutral", "unknown": "neutral", "mined": "neutral",
+    "archived": "neutral", "saturated": "neutral", "continued_as_new": "neutral", "unknown": "neutral", "mined": "neutral", "superseded": "neutral",
     # task origin badges (swesim.dashboard.origin): categorical, not a status
     "novel": "info", "swe-bench a": "neutral", "authored": "neutral",
 }
