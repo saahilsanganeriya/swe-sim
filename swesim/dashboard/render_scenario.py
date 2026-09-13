@@ -8,7 +8,7 @@ judge/draft metadata, task-sense reasons) are rendered only when ``identity.eval
 from __future__ import annotations
 
 from swesim.dashboard.render import (
-    Column, chip, code_block, dash, difficulty_chip, evaluator_switch, h, ident, kv, outcome_chip, short, table,
+    Column, chip, dash, difficulty_chip, evaluator_switch, h, ident, kv, outcome_chip, short, table,
 )
 
 SCENARIO_COLUMNS = (

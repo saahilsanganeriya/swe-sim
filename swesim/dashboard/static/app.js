@@ -171,6 +171,11 @@
     const a = el("a"); a.href = URL.createObjectURL(blob); a.download = (t.dataset.table || "table") + ".csv"; a.click(); URL.revokeObjectURL(a.href);
   }
   document.querySelectorAll("[data-table]").forEach((t) => {
+    t.querySelectorAll("[data-page]").forEach((link) => {
+      const current = new URL(window.location.href), next = new URL(link.href);
+      ["offset", "limit"].forEach((key) => current.searchParams.set(key, next.searchParams.get(key)));
+      link.href = current.toString();
+    });
     t.addEventListener("click", (ev) => {
       const s = ev.target.closest("th .sort");
       if (s) { const st = tableState(t); if (st.sort === s.dataset.sort) st.dir = st.dir === "asc" ? "desc" : "asc"; else { st.sort = s.dataset.sort; st.dir = "asc"; } applyTable(t); }
@@ -236,7 +241,9 @@
   /* tables with their own source (no page source) */
   document.querySelectorAll("[data-table][data-source]").forEach((t) => {
     poll(parseInt(body.dataset.pollMs || "8000", 10), async () => {
-      const data = await getJSON(t.dataset.source);
+      const url = new URL(t.dataset.source, window.location.origin);
+      new URLSearchParams(window.location.search).forEach((value, key) => url.searchParams.append(key, value));
+      const data = await getJSON(url);
       const items = Array.isArray(data) ? data : (data.items || data[t.dataset.table] || []);
       setRows(t, items); lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
     });
@@ -340,6 +347,7 @@
   if (body.dataset.page === "episode" && body.dataset.trial && body.dataset.live === "true") {
     const url = "/api/trial/" + encodeURIComponent(body.dataset.trial) + "/timeline";
     poll(parseInt(body.dataset.pollMs || "3000", 10), async () => {
+      if (body.dataset.live !== "true") return;
       const t = await getJSON(url);
       const chat = document.getElementById("chat");
       if (chat && Array.isArray(t.timeline)) {
@@ -357,7 +365,17 @@
       const pat = document.getElementById("patience-live");
       if (pat && t.patience) pat.textContent = (t.patience.end === null || t.patience.end === undefined ? "—" : t.patience.end) + " / " + (t.patience.start === null || t.patience.start === undefined ? "—" : t.patience.start) + " remaining";
       lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
-      if (!t.live) window.location.reload();
+      if (!t.live) {
+        body.dataset.live = "false";
+        const verifier = document.getElementById("verifier-result");
+        if (verifier) {
+          verifier.replaceChildren(el("p", null, (t.report.outcome || t.status.status || "completed") + " · reward " + (t.reward.reward ?? "unknown")));
+          const detail = el("pre", "code", JSON.stringify(t.report, null, 2)); verifier.appendChild(detail);
+        }
+        const patch = document.getElementById("submitted-patch");
+        if (patch && t.patch) patch.replaceChildren(el("pre", "code", t.patch));
+        liveIndicator("ok", "completed");
+      }
     });
   }
 })();

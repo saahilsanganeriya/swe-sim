@@ -83,7 +83,7 @@ def chat_bubbles(rows: list[dict], live: bool, evaluator: bool, audit_by_seq: di
                 body += f"<div class='audit' data-evaluator-only><strong>audit (evaluator-only):</strong> {' · '.join(bits)}</div>"
         elif evaluator and r["actor"] == "agent" and (audit_by_seq or {}).get(m.get("seq")):
             a = audit_by_seq[m.get("seq")]
-            body += f"<div class='audit' data-evaluator-only><strong>question audit (evaluator-only):</strong> " + ", ".join(f"{h(k)}={h(v)}" for k, v in a.items() if k not in ("seq", "reason")) + (f" — {h(a.get('reason'))}" if a.get("reason") else "") + "</div>"
+            body += "<div class='audit' data-evaluator-only><strong>question audit (evaluator-only):</strong> " + ", ".join(f"{h(k)}={h(v)}" for k, v in a.items() if k not in ("seq", "reason")) + (f" — {h(a.get('reason'))}" if a.get("reason") else "") + "</div>"
         if m.get("request_id"):
             body += f"<div class='muted small'>request {ident(m['request_id'], 10)}</div>"
         parts.append(f"<div class='bubble {h(r['actor'])} {h(kind)}{' refusal' if refusal else ''}'>{head}{body}</div>")
@@ -242,6 +242,6 @@ def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extra
                   ("started", f"<span class='mono'>{dash(m.get('started_at'))}</span>"), ("finished", f"<span class='mono'>{dash(m.get('finished_at'))}</span>"),
                   ("origin / launcher", f"{dash(row.origin if row else None)} / {dash(row.launcher if row else None)}" + (f" · <span class='mono'>{h(row.job_name)}</span>" if row and row.job_name else "")),
                   ("workflow", f"<a class='mono' href='/workflows/{h(row.workflow_id)}'>{h(row.workflow_id)}</a>" if row and row.workflow_id else "—")])
-    right = ["<div class='panel card'><h2>Brief</h2>", brief, "<h2>Patch</h2>", patch, "<h2>Verifier</h2>", verifier_section(t, tid), cost, "<h2>Lineage</h2>", lineage,
+    right = ["<div class='panel card'><h2>Brief</h2>", brief, "<h2>Patch</h2><div id='submitted-patch'>", patch, "</div><h2>Verifier</h2><div id='verifier-result'>", verifier_section(t, tid), "</div>", cost, "<h2>Lineage</h2>", lineage,
              "<h2>Reviewer label</h2>", label_form(t, tid), "<h2>Files</h2>", files_section(t, tid, resolve, evaluator), "</div>"]
     return f"<div class='two-col'><div>{''.join(left)}</div>{''.join(right)}</div>"

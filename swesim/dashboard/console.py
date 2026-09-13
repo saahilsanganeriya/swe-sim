@@ -211,18 +211,23 @@ def validate_run(body: dict, valid_ids: set[str] | Path) -> tuple[dict, list[str
             errors.append(f"not a registered valid scenario: {sid!r}")
     models = _lines(body.get("models")) + _lines(body.get("models_extra"))
     models = list(dict.fromkeys(models))
+    purpose = str(body.get("purpose") or "comparison")
+    if purpose == "screen" and not models:
+        from swesim.roles import ROLE_CHAINS
+        models = [ROLE_CHAINS["screen_model"][0]]
     if not models:
         errors.append("select or enter at least one solver model id")
     for m in models:
         if not MODEL_RE.fullmatch(m):
             errors.append(f"model id must look like provider/model-id (got {m!r})")
     conditions = list(_lines(body.get("conditions")))
+    if purpose == "screen":
+        conditions = ["hidden", "full"]
     if not conditions:
         errors.append("select at least one condition")
     for c in conditions:
         if c not in CONDITIONS:
             errors.append(f"unknown condition {c!r}")
-    purpose = str(body.get("purpose") or "comparison")
     if purpose not in PURPOSES:
         errors.append("purpose must be calibration, comparison, demonstration or screen")
     profile = str(body.get("brief_profile") or "withheld")
@@ -230,7 +235,7 @@ def validate_run(body: dict, valid_ids: set[str] | Path) -> tuple[dict, list[str
         errors.append("brief profile must be withheld or natural")
     params = {
         "scenario_ids": scenario_ids, "models": models, "conditions": conditions,
-        "k": _int(body.get("k"), "k", 1, 10, errors, d["k"]), "purpose": purpose, "brief_profile": profile,
+        "k": 2 if purpose == "screen" else _int(body.get("k"), "k", 1, 10, errors, d["k"]), "purpose": purpose, "brief_profile": profile,
         "stakeholder_model": _model(body.get("stakeholder_model"), "stakeholder model", errors, d["stakeholder_model"]),
         "max_parallel": _int(body.get("max_parallel"), "max parallel trials", 1, MAX_PARALLEL, errors, d["max_parallel"]),
         "attempt_offset": _int(body.get("attempt_offset"), "attempt offset", 0, 1000, errors, 0),

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 
 from swesim.dashboard import console
-from swesim.dashboard.render import TIERS, chip, dash, h, ident, model_chip, table, Column
+from swesim.dashboard.render import TIERS, chip, h, ident, model_chip, table, Column
 from swesim.dashboard.render_scenario import scenario_sections
 
 
@@ -83,7 +83,7 @@ def run_body(d: dict, scenarios: list, spend_cap) -> str:
     cap = f"${spend_cap:,.2f}" if spend_cap is not None else "none (SWESIM_SPEND_CAP_USD unset)"
     body = ["<h1>Run trials</h1>",
             ("<p class='lead'>Start a run (RunTasksWorkflow) over registered, valid scenarios: k attempts per model per condition, grouped by frozen run configuration. "
-             "Calibration, comparison, demonstration and screen runs are never pooled. You confirm the exact command before it runs.</p>"), banner_slot(),
+             "Calibration, comparison, demonstration and screen runs are never pooled. A screen uses hidden k=2 and full k=1, and defaults to the configured screen model when none is selected. You confirm the exact command before it runs.</p>"), banner_slot(),
             "<form id='run-form' class='console' data-action='run'><fieldset><legend>Scenarios</legend>"]
     if scenarios:
         body.append("<p class='muted small'>Difficulty labels: informative = on the leaderboard; saturated = excluded by default from frontier runs; unlabelled = run the screen first (purpose = screen).</p>")

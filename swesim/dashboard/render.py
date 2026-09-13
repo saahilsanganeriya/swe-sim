@@ -410,7 +410,7 @@ def nav_html(active: str, counts: dict | None) -> str:
 def crumbs_html(crumbs: Sequence[tuple[str, str | None]]) -> str:
     if not crumbs:
         return ""
-    items = [f"<li><a href='/'>Home</a></li>"]
+    items = ["<li><a href='/'>Home</a></li>"]
     for label, href in crumbs:
         items.append(f"<li><a href='{h(href)}'>{h(label)}</a></li>" if href else f"<li aria-current='page'>{h(label)}</li>")
     return f"<nav class='crumbs' aria-label='breadcrumb'><ol>{''.join(items)}</ol></nav>"
