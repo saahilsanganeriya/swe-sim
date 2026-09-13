@@ -318,15 +318,16 @@ def test_judge_candidate_adds_code_owned_fields(monkeypatch):
     seen = {}
 
     base = {"derivable_from_repo": False, "consequential": True, "category": "behavior"}
+    cand_text = judge.issue_contract_delta(_row())[0]["text"]          # "tests assert the literal 'dimension '": the one code-extracted gap of the fixture
 
     def fake_chat(model_id, system, messages, schema, **kw):
         seen.update(model=model_id, system=system, user=json.loads(messages[0]["content"]))
-        return {"gaps": [{"id": "g1", "text": "tests expect ValueError", "source": "test-exception", "resolved_by": "thread",
+        return {"gaps": [{"id": "g1", "text": cand_text, "source": "test-literal", "resolved_by": "thread",
                           "resolution_excerpt": "raise a ValueError when the dim is missing", **base},
                          {"id": "g2", "text": "message names the dim", "source": "proposed", "evidence": "match=\"dimension 'z' not found\"", "question": "message?",
                           "resolved_by": "tests", "resolution_excerpt": "", **base},
                          {"id": "g3", "text": "invented", "source": "proposed", "evidence": "raise TypeError('nope')", "resolved_by": "tests", **base},   # not verbatim: dropped
-                         {"id": "g4", "text": "dup", "source": "proposed", "evidence": "match=\"dimension  'z' not found\"", "resolved_by": "tests", **base}],  # same evidence: dropped
+                         {"id": "g4", "text": "dup", "source": "proposed", "evidence": "match=\"dimension  'z' not found\"", "question": "message?", "resolved_by": "tests", **base}],  # same evidence + question: dropped
                 "verified_rubric_score": "2", "complexity": 2, "test_behavioralness": 4, "self_contained": True, "alternatives_accepted": False, "rationale": "ok"}
     monkeypatch.setattr(judge, "chat_json", fake_chat)
     row = _row(annotation={**_row()["annotation"], "underspecified_notes": "ANNOTATOR SECRET NOTE"})
@@ -397,27 +398,58 @@ def test_ground_gaps_requires_verbatim_evidence_and_grounded_resolutions():
     from swesim.stages.judge import accept, ground_gaps
     row = _row()
     base = {"derivable_from_repo": False, "consequential": True, "category": "behavior"}
+    from swesim.stages.judge import issue_contract_delta
+    assert [c["text"] for c in issue_contract_delta(row)] == ["tests assert the literal 'dimension '"]   # the issue already names ValueError
     gaps = [
-        {"id": "g1", "source": "test-exception", "text": "tests expect ValueError", "resolved_by": "thread", "resolution_excerpt": "raise a ValueError when the dim is missing", **base},
+        {"id": "g1", "source": "test-exception", "text": "tests assert the literal 'dimension '", "resolved_by": "thread", "resolution_excerpt": "raise a ValueError when the dim is missing", **base},
         {"id": "g2", "source": "proposed", "text": "message names the dim", "evidence": "match=\"dimension 'z' not found\"", "resolved_by": "tests", "resolution_excerpt": "", **base},
         {"id": "g3", "source": "proposed", "text": "invented", "evidence": "raise TypeError('nope')", "resolved_by": "tests", **base},                 # not in tests/patch: dropped
         {"id": "g4", "source": "proposed", "text": "dup", "evidence": "match=\"dimension  'z' not found\"", "resolved_by": "tests", **base},            # same evidence after _norm: dropped
         {"id": "g5", "source": "proposed", "text": "short", "evidence": "x\n", "resolved_by": "tests", **base},                                          # below the 12-char floor: dropped
-        {"id": "g6", "source": "proposed", "text": "claims thread", "evidence": "ds.weighted(w).mean('z')", "resolved_by": "thread",
-         "resolution_excerpt": "the maintainer agreed to raise", **base},                                                                             # thread claim not in thread -> tests
-        {"id": "g7", "source": "test-literal", "text": "literal", "resolved_by": "tests", **base},                                                     # extracted, no test evidence -> none
+        {"id": "g6", "source": "proposed", "text": "claims thread", "evidence": "with pytest.raises(ValueError, match=\"dimension 'z' not found\"):",
+         "resolved_by": "thread", "resolution_excerpt": "the maintainer agreed to raise", **base},                                                    # thread claim not in thread -> tests
+        {"id": "g7", "source": "test-literal", "text": "literal", "resolved_by": "tests", **base},                              # extracted-looking label, text matches no candidate gap: a proposal without evidence -> dropped
         {"id": "g8", "source": "diff-branch", "text": "invented source", "resolved_by": "none", **base},                                              # non-extracted source, no evidence: dropped
         "garbage",
     ]
     kept, stats = ground_gaps(gaps, row)
-    assert [g["id"] for g in kept] == ["g1", "g2", "g6", "g7"]
-    assert stats == {"gaps_proposed": 2, "gaps_dropped": 5, "resolution_downgraded": 2}
+    assert [g["id"] for g in kept] == ["g1", "g2", "g6"]
+    assert stats == {"gaps_proposed": 2, "gaps_dropped": 6, "resolution_downgraded": 1}
     by = {g["id"]: g for g in kept}
-    assert by["g1"]["resolved_by"] == "thread" and by["g2"]["resolved_by"] == "tests" and by["g6"]["resolved_by"] == "tests" and by["g7"]["resolved_by"] == "none"
-    assert by["g6"]["source"] == "proposed" and by["g2"]["evidence_grounded"] is True and by["g1"]["evidence_grounded"] is False
+    assert by["g1"]["resolved_by"] == "thread" and by["g2"]["resolved_by"] == "tests" and by["g6"]["resolved_by"] == "tests"
+    assert by["g1"]["source"] == "test-literal" and by["g6"]["source"] == "proposed" and by["g2"]["evidence_grounded"] is True and by["g1"]["evidence_grounded"] is False   # source is code-owned
+    assert by["g2"]["evidence_in_tests"] is True and by["g6"]["evidence_in_tests"] is True
     assert accept({"self_contained": True, "gaps": [by["g2"]]}) and accept({"self_contained": True, "gaps": [by["g1"]]})
-    assert not accept({"self_contained": True, "gaps": [by["g7"]]}) and not accept({"self_contained": False, "gaps": [by["g2"]]})
+    assert not accept({"self_contained": True, "gaps": [{**by["g2"], "resolved_by": "none"}]}) and not accept({"self_contained": False, "gaps": [by["g2"]]})
     assert ground_gaps([], row) == ([], {"gaps_proposed": 0, "gaps_dropped": 0, "resolution_downgraded": 0})
+
+
+def test_ground_gaps_closes_the_label_smuggle_and_boilerplate_evidence_holes():
+    """Reviewer probes on d5ad128: an invented gap labelled with an extracted source, `diff --git a/` as evidence, and patch-only
+    evidence all passed both auto gates. None may."""
+    from swesim.stages.draft_spec import tests_resolved_facts
+    from swesim.stages.judge import accept, evidence_ok, ground_gaps
+    row = _row(patch="diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n@@ -1 +1,3 @@\n x\n"
+                     "+    if dim not in self.obj.dims:\n+        raise ValueError(f\"dimension {dim!r} not found in weights\")\n")
+    base = {"derivable_from_repo": False, "consequential": True, "category": "behavior"}
+    smuggled = {"id": "s1", "source": "test-exception", "text": "tests require a retry loop", "resolved_by": "thread", "resolution_excerpt": "Please raise a ValueError", **base}
+    boiler = {"id": "s2", "source": "proposed", "text": "invented decision", "evidence": "diff --git a/", "resolved_by": "tests", **base}
+    header = {"id": "s3", "source": "proposed", "text": "invented decision", "evidence": "+++ b/xarray/core/weighted.py", "resolved_by": "tests", **base}
+    keywords = {"id": "s4", "source": "proposed", "text": "invented decision", "evidence": "if not in", "resolved_by": "tests", **base}
+    patch_only = {"id": "s5", "source": "proposed", "text": "the fix rejects unknown dims", "evidence": "if dim not in self.obj.dims:", "question": "which dims?", "resolved_by": "tests", **base}
+    kept, stats = ground_gaps([smuggled, boiler, header, keywords, patch_only], row)
+    assert [g["id"] for g in kept] == ["s5"] and stats["gaps_dropped"] == 4
+    assert kept[0]["evidence_grounded"] is True and kept[0]["evidence_in_tests"] is False and kept[0]["resolved_by"] == "none"   # patch-only evidence cannot be tests-resolved
+    assert not accept({"self_contained": True, "gaps": kept})
+    assert tests_resolved_facts(row, {"gaps": [{**patch_only, "resolved_by": "tests"}]}) == []                                     # and synthesizes no on-request fact
+    assert not evidence_ok("diff --git a/") and not evidence_ok("assert not in") and not evidence_ok("valueerror") and evidence_ok("raise valueerror(msg) here")
+    # two distinct decisions pinned by the same test line both survive (dedupe is on evidence + question)
+    ev = "match=\"dimension 'z' not found\""
+    two = [{"id": "d1", "source": "proposed", "text": "message names the dim", "evidence": ev, "question": "what message?", "resolved_by": "tests", **base},
+           {"id": "d2", "source": "proposed", "text": "message quotes the dim name", "evidence": ev, "question": "is the dim name quoted?", "resolved_by": "tests", **base},
+           {"id": "d3", "source": "proposed", "text": "dup of d1", "evidence": ev, "question": "what message?", "resolved_by": "tests", **base}]
+    kept, stats = ground_gaps(two, _row())
+    assert [g["id"] for g in kept] == ["d1", "d2"] and stats["gaps_dropped"] == 1
 
 
 def test_tests_for_excerpt_and_synthesized_authored_facts():
@@ -426,16 +458,33 @@ def test_tests_for_excerpt_and_synthesized_authored_facts():
     f2p = [F2P, "xarray/tests/test_weighted.py::test_new", "xarray/tests/test_other.py::test_x"]
     assert tests_for_excerpt(row["test_patch"], "match=\"dimension 'z' not found\"", f2p) == [F2P]                       # enclosing test function
     assert tests_for_excerpt(row["test_patch"], "def test_new(): pass", f2p) == ["xarray/tests/test_weighted.py::test_new"]
-    assert tests_for_excerpt(row["test_patch"], "not in the test patch at all", f2p) == sorted(f2p)                   # evidence from the source patch: every F2P test
+    assert tests_for_excerpt(row["test_patch"], "not in the test patch at all", f2p) == []                            # no all-F2P fallback any more
+    assert tests_for_excerpt(row["test_patch"], "", f2p) == []
+    # the hunk trailer names the existing test an edit lands in; a hunk without a test trailer is module level and links nothing
+    edited = ("diff --git a/xarray/tests/test_weighted.py b/xarray/tests/test_weighted.py\n--- a/xarray/tests/test_weighted.py\n+++ b/xarray/tests/test_weighted.py\n"
+              "@@ -1,2 +1,3 @@\n import pytest\n+import numpy as np\n"
+              "@@ -5,2 +5,3 @@ def test_new():\n     first = 1\n+    assert first == 1\n"
+              "@@ -40,3 +41,5 @@ def test_weighted_operations_nonexistent_dim(a):\n     w = weights()\n+    with pytest.raises(ValueError, match=\"dimension 'z' not found\"):\n+        ds.weighted(w).mean('z')\n"
+              "@@ -80,2 +83,3 @@ class TestOther:\n     pass\n+    helper_line = 2\n")
+    assert tests_for_excerpt(edited, "match=\"dimension 'z' not found\"", f2p) == [F2P]                                # not test_new, the previous block
+    assert tests_for_excerpt(edited, "assert first == 1", f2p) == ["xarray/tests/test_weighted.py::test_new"]
+    assert tests_for_excerpt(edited, "helper_line = 2", f2p) == []                                                    # a class trailer is not a test function
+    assert tests_for_excerpt(edited, "import numpy as np", f2p) == []                                                 # module-level hunk
     facts = tests_resolved_facts(row, _judged())
     assert len(facts) == 1 and facts[0]["id"] == "tests-001" and facts[0]["provenance"] == "authored" and facts[0]["discovery"] == "on-request"
     assert facts[0]["source_excerpt"] == "match=\"dimension 'z' not found\"" and facts[0]["source_url"] == "https://github.com/pydata/xarray/pull/5362"
     assert facts[0]["tests"] == [F2P] and facts[0]["kind"] == "behavior" and "g2" in facts[0]["authored_rationale"] and "What should the message say?" in facts[0]["authored_rationale"]
-    assert facts[0]["text"] == "The error message names the missing dimension"
+    assert facts[0]["text"] == "Expected error: dimension not found"                                                  # judge prose within the fact_text bounds
+    j = _judged(); j["gaps"][1]["text"] = "The kubernetes scheduler must reject the dimension"                          # foreign content words: falls back to the question, then the excerpt
+    assert tests_resolved_facts(row, j)[0]["text"] == "What should the message say?" or tests_resolved_facts(row, j)[0]["text"] == j["gaps"][1]["evidence"]
+    j = _judged(); j["gaps"][1]["text"] = "x" * 500; j["gaps"][1]["question"] = "y" * 500
+    assert tests_resolved_facts(row, j)[0]["text"] == j["gaps"][1]["evidence"]
     j = _judged(); j["gaps"][1]["evidence"] = "raise TypeError('nope')"                                             # evidence re-checked by code: fabricated -> no fact
     assert tests_resolved_facts(row, j) == []
     j = _judged(); j["gaps"][1]["derivable_from_repo"] = True
     assert tests_resolved_facts(row, j) == []
+    j = _judged(); j["gaps"][1]["evidence"] = "def test_new(): pass"                                                # in a test function -> linked to it, not to every F2P test
+    assert tests_resolved_facts(row, j) == [] if F2P.startswith("xarray/tests/test_weighted.py::test_new") else tests_resolved_facts(_row(fail_to_pass=f2p), j)[0]["tests"] == ["xarray/tests/test_weighted.py::test_new"]
     assert tests_resolved_facts(_row(thread={}), _judged())[0]["source_url"] == "https://github.com/pydata/xarray/pull/5362"   # PR url fallback from the instance id
 
 
@@ -786,9 +835,9 @@ def _thread(repo, pr):
 
 
 def _judged(**over):
-    j = {"gaps": [{"id": "g1", "text": "tests expect ValueError", "source": "test-exception", "evidence": "pytest.raises(ValueError", "question": "Which exception?",
+    j = {"gaps": [{"id": "g1", "text": "tests assert the literal 'dimension '", "source": "test-literal", "evidence": "pytest.raises(ValueError", "question": "Which exception?",
                    "derivable_from_repo": False, "consequential": True, "resolved_by": "thread", "resolution_excerpt": "raise a ValueError when the dim is missing", "category": "behavior"},
-                  {"id": "g2", "text": "The error message names the missing dimension", "source": "proposed", "evidence": "match=\"dimension 'z' not found\"",
+                  {"id": "g2", "text": "Expected error: dimension not found", "source": "proposed", "evidence": "match=\"dimension 'z' not found\"",
                    "question": "What should the message say?", "derivable_from_repo": False, "consequential": True, "resolved_by": "tests",
                    "resolution_excerpt": "match=\"dimension 'z' not found\"", "category": "behavior"}],
          "gaps_proposed": 1, "gaps_extracted": 1, "gaps_dropped": 0, "resolution_downgraded": 0,

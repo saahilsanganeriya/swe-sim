@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import keyword
 import random
 import re
 from pathlib import Path
@@ -41,7 +42,21 @@ P2P_SAMPLE = 40
 EXTRACTED_SOURCES = {"test-exception", "test-literal", "patch-public-name"}
 ACCEPTED_RESOLUTIONS = {"thread", "tests"}
 MIN_EVIDENCE_CHARS = 12  # after norm_text; a one-word "evidence" pins nothing
+MIN_EVIDENCE_TOKENS = 3
+DIFF_KEYWORDS = {"diff", "git", "index", "new", "file", "mode", "similarity", "dissimilarity", "rename", "copy", "deleted", "old", "binary",
+                 "files", "differ", "no", "newline", "at", "end", "of"}
+_PY_KEYWORDS = {k.casefold() for k in keyword.kwlist} | {k.casefold() for k in getattr(keyword, "softkwlist", [])}
+_IDENT = re.compile(r"[a-z_]\w{2,}")
 _BLOCKQUOTE = re.compile(r"(?m)^[ \t]*(?:>[ \t]?)+")
+
+
+def evidence_ok(ev: str) -> bool:
+    """A normalized evidence span can ground a gap only if it is >= MIN_EVIDENCE_CHARS, >= MIN_EVIDENCE_TOKENS whitespace tokens,
+    and contains at least one identifier-like token that is neither diff boilerplate nor a Python keyword (`diff --git a/`
+    or `assert not in` pin nothing)."""
+    if len(ev) < MIN_EVIDENCE_CHARS or len(ev.split()) < MIN_EVIDENCE_TOKENS:
+        return False
+    return any(t not in DIFF_KEYWORDS and t not in _PY_KEYWORDS for t in _IDENT.findall(ev))
 
 _EXC = re.compile(r"pytest\.raises\(\s*([A-Za-z_][\w.]*)")
 _LIT = re.compile(r"(?:assert[^\n]*?|match=)\s*[\"']([^\"'\n]{6,80})[\"']")
@@ -203,43 +218,52 @@ def evidence_text(row: dict) -> str:
 def ground_gaps(gaps: list, row: dict) -> tuple[list[dict], dict]:
     """Code-owned grounding of the model's gap list.
 
-    Code-extracted gaps (source in EXTRACTED_SOURCES) are kept as classified. Every other gap is a proposal and survives only
-    if its `evidence` is a verbatim span (after norm_text, >= MIN_EVIDENCE_CHARS) of test_patch or patch. Gaps are deduplicated
-    by evidence. `resolved_by="thread"` needs a verbatim `resolution_excerpt` from the thread, else it is downgraded to
-    "tests" (evidence grounded) or "none"; `resolved_by="tests"` needs grounded evidence, else "none".
+    A gap counts as code-extracted only when its normalized `text` matches an entry of `issue_contract_delta(row)` (its
+    `source` is then taken from that entry; a source label alone never exempts anything). Every other gap is a proposal and
+    survives only if its `evidence` passes `evidence_ok` and is a verbatim span (after norm_text) of the added/context lines
+    of test_patch or patch. Gaps are deduplicated on (evidence, question) so distinct decisions pinned by the same line both
+    survive. `resolved_by="thread"` needs a verbatim `resolution_excerpt` from the thread, else it is downgraded to "tests"
+    when the evidence sits in the test files, otherwise "none"; `resolved_by="tests"` needs evidence (or the resolution
+    excerpt) in the test files — patch-only evidence describes the implementation and cannot make a gap tests-resolved.
     Returns (gaps, {"gaps_proposed", "gaps_dropped", "resolution_downgraded"})."""
-    evidence = norm_text(evidence_text(row))
+    tests_corpus = norm_text(diff_body_text(row.get("test_patch")))
+    patch_corpus = norm_text(diff_body_text(row.get("patch")))
     thread = norm_text(thread_text(row))
+    extracted = {norm_text(c["text"]): c["source"] for c in issue_contract_delta(row)}
     kept, seen = [], set()
     stats = {"gaps_proposed": 0, "gaps_dropped": 0, "resolution_downgraded": 0}
     for g in gaps or []:
         if not isinstance(g, dict):
             stats["gaps_dropped"] += 1
             continue
-        proposed = g.get("source") not in EXTRACTED_SOURCES
+        text_n = norm_text(g.get("text"))
+        proposed = text_n not in extracted
         ev = norm_text(g.get("evidence"))
-        ev_ok = len(ev) >= MIN_EVIDENCE_CHARS and ev in evidence
+        ev_valid = evidence_ok(ev)
+        ev_tests = ev_valid and ev in tests_corpus
+        ev_ok = ev_tests or (ev_valid and ev in patch_corpus)
         if proposed and not ev_ok:
             stats["gaps_dropped"] += 1
             continue
-        key = ev if ev_ok else norm_text(g.get("text"))
+        key = (ev, norm_text(g.get("question"))) if ev_ok else ("extracted", text_n)
         if key in seen:
             stats["gaps_dropped"] += 1
             continue
         seen.add(key)
         rb, rx = g.get("resolved_by"), norm_text(g.get("resolution_excerpt"))
-        rx_in_tests = len(rx) >= MIN_EVIDENCE_CHARS and rx in evidence
+        rx_tests = evidence_ok(rx) and rx in tests_corpus
         if rb == "thread" and not (len(rx) >= MIN_EVIDENCE_CHARS and rx in thread):
-            rb = "tests" if (ev_ok or rx_in_tests) else "none"
+            rb = "tests" if (ev_tests or rx_tests) else "none"
             stats["resolution_downgraded"] += 1
-        elif rb == "tests" and not (ev_ok or rx_in_tests):
+        elif rb == "tests" and not (ev_tests or rx_tests):
             rb = "none"
             stats["resolution_downgraded"] += 1
         elif rb not in ACCEPTED_RESOLUTIONS:
             rb = "none"
         if proposed:
             stats["gaps_proposed"] += 1
-        kept.append({**g, "source": g.get("source") if not proposed else "proposed", "resolved_by": rb, "evidence_grounded": ev_ok})
+        kept.append({**g, "source": "proposed" if proposed else extracted[text_n], "resolved_by": rb, "evidence_grounded": ev_ok,
+                     "evidence_in_tests": ev_tests})
     return kept, stats
 
 

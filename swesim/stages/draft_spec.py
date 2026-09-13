@@ -22,7 +22,7 @@ from swesim.sources import threads
 from swesim.sources.swebench_annotated import TEST_PYTHON, test_files_from_patch
 import keyword
 
-from swesim.stages.judge import DIFF_HEADER_PREFIXES, _BLOCKQUOTE, evidence_text, llm_view, norm_text
+from swesim.stages.judge import DIFF_HEADER_PREFIXES, _BLOCKQUOTE, diff_body_text, evidence_ok, evidence_text, llm_view, norm_text
 
 DRAFT_PROMPT_VERSION = "draft-v1"
 CONTEXT_BUDGET_CHARS = 120000
@@ -381,7 +381,9 @@ def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None,
 
 def _test_blocks(test_patch: str) -> list[tuple[str | None, str | None, list[str]]]:
     """(file, test function or None, body lines) blocks of the hidden-test diff, built from added and context lines with the
-    diff markers stripped; a block runs from a `def test_*` to the next def or file."""
+    diff markers stripped. A block starts at every file header, at every hunk header (`@@ -a,b +c,d @@ def test_existing(...)`
+    names the function an edit lands in, so lines added inside an existing test belong to it) and at every `def test_*`
+    line, and runs to the next boundary."""
     blocks: list[tuple[str | None, str | None, list[str]]] = []
     current_file = None
     for raw in (test_patch or "").splitlines():
@@ -389,6 +391,11 @@ def _test_blocks(test_patch: str) -> list[tuple[str | None, str | None, list[str
         if m:
             current_file = m.group(1)
             blocks.append((current_file, None, []))
+            continue
+        if raw.startswith("@@"):
+            trailer = raw.split("@@", 2)[2] if raw.count("@@") >= 2 else ""
+            d = _TEST_DEF.match(trailer.strip())
+            blocks.append((current_file, d.group(1) if d else None, []))
             continue
         if raw.startswith(DIFF_HEADER_PREFIXES) or raw[:1] == "-":
             continue
@@ -433,42 +440,52 @@ def auto_link_tests(text: str | None, test_patch: str, fail_to_pass: list[str], 
 
 
 def tests_for_excerpt(test_patch: str, excerpt: str, fail_to_pass: list[str]) -> list[str]:
-    """FAIL_TO_PASS ids whose test function (in the unified diff of the hidden tests) contains `excerpt`. Falls back to the
-    F2P tests of the containing file when the excerpt sits at module level, and to every F2P test when the excerpt is not in
-    the test patch at all (evidence from the source patch)."""
+    """FAIL_TO_PASS ids whose test function (a `def test_*` block of the hidden-test diff, or the function named by the hunk
+    header the excerpt was added under) contains `excerpt`. No fallback: an excerpt outside every test function (module
+    level, or evidence from the source patch) links nothing."""
     needle = _norm(excerpt)
-    hits = [(f, fn) for f, fn, lines in _test_blocks(test_patch) if needle and needle in _norm("\n".join(lines))]
-    if not hits:
-        return sorted(fail_to_pass)
     out: set[str] = set()
-    for f, fn in hits:
-        out |= _f2p_for_block(f, fn, fail_to_pass)
-    return sorted(out) or sorted(fail_to_pass)
+    if not needle:
+        return []
+    for f, fn, lines in _test_blocks(test_patch):
+        if fn is not None and needle in _norm("\n".join(lines)):
+            out |= _f2p_for_block(f, fn, fail_to_pass)
+    return sorted(out)
 
 
 def tests_resolved_facts(row: dict, judged: dict) -> list[dict]:
-    """Code-synthesized ledger facts for judge gaps that only the merged tests/patch resolve: provenance `authored`,
-    source_url = the PR, source_excerpt = the verbatim evidence (re-checked here), discovery on-request, linked to the
-    FAIL_TO_PASS tests whose code the excerpt comes from. Ids `tests-NNN`."""
-    corpus = _corpora(row)["authored"]
+    """Code-synthesized ledger facts for judge gaps that only the merged tests resolve: provenance `authored`, source_url =
+    the PR, source_excerpt = the verbatim evidence (re-checked here against the added/context lines of the test files and
+    `evidence_ok`), discovery on-request, linked to the FAIL_TO_PASS tests whose function contains the excerpt — a gap whose
+    excerpt sits in no test function is not tests-resolved and yields no fact. The ledger `text` is the judge's prose only
+    when it stays within `_fact_text_violation` (<= 400 chars, content words from the excerpt or the issue), else the
+    question, else the excerpt itself. Distinct decisions sharing evidence are kept apart by (evidence, question). Ids
+    `tests-NNN`."""
+    tests_corpus = _norm(diff_body_text(row.get("test_patch")))
     thread = row.get("thread") or {}
     pr_url = thread.get("pr_url") or f"https://github.com/{row['repo']}/pull/{str(row.get('instance_id', '')).rsplit('-', 1)[-1]}"
     kinds = {"behavior", "interface", "constraint", "reproduction", "context"}
+    natural = row.get("problem_statement") or ""
     out, seen = [], set()
     for g in judged.get("gaps") or []:
-        if not (g.get("resolved_by") == "tests" and g.get("derivable_from_repo") is False and g.get("consequential") is True):
+        if not isinstance(g, dict) or not (g.get("resolved_by") == "tests" and g.get("derivable_from_repo") is False and g.get("consequential") is True):
             continue
         evidence = (g.get("evidence") or "").strip()
         key = _norm(evidence)
-        if len(key) < MIN_EXCERPT_CHARS or key not in corpus or key in seen:
-            continue
-        seen.add(key)
         question = (g.get("question") or "").strip()
-        out.append({"id": f"tests-{len(out) + 1:03d}", "text": (g.get("text") or question or evidence).strip(), "kind": g.get("category") if g.get("category") in kinds else "behavior",
+        if not evidence_ok(key) or key not in tests_corpus or (key, _norm(question)) in seen:
+            continue
+        tests = tests_for_excerpt(row.get("test_patch") or "", evidence, list(row.get("fail_to_pass") or []))
+        if not tests:
+            continue
+        seen.add((key, _norm(question)))
+        text = next((c.strip() for c in (g.get("text") or "", question) if c and c.strip() and _fact_text_violation(c.strip(), evidence, natural) is None),
+                    evidence[:MAX_FACT_TEXT_CHARS])
+        out.append({"id": f"tests-{len(out) + 1:03d}", "text": text, "kind": g.get("category") if g.get("category") in kinds else "behavior",
                     "provenance": "authored", "source_excerpt": evidence, "source_url": pr_url,
-                    "authored_rationale": "Pinned only by the merged tests/patch; no issue or thread statement resolves it (judge gap "
+                    "authored_rationale": "Pinned only by the merged tests; no issue or thread statement resolves it (judge gap "
                                           f"{g.get('id', '?')}, resolved_by=tests)." + (f" Question a developer would ask: {question}" if question else ""),
-                    "discovery": "on-request", "tests": tests_for_excerpt(row.get("test_patch") or "", evidence, list(row.get("fail_to_pass") or []))})
+                    "discovery": "on-request", "tests": tests})
     return out
 
 
@@ -529,6 +546,10 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     assets = out_dir / "assets"
     assets.mkdir(exist_ok=True)
     synthesized = tests_resolved_facts(row, judged)
+    bad = ledger_violations({"ledger": synthesized}, row, corpus_by_fact={f["id"]: f["source_excerpt"] for f in synthesized},
+                            allow_reserved=True, require_f2p_link=False)
+    if bad:  # code-built from judge evidence; a failure here is a bug or an unusable evidence span, never a model correction
+        raise ValueError("synthesized tests-resolved facts failed grounding: " + "; ".join(bad))
     d, auto_linked = _author(row, judged, model_id, extra_facts=synthesized)
 
     pw = d.get("plausible_wrong") or {}
