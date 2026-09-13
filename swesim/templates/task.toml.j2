@@ -1,0 +1,57 @@
+schema_version = "1.4"
+artifacts = ["/var/swesim-collect/app.tar", "/var/swesim-collect/collect.status"]
+
+[task]
+name = {{ ("swesim/" ~ task_name) | tojson }}
+version = {{ (spec.version | string) | tojson }}
+description = {{ (spec.source.value ~ " " ~ spec.source_ref ~ " [" ~ condition ~ "]") | tojson }}
+
+[metadata]
+source = {{ spec.source.value | tojson }}
+source_ref = {{ spec.source_ref | tojson }}
+scenario_id = {{ spec.id | tojson }}
+spec_hash = "{{ spec.spec_hash }}"
+condition = "{{ condition }}"
+brief_profile = "{{ brief_profile }}"
+run_config_hash = "{{ run_config.run_config_hash }}"
+compiled_hash = "{{ compiled_hash }}"
+annotated_difficulty = {{ (spec.difficulty.annotated or "unknown") | tojson }}
+image_digest = {{ (image_digest or "") | tojson }}
+
+[verifier]
+timeout_sec = {{ verifier_timeout }}
+network_mode = "no-network"
+environment_mode = "separate"
+
+[verifier.environment]
+network_mode = "no-network"
+build_timeout_sec = 1800.0
+
+[[verifier.collect]]
+user = "root"
+timeout_sec = 300.0
+command = {{ collect_command | tojson }}
+
+[agent]
+timeout_sec = {{ run_config.solver_timeout_sec }}
+user = "agent"
+network_mode = "allowlist"
+allowed_hosts = {{ agent_hosts | tojson }}
+
+[environment]
+network_mode = "allowlist"
+allowed_hosts = {{ agent_hosts | tojson }}
+build_timeout_sec = 3600.0
+os = "linux"
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+
+[environment.env]
+UV_OFFLINE = "1"
+UV_NO_PROGRESS = "1"
+UV_CACHE_DIR = "/tmp/uv-cache"
+SWESIM_STAKEHOLDER_URL = {{ stakeholder_url | tojson }}
+SWESIM_SESSION_TOKEN = {{ session_token | tojson }}
+SWESIM_TRIAL_ID = {{ trial_id | tojson }}
+SWESIM_REPO_DIR = {{ repo_dir | tojson }}
