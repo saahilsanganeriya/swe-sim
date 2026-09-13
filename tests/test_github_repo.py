@@ -259,6 +259,7 @@ def test_probe_tests_builds_probe_task_and_derives_f2p_p2p(monkeypatch, tmp_path
     root = ws.root / "probes" / "o--r-42"
     assert seen["task_dir"] == root and seen["agent"] == "nop" and seen["jobs_dir"] == ws.jobs_dir / "probe" and seen["job_name"] == "o--r-42"
     assert (root / "environment" / "Dockerfile").read_text() == out["dockerfile"] and (root / "tests" / "Dockerfile").read_text().endswith("COPY . /tests/\n")
+    assert "/usr/local/bin/swesim-python" in (root / "tests" / "Dockerfile").read_text() and (root / "tests" / "test.sh").read_text().endswith("/usr/local/bin/swesim-python -I /tests/probe.py\n")
     assert {p.name for p in (root / "tests").glob("*.py")} >= {"grader.py", "policy.py", "parsers.py", "run_pytest.py", "probe.py"}
     assert (root / "tests" / "test.patch").read_text() == "TP" and (root / "tests" / "oracle.diff").read_text() == "OP"
     cfg = json.loads((root / "tests" / "probe_config.json").read_text())
@@ -322,10 +323,20 @@ def test_probe_tests_measures_swebench_image_rows_offline(monkeypatch, tmp_path)
     cfg = json.loads((root / "tests" / "probe_config.json").read_text())
     assert cfg["command"] == gr.SWEBENCH_PYTHON + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} xarray/tests/test_weighted.py"   # all tests of the touched .py files
     assert cfg["repo_dir"] == "/testbed" and cfg["kind"] == "image" and cfg["test_timeout_sec"] == gr.PROBE_TIMEOUT_SEC
-    assert (root / "tests" / "test.sh").read_text().endswith(gr.SWEBENCH_PYTHON + " -I /tests/probe.py\n")
+    # scikit-learn__scikit-learn-13584: the testbed interpreter predates `from __future__ import annotations`, so the probe
+    # controller must run under the verifier image's pinned swesim-python; only the pytest subprocess uses the task interpreter
+    assert (root / "tests" / "test.sh").read_text() == "#!/bin/bash\nset -euo pipefail\n/usr/local/bin/swesim-python -I /tests/probe.py\n"
+    tests_df = (root / "tests" / "Dockerfile").read_text()
+    assert tests_df.startswith(out["dockerfile"]) and tests_df.endswith("COPY . /tests/\n")
+    assert "uv python install 3.12" in tests_df and 'ln -s "$(uv python find 3.12)" /usr/local/bin/swesim-python' in tests_df and "astral.sh/uv/install.sh" in tests_df
+    assert gr.SWEBENCH_PYTHON not in (root / "tests" / "test.sh").read_text() and cfg["command"].startswith(gr.SWEBENCH_PYTHON)
+    assert gr.SWEBENCH_PYTHON not in (root / "environment" / "Dockerfile").read_text() and "uv python install" not in (root / "environment" / "Dockerfile").read_text()
     probe_py = (root / "tests" / "probe.py").read_text()
     assert "probe.get('repo_dir'" in probe_py and "cwd=repo" in probe_py and "'/app'" not in probe_py.replace("probe.get('repo_dir','/app')", "")
     assert seen["agent"] == "nop" and seen["job_name"] == "pydata--xarray-5362" and out["probe"]["probe_dir"] == str(seen["jobs_dir"] / "pydata--xarray-5362" / "trial-1")
+    assert out["probe"]["job_dir"] == out["probe"]["probe_dir"] and out["probe"]["stages"] == ["base", "test", "gold"]
+    assert out["probe"]["binding"] == gr.probe_binding(row) and out["probe"]["probed_at"].endswith("+00:00")            # bound to base_commit + test_patch
+    assert gr.probe_binding({**row, "test_patch": row["test_patch"] + "\n"}) != out["probe"]["binding"]
     # without a Docker Hub answer the image tag is used as-is
     monkeypatch.setattr(gr, "_compile_imports", lambda: (lambda image: None, tmp_path / "verifier"))
     out = gr.probe_tests(_swebench_probe_row(), Workspace(tmp_path / "ws2"))
@@ -339,6 +350,56 @@ def test_classify_probe_buckets():
     after = {"a": "passed", "b": "passed", "c": "failed", "d": "error", "e": "passed"}
     assert gr.classify_probe(before, after) == {"fail_to_pass": ["a", "e"], "pass_to_pass": ["b"], "dropped": {"network_or_env": ["c"], "gold_regressions": ["d"]}}
     assert gr.probe_kind({"image": "x:latest"}) == "image" and gr.probe_kind({"install_command": "pip install -e ."}) == "dockerfile"
+
+
+def _old_style_repo_row(tmp_path):
+    """A repo-URL row as mine_github_repo wrote it before `probe` existed: measured lists, probe_dir, test_python, dockerfile."""
+    job = tmp_path / "jobs" / "probe" / "py-pdf--pypdf-3826" / "trial-1"
+    (job / "verifier").mkdir(parents=True, exist_ok=True)
+    f = "tests/test_writer.py::"
+    (job / "verifier" / "probe.json").write_text(json.dumps({
+        "base": {"statuses": {}, "exit_code": 4, "error": "no tests", "tail": ""},
+        "test": {"statuses": {f + "test_new_a": "failed", f + "test_new_b": "error", f + "test_old": "passed", f + "test_socket": "failed"}, "exit_code": 1, "error": None, "tail": ""},
+        "gold": {"statuses": {f + "test_new_a": "passed", f + "test_new_b": "passed", f + "test_old": "passed", f + "test_socket": "failed"}, "exit_code": 1, "error": None, "tail": ""}}))
+    tp = "diff --git a/tests/test_writer.py b/tests/test_writer.py\n--- a/tests/test_writer.py\n+++ b/tests/test_writer.py\n@@ -1 +1,3 @@\n x\n+def test_new_a(): pass\n+def test_new_b(): pass\n"
+    return {"source": "github-repo", "instance_id": "py-pdf__pypdf-3826", "repo": "py-pdf/pypdf", "base_commit": "c" * 40, "repo_dir": "/app", "image": None,
+            "test_patch": tp, "patch": "OP", "test_files": ["tests/test_writer.py"], "install_command": "pip install -e '.[full]'",
+            "fail_to_pass": [f + "test_new_a", f + "test_new_b"], "pass_to_pass": [f + "test_old"], "probe_dir": str(job), "test_python": "/usr/local/bin/python",
+            "dockerfile": "FROM python@sha256:abc\n", "judge": {"keep": True, "gaps": []}}
+
+
+def test_reconstruct_probe_from_job_dir_and_probe_candidates_reuses_measurements(monkeypatch, tmp_path):
+    from swesim.paths import Workspace
+    from swesim.stages.mine import probe_candidates
+    row = _old_style_repo_row(tmp_path)
+    f = "tests/test_writer.py::"
+    rec = gr.reconstruct_probe(row)
+    assert rec["fail_to_pass"] == [f + "test_new_a", f + "test_new_b"] and rec["pass_to_pass"] == [f + "test_old"]
+    assert rec["dropped"] == {"network_or_env": [f + "test_socket"], "gold_regressions": []} and rec["probe"]["reconstructed"] is True
+    assert rec["probe"]["kind"] == "dockerfile" and rec["probe"]["repo_dir"] == "/app" and rec["probe"]["test_python"] == "/usr/local/bin/python"
+    assert rec["probe"]["binding"] == gr.probe_binding(row) and rec["probe"]["job_dir"] == row["probe_dir"] and rec["probe"]["probed_at"]
+    assert rec["probe"]["command"] == "/usr/local/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} tests/test_writer.py"
+    assert gr.reconstruct_probe({**row, "probe_dir": str(tmp_path / "nowhere")}) is None and gr.reconstruct_probe({**row, "probe_dir": None}) is None
+    # probe_candidates attaches the metadata from disk (no Modal run), passes valid probes through, and re-probes only stale ones
+    fresh = {**_old_style_repo_row(tmp_path), "instance_id": "py-pdf__pypdf-1", "probe_dir": None, "probe": {**rec["probe"]}}
+    fresh["probe"]["binding"] = gr.probe_binding(fresh)
+    stale = {**_old_style_repo_row(tmp_path), "instance_id": "py-pdf__pypdf-2", "probe_dir": None, "probe": {**rec["probe"], "binding": "0" * 64}}
+    judged = tmp_path / "github-repo--py-pdf__pypdf.judged.jsonl"
+    judged.write_text("".join(json.dumps(r) + "\n" for r in (row, fresh, stale)))
+    probed = []
+
+    def fake_probe(r, ws):
+        probed.append(r["instance_id"])
+        return {**rec, "probe": {**rec["probe"], "reconstructed": False, "binding": gr.probe_binding(r)}}
+    monkeypatch.setattr(gr, "probe_tests", fake_probe)
+    out = probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=1)
+    got = {r["instance_id"]: r for r in (json.loads(l) for l in out.read_text().splitlines())}
+    assert probed == ["py-pdf__pypdf-2"]                                                                          # only the stale row cost a build
+    assert got["py-pdf__pypdf-3826"]["probe"]["reconstructed"] is True and got["py-pdf__pypdf-3826"]["judge"]["keep"] is True
+    assert got["py-pdf__pypdf-3826"]["swebench_fail_to_pass"] == [f + "test_new_a", f + "test_new_b"] and got["py-pdf__pypdf-3826"]["fail_to_pass"] == [f + "test_new_a", f + "test_new_b"]
+    assert got["py-pdf__pypdf-1"]["probe"]["binding"] == gr.probe_binding(fresh) and got["py-pdf__pypdf-2"]["probe"]["binding"] == gr.probe_binding(stale)
+    summary = json.loads(out.with_suffix(".summary.json").read_text())
+    assert summary == {"rows": 3, "probed": 1, "already-probed": 1, "reconstructed": 1, "reproducible": 2}
 
 
 def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_rows(monkeypatch, tmp_path):

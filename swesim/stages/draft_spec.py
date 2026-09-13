@@ -19,6 +19,7 @@ from swesim import tamper
 from swesim.llm import chat_json
 from swesim.paths import atomic_json
 from swesim.sources import threads
+from swesim.sources.github_repo import probe_binding
 from swesim.sources.swebench_annotated import TEST_PYTHON, test_files_from_patch
 import keyword
 
@@ -577,10 +578,14 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     if judged.get("model_id") and judged["model_id"] == model_id:
         raise ValueError(f"judge and draft models must differ so their errors are not correlated (both {model_id})")
     probe = row.get("probe") or {}
-    if require_probe and not probe.get("statuses"):
-        raise ValueError("row has no offline probe metadata (measured FAIL_TO_PASS / PASS_TO_PASS from probe_tests); SWE-bench's lists were "
-                         "produced with network access and do not reproduce in the offline verifier. Run `swesim probe` first, or pass "
-                         "require_probe=False to draft unmeasured.")
+    if require_probe:
+        if not probe.get("statuses"):
+            raise ValueError("row has no offline probe metadata (measured FAIL_TO_PASS / PASS_TO_PASS from probe_tests); SWE-bench's lists were "
+                             "produced with network access and do not reproduce in the offline verifier. Run `swesim probe` first, or pass "
+                             "require_probe=False to draft unmeasured.")
+        if probe.get("binding") != probe_binding(row):
+            raise ValueError("probe metadata binding mismatch: the probe measured a different base_commit/test_patch than this row carries "
+                             "(stale or foreign measurement). Re-run `swesim probe`, or pass require_probe=False to draft unmeasured.")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     assets = out_dir / "assets"

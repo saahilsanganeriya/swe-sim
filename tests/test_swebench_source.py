@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from swesim.sources import github_repo as gr
 from swesim.sources import swebench_annotated as sb
 from swesim.sources import threads
 
@@ -813,7 +814,10 @@ def _row(**over):
            "image": sb.image_for("pydata__xarray-5362"), "repo_dir": "/testbed",
            "annotation": {"underspecified": "2.0", "underspecified_notes": "n", "false_negative": "0.0", "false_negative_notes": "", "difficulty": "15 min - 1 hour"},
            "thread": _thread("pydata/xarray", 5362), "probe": _probe_meta()}
-    row.update(over); return row
+    row.update(over)
+    if "probe" not in over and isinstance(row.get("probe"), dict):
+        row["probe"]["binding"] = gr.probe_binding(row)   # the default probe is bound to whatever base_commit/test_patch the row ends up with
+    return row
 
 
 def _probe_meta():
@@ -1065,7 +1069,22 @@ def test_draft_requires_offline_probe_metadata(monkeypatch, tmp_path):
         draft_spec.draft(_row(probe=None), _judged(), "fake/model", tmp_path / "s1")
     with pytest.raises(ValueError, match="no offline probe metadata"):
         draft_spec.draft(_row(probe={"error": "unreliable base/gold probe"}), _judged(), "fake/model", tmp_path / "s2")   # a failed probe is not a measurement
+    stale = _row(); stale["probe"]["binding"] = "0" * 64                                                                  # measured a different base_commit/test_patch
+    with pytest.raises(ValueError, match="binding mismatch"):
+        draft_spec.draft(stale, _judged(), "fake/model", tmp_path / "s2b")
+    edited = _row(); edited["test_patch"] += "\n"                                                                          # row edited after the probe: the binding no longer matches
+    with pytest.raises(ValueError, match="binding mismatch"):
+        draft_spec.draft(edited, _judged(), "fake/model", tmp_path / "s2c")
     assert calls == [] and not (tmp_path / "s1").exists()                                                                    # refused before any LLM call or file
+    # a repo-URL row probed by mine_github_repo carries the same metadata and is accepted without a second Modal run
+    repo_row = _row(source="github-repo", instance_id="py-pdf__pypdf-3826", repo="py-pdf/pypdf", image=None, repo_dir="/app", dockerfile="FROM python@sha256:abc\n",
+                    test_python="/usr/local/bin/python", thread={**_thread("py-pdf/pypdf", 3826), "gold_commit": None, "linked_issues": [], "issue_url": None},
+                    annotation={"underspecified": "", "underspecified_notes": "", "false_negative": "", "false_negative_notes": "", "difficulty": ""})
+    repo_row["probe"].update(kind="dockerfile", repo_dir="/app", job_dir="/ws/jobs/probe/py-pdf--pypdf-3826/trial-1", probed_at="2026-09-12T20:00:00+00:00")
+    assert repo_row["probe"]["binding"] == gr.probe_binding(repo_row)
+    _patch_llm(monkeypatch, _draft_llm(repo="py-pdf/pypdf", pr=3826), _withhold_llm())
+    assert draft_spec.draft(repo_row, _judged(), "fake/model", tmp_path / "s2d").exists()
+    _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
     p = draft_spec.draft(_row(probe=None), _judged(), "fake/model", tmp_path / "s3", require_probe=False)
     meta = json.loads((tmp_path / "s3" / "draft.meta.json").read_text())
     assert p.exists() and meta["probe"] == {"unmeasured": True}

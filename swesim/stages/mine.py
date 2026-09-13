@@ -71,6 +71,20 @@ def probe_candidates(ws: Workspace, judged_path: Path | str, instance_ids: list[
     wanted = set(instance_ids) if instance_ids else None
     summary: Counter = Counter()
     built = 0
+
+    def apply(row: dict, res: dict) -> None:
+        row.setdefault("swebench_fail_to_pass", list(row.get("fail_to_pass") or []))
+        row.setdefault("swebench_pass_to_pass", list(row.get("pass_to_pass") or []))
+        row["fail_to_pass"], row["pass_to_pass"] = res["fail_to_pass"], res["pass_to_pass"]
+        row["test_python"] = res["test_python"]
+        row["probe"] = res["probe"]
+        if not row["fail_to_pass"]:
+            row["reject_reason"] = "not-reproducible-offline"
+            row.setdefault("judge", {})["keep"] = False
+            summary["not-reproducible-offline"] += 1
+        else:
+            summary["reproducible"] += 1
+
     with open(out, "w") as f:
         for row in rows:
             if wanted is not None:
@@ -79,12 +93,23 @@ def probe_candidates(ws: Workspace, judged_path: Path | str, instance_ids: list[
             elif (row.get("judge") or {}).get("keep") is not True:
                 summary["skipped-not-accepted"] += 1
                 continue
+            existing = row.get("probe") or {}
+            if existing.get("statuses") and existing.get("binding") == gr.probe_binding(row):
+                summary["already-probed"] += 1  # a valid measurement bound to this row: no second Modal run
+                f.write(json.dumps(row) + "\n")
+                continue
+            reconstructed = gr.reconstruct_probe(row)
+            if reconstructed is not None:  # probed before `probe` metadata existed: rebuild it from the job dir on disk
+                summary["reconstructed"] += 1
+                apply(row, reconstructed)
+                f.write(json.dumps(row) + "\n")
+                continue
             if built >= max_builds:
                 summary["build-budget-exhausted"] += 1
                 continue
             built += 1
-            row["swebench_fail_to_pass"] = list(row.get("fail_to_pass") or [])
-            row["swebench_pass_to_pass"] = list(row.get("pass_to_pass") or [])
+            row.setdefault("swebench_fail_to_pass", list(row.get("fail_to_pass") or []))
+            row.setdefault("swebench_pass_to_pass", list(row.get("pass_to_pass") or []))
             try:
                 res = gr.probe_tests(row, ws)
             except Exception as e:  # keep the evidence, reject the candidate, continue
@@ -94,15 +119,7 @@ def probe_candidates(ws: Workspace, judged_path: Path | str, instance_ids: list[
                 summary["probe-failed"] += 1
                 f.write(json.dumps(row) + "\n")
                 continue
-            row["fail_to_pass"], row["pass_to_pass"] = res["fail_to_pass"], res["pass_to_pass"]
-            row["test_python"] = res["test_python"]
-            row["probe"] = res["probe"]
-            if not row["fail_to_pass"]:
-                row["reject_reason"] = "not-reproducible-offline"
-                row.setdefault("judge", {})["keep"] = False
-                summary["not-reproducible-offline"] += 1
-            else:
-                summary["reproducible"] += 1
+            apply(row, res)
             f.write(json.dumps(row) + "\n")
     out.with_suffix(".summary.json").write_text(json.dumps({"rows": len(rows), "probed": built, **summary}, indent=2, sort_keys=True))
     return out
