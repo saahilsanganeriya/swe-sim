@@ -17,7 +17,7 @@ import typer
 
 from swesim.index import schema as S
 from swesim.index.project import ORIGINS
-from swesim.index.store import IndexStore
+from swesim.index.store import IndexStore, ensure_migrated
 from swesim.settings import Settings, get_settings
 from swesim.storage.layout import Layout
 
@@ -37,7 +37,7 @@ def migrate() -> None:
     """Upgrade the index schema to the latest revision."""
     settings = get_settings()
     store = _store(settings)
-    store.migrate()
+    ensure_migrated(settings)
     typer.echo(f"index: migrated to head ({store.engine.dialect.name}, revision {_revision(store)})")
 
 

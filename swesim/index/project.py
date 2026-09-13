@@ -20,12 +20,14 @@ Contract
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import os
 import re
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from pydantic import ValidationError
 
@@ -281,6 +283,80 @@ def project_scenario_versions(layout: Layout, scenario_id: str, *, registry: dic
 
 
 # ----------------------------------------------------------------------------- candidates
+
+def discovery_source_keys(layout: Layout) -> list[str]:
+    """Sources with discovery evidence, even when every PR was rejected before candidate creation."""
+    keys = {p.name[:-len(".rejects.json")] for p in layout.candidates_dir().glob("*.rejects.json")}
+    if layout.discovery_dir().is_dir():
+        keys.update(p.name for p in layout.discovery_dir().iterdir() if p.is_dir())
+    return sorted(key for key in keys if SEGMENT_RE.fullmatch(key) and key not in (".", ".."))
+
+
+def project_discovery(layout: Layout, source_key: str, *, origin: str | None = None, workflow_id: str | None = None,
+                      run_id: str | None = None, worker_image_digest: str | None = None, discovered_at: datetime | str | None = None,
+                      artifact_sha256: str | None = None, artifact_path: Path | str | None = None,
+                      repo: str | None = None, band: M.DiscoveryBand | None = None) -> M.DiscoveryRow | None:
+    """One observation of the authoritative rejects file; supplied workflow identity requires its expected digest."""
+    path = layout.resolve_artifact(artifact_path if artifact_path is not None else layout.candidates_file(source_key, "rejects"))
+    if not path.name.endswith(".rejects.json"):
+        raise ProjectionError("discovery artifact must be a rejects JSON file")
+    if (workflow_id or run_id) and not artifact_sha256:
+        raise ProjectionError("discovery workflow provenance requires the expected artifact SHA256")
+    try:
+        with path.open("rb") as stream:
+            data = stream.read()
+            observed = datetime.fromtimestamp(os.fstat(stream.fileno()).st_mtime, UTC)
+    except FileNotFoundError:
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    if artifact_sha256 is not None and digest != artifact_sha256:
+        raise ProjectionError("discovery rejects artifact changed since the discovery activity")
+    try:
+        counts = json.loads(data)
+    except (ValueError, UnicodeError) as exc:
+        raise ProjectionError(f"discovery rejects file is not valid JSON: {source_key}") from exc
+    source, _, slug = source_key.partition("--")
+    stem, _, suffix = slug.rpartition("--")
+    inferred_band = suffix if suffix in get_args(M.DiscoveryBand) else None
+    if inferred_band is not None:
+        slug = stem
+        if band is not None and band != inferred_band:
+            raise ProjectionError("discovery band differs from its source key")
+        band = inferred_band
+    inferred_repo = slug.replace("__", "/", 1) if source == "github-repo" and "__" in slug else None
+    if repo is not None and inferred_repo is not None and repo != inferred_repo:
+        raise ProjectionError("discovery repository differs from its source key")
+    return M.DiscoveryRow(
+        source_key=source_key, discovery_id=M.discovery_identity(source_key, digest, workflow_id, run_id),
+        source=source, repo=repo or inferred_repo, band=band, identity_kind="workflow" if workflow_id or run_id else "legacy",
+        rejects=counts, artifact_path=layout.relative(path), artifact_sha256=digest, discovered_at=discovered_at or observed,
+        created_at=discovered_at or observed, updated_at=discovered_at or observed, workflow_id=workflow_id, run_id=run_id,
+        worker_image_digest=worker_image_digest, origin=_default_origin(origin))
+
+
+def read_discovery_snapshot(layout: Layout, source_key: str, discovery_id: str) -> M.DiscoveryRow:
+    """A snapshot must agree with its content identity and layout location."""
+    path = layout.discovery_snapshot(source_key, discovery_id)
+    try:
+        row = M.DiscoveryRow.model_validate_json(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ProjectionError(f"invalid discovery snapshot {source_key}/{discovery_id}") from exc
+    artifact = layout.resolve_artifact(row.artifact_path)
+    if row.source_key != source_key or row.discovery_id != discovery_id or not artifact.name.endswith(".rejects.json"):
+        raise ProjectionError("discovery snapshot identity differs from its layout")
+    return row
+
+
+def project_discoveries(layout: Layout, source_key: str | None = None, *, origin: str | None = None) -> list[M.DiscoveryRow]:
+    """Immutable history plus unrecorded legacy rejects files; never invent a second observation of a snapshotted file."""
+    rows: list[M.DiscoveryRow] = []
+    for key in [source_key] if source_key is not None else discovery_source_keys(layout):
+        snapshots = [read_discovery_snapshot(layout, key, path.stem) for path in sorted(layout.discovery_dir(key).glob("*.json"))]
+        current = project_discovery(layout, key, origin=origin)
+        if current is not None and not any(row.artifact_sha256 == current.artifact_sha256 for row in snapshots):
+            snapshots.append(current)
+        rows.extend(snapshots)
+    return rows
 
 def source_keys(layout: Layout) -> list[str]:
     """Source keys with a mined file (`<key>.jsonl`); derived files (`.judged`, `.probed`) are not keys."""
@@ -684,5 +760,6 @@ def project_workflows_from_jobs(layout: Layout, *, origin: str | None = None, no
 
 __all__ = ["ProjectionError", "aware", "dec", "mtime", "provider_of", "scenario_id_for", "pr_number_of", "read_json",
            "project_registry", "scenario_ids", "scenario_version_of", "validation_status_of", "project_scenario", "project_scenario_versions",
-           "source_keys", "project_candidates", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_workflow_costs",
+           "source_keys", "discovery_source_keys", "project_discovery", "project_discoveries", "read_discovery_snapshot",
+           "project_candidates", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_workflow_costs",
            "project_scores", "project_workflows_from_jobs"]

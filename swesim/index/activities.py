@@ -1,16 +1,18 @@
 """Index activities (interfaces §2): Temporal activities on the `swesim-control` queue that keep the index current.
 
 Contract
-- Six activities, names exact (`swesim.workflows.queues.QUEUE_OF` routes them to CONTROL): `index_scenario_activity`,
+- Seven activities, names exact (`swesim.workflows.queues.QUEUE_OF` routes them to CONTROL): `index_scenario_activity`,
   `index_candidate_activity`, `index_trial_activity`, `index_score_activity`, `index_workflow_activity`,
-  `index_rebuild_activity`. `ALL` lists them for the worker.
+  `index_rebuild_activity`, `index_discovery_activity`. `ALL` lists them for the worker.
 - Each reads the files through `Layout`, projects rows with `swesim.index.project`, upserts them, and returns
   `{"indexed": True, "rows": n}`. Idempotent: the same payload twice leaves the same rows.
-- When the index is disabled (`Settings.database_url` unset) every activity returns
-  `{"indexed": False, "reason": "index disabled"}` and never raises, whatever the payload.
+- When the index is disabled (`Settings.database_url` unset), index-only activities return
+  `{"indexed": False, "reason": "index disabled"}`. Discovery still freezes its immutable file snapshot and requires
+  a valid source payload; it also returns the snapshot's discovery_id.
 - A payload or record that cannot identify a row raises `ApplicationError(type="projection", non_retryable=True)`;
   transient database errors propagate unchanged so Temporal retries them (`retries.HOOK`).
-- Payloads carry ids only. `index_workflow_activity` is the one exception: the workflow itself is the source of
+- Payloads carry ids and artifact references. Discovery additionally carries provenance (workflow/run, band and time).
+  `index_workflow_activity` also carries state: the workflow itself is the source of
   Temporal state, so its payload carries the row's fields (`workflow_id, run_id, type, status, params_summary,
   failure, parent_workflow_id`, optionally `started_at, closed_at, task_queue, cost_usd, search_attributes`).
 - The database work is synchronous SQLAlchemy; the activities run it in a thread so the worker's event loop stays free.
@@ -19,6 +21,7 @@ Contract
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from typing import Any
 
 from temporalio import activity
@@ -27,6 +30,7 @@ from temporalio.exceptions import ApplicationError
 from swesim.index import models as M
 from swesim.index import project as P
 from swesim.index.store import IndexStore
+from swesim.paths import atomic_json
 from swesim.settings import Settings, get_settings
 from swesim.storage.layout import Layout
 
@@ -107,6 +111,43 @@ def index_candidate(p: dict, settings: Settings | None = None) -> dict:
     if not rows:
         raise _projection_error(f"candidate {instance_id} is not in the {source_key} files")
     return {"indexed": True, "rows": store.upsert_candidates(rows)}
+
+
+def index_discovery(p: dict, settings: Settings | None = None) -> dict:
+    """Freeze discovery provenance before indexing, including sources with zero candidates and SQL-disabled runs.
+
+    Payload: source_key, artifact_sha256, workflow_id, run_id, optional repo/band/discovered_at. A replay reads its
+    immutable snapshot even if another discovery has replaced the flat rejects file in the meantime.
+    """
+    s = settings or get_settings()
+    (key,) = _require(p, "source_key")
+    layout = _layout(s)
+    store = store_for(s)
+    expected = p.get("artifact_sha256")
+    identity = M.discovery_identity(key, expected, p.get("workflow_id"), p.get("run_id")) if expected else None
+    try:
+        artifact = layout.resolve_artifact(p["artifact_path"]) if p.get("artifact_path") is not None else None
+        # On the hosted stack the database serializes publication of the same immutable observation across workers.
+        with store.advisory_lock(f"swesim.discovery:{key}:{identity}") if store is not None else nullcontext():
+            path = layout.discovery_snapshot(key, identity) if identity else None
+            if path is not None and path.is_file():
+                row = P.read_discovery_snapshot(layout, key, identity)
+            else:
+                row = P.project_discovery(layout, key, origin=s.origin, workflow_id=p.get("workflow_id"), run_id=p.get("run_id"),
+                                          artifact_sha256=expected, worker_image_digest=s.worker_image_digest,
+                                          artifact_path=artifact, discovered_at=p.get("discovered_at"), repo=p.get("repo"), band=p.get("band"))
+                if row is None:
+                    raise P.ProjectionError("discovery rejects file is missing")
+                path = layout.discovery_snapshot(key, row.discovery_id)
+                if path.is_file():
+                    row = P.read_discovery_snapshot(layout, key, row.discovery_id)
+                else:
+                    atomic_json(path, row.model_dump(mode="json"))
+        if store is not None:
+            store.upsert_discovery(row)
+    except (ValueError, TypeError) as exc:
+        raise _projection_error(f"discovery {key}: {exc}") from exc
+    return {"indexed": True, "rows": 1, "discovery_id": row.discovery_id} if store is not None else {**DISABLED, "discovery_id": row.discovery_id}
 
 
 def index_trial(p: dict, settings: Settings | None = None) -> dict:
@@ -221,5 +262,10 @@ async def index_rebuild_activity(p: dict) -> dict:
     return await asyncio.to_thread(index_rebuild, p)
 
 
+@activity.defn
+async def index_discovery_activity(p: dict) -> dict:
+    return await asyncio.to_thread(index_discovery, p)
+
+
 ALL = [index_scenario_activity, index_candidate_activity, index_trial_activity, index_score_activity, index_workflow_activity,
-       index_rebuild_activity]
+       index_rebuild_activity, index_discovery_activity]

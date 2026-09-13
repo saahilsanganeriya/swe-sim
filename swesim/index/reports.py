@@ -14,6 +14,7 @@ Contract
 from __future__ import annotations
 
 from collections.abc import Iterable
+from collections import Counter
 from decimal import ROUND_HALF_EVEN, Decimal
 
 from swesim.index import models as M
@@ -24,6 +25,28 @@ _Q6 = Decimal("0.000001")
 
 def q6(value: Decimal) -> Decimal:
     return value.quantize(_Q6, rounding=ROUND_HALF_EVEN)
+
+
+def reject_histogram(discoveries: Iterable[M.DiscoveryRow], candidates: Iterable[M.CandidateRow]) -> dict[str, int]:
+    """Latest discovery counts per source plus one current reject gate per candidate identity.
+
+    `discovery:` counts PRs filtered before candidate creation; `candidate:` counts later gate rejections, not reasons
+    or intermediate stage files. Counts describe decisions within each source scan; distinct source keys may have
+    scanned the same PR, so the combined histogram is not a global unique-PR count.
+    """
+    latest: dict[str, M.DiscoveryRow] = {}
+    for row in discoveries:
+        prior = latest.get(row.source_key)
+        if prior is None or (row.discovered_at, row.discovery_id) > (prior.discovered_at, prior.discovery_id):
+            latest[row.source_key] = row
+    counts: Counter[str] = Counter()
+    for row in latest.values():
+        counts.update({f"discovery:{reason}": count for reason, count in row.rejects.items() if count})
+    unique = {(row.source_key, row.instance_id): row for row in candidates}
+    for row in unique.values():
+        if row.status == "rejected" and row.gate:
+            counts[f"candidate:{row.gate}"] += 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
 def funnel_steps(rows: Iterable[M.CandidateRow]) -> list[M.FunnelStep]:
