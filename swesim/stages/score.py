@@ -77,7 +77,7 @@ def message_events(rec: dict) -> list[dict]:
 
 
 def count_exchanges(rec: dict, exchange: str) -> int:
-    """Agent-initiated exchanges of one kind (``ask`` or ``review``) recorded by the stakeholder service."""
+    """Agent-initiated exchanges of one kind (``ask``, ``confirm`` or ``review``) recorded by the stakeholder service."""
     return sum(1 for e in message_events(rec) if e.get("role") == "user" and e.get("exchange") == exchange)
 
 
@@ -342,6 +342,7 @@ def summarize(records: list[dict], k: int) -> dict:
             "questions_asked": [count_exchanges(r, "ask") for r in valid],
             "reviews": [count_exchanges(r, "review") for r in valid],
             "reviews_requested": [count_exchanges(r, "review") for r in valid],
+            "confirmations": [count_exchanges(r, "confirm") for r in valid],
             "patience_end": [(r.get("transcript") or {}).get("patience_end") for r in valid],
             # Diff-only pilot: the review snapshot is unverified, so this stays null until a trusted protocol exists.
             "reviewed_equals_submitted": [(r.get("report") or {}).get("reviewed_equals_submitted") for r in valid],

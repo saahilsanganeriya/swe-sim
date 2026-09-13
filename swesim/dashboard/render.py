@@ -320,9 +320,10 @@ def chat_bubbles(rows: list[dict], live: bool, evaluator: bool = False) -> str:
     parts = []
     for r in convo:
         m = r.get("meta") or {}
-        review = r.get("kind") == "review"
+        review = r.get("kind") == "review"; confirm = r.get("kind") == "confirm"
         refusal = r["actor"] == "stakeholder" and (m.get("tier") == "refused" or str(r.get("text") or "").startswith(REFUSAL_PREFIX))
         role = ("refusal" if refusal else "review request" if review and r["actor"] == "agent" else "review" if review
+                else "describes behavior" if confirm and r["actor"] == "agent" else "confirms / denies" if confirm
                 else "question" if r["actor"] == "agent" else "reply")
         when = (f"<time datetime='{h(r['ts_iso'])}'>{h(clock(r['ts']))}</time>" if r.get("ts") is not None
                 else "<span class='flag' title='no timestamp'>no timestamp</span>")
@@ -355,8 +356,8 @@ def chat_bubbles(rows: list[dict], live: bool, evaluator: bool = False) -> str:
         parts.append(f"<div class='bubble {h(r['actor'])}{' review' if review else ''}{' refusal' if refusal else ''}'>{head}{body}</div>")
     if live:
         parts.append("<div class='working'><span class='dots'><i></i><i></i><i></i></span><span>agent is working…</span></div>")
-    empty = ("<p class='empty' id='chat-empty'><strong>No exchanges yet.</strong> The agent asks with <code>ask-user</code> and requests a "
-             "diff review with <code>request-review</code>; questions appear on the left, stakeholder replies on the right.</p>")
+    empty = ("<p class='empty' id='chat-empty'><strong>No exchanges yet.</strong> The agent asks with <code>ask-user</code> and describes its "
+             "resulting behavior with <code>confirm-behavior</code>; agent messages appear on the left, stakeholder replies on the right.</p>")
     return f"<div class='chat' id='chat'>{''.join(parts)}</div>" + _hidden_unless(convo, empty)
 
 

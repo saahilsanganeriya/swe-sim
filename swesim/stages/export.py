@@ -28,9 +28,9 @@ from swesim.stages.score import (
     outcome_code,
 )
 
-SHIMS = ("ask-user", "request-review")
+SHIMS = ("ask-user", "confirm-behavior", "request-review")
 # First token of a command segment, with an optional path prefix, followed by end or whitespace.
-_SHIM_RE = re.compile(r"^\s*(?:\S*/)?(ask-user|request-review)(?:\s+(.*))?$", re.DOTALL)
+_SHIM_RE = re.compile(r"^\s*(?:\S*/)?(ask-user|confirm-behavior|request-review)(?:\s+(.*))?$", re.DOTALL)
 _SEGMENTS = re.compile(r"&&|\|\||;|\n")
 
 
@@ -153,8 +153,10 @@ def episode_manifest(ws: Workspace, rec: dict, scenario_id: str) -> dict:
         "reward": rec.get("reward") or {}, "simulator_validity": simulator_validity,
         "interaction": {"patience_start": transcript.get("patience_start"), "patience_end": transcript.get("patience_end"),
                         "questions": count_exchanges(rec, "ask"), "reviews": count_exchanges(rec, "review"),
+                        "confirmations": count_exchanges(rec, "confirm"),
                         "questions_observed_by_policy": sum(1 for r in replies if r["shim"] == "ask-user"),
-                        "reviews_observed_by_policy": sum(1 for r in replies if r["shim"] == "request-review")},
+                        "reviews_observed_by_policy": sum(1 for r in replies if r["shim"] == "request-review"),
+                        "confirmations_observed_by_policy": sum(1 for r in replies if r["shim"] == "confirm-behavior")},
     }
 
 

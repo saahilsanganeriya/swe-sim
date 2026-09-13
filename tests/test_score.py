@@ -554,8 +554,8 @@ def test_export_scenario_manifest(tmp_path):
                   "image_digest": IMAGE, "purpose": "calibration", "patch_sha256": "p" * 64, "transcript_hash": "h" * 64,
                   "harbor_trial_dir": str(ws.jobs_dir / "runs" / tid / f"{spec.id}__interactive__1"), "attempt_index": 0}
     assert m["reward"]["outcome_code"] == 1 and m["simulator_validity"] == "unadjudicated" and m["training_eligible"] is False
-    assert m["interaction"] == {"patience_start": 6, "patience_end": 3, "questions": 1, "reviews": 1,
-                                "questions_observed_by_policy": 1, "reviews_observed_by_policy": 0}
+    assert m["interaction"] == {"patience_start": 6, "patience_end": 3, "questions": 1, "reviews": 1, "confirmations": 0,
+                                "questions_observed_by_policy": 1, "reviews_observed_by_policy": 0, "confirmations_observed_by_policy": 0}
     f = json.loads((ws.root / "exports" / f"{full}.episode.json").read_text())
     assert f["simulator_validity"] == "n/a" and f["training_eligible"] is True and f["interaction"]["questions"] == 0
     # full condition has no stakeholder: nothing is exported as a reply even though the shared fixture trajectory

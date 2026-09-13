@@ -9,7 +9,7 @@ from swesim.paths import Workspace
 from swesim.stages import compile as comp
 
 VERIFIER_FILES = ("grader.py", "policy.py", "parsers.py", "run_pytest.py")
-SHIM_FILES = ("ask-user", "request-review")
+SHIM_FILES = ("ask-user", "confirm-behavior", "request-review")
 GRADE_CONFIG_FIELDS = {"artifacts_dir", "pristine_dir", "work_dir", "expected_tests", "groups", "protected", "runner",
                        "test_user", "verifier_out", "test_timeout_sec", "target_dir", "contract_patch"}
 URL = "https://x.modal.run"
@@ -127,7 +127,8 @@ def test_environment_dockerfile_reproduces_verified_recipe(tmp_path):
     assert "export PATH=\"$HOME/.local/bin:$PATH\"" in df  # proven pre-bake shape (smoke6)
     assert "chown -R agent:agent /home/agent" in df
     assert "COPY collect.py /opt/swesim/collect.py" in df and "chmod 700 /var/swesim-collect" in df
-    assert "COPY shims/ask-user shims/request-review /opt/swesim/bin/" in df
+    assert "COPY shims/ask-user shims/confirm-behavior shims/request-review /opt/swesim/bin/" in df
+    assert "ln -s /opt/swesim/bin/confirm-behavior /usr/local/bin/confirm-behavior" in df
     assert "rm -rf .git && git init" in df  # base-only object database
     assert df.rstrip().endswith("WORKDIR /app")
     # root owns the collector and the shims; the agent owns the repository
@@ -153,11 +154,11 @@ def test_task_dir_layout_and_permissions(tmp_path):
     res = comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
     t = res.task_dirs["hidden"]
     for rel in ("task.toml", "instruction.md", "environment/Dockerfile", "environment/collect.py", "environment/shims/ask-user",
-                "environment/shims/request-review", "tests/Dockerfile", "tests/test.sh", "tests/grader.py", "tests/policy.py",
+                "environment/shims/confirm-behavior", "environment/shims/request-review", "tests/Dockerfile", "tests/test.sh", "tests/grader.py", "tests/policy.py",
                 "tests/parsers.py", "tests/run_pytest.py", "tests/grader_config.json", "tests/test.patch", "solution/solve.sh",
                 "solution/oracle.diff", "controls/keyerror.diff", "controls/root-conftest.diff"):
         assert (t / rel).is_file(), rel
-    for rel in ("solution/solve.sh", "environment/shims/ask-user", "environment/shims/request-review", "tests/test.sh"):
+    for rel in ("solution/solve.sh", "environment/shims/ask-user", "environment/shims/confirm-behavior", "environment/shims/request-review", "tests/test.sh"):
         assert (t / rel).stat().st_mode & stat.S_IXUSR, rel
     assert (t / "environment" / "collect.py").read_bytes() == (comp.TEMPLATES / "collect.py").read_bytes()
     assert (t / "tests" / "test.sh").read_bytes() == (comp.TEMPLATES / "test.sh").read_bytes()

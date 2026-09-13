@@ -199,7 +199,7 @@ class PatienceProfile(Strict):
 class StakeholderConfig(Strict):
     model_id: str = "openai/gpt-5.5"; prompt_version: str = "v1"; temperature: float = 0.0
     patience_profile: PatienceProfile = Field(default_factory=PatienceProfile)
-    review_mode: Literal["diff-only"] = "diff-only"; max_tool_calls_per_activation: int = Field(2, ge=0, le=4)
+    review_mode: Literal["behavior", "diff-only"] = "behavior"; max_tool_calls_per_activation: int = Field(2, ge=0, le=4)
 
 class RunConfig(Strict):
     agent: str = "mini-swe-agent"; agent_version: str | None = "2.4.6"

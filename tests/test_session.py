@@ -25,7 +25,8 @@ class FakeLLM:
 
 def cfg(**patience):
     base = {"start": 3, "question_cost": 1, "review_cost": 2, "terse_below": 2, "refuse_at": 0}
-    return StakeholderConfig.model_validate({"patience_profile": {**base, **patience}})
+    # These tests exercise the diff-only pilot channel; the default review_mode is now "behavior" (confirm-behavior only).
+    return StakeholderConfig.model_validate({"patience_profile": {**base, **patience}, "review_mode": "diff-only"})
 
 
 def test_patience_tiers_and_idempotency():
@@ -86,7 +87,7 @@ def test_review_tool_calls_bounded_by_config():
     """read_diff counts toward max_tool_calls_per_activation; a budget of 0 makes reviews unavailable."""
     diff = "".join(f"diff --git a/f{i}.py b/f{i}.py\n--- a/f{i}.py\n+++ b/f{i}.py\n@@ -1 +1 @@\n-a\n+b\n" for i in range(3))
     files = {f"f{i}.py": "b\n" for i in range(3)}
-    def mk(n): return Session("t1", VIEW, StakeholderConfig.model_validate({"patience_profile": {"start": 6}, "max_tool_calls_per_activation": n}))
+    def mk(n): return Session("t1", VIEW, StakeholderConfig.model_validate({"patience_profile": {"start": 6}, "max_tool_calls_per_activation": n, "review_mode": "diff-only"}))
     r = asyncio.run(mk(2).review("v1", diff, files, FakeLLM(ids=[])))
     assert len(r.tool_calls) == 2 and r.tool_calls[0]["tool"] == "read_diff"
     r1 = asyncio.run(mk(1).review("v1", diff, files, FakeLLM(ids=[]))); assert [c["tool"] for c in r1.tool_calls] == ["read_diff"]
