@@ -150,6 +150,49 @@ def write_trial(ws: Workspace, spec: ScenarioSpec, *, condition: str = "interact
     return tid
 
 
+def write_unresolved(ws: Workspace, spec: ScenarioSpec, *, kind: str, attempt: int = 0, condition: str = "interactive",
+                     model: str = HAIKU, purpose: str = "calibration") -> str:
+    """An attempt directory that ended without record.json, in one of the shapes the run stage / Temporal runner leave:
+    status-error (run.py unknown-exception path: status.json + materialized task/task.toml), status-error-rc (same plus a
+    run_config.json sibling), runner-error (runner-error.json + request.json + launch.json), request-only, launch-failed,
+    stale-running (status.json at running, nothing else), request-no-rc (request.json without run_config)."""
+    rc = RunConfig(condition=condition, model=model, purpose=purpose, compiled_hash=COMPILED,
+                   brief_profile="natural" if condition == "full" else "withheld")
+    tid = trial_id(spec.spec_hash, rc.condition, rc.run_config_hash, attempt)
+    d = ws.root / "trials" / tid
+    d.mkdir(parents=True)
+    request = {"trial_id": tid, "scenario_id": spec.id, "spec_hash": spec.spec_hash, "condition": condition, "model": model,
+               "run_config": rc.model_dump(mode="json"), "run_config_hash": rc.run_config_hash, "attempt_index": attempt,
+               "stakeholder_url": "https://stakeholder.example.test"}
+    started, finished = "2026-09-13T12:00:00Z", "2026-09-13T12:03:00Z"
+    if kind in ("status-error", "status-error-rc"):
+        (d / "task").mkdir()
+        (d / "task" / "task.toml").write_text(
+            f'[metadata]\ntrial_id = "{tid}"\nrun_config_hash = "{rc.run_config_hash}"\ncompiled_hash = "{COMPILED}"\n'
+            f'condition = "{condition}"\nbrief_profile = "{rc.brief_profile}"\n')
+        (d / "status.json").write_text(json.dumps({"status": "error", "trial_id": tid, "started_at": started, "finished_at": finished,
+                                                   "error": "RuntimeError"}))
+        if kind == "status-error-rc":
+            (d / "run_config.json").write_text(json.dumps(rc.model_dump(mode="json")))
+    elif kind == "runner-error":
+        (d / "request.json").write_text(json.dumps(request))
+        (d / "launch.json").write_text(json.dumps({"trial_id": tid, "phase": "acknowledged", "unit": f"swesim-trial-{tid}", "returncode": 0}))
+        (d / "runner-error.json").write_text(json.dumps({"trial_id": tid, "error": "HarborRunError('no trial dir')",
+                                                         "type": "HarborRunError", "at": T0 + 100}))
+    elif kind == "request-only":
+        (d / "request.json").write_text(json.dumps(request))
+    elif kind == "launch-failed":
+        (d / "request.json").write_text(json.dumps(request))
+        (d / "launch.json").write_text(json.dumps({"trial_id": tid, "phase": "failed", "error": "FileNotFoundError('systemd-run')"}))
+    elif kind == "stale-running":
+        (d / "status.json").write_text(json.dumps({"status": "running", "trial_id": tid, "started_at": started, "finished_at": None}))
+    elif kind == "request-no-rc":
+        (d / "request.json").write_text(json.dumps({"trial_id": tid, "scenario_id": spec.id, "spec_hash": spec.spec_hash}))
+    else:
+        raise ValueError(kind)
+    return tid
+
+
 # ---------------------------------------------------------------- pass metrics (brief tests, verbatim semantics)
 
 def test_pass_metrics():
@@ -288,6 +331,106 @@ def test_score_scenario_writes_scores(tmp_path):
     assert cmpg["trial_ids"] == [d]
     fg = scores[f"full|natural|{full.run_config_hash}"]
     assert fg["trial_ids"] == [e] and fg["questions_asked"] == [0] and fg["patience_end"] == [None]
+
+
+def test_load_trial_records_yields_unresolved_attempts_for_each_source_kind(tmp_path):
+    spec = make_spec()
+    ws = make_workspace(tmp_path, spec)
+    rc = RunConfig(condition="interactive", model=HAIKU, purpose="calibration", compiled_hash=COMPILED, brief_profile="withheld")
+    done = write_trial(ws, spec, attempt=0)
+    kinds = ("status-error", "status-error-rc", "runner-error", "request-only", "launch-failed")
+    tids = {kind: write_unresolved(ws, spec, kind=kind, attempt=i + 1) for i, kind in enumerate(kinds)}
+    stale = write_unresolved(ws, spec, kind="stale-running", attempt=9)
+    recs = {r["trial_id"]: r for r in load_trial_records(ws)}
+    assert set(recs) == {done, stale, *tids.values()}
+    assert not recs[done].get("unresolved")
+    for tid in tids.values():
+        u = recs[tid]
+        assert u["unresolved"] is True and u["reward"] == {} and u["report"] == {} and u["transcript"] == {}
+    u = recs[tids["status-error"]]  # run.py unknown-exception path launched from the CLI: only status.json + task/task.toml
+    assert (u["status"], u["error_type"], u["source_file"]) == ("error", "RuntimeError", "status.json")
+    assert u["started_at"] == "2026-09-13T12:00:00Z" and u["finished_at"] == "2026-09-13T12:03:00Z"
+    assert u["run_config_source"] == "task/task.toml" and u["run_config_hash"] == rc.run_config_hash
+    assert u["condition"] == "interactive" and u["brief_profile"] == "withheld" and u["compiled_hash"] == COMPILED
+    assert u["scenario_id"] is None and u["model"] is None and u["source_files"] == ["status.json"]
+    u = recs[tids["status-error-rc"]]
+    assert u["run_config_source"] == "run_config.json" and u["run_config_hash"] == rc.run_config_hash
+    assert u["model"] == HAIKU and u["purpose"] == "calibration" and u["status"] == "error"
+    u = recs[tids["runner-error"]]
+    assert (u["status"], u["error_type"], u["source_file"]) == ("runner-error", "HarborRunError", "runner-error.json")
+    assert u["run_config_source"] == "request.json" and u["run_config_hash"] == rc.run_config_hash
+    assert u["scenario_id"] == spec.id and u["spec_hash"] == spec.spec_hash and u["attempt_index"] == 3
+    assert u["source_files"] == ["runner-error.json", "request.json", "launch.json"] and u["started_at"] is None
+    u = recs[tids["request-only"]]
+    assert (u["status"], u["error_type"], u["source_file"]) == ("requested", None, "request.json") and u["model"] == HAIKU
+    u = recs[tids["launch-failed"]]
+    assert (u["status"], u["error_type"], u["source_file"]) == ("launch-failed", "launch-failed", "launch.json")
+    u = recs[stale]
+    assert (u["status"], u["error_type"], u["source_file"]) == ("running", None, "status.json")
+    assert u["run_config_hash"] is None and u["scenario_id"] is None and u["started_at"] == "2026-09-13T12:00:00Z"
+    # scenario attribution: request/spec id, else compiled hash (task.toml / run_config.json); the stale one is unattributable
+    scoped = {r["trial_id"] for r in load_trial_records(ws, spec.id)}
+    assert scoped == {done, *tids.values()}
+    assert {r["trial_id"] for r in load_trial_records(ws, spec.id, include_unresolved=False)} == {done}
+    other = make_spec("other-scenario")
+    make_workspace(tmp_path, other)
+    write_unresolved(ws, other, kind="runner-error", attempt=0)
+    assert {r["trial_id"] for r in load_trial_records(ws, spec.id)} == scoped
+    assert len(load_trial_records(ws)) == 8
+    # an unreadable record.json is an unresolved attempt too, never a silently skipped trial
+    (ws.root / "trials" / done / "record.json").write_text("{not json")
+    u = {r["trial_id"]: r for r in load_trial_records(ws)}[done]
+    assert u["unresolved"] is True and u["status"] == "unreadable-record" and u["source_file"] == "record.json"
+
+
+def test_unresolved_attempts_never_change_metrics(tmp_path):
+    spec = make_spec()
+    ws = make_workspace(tmp_path, spec)
+    for i, (code, success, reward) in enumerate([(1, 1, 1.0), (2, 0, 0.5), (3, 0, 0.0)]):
+        write_trial(ws, spec, attempt=i, outcome_code=code, success=success, reward=reward)
+    before = json.loads(score_scenario(ws, spec.id, k=2).read_text())
+    assert len(before) == 1
+    key = next(iter(before))
+    assert before[key]["attempts_total"] == 3 and before[key]["attempts_unresolved"] == 0 and before[key]["unresolved"] == []
+    for i, kind in enumerate(("status-error", "runner-error", "request-only", "launch-failed", "status-error-rc")):
+        write_unresolved(ws, spec, kind=kind, attempt=10 + i)
+    write_unresolved(ws, spec, kind="stale-running", attempt=20)  # unattributable: not in this scenario's table
+    after = json.loads(score_scenario(ws, spec.id, k=2).read_text())
+    assert set(after) == {key}
+    volatile = {"attempts_total", "attempts_unresolved", "unresolved_by_status", "unresolved"}
+    assert {k: v for k, v in before[key].items() if k not in volatile} == {k: v for k, v in after[key].items() if k not in volatile}
+    g = after[key]
+    assert g["n"] == 3 and g["n_total"] == 3 and g["success_count"] == 1 and g["pass_at_k"] == pytest.approx(2 / 3)
+    assert g["mean_reward"] == pytest.approx(0.5) and len(g["trial_ids"]) == 3
+    assert g["attempts_total"] == 8 and g["attempts_unresolved"] == 5
+    assert g["unresolved_by_status"] == {"error": 2, "launch-failed": 1, "requested": 1, "runner-error": 1}
+    assert len(g["unresolved"]) == 5 and all(set(x) == {"trial_id", "status", "error_type", "source_file", "started_at", "finished_at"} for x in g["unresolved"])
+    assert not (set(g["trial_ids"]) & {x["trial_id"] for x in g["unresolved"]})
+    # an attributable attempt with no recoverable run config lands in the unknown-config group, with no metrics
+    write_unresolved(ws, spec, kind="request-no-rc", attempt=30)
+    final = json.loads(score_scenario(ws, spec.id, k=2).read_text())
+    assert set(final) == {key, "unknown-config"}
+    ug = final["unknown-config"]
+    assert ug["n"] == 0 and ug["n_total"] == 0 and ug["success_count"] == 0 and ug["pass_at_k"] is None and ug["mean_reward"] is None
+    assert ug["attempts_total"] == 1 and ug["attempts_unresolved"] == 1 and ug["unresolved_by_status"] == {"requested": 1}
+    assert ug["condition"] is None and ug["model"] is None and ug["run_config_hash"] is None and ug["trial_ids"] == []
+    assert {k: v for k, v in final[key].items() if k not in volatile} == {k: v for k, v in before[key].items() if k not in volatile}
+    # summarize() alone: unresolved-only input, duplicate detection across kinds
+    only = summarize([{"trial_id": "a" * 24, "unresolved": True, "status": "error"}], k=1)
+    assert set(only) == {"unknown-config"} and only["unknown-config"]["attempts_unresolved"] == 1 and only["unknown-config"]["n"] == 0
+    with pytest.raises(ValueError, match="duplicate"):
+        summarize([_rec(1, 1, 1.0, trial_id="a" * 24), {"trial_id": "a" * 24, "unresolved": True, "status": "error"}], k=1)
+
+
+def test_export_and_register_skip_unresolved_attempts(tmp_path):
+    spec = make_spec()
+    ws = make_workspace(tmp_path, spec)
+    done = write_trial(ws, spec, attempt=0)
+    runner = write_unresolved(ws, spec, kind="runner-error", attempt=1)  # carries spec_hash via request.json
+    write_unresolved(ws, spec, kind="status-error", attempt=2)  # no spec_hash anywhere
+    assert [p.name for p in export_scenario(ws, spec.id)] == [f"{done}.episode.json"]
+    entry = register_scenario(ws, spec)
+    assert entry["calibration_runs"] == [done] and entry["comparison_runs"] == [] and entry["unresolved_runs"] == [runner]
 
 
 def test_score_scenario_requires_frozen_lineage(tmp_path):

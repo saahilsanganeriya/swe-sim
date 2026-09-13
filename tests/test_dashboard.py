@@ -21,6 +21,7 @@ try:  # pytest's default (prepend) import mode puts tests/ on sys.path
         make_workspace,
         review_events,
         write_trial,
+        write_unresolved,
     )
 except ImportError:  # pragma: no cover - importlib mode
     from tests.test_score import (
@@ -32,6 +33,7 @@ except ImportError:  # pragma: no cover - importlib mode
         make_workspace,
         review_events,
         write_trial,
+        write_unresolved,
     )
 
 
@@ -274,3 +276,31 @@ def test_runs_page_tolerates_malformed_scores_files(site):
     assert r.text.count('unreadable scores.json') == 2 and 'mixed-scenario' in r.text and 'valid-correct 1' in r.text
     for tid in (site['done'], site['wrong'], site['full'], site['running']):
         assert f'href="/trial/{tid}"' in r.text  # the trials table still renders
+
+
+def test_unresolved_attempts_are_flagged_on_runs_table_and_render_an_episode_page(site):
+    c, ws, spec = site['client'], site['ws'], site['spec']
+    err = write_unresolved(ws, spec, kind='status-error', attempt=5)
+    rerr = write_unresolved(ws, spec, kind='runner-error', attempt=6)
+    req = write_unresolved(ws, spec, kind='request-only', attempt=7)
+    score_scenario(ws, spec.id, k=3)
+    html = c.get('/').text
+    for tid in (err, rerr, req):
+        assert f'href="/trial/{tid}"' in html
+    assert html.count('>unresolved</span>') >= 3 and 'RuntimeError' in html and 'HarborRunError' in html
+    assert 'runner-error' in html and 'requested' in html and 'attempts (unresolved)' in html
+    for tid in (site['done'], site['wrong'], site['full']):  # finished trials are not flagged
+        row = html[html.index(f'href="/trial/{tid}"'):]
+        assert '>unresolved</span>' not in row[:row.index('</tr>')]
+    page = c.get(f'/trial/{rerr}').text
+    assert 'Unresolved attempt' in page and 'HarborRunError' in page and 'runner-error.json' in page and spec.id in page
+    assert f'href="/trial/{rerr}/file/runner-error.json"' in page and f'href="/trial/{rerr}/file/launch.json"' in page
+    assert c.get(f'/trial/{rerr}/file/runner-error.json').json()['type'] == 'HarborRunError'
+    err_page = c.get(f'/trial/{err}').text
+    assert 'Unresolved attempt' in err_page and 'RuntimeError' in err_page and 'status.json' in err_page and 'setInterval' not in err_page
+    assert c.get(f'/trial/{req}').status_code == 200 and 'requested' in c.get(f'/trial/{req}').text
+    body = c.get(f'/api/trial/{err}/timeline').json()
+    assert body['unresolved']['status'] == 'error' and body['unresolved']['error_type'] == 'RuntimeError' and body['timeline'] == []
+    assert c.get(f"/api/trial/{site['done']}/timeline").json()['unresolved'] is None
+    live = c.get(f"/api/trial/{site['running']}/timeline").json()  # running without a record: unresolved so far, still live
+    assert live['live'] is True and live['unresolved']['status'] == 'running'

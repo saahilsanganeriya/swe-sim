@@ -163,8 +163,8 @@ def export_scenario(ws: Workspace, scenario_id: str) -> list[Path]:
     outs: list[Path] = []
     (ws.root / "exports").mkdir(parents=True, exist_ok=True)
     for rec in load_trial_records(ws, scenario_id):
-        if not rec.get("trial_id"):
-            continue
+        if not rec.get("trial_id") or rec.get("unresolved"):
+            continue  # unresolved attempts have no observations or reward to export
         p = ws.root / "exports" / f"{rec['trial_id']}.episode.json"
         atomic_json(p, episode_manifest(ws, rec, scenario_id))
         outs.append(p)

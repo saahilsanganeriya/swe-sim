@@ -24,7 +24,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from swesim.paths import atomic_json
-from swesim.stages.score import OUTCOME_NAMES, count_exchanges, normalize_record, outcome_code
+from swesim.stages.score import (
+    OUTCOME_NAMES,
+    UNRESOLVED_FILES,
+    count_exchanges,
+    normalize_record,
+    outcome_code,
+    unresolved_attempt,
+)
 
 app = FastAPI(title="swesim dashboard", docs_url=None, redoc_url=None)
 ROOT = Path(os.environ.get("SWESIM_WORKSPACE", "workspace")).resolve()
@@ -38,7 +45,8 @@ TRIAL_FILES = {
     "record.json": ("trial", "record.json"), "reward.json": ("trial", "reward.json"), "report.json": ("trial", "report.json"),
     "transcript.json": ("trial", "transcript.json"), "run_config.json": ("trial", "run_config.json"),
     "spec.json": ("trial", "spec.json"), "status.json": ("trial", "status.json"), "label.json": ("trial", "label.json"),
-    "request.json": ("trial", "request.json"), "instruction.md": ("trial", "task/instruction.md"),
+    "request.json": ("trial", "request.json"), "runner-error.json": ("trial", "runner-error.json"),
+    "launch.json": ("trial", "launch.json"), "instruction.md": ("trial", "task/instruction.md"),
     "harbor-result.json": ("harbor", "result.json"), "trajectory.json": ("harbor", "agent/trajectory.json"),
     "verifier-reward.json": ("harbor", "verifier/reward.json"), "verifier-report.json": ("harbor", "verifier/report.json"),
 }
@@ -166,10 +174,12 @@ def load_trial(tid: str) -> dict:
     if not d.is_dir():
         raise HTTPException(404)
     status = read_json(d / "status.json")
-    has_record = (d / "record.json").exists()
-    record = normalize_record(read_json(d / "record.json"), d) if has_record else {}
+    raw = read_json(d / "record.json") if (d / "record.json").exists() else {}
+    has_record = bool(raw)
+    record = normalize_record(raw, d) if has_record else {}
+    unresolved = None if has_record else unresolved_attempt(d)  # no record: describe whatever files exist
     request = read_json(d / "request.json")
-    rc = record.get("run_config") or request.get("run_config") or {}
+    rc = record.get("run_config") or request.get("run_config") or (unresolved or {}).get("run_config") or {}
     live = status.get("status") == "running" and not has_record
     live_error = None
     if live:
@@ -190,16 +200,17 @@ def load_trial(tid: str) -> dict:
     p_end = (transcript or {}).get("patience_end")
     if p_end is None and last_reply is not None:
         p_end = last_reply.get("patience_remaining")
+    u = unresolved or {}
     meta = {
-        "scenario_id": record.get("scenario_id") or request.get("scenario_id"),
-        "condition": record.get("condition") or request.get("condition"),
-        "brief_profile": record.get("brief_profile") or rc.get("brief_profile"),
-        "model": record.get("model") or request.get("model") or rc.get("model"),
-        "purpose": record.get("purpose") or rc.get("purpose"),
+        "scenario_id": record.get("scenario_id") or request.get("scenario_id") or u.get("scenario_id"),
+        "condition": record.get("condition") or request.get("condition") or u.get("condition"),
+        "brief_profile": record.get("brief_profile") or rc.get("brief_profile") or u.get("brief_profile"),
+        "model": record.get("model") or request.get("model") or rc.get("model") or u.get("model"),
+        "purpose": record.get("purpose") or rc.get("purpose") or u.get("purpose"),
         "attempt_index": record.get("attempt_index", request.get("attempt_index")),
         "spec_hash": record.get("spec_hash") or request.get("spec_hash"),
-        "run_config_hash": record.get("run_config_hash") or request.get("run_config_hash"),
-        "compiled_hash": record.get("compiled_hash") or rc.get("compiled_hash"),
+        "run_config_hash": record.get("run_config_hash") or request.get("run_config_hash") or u.get("run_config_hash"),
+        "compiled_hash": record.get("compiled_hash") or rc.get("compiled_hash") or u.get("compiled_hash"),
         "image_digest": (report or {}).get("image_digest"),
         "trial_dir": record.get("trial_dir"),
     }
@@ -208,6 +219,7 @@ def load_trial(tid: str) -> dict:
     meta.update(timestamps)
     status_view = {**{k: v for k, v in timestamps.items() if v}, **status}
     return {"trial_id": tid, "dir": d, "status": status_view, "record": record, "request": request, "live": live,
+            "unresolved": unresolved,
             "live_transcript_error": live_error, "transcript": transcript or {}, "report": report or {},
             "reward": reward or {}, "trajectory": traj, "instruction": ins.read_text() if ins else None,
             "label": read_json(d / "label.json", default=None) or None, "meta": meta,
@@ -217,19 +229,23 @@ def load_trial(tid: str) -> dict:
 
 
 def trial_summary(d: Path) -> dict:
-    """One runs-table row from status.json plus record.json (or request.json while running)."""
+    """One runs-table row from status.json plus record.json, or from whatever an unresolved attempt left behind."""
     status = read_json(d / "status.json")
-    has_record = (d / "record.json").exists()
-    rec = normalize_record(read_json(d / "record.json"), d) if has_record else {}
+    raw = read_json(d / "record.json") if (d / "record.json").exists() else {}
+    has_record = bool(raw)
+    rec = normalize_record(raw, d) if has_record else {}
+    u = ({} if has_record else unresolved_attempt(d)) or {}
     request = read_json(d / "request.json")
-    rc = rec.get("run_config") or request.get("run_config") or {}
+    rc = rec.get("run_config") or request.get("run_config") or u.get("run_config") or {}
     label = read_json(d / "label.json", default=None) or {}
     code = outcome_code(rec) if rec.get("reward") else None
-    return {"trial_id": d.name, "status": status.get("status") or ("finished" if has_record else "unknown"),
-            "scenario_id": rec.get("scenario_id") or request.get("scenario_id"),
-            "condition": rec.get("condition") or request.get("condition"),
-            "brief_profile": rec.get("brief_profile") or rc.get("brief_profile"),
-            "model": rec.get("model") or request.get("model") or rc.get("model"), "purpose": rec.get("purpose") or rc.get("purpose"),
+    return {"trial_id": d.name, "status": status.get("status") or u.get("status") or ("finished" if has_record else "unknown"),
+            "unresolved": not has_record, "error_type": u.get("error_type"), "source_file": u.get("source_file"),
+            "scenario_id": rec.get("scenario_id") or request.get("scenario_id") or u.get("scenario_id"),
+            "condition": rec.get("condition") or request.get("condition") or u.get("condition"),
+            "brief_profile": rec.get("brief_profile") or rc.get("brief_profile") or u.get("brief_profile"),
+            "model": rec.get("model") or request.get("model") or rc.get("model") or u.get("model"),
+            "purpose": rec.get("purpose") or rc.get("purpose") or u.get("purpose"),
             "attempt_index": rec.get("attempt_index", request.get("attempt_index")),
             "outcome": OUTCOME_NAMES[code] if code is not None else None,
             "success": (rec.get("reward") or {}).get("success"), "reward": (rec.get("reward") or {}).get("reward"),
@@ -312,6 +328,11 @@ def _outcome_cell(name: str | None, success) -> str:
     return f'<span class="status {cls}">{h(name)}</span>'
 
 
+def _unresolved_cell(r: dict) -> str:
+    err = f"error {h(r['error_type'])}" if r.get("error_type") else "no verifier record"
+    return f"<span class='flag'>{err}</span> <span class='muted'>({h(r.get('source_file') or 'no files')})</span>"
+
+
 def render_runs_page() -> str:
     registry = read_json(REGISTRY).get("scenarios") or {}
     parts = ["<h1>swesim runs</h1>",
@@ -350,16 +371,23 @@ def render_runs_page() -> str:
         if not groups:
             parts.append("<p class='muted'>No finished trials.</p>")
             continue
-        parts.append("<table><tr><th>condition</th><th>profile</th><th>model</th><th>purpose</th><th>valid / total</th><th>success</th>"
-                     "<th>pass@k</th><th>pass^k</th><th>mean reward</th><th>questions</th><th>reviews</th><th>outcomes</th><th>labels</th><th>trials</th></tr>")
+        parts.append("<table><tr><th>condition</th><th>profile</th><th>model</th><th>purpose</th><th>valid / total</th>"
+                     "<th title='attempt directories in this group; unresolved = ended without a verifier record'>attempts (unresolved)</th>"
+                     "<th>success</th><th>pass@k</th><th>pass^k</th><th>mean reward</th><th>questions</th><th>reviews</th><th>outcomes</th><th>labels</th><th>trials</th></tr>")
         for key, g in sorted(groups.items()):
             k = g.get("requested_k")
             qs, rv = g.get("questions_asked") or [], g.get("reviews") or []
             outcomes = ", ".join(f"{h(n)} {c}" for n, c in sorted((g.get("outcomes") or {}).items()))
             labels = ", ".join(f"{h(n)} {c}" for n, c in sorted((g.get("labels") or {}).items())) or "—"
             trials = " ".join(f"<a class='mono' href='/trial/{h(t)}'>{short(t, 8)}</a>" for t in g.get("trial_ids") or [] if t)
-            parts.append(f"<tr><td>{h(g.get('condition'))}</td><td>{h(g.get('brief_profile'))}</td><td>{h(g.get('model'))}</td><td>{h(g.get('purpose'))}</td>"
-                         f"<td class='num'>{h(g.get('n_valid'))} / {h(g.get('n_total'))}</td><td class='num'>{h(g.get('success_count'))}</td>"
+            trials += "".join(f" <a class='mono flag' title='unresolved attempt: {h(x.get('status'))}' href='/trial/{h(x.get('trial_id'))}'>{short(x.get('trial_id'), 8)}</a>"
+                              for x in g.get("unresolved") or [] if x.get("trial_id"))
+            n_unres = g.get("attempts_unresolved") or 0
+            by_status = ", ".join(f"{h(sname)} {cnt}" for sname, cnt in sorted((g.get("unresolved_by_status") or {}).items()))
+            attempts = (f"{h(g.get('attempts_total'))} (<span class='{'flag' if n_unres else 'muted'}' title='{by_status or 'none'}'>{h(n_unres)}</span>)"
+                        if g.get("attempts_total") is not None else "—")
+            parts.append(f"<tr><td>{h(g.get('condition') or key)}</td><td>{h(g.get('brief_profile') or '—')}</td><td>{h(g.get('model') or '—')}</td><td>{h(g.get('purpose') or '—')}</td>"
+                         f"<td class='num'>{h(g.get('n_valid'))} / {h(g.get('n_total'))}</td><td class='num'>{attempts}</td><td class='num'>{h(g.get('success_count'))}</td>"
                          f"<td class='num' title='k={h(k)}'>{fmt_metric(g.get('pass_at_k'))} <span class='muted'>@{h(k)}</span></td>"
                          f"<td class='num' title='k={h(k)}'>{fmt_metric(g.get('pass_pow_k'))} <span class='muted'>^{h(k)}</span></td>"
                          f"<td class='num'>{fmt_metric(g.get('mean_reward'))}</td>"
@@ -368,9 +396,11 @@ def render_runs_page() -> str:
                          f"<td>{outcomes}</td><td>{labels}</td><td>{trials}</td></tr>")
         parts.append("</table>")
     # trials
-    parts.append("<h2>Trials</h2>")
-    dirs = sorted((ROOT / "trials").glob("*/status.json")) if (ROOT / "trials").is_dir() else []
-    rows = [trial_summary(p.parent) for p in dirs if TRIAL_RE.fullmatch(p.parent.name)]
+    parts.append("<h2>Trials</h2><p class='muted'>Every attempt directory is listed. <span class='flag'>unresolved</span> marks an attempt "
+                 "that ended without a verifier record (run-stage error, runner error, vanished launch); it is never counted in n or pass@k.</p>")
+    dirs = ([p for p in (ROOT / "trials").iterdir() if p.is_dir() and TRIAL_RE.fullmatch(p.name)
+             and any((p / name).exists() for name in ("record.json", *UNRESOLVED_FILES))] if (ROOT / "trials").is_dir() else [])
+    rows = [trial_summary(p) for p in sorted(dirs)]
     rows.sort(key=lambda r: (r["started_at"] or "", r["trial_id"]), reverse=True)
     if not rows:
         parts.append("<p class='muted'>No trials yet.</p>")
@@ -380,8 +410,10 @@ def render_runs_page() -> str:
         for r in rows:
             parts.append(f"<tr><td><a class='mono' href=\"/trial/{h(r['trial_id'])}\">{h(r['trial_id'])}</a></td><td>{h(r['scenario_id'])}</td>"
                          f"<td>{h(r['condition'])}</td><td>{h(r['brief_profile'])}</td><td>{h(r['model'])}</td><td>{h(r['purpose'])}</td>"
-                         f"<td class='num'>{h(r['attempt_index'])}</td><td><span class='status {status_class(r['status'])}'>{h(r['status'])}</span></td>"
-                         f"<td>{_outcome_cell(r['outcome'], r['success'])}</td><td class='num'>{h(r['reward']) if r['reward'] is not None else '—'}</td>"
+                         f"<td class='num'>{h(r['attempt_index'])}</td><td><span class='status {status_class(r['status'])}'>{h(r['status'])}</span>"
+                         + (" <span class='flag' title='no record.json: this attempt ended without a verifier record'>unresolved</span>" if r.get("unresolved") else "")
+                         + f"</td><td>{_outcome_cell(r['outcome'], r['success']) if not r.get('unresolved') else _unresolved_cell(r)}</td>"
+                         f"<td class='num'>{h(r['reward']) if r['reward'] is not None else '—'}</td>"
                          f"<td class='num'>{h(r['questions']) if r['questions'] is not None else '—'}</td>"
                          f"<td class='num'>{h(r['reviews']) if r['reviews'] is not None else '—'}</td>"
                          f"<td>{h(r['label']) if r['label'] else '—'}</td><td class='mono'>{h(r['started_at'] or '')}</td></tr>")
@@ -539,6 +571,11 @@ def render_episode(t: dict) -> str:
              f"<dt>spec hash</dt><dd class='mono'>{h(m.get('spec_hash'))}</dd><dt>run config hash</dt><dd class='mono'>{h(m.get('run_config_hash'))}</dd>",
              f"<dt>compiled hash</dt><dd class='mono'>{h(m.get('compiled_hash'))}</dd><dt>image digest</dt><dd class='mono'>{h(m.get('image_digest'))}</dd>",
              "</dl>"]
+    if t["unresolved"] and not t["live"]:
+        u = t["unresolved"]
+        parts.append(f"<p class='flag'>Unresolved attempt: no record.json was written. status {h(u['status'])}"
+                     f"{' · error ' + h(u['error_type']) if u.get('error_type') else ''} · from {h(u['source_file'])}. "
+                     "Not counted in n, success or pass@k; reported as attempts_unresolved. Files that exist are listed below.</p>")
     parts.append("<h2>Brief (instruction.md as the agent saw it)</h2>")
     parts.append(f"<pre>{h(t['instruction'])}</pre>" if t["instruction"] else "<p class='muted'>Preparing task; instruction not materialized yet.</p>")
     p = t["patience"]
@@ -578,6 +615,7 @@ def runs() -> HTMLResponse:
 def timeline(tid: str) -> dict:
     t = load_trial(tid)
     return {"trial_id": tid, "status": t["status"], "live": t["live"], "live_transcript_error": t["live_transcript_error"],
+            "unresolved": t["unresolved"],
             "timeline": merge_timeline(t["trajectory"], t["transcript"], report=t["report"], reward=t["reward"], status=t["status"]),
             "report": t["report"], "reward": t["reward"], "label": t["label"], "patience": t["patience"], "meta": t["meta"]}
 
