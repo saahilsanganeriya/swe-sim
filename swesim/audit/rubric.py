@@ -182,10 +182,10 @@ def _stem(tok: str) -> str:
         return tok[:-3]
     if tok.endswith("ed") and len(tok) > 4:
         return tok[:-2]
-    if tok.endswith("es") and len(tok) > 4:
-        return tok[:-2]
+    if tok.endswith(("sses", "xes", "zes", "ches", "shes")) and len(tok) > 4:
+        return tok[:-2]                       # classes -> class, fixes -> fix, matches -> match
     if tok.endswith("s") and len(tok) > 3 and not tok.endswith("ss"):
-        return tok[:-1]
+        return tok[:-1]                       # raises -> raise, floats -> float
     return tok
 
 
