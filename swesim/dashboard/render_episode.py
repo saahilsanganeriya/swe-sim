@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 
+from swesim.dashboard import origin
 from swesim.dashboard.data import REFUSAL_PREFIX, clock, EVALUATOR_TRIAL_FILES
 from swesim.dashboard.render import chip, code_block, dash, evaluator_switch, h, ident, kv, meter, model_chip, outcome_chip, short
 from swesim.stages.score import OUTCOME_NAMES, outcome_code
@@ -193,7 +194,9 @@ def files_section(t: dict, tid: str, resolve, evaluator: bool) -> str:
 
 
 def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extras: dict | None = None) -> str:
+    """``extras['scenario_source']`` (the scenario row's source, looked up by app.py) puts the task-origin badge in the header."""
     m, tid = t["meta"], t["trial_id"]
+    src = (extras or {}).get("scenario_source")
     rows = rows if evaluator else public_rows(rows)
     st = (row.status if row else None) or t["status"].get("status") or ("completed" if t["record"] else "unknown")
     live = bool(t["live"])
@@ -205,7 +208,7 @@ def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extra
             if isinstance(item, dict) and "seq" in item:
                 by_seq[item["seq"]] = item
     left = [f"<h1>Episode {ident(tid, 24)}</h1>",
-            (f"<p class='lead'>{chip(st)} <a href='/scenario/{h(m.get('scenario_id'))}'>{dash(m.get('scenario_id'))}</a> · {dash(m.get('condition'))} · brief {dash(m.get('brief_profile'))} · "
+            (f"<p class='lead'>{chip(st)} <a href='/scenario/{h(m.get('scenario_id'))}'>{dash(m.get('scenario_id'))}</a>{' ' + origin.badge(src) if src else ''} · {dash(m.get('condition'))} · brief {dash(m.get('brief_profile'))} · "
              f"{model_chip(m.get('model'))} · {dash(m.get('purpose'))} · attempt {dash(m.get('attempt_index'))}"
              + (f" · stakeholder <span class='mono'>{h(m.get('stakeholder_model'))}</span>" if m.get("stakeholder_model") else "") + "</p>")]
     if t["unresolved"] and not live:

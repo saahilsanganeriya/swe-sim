@@ -463,7 +463,11 @@ class IndexStore:
         return R.funnel_steps(self._rows(stmt, M.CandidateRow))
 
     def trials(self, f: M.TrialFilter) -> M.Page[M.TrialRow]:
-        return self._page(S.trials, M.TrialRow, f, self._conditions(S.trials, f), DEFAULT_ORDER["trials"])
+        t = S.trials
+        conds = self._conditions(t, f)
+        if f.source:  # `source` is a scenarios column: filter through the scenario_id join
+            conds.append(t.c.scenario_id.in_(sa.select(S.scenarios.c.scenario_id).where(S.scenarios.c.source.in_(f.source))))
+        return self._page(t, M.TrialRow, f, conds, DEFAULT_ORDER["trials"])
 
     def trial(self, trial_id: str) -> M.TrialRow | None:
         return self._one(sa.select(S.trials).where(S.trials.c.trial_id == trial_id), M.TrialRow)

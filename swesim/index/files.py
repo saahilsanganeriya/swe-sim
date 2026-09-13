@@ -239,6 +239,9 @@ class FileIndexReader:
 
     def trials(self, f: M.TrialFilter) -> M.Page[M.TrialRow]:
         rows = [t for t, _ex, _c in self._trials()]
+        if f.source:  # `source` lives on the scenario: keep the trials whose scenario has one of the wanted sources
+            wanted = {s.scenario_id for s in self._scenario_rows() if s.source in f.source}
+            rows = [r for r in rows if r.scenario_id in wanted]
         return page([r for r in rows if matches(r, f, TEXT_FIELDS["trials"])], f, DEFAULT_ORDER["trials"])
 
     def trial(self, trial_id: str) -> M.TrialRow | None:

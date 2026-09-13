@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from html import escape
 from typing import Iterable, Sequence
+from urllib.parse import urlencode
 
 # ----------------------------------------------------------------------------- primitives
 
@@ -96,6 +97,8 @@ STATUS_KIND = {
     "unresolved": "serious", "cancelled": "serious", "review_needed": "serious",
     # neutral
     "archived": "neutral", "saturated": "neutral", "continued_as_new": "neutral", "unknown": "neutral", "mined": "neutral",
+    # task origin badges (swesim.dashboard.origin): categorical, not a status
+    "novel": "info", "swe-bench a": "neutral", "authored": "neutral",
 }
 STATUS_ICON = {"good": "●", "run": "◐", "critical": "✕", "serious": "◇", "neutral": "○", "": "○"}
 
@@ -251,9 +254,10 @@ def cell(col: Column, row: dict) -> str:
 
 def table(table_id: str, columns: Sequence[Column], rows: Iterable[dict], *, key: str, empty: str, source: str | None = None,
           total: int | None = None, offset: int = 0, limit: int | None = None, caption: str | None = None,
-          export: bool = True, dense: bool = True) -> str:
+          export: bool = True, dense: bool = True, keep: Sequence[tuple[str, str]] | None = None) -> str:
     """Declarative table: sticky header, sortable columns, per-column filters, paging footer, CSV export, empty state.
-    With ``source`` the client polls that JSON endpoint and re-renders the rows from ``data-cols``."""
+    With ``source`` the client polls that JSON endpoint and re-renders the rows from ``data-cols``. ``keep`` lists the
+    query pairs (filters, facets) the paging links carry along, so a page's selection survives prev/next without JS."""
     rows = list(rows)
     cols = list(columns)
     filt = "".join(f"<label class='colf'>{h(c.label)}<input type='search' data-filter='{h(c.key)}' placeholder='filter'></label>"
@@ -265,9 +269,11 @@ def table(table_id: str, columns: Sequence[Column], rows: Iterable[dict], *, key
     total = n if total is None else total
     paging = ""
     if limit and total > limit:
-        paging = (f"<nav class='paging' aria-label='pages'><a class='button small' data-page='prev' href='?offset={max(0, offset - limit)}&limit={limit}'"
+        kept = urlencode([(k, v) for k, v in (keep or ()) if k not in ("offset", "limit") and v not in (None, "")])
+        pre = f"?{h(kept)}&" if kept else "?"
+        paging = (f"<nav class='paging' aria-label='pages'><a class='button small' data-page='prev' href='{pre}offset={max(0, offset - limit)}&limit={limit}'"
                   f"{' aria-disabled=true' if offset == 0 else ''}>‹ prev</a><span class='muted small'>{offset + 1}–{min(total, offset + n)} of {total}</span>"
-                  f"<a class='button small' data-page='next' href='?offset={offset + limit}&limit={limit}'{' aria-disabled=true' if offset + n >= total else ''}>next ›</a></nav>")
+                  f"<a class='button small' data-page='next' href='{pre}offset={offset + limit}&limit={limit}'{' aria-disabled=true' if offset + n >= total else ''}>next ›</a></nav>")
     attrs = f" data-source='{h(source)}'" if source else ""
     cap = f"<caption class='sr-only'>{h(caption)}</caption>" if caption else ""
     tools = (f"<div class='tbl-tools'>{filt}<span class='spacer'></span><span class='muted small' data-count>{n} row{'s' if n != 1 else ''}"

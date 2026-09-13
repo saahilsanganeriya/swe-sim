@@ -47,7 +47,7 @@ def site(tmp_path, monkeypatch):
 
 def test_candidates_page_shows_every_source_funnel_from_the_scan_files(site):
     html = site["client"].get("/candidates").text
-    assert "data-table='source-funnels'" in html and "PRs listed" in html
+    assert "data-table='source-funnels-novel'" in html and "data-table='source-funnels-swebench-a'" in html and "PRs listed" in html
     row = html.split(f"<tr data-key='{KEY}'>", 1)[1].split("</tr>", 1)[0]
     cells = [c.split(">", 1)[1].rsplit("<", 1)[0] for c in row.split("<td")[1:]]
     assert cells[3:10] == ["105", "4", "2", "1", "1", "1", "0"], cells  # listed, merged in range, linked issue, band passed, retained, judged, probed

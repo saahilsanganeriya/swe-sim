@@ -344,6 +344,7 @@ class CandidateFilter(PageFilter):
 class TrialFilter(PageFilter):
     trial_id: list[str] | None = None
     scenario_id: list[str] | None = None
+    source: list[str] | None = None  # the trial's scenario source (join on scenario_id): the console's task-origin facet
     version: list[int] | None = None
     spec_hash: list[str] | None = None
     condition: list[Condition] | None = None
