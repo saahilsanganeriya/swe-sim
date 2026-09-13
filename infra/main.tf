@@ -25,7 +25,7 @@ locals {
   # Secret resources whose values are pushed by scripts/cloud/push_secrets.py (never by Terraform).
   pushed_secret_names = [
     "TEMPORAL_API_KEY", "SWESIM_WORKER_SECRET", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-    "OPENROUTER_API_KEY", "GH_TOKEN", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET",
+    "OPENROUTER_API_KEY", "GH_TOKEN", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "GH_APP_PRIVATE_KEY",
   ]
   # Secrets the deployer may read: TEMPORAL_API_KEY for the open-executions check in CI; the two Terraform-managed
   # versions because `google_secret_manager_secret_version` reads its payload back on refresh.
@@ -101,6 +101,8 @@ module "run" {
   stakeholder_url          = var.stakeholder_url
   temporal_address         = var.temporal_address
   temporal_namespace       = var.temporal_namespace
+  gh_app_id                = var.gh_app_id
+  gh_app_installation_id   = var.gh_app_installation_id
   worker_cpu               = var.worker_cpu
   worker_memory            = var.worker_memory
   console_min_instances    = var.console_min_instances

@@ -69,7 +69,12 @@ ENV_VARS: tuple[EnvVar, ...] = (
     EnvVar(name="ANTHROPIC_API_KEY", purpose="Anthropic API key (judge, drafter, stakeholder, Anthropic solvers).", secret=True, where="console.anthropic.com."),
     EnvVar(name="OPENAI_API_KEY", purpose="OpenAI API key (fallback roles, OpenAI solvers).", secret=True, where="platform.openai.com."),
     EnvVar(name="OPENROUTER_API_KEY", purpose="OpenRouter API key (open-model solvers).", secret=True, where="openrouter.ai/keys."),
-    EnvVar(name="GH_TOKEN", purpose="Read-only GitHub token for repository discovery (public_repo scope is enough).", secret=True, where="`gh auth token` or github.com/settings/tokens."),
+    EnvVar(name="GH_TOKEN", purpose="Read-only GitHub token for repository discovery (public_repo scope is enough). Optional extra buckets: GH_TOKEN_2, GH_TOKEN_3, ... (see SWESIM_GH_EXTRA_TOKENS).", secret=True, where="`gh auth token` or github.com/settings/tokens."),
+    EnvVar(name="SWESIM_GH_EXTRA_TOKENS", purpose="How many optional GH_TOKEN_n (n = 2..) discovery looks for in this file; each is another 5,000/h quota bucket (laptop only, not in Secret Manager).", default="3"),
+    EnvVar(name="GH_APP_ID", purpose="Optional GitHub App whose installation token is one more 5,000/h discovery bucket next to GH_TOKEN; empty = no App.", where="github.com/settings/apps > your app > App ID (docs/setup.md, GitHub App)."),
+    EnvVar(name="GH_APP_INSTALLATION_ID", purpose="Installation id of that App on the account whose repositories are mined.", where="github.com/settings/installations > Configure: the number at the end of the URL."),
+    EnvVar(name="GH_APP_PRIVATE_KEY_PATH", purpose="Path of the App's private key (.pem) on this machine; hosted workers read the content from the GH_APP_PRIVATE_KEY secret instead.", where="App settings > Private keys > Generate; store it mode 600 outside the repository."),
+    EnvVar(name="GH_APP_PRIVATE_KEY", purpose="Content of the App's private key (PEM); pushed from GH_APP_PRIVATE_KEY_PATH by `make push-secrets`, read by the hosted pools.", secret=True, where="`make push-secrets` copies the file named by GH_APP_PRIVATE_KEY_PATH; leave it empty here."),
     EnvVar(name="MODAL_TOKEN_ID", purpose="Modal token id (Harbor's Modal backend, stakeholder deploy).", secret=True, where="modal.com/settings or ~/.modal.toml."),
     EnvVar(name="MODAL_TOKEN_SECRET", purpose="Modal token secret.", secret=True, where="modal.com/settings or ~/.modal.toml."),
 )
@@ -107,6 +112,10 @@ class Settings(BaseModel):
     temporal_namespace: str = "default"
     temporal_ui_url: str | None = None
     direct_stages: bool = False
+    gh_app_id: int | None = None
+    gh_app_installation_id: int | None = None
+    gh_app_private_key_path: Path | None = None
+    gh_extra_tokens: int = Field(default=3, ge=0)
 
     @property
     def index_enabled(self) -> bool:
@@ -163,6 +172,10 @@ class Settings(BaseModel):
             temporal_namespace=env.get("TEMPORAL_NAMESPACE") or "default",
             temporal_ui_url=env.get("SWESIM_TEMPORAL_UI_URL") or None,
             direct_stages=env.get("SWESIM_DIRECT") == "1",
+            gh_app_id=int(env["GH_APP_ID"]) if env.get("GH_APP_ID") else None,
+            gh_app_installation_id=int(env["GH_APP_INSTALLATION_ID"]) if env.get("GH_APP_INSTALLATION_ID") else None,
+            gh_app_private_key_path=Path(env["GH_APP_PRIVATE_KEY_PATH"]).expanduser() if env.get("GH_APP_PRIVATE_KEY_PATH") else None,
+            gh_extra_tokens=int(env["SWESIM_GH_EXTRA_TOKENS"]) if env.get("SWESIM_GH_EXTRA_TOKENS") else 3,
         )
 
 
@@ -184,6 +197,13 @@ def secret(name: str, settings: Settings | None = None, environ: Mapping[str, st
         if not value:
             raise MissingSecret(f"{name} is not set in the environment or in {path}")
     return value
+
+
+def child_environment(**overrides: str) -> dict[str, str]:
+    """A copy of the process environment with `overrides` applied, for a subprocess that must receive one credential
+    through its environment (never on its command line, where `ps` would show it). The process environment is not
+    modified. This is the sanctioned place for that `os.environ` read (the module contract above)."""
+    return {**os.environ, **overrides}
 
 
 def has_secret(name: str, settings: Settings | None = None) -> bool:

@@ -48,9 +48,9 @@ def transcript(*events: list[dict], start: int = 6) -> dict:
 # ---------------------------------------------------------------- rubric as data and the label models
 
 def test_rubric_version_and_definitions_cover_every_label():
-    assert R.RUBRIC_VERSION == "2026-09-13.1"
-    for label in ("coherent", "fair_tests", "plausible_withholding", "specific", "decision_oriented", "before_implementation",
-                  "redundant", "fishing", "targeted", "volunteered", "test_or_identifier_disclosed", "behaviour_level"):
+    assert R.RUBRIC_VERSION == "2026-09-13.2"
+    for label in ("coherent", "fair_tests", "plausible_withholding", "facts_within_contract", "specific", "decision_oriented",
+                  "before_implementation", "redundant", "fishing", "targeted", "volunteered", "test_or_identifier_disclosed", "behaviour_level"):
         assert label in R.RUBRIC and R.RUBRIC[label].strip()
     text = R.rubric_text()
     assert "coherent" in text and "behaviour_level" in text
@@ -70,6 +70,15 @@ def test_label_models_match_interfaces_and_forbid_extras():
                         unfair_tests=["tests/t.py::test_x"], model="anthropic/claude-opus-5", audited_at="2026-09-13T10:00:00+00:00",
                         rubric_version=R.RUBRIC_VERSION, inputs_hash="1" * 64)
     assert set(s.model_dump()) >= {"coherent", "fair_tests", "plausible_withholding", "reasons", "model", "audited_at", "rubric_version"}
+    # additive (interfaces §9.1): the fact-scope label defaults so older audit files still validate
+    assert s.facts_within_contract is None and s.fact_scope == []
+    scoped = s.model_copy(update={"facts_within_contract": False, "fact_scope": [R.FactScope(
+        fact_id="f05", within_contract=False, reason="names a PASS_TO_PASS-only parametrisation", offending_tests=["t0"], markers=["@x"])]})
+    dumped = scoped.model_dump()
+    assert dumped["facts_within_contract"] is False and dumped["fact_scope"][0] == {
+        "fact_id": "f05", "within_contract": False, "reason": "names a PASS_TO_PASS-only parametrisation", "offending_tests": ["t0"], "markers": ["@x"]}
+    with pytest.raises(ValidationError):
+        R.FactScope(fact_id="f05", within_contract="no", reason="x")
     t = R.TrialAudit(trial_id="t" * 24, scenario_id="a-b", spec_hash="0" * 64, stakeholder_version="v2", legacy=False,
                      questions=[q], replies=[r], asked_before_implementing=True, useful_question_rate=1.0,
                      patience=None, trajectory_source=None, model="anthropic/claude-opus-5",
@@ -281,3 +290,147 @@ def test_useful_question_rate_counts_specific_decision_oriented_non_fishing_non_
     assert R.useful_question_rate([]) is None
     assert R.useful_question_rate([q(1, specific=None)]) is None          # unknown labels never count as useful or useless
     assert R.useful_question_rate([q(1), q(3, decision_oriented=None)]) == 1.0
+
+
+# ---------------------------------------------------------------- fact scope (pytest-dev--pytest-7283, measured 2026-09-13)
+
+# The hosted scenario's contract: one FAIL_TO_PASS parametrisation; the sibling parametrisation and the rest of the file pass on base.
+F2P_7283 = ["testing/test_unittest.py::test_pdb_teardown_skipped[@unittest.skip]"]
+P2P_7283 = ["testing/test_unittest.py::test_pdb_teardown_skipped[@pytest.mark.skip]",
+            "testing/test_unittest.py::test_simple_unittest",
+            "testing/test_unittest.py::test_pdb_teardown_called",
+            "testing/test_unittest.py::test_setUpModule",
+            "testing/test_unittest.py::test_class_method_containing_test_issue1558",
+            "testing/test_unittest.py::test_trace[True]"]
+TEST_PATCH_7283 = '''diff --git a/testing/test_unittest.py b/testing/test_unittest.py
+--- a/testing/test_unittest.py
++++ b/testing/test_unittest.py
+@@ -1193,3 +1193,32 @@ def test_pdb_teardown_called(testdir, monkeypatch):
+     assert tracked == ["setUp:test_1", "tearDown:test_1", "setUp:test_2", "tearDown:test_2"]
++
++
++@pytest.mark.parametrize("mark", ["@unittest.skip", "@pytest.mark.skip"])
++def test_pdb_teardown_skipped(testdir, monkeypatch, mark: str) -> None:
++    """With --pdb, setUp and tearDown should not be called for skipped tests."""
++    tracked = []  # type: List[str]
++    monkeypatch.setattr(pytest, "test_pdb_teardown_skipped", tracked, raising=False)
++
++    testdir.makepyfile(
++        """
++        import unittest
++        import pytest
++
++        class MyTestCase(unittest.TestCase):
++
++            def setUp(self):
++                pytest.test_pdb_teardown_skipped.append("setUp:" + self.id())
++
++            def tearDown(self):
++                pytest.test_pdb_teardown_skipped.append("tearDown:" + self.id())
++
++            {mark}("skipped for reasons")
++            def test_1(self):
++                pass
++
++        """.format(
++            mark=mark
++        )
++    )
++    result = testdir.runpytest_inprocess("--pdb")
++    result.stdout.fnmatch_lines("* 1 skipped in *")
++    assert tracked == []
+'''
+F01_7283 = "With --pdb, setUp and tearDown are not called for a unittest.TestCase test that is skipped with unittest.skip"
+F05_7283 = ("The same skipped lifecycle behavior applies to unittest.TestCase methods skipped with unittest.skip and with "
+            "pytest's skip marker")
+FACTS_7283 = [{"id": "f01", "text": F01_7283, "discovery": "on-request"},
+              {"id": "f05", "text": F05_7283, "discovery": "on-request"}]
+
+
+def spec_dict_7283() -> dict:
+    """A ScenarioSpec dict with the pytest-7283 contract, f01 (linked to the F2P test) and the out-of-contract f05; the
+    author-only f09 restates f05 and must stay exempt."""
+    from swesim.models import minimal_spec_dict
+    d = minimal_spec_dict()
+    d["id"] = "pytest-dev--pytest-7283"
+    d["briefs"][0]["text"] = "unittest.TestCase.tearDown executed on skipped tests when running --pdb\nWith --pdb, tearDown runs for skipped tests."
+    d["ledger"] = [
+        {"id": "f01", "text": F01_7283, "kind": "behavior", "provenance": "pr-thread", "source_excerpt": "tearDown should not run",
+         "source_url": "https://example.com/pr#c1", "discovery": "on-request", "tests": F2P_7283},
+        {"id": "f05", "text": F05_7283, "kind": "behavior", "provenance": "authored", "authored_rationale": "judge gap resolved by tests",
+         "discovery": "on-request", "tests": []},
+        {"id": "f09", "text": F05_7283, "kind": "context", "provenance": "authored", "authored_rationale": "kept for the record",
+         "discovery": "author-only"},
+    ]
+    d["requirements"] = [{"id": "r01", "text": F01_7283, "fact_id": "f01", "tests": F2P_7283}]
+    d["contract"]["fail_to_pass"] = list(F2P_7283)
+    d["contract"]["pass_to_pass"] = list(P2P_7283)
+    d["groups"] = [{"id": "g01", "weight": 1.0, "tests": list(F2P_7283)}]
+    return d
+
+
+def test_parse_test_id_splits_path_names_and_parametrisation():
+    ref = R.parse_test_id("testing/test_unittest.py::TestX::test_pdb_teardown_skipped[@pytest.mark.skip]")
+    assert (ref.path, ref.classes, ref.name, ref.param) == ("testing/test_unittest.py", ["TestX"], "test_pdb_teardown_skipped", "@pytest.mark.skip")
+    plain = R.parse_test_id("tests/test_x.py::test_simple")
+    assert (plain.name, plain.param, plain.classes) == ("test_simple", None, [])
+    assert R.parse_test_id("t1").name == "t1" and R.parse_test_id("a::b[x-[y]]").param == "x-[y]"
+
+
+def test_test_bodies_split_a_test_patch_into_functions_with_their_decorators():
+    bodies = R.test_bodies({"test.patch": TEST_PATCH_7283})
+    assert set(bodies) == {"test_pdb_teardown_skipped"}
+    body = bodies["test_pdb_teardown_skipped"]
+    assert body.startswith('@pytest.mark.parametrize("mark", ["@unittest.skip", "@pytest.mark.skip"])\ndef test_pdb_teardown_skipped(')
+    assert "assert tracked == []" in body and "diff --git" not in body and "\n+" not in body
+    plain = R.test_bodies({"tests/test_x.py": "import x\n\ndef helper():\n    return 1\n\n\nclass TestA:\n    def test_one(self):\n        assert helper() == 1\n\n    def test_two(self):\n        assert legacy_offset == 2\n\ndef test_three():\n    pass\n"})
+    assert set(plain) == {"test_one", "test_two", "test_three"}
+    assert "legacy_offset" in plain["test_two"] and "legacy_offset" not in plain["test_one"]
+
+
+def test_fact_scope_flags_f05_by_the_pass_to_pass_only_parametrisation_and_keeps_f01():
+    """f05 names `pytest's skip marker`: the `@pytest.mark.skip` parametrisation, which only the PASS_TO_PASS sibling carries.
+    f01 names the F2P parametrisation and the shared body only."""
+    out = R.fact_scope_mechanical(FACTS_7283, F2P_7283, P2P_7283, {"test.patch": TEST_PATCH_7283})
+    by_id = {fs.fact_id: fs for fs in out}
+    assert set(by_id) == {"f01", "f05"}
+    f05 = by_id["f05"]
+    assert f05.within_contract is False and f05.offending_tests == [P2P_7283[0]] and f05.markers == ["@pytest.mark.skip"]
+    assert P2P_7283[0] in f05.reason and "@pytest.mark.skip" in f05.reason and "FAIL_TO_PASS" in f05.reason
+    f01 = by_id["f01"]
+    assert f01.within_contract is None and f01.offending_tests == [] and f01.markers == []
+    assert R.facts_within_contract(out) is False
+    assert R.facts_within_contract([f01]) is None
+    assert R.facts_within_contract([f01.model_copy(update={"within_contract": True})]) is True
+    assert R.facts_within_contract([]) is True
+
+
+def test_fact_scope_does_not_fire_on_generic_or_f2p_parametrisations_or_shared_bodies():
+    # [True] is a generic parametrisation; "pytest" and "mark" alone do not cover the whole `@pytest.mark.skip` id
+    facts = [{"id": "a", "text": "When the option is true the teardown must not run", "discovery": "on-request"},
+             {"id": "b", "text": "pytest should not call tearDown for skipped unittest tests", "discovery": "on-request"},
+             {"id": "c", "text": "The skip applies to unittest.skip on TestCase methods", "discovery": "brief"}]
+    out = R.fact_scope_mechanical(facts, F2P_7283, P2P_7283, {"test.patch": TEST_PATCH_7283})
+    assert all(fs.within_contract is None and not fs.offending_tests for fs in out)
+    # without any test text the parametrisation check still works from the ids alone
+    out = R.fact_scope_mechanical(FACTS_7283, F2P_7283, P2P_7283, {})
+    assert {fs.fact_id: fs.within_contract for fs in out} == {"f01": None, "f05": False}
+    # author-only facts are never scoped: they are not stakeholder-visible
+    out = R.fact_scope_mechanical(FACTS_7283 + [{"id": "f09", "text": F05_7283, "discovery": "author-only"}], F2P_7283, P2P_7283, {})
+    assert [fs.fact_id for fs in out] == ["f01", "f05"]
+
+
+def test_fact_scope_flags_identifiers_that_exist_only_in_a_pass_to_pass_body():
+    patch = ("diff --git a/tests/test_x.py b/tests/test_x.py\n--- a/tests/test_x.py\n+++ b/tests/test_x.py\n@@ -1,4 +1,12 @@\n"
+             "+def test_reads_legacy_header(loader):\n+    assert loader.read(legacy_header_offset=12).ok\n+\n"
+             "+def test_rejects_missing_key(loader):\n+    with pytest.raises(ValueError):\n+        loader.load(strict_mode=True)\n")
+    f2p, p2p = ["tests/test_x.py::test_rejects_missing_key"], ["tests/test_x.py::test_reads_legacy_header", "tests/test_x.py::test_other"]
+    facts = [{"id": "f1", "text": "Loading with strict_mode raises ValueError for a missing key", "discovery": "on-request"},
+             {"id": "f2", "text": "The legacy_header_offset of 12 bytes must still be honoured", "discovery": "on-request"},
+             {"id": "f3", "text": "Reading the legacy header offset should keep working", "discovery": "on-request"}]
+    out = {fs.fact_id: fs for fs in R.fact_scope_mechanical(facts, f2p, p2p, {"test.patch": patch})}
+    assert out["f1"].within_contract is None and out["f1"].markers == []
+    assert out["f2"].within_contract is False and out["f2"].markers == ["legacy_header_offset"]
+    assert out["f2"].offending_tests == ["tests/test_x.py::test_reads_legacy_header"] and "legacy_header_offset" in out["f2"].reason
+    # plain words shared with a PASS_TO_PASS-only body are evidence for the reading pass, never a mechanical verdict
+    assert out["f3"].within_contract is None and "test_reads_legacy_header" in out["f3"].reason and out["f3"].offending_tests == []

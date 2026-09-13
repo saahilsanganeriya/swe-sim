@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import builtins
 import json
+import keyword
 import re
 import shlex
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
@@ -28,7 +30,7 @@ from swesim.stages.export import shim_invocation
 from swesim.stakeholder.session import REFUSAL, find_forbidden
 from swesim.stakeholder.view import FIXED_FORBIDDEN
 
-RUBRIC_VERSION = "2026-09-13.1"
+RUBRIC_VERSION = "2026-09-13.2"
 
 RUBRIC: dict[str, str] = {
     # scenario
@@ -39,6 +41,10 @@ RUBRIC: dict[str, str] = {
                   "merged patch has) is unfair.",
     "plausible_withholding": "Each span removed from the natural brief is something a reporter would plausibly leave out and a "
                              "developer would plausibly ask about; withholding the symptom itself or the title is not plausible.",
+    "facts_within_contract": "Every stakeholder-visible fact asserts behaviour the hidden FAIL_TO_PASS tests require; a fact that "
+                             "widens the ask to behaviour those tests do not check, or that a PASS_TO_PASS test already pins or "
+                             "contradicts, is outside the contract (acting on it changes more than the contract asks and risks a "
+                             "regression that zeroes the reward).",
     # questions
     "specific": "Asks about one identifiable decision with enough context that a one- or two-sentence answer settles it.",
     "decision_oriented": "The answer changes what the agent builds (behaviour on an input, scope, error type or message, API "
@@ -142,6 +148,18 @@ class Accounting(Label):
     cost_recorded: bool | None = None
 
 
+class FactScope(Label):
+    """One stakeholder-visible fact against the contract: ``within_contract`` False when the fact asserts behaviour outside the
+    FAIL_TO_PASS tests (mechanical marker or the model's reading), True when the model judged it inside, None when undecided.
+    ``offending_tests`` and ``markers`` are the mechanical evidence (PASS_TO_PASS-only test ids and the parametrisation ids or
+    identifiers the fact names)."""
+    fact_id: str
+    within_contract: bool | None
+    reason: str
+    offending_tests: list[str] = Field(default_factory=list)
+    markers: list[str] = Field(default_factory=list)
+
+
 class ScenarioAudit(Accounting):
     scenario_id: str
     spec_hash: str | None
@@ -150,6 +168,8 @@ class ScenarioAudit(Accounting):
     plausible_withholding: bool | None
     reasons: dict[str, str]
     unfair_tests: list[str] = Field(default_factory=list)
+    facts_within_contract: bool | None = None          # additive (interfaces §9.1): None on audits written before rubric 2026-09-13.2
+    fact_scope: list[FactScope] = Field(default_factory=list)
     model: str | None
     audited_at: str
     rubric_version: str
@@ -606,3 +626,191 @@ def useful_question_rate(questions: list[QuestionLabel]) -> float | None:
     """Share of fully labelled questions that are useful; None when no question is fully labelled."""
     known = [u for u in (useful(q) for q in questions) if u is not None]
     return (sum(known) / len(known)) if known else None
+
+
+# ---------------------------------------------------------------- fact scope (facts_within_contract)
+
+FACT_SCOPE_BEHAVIOUR_COVERAGE = 0.6   # share of a fact's content words a PASS_TO_PASS-only body must contain to be noted for the reading pass
+FACT_SCOPE_MIN_TOKENS = 3             # facts with fewer distinctive words are never noted by the soft rule
+MIN_PREFIX_MATCH = 4                  # "marker" names "mark", "skipped" names "skip": prefix matches need this many characters
+GENERIC_PARAM_TOKENS = frozenset({"true", "false", "none", "null", "default", "str", "int", "float", "bool", "list", "dict", "tuple",
+                                  "bytes", "set", "yes"})
+_RESERVED_NAMES = frozenset(keyword.kwlist) | frozenset(keyword.softkwlist) | frozenset(dir(builtins))
+_PATCH_FRAMING = ("diff ", "index ", "--- ", "+++ ", "@@", "new file mode", "deleted file mode", "old mode", "new mode",
+                  "similarity index", "rename from", "rename to", "Binary files", "\\ No newline")
+_TEST_DEF = re.compile(r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(?P<name>test\w*)\s*\(")
+_DECORATOR = re.compile(r"^[ \t]*@")
+_DOTTED = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+_IDENT_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+
+
+@dataclass
+class TestRef:
+    """A pytest node id taken apart: ``path::Class::name[param]``."""
+    test_id: str
+    path: str
+    classes: list[str]
+    name: str
+    param: str | None
+
+
+def parse_test_id(test_id: str) -> TestRef:
+    head, param = test_id, None
+    i = test_id.find("[")
+    if i >= 0 and test_id.endswith("]"):
+        head, param = test_id[:i], test_id[i + 1:-1]
+    parts = head.split("::")
+    return TestRef(test_id, parts[0] if len(parts) > 1 else "", parts[1:-1], parts[-1], param)
+
+
+def _is_diff(text: str) -> bool:
+    return any(line.startswith(("diff --git", "+++ ", "@@ ")) for line in text.splitlines()[:200])
+
+
+def _source_lines(text: str) -> list[str]:
+    """A test asset as code lines: for a unified diff the framing and removed lines are dropped and the ``+``/context
+    prefixes stripped; plain source is returned as is."""
+    if not _is_diff(text):
+        return text.splitlines()
+    out: list[str] = []
+    for line in text.splitlines():
+        if line.startswith(_PATCH_FRAMING):
+            continue
+        if line[:1] == "-":
+            continue
+        out.append(line[1:] if line[:1] in "+ " else line)
+    return out
+
+
+def test_bodies(texts: dict[str, str]) -> dict[str, str]:
+    """Test function name -> its source (decorators included) across every asset text; a function present in several texts
+    is concatenated. A body runs from its ``def test_...`` line to the next line at the same or a lower indentation."""
+    out: dict[str, list[str]] = {}
+    for text in texts.values():
+        pending: list[str] = []
+        current: str | None = None
+        indent = 0
+        for line in _source_lines(text or ""):
+            stripped = line.strip()
+            if current is not None:
+                if not stripped or len(line) - len(line.lstrip()) > indent:
+                    out[current].append(line)
+                    continue
+                current = None
+            if _DECORATOR.match(line):
+                pending.append(line)
+                continue
+            m = _TEST_DEF.match(line)
+            if m:
+                current, indent = m.group("name"), len(m.group("indent"))
+                out.setdefault(current, []).extend(pending + [line])
+            pending = []
+    return {name: "\n".join(lines).strip() for name, lines in out.items()}
+
+
+def _identifiers(text: str) -> set[str]:
+    """Code-like names in a text (snake_case, dotted, camelCase, CapWords), keywords and builtins excluded."""
+    found = set(_DOTTED.findall(text or "")) | set(_IDENT_TOKEN.findall(text or ""))
+    return {t for t in found if t not in _RESERVED_NAMES and _CODE_LIKE.search(t)}
+
+
+def _word_tokens(text: str) -> set[str]:
+    """Content tokens with snake_case split into words as well, so ``legacy_header_offset`` covers ``legacy header offset``."""
+    return content_tokens(text) | content_tokens((text or "").replace("_", " "))
+
+
+def _names(fact_tokens: set[str], marker_token: str) -> bool:
+    for t in fact_tokens:
+        if t == marker_token:
+            return True
+        if len(marker_token) >= MIN_PREFIX_MATCH and t.startswith(marker_token):
+            return True
+        if len(t) >= MIN_PREFIX_MATCH and marker_token.startswith(t):
+            return True
+    return False
+
+
+def _param_tokens(param: str) -> set[str]:
+    return {t for t in content_tokens(param) if t not in GENERIC_PARAM_TOKENS}
+
+
+def fact_scope_mechanical(facts: list[dict], fail_to_pass: list[str], pass_to_pass: list[str], test_texts: dict[str, str]) -> list[FactScope]:
+    """One ``FactScope`` per stakeholder-visible fact (dicts with ``id``/``text``/``discovery``; author-only facts are skipped).
+
+    ``within_contract`` is False with the offending PASS_TO_PASS test ids and the markers when the fact names
+    (a) a parametrisation id carried by a PASS_TO_PASS test and by no FAIL_TO_PASS test, all of whose content words the fact
+        contains (prefix-tolerant), at least one of them absent from every FAIL_TO_PASS id; generic ids (``True``, ``None``...)
+        never count; or
+    (b) a code identifier that occurs in the body (from ``test_texts``: test assets or a compiled task's tests) or id of a
+        PASS_TO_PASS-only test function and in no FAIL_TO_PASS test body or id.
+    Otherwise None: plain words shared with a PASS_TO_PASS-only body (>= ``FACT_SCOPE_BEHAVIOUR_COVERAGE``, polarity ignored)
+    are noted in the reason for the reading pass; a clean fact says so. The mechanical rule never returns True."""
+    f2p = [parse_test_id(t) for t in fail_to_pass or []]
+    p2p = [parse_test_id(t) for t in pass_to_pass or []]
+    bodies = test_bodies(test_texts or {})
+    f2p_names = {r.name for r in f2p}
+    f2p_id_tokens: set[str] = set().union(*(content_tokens(r.test_id) for r in f2p)) if f2p else set()
+    f2p_params = {r.param.strip().casefold() for r in f2p if r.param}
+    f2p_body = "\n".join(bodies[n] for n in sorted(f2p_names) if n in bodies)
+    f2p_idents = _identifiers(f2p_body) | set().union(*(_identifiers(r.test_id) for r in f2p)) if f2p else _identifiers(f2p_body)
+    f2p_body_tokens = _word_tokens(f2p_body)
+    # PASS_TO_PASS-only markers
+    param_markers: list[tuple[TestRef, set[str]]] = []
+    ident_markers: dict[str, list[str]] = {}
+    p2p_only_bodies: list[tuple[TestRef, set[str]]] = []
+    for r in p2p:
+        if r.param and r.param.strip().casefold() not in f2p_params:
+            toks = _param_tokens(r.param)
+            if toks and toks - f2p_id_tokens:
+                param_markers.append((r, toks))
+        if r.name in f2p_names:
+            continue
+        body = bodies.get(r.name, "")
+        for tok in sorted((_identifiers(body) | {r.name, *r.classes}) - f2p_idents - _RESERVED_NAMES):
+            ident_markers.setdefault(tok, []).append(r.test_id)
+        if body:
+            p2p_only_bodies.append((r, _word_tokens(body)))
+    out: list[FactScope] = []
+    for fact in facts or []:
+        if not isinstance(fact, dict) or fact.get("discovery") == "author-only" or not fact.get("id"):
+            continue
+        text = str(fact.get("text") or "")
+        tokens, idents = content_tokens(text), _identifiers(text)
+        reasons: list[str] = []
+        offending: list[str] = []
+        markers: list[str] = []
+        for r, toks in param_markers:
+            if all(_names(tokens, t) for t in toks):
+                reasons.append(f"names parametrisation '{r.param}' of PASS_TO_PASS-only test {r.test_id}, which no FAIL_TO_PASS test "
+                               f"carries (FAIL_TO_PASS parametrisations: {', '.join(sorted(f2p_params)) or 'none'})")
+                offending.append(r.test_id)
+                markers.append(r.param)
+        for tok in sorted(idents & set(ident_markers)):
+            tests = ident_markers[tok]
+            reasons.append(f"names identifier '{tok}' that occurs only in PASS_TO_PASS test {', '.join(tests)}, in no FAIL_TO_PASS test body or id")
+            offending.extend(tests)
+            markers.append(tok)
+        if reasons:
+            seen: set[str] = set()
+            offending = [t for t in offending if not (t in seen or seen.add(t))]
+            out.append(FactScope(fact_id=str(fact["id"]), within_contract=False, reason="; ".join(reasons), offending_tests=offending, markers=markers))
+            continue
+        if len(tokens) >= FACT_SCOPE_MIN_TOKENS:
+            f2p_cover = len(tokens & f2p_body_tokens) / len(tokens)
+            for r, body_tokens in p2p_only_bodies:
+                shared = len(tokens & body_tokens)
+                if shared / len(tokens) >= FACT_SCOPE_BEHAVIOUR_COVERAGE > f2p_cover:
+                    reasons.append(f"shares {shared} of {len(tokens)} content words with PASS_TO_PASS-only test {r.test_id} (polarity ignored) "
+                                   f"and fewer with the FAIL_TO_PASS bodies: left to the reading pass")
+        out.append(FactScope(fact_id=str(fact["id"]), within_contract=None,
+                             reason="; ".join(reasons) or "no identifier or parametrisation of a PASS_TO_PASS-only test is named"))
+    return out
+
+
+def facts_within_contract(scope: list[FactScope]) -> bool | None:
+    """False when any fact is outside the contract, True when every fact was judged inside (vacuously for no facts), else None."""
+    if any(fs.within_contract is False for fs in scope):
+        return False
+    if all(fs.within_contract is True for fs in scope):
+        return True
+    return None

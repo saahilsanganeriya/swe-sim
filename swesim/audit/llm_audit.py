@@ -6,8 +6,10 @@ Contract
   version, which is part of the audit's inputs hash.
 - Inputs are evaluator-only and passed as one JSON payload: the natural brief, the withheld brief and removed spans, the
   stakeholder-visible facts (author-only facts listed separately, marked), the requirements with their fact grounding, the
-  hidden test source, the oracle diff (scenario) or the transcript (trial). Large fields are clipped at ``MAX_FIELD_CHARS``.
-  The deny-list (``forbidden_terms``) is worker material and never enters a prompt.
+  hidden test source, the contract ids with the FAIL_TO_PASS and PASS_TO_PASS test bodies found in the assets (for the
+  ``fact_scope`` judgement), the oracle diff (scenario) or the transcript (trial). Large fields are clipped at
+  ``MAX_FIELD_CHARS``, PASS_TO_PASS ids at ``MAX_P2P_IDS``. The deny-list (``forbidden_terms``) is worker material and never
+  enters a prompt.
 - ``Judge`` calls ``swesim.llm.chat_json_with_usage`` on the configured model and follows the role fallback chain on ``LLMError``;
   when both fail it raises ``AuditLLMError`` (retryable). Every call is recorded in ``Judge.calls`` for the usage report;
   provider usage is retained and priced through the shared price table. Character estimates are labelled for older injected clients.
@@ -21,15 +23,17 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from swesim.audit.record import ScenarioBundle, TrialBundle, strip_confirm_prefix
-from swesim.audit.rubric import rubric_text
+from swesim.audit.rubric import parse_test_id, rubric_text, test_bodies
 from swesim.costs import Usage, usd_for
 from swesim.llm import ChatResult, LLMError, chat_json_with_usage, take_last_usage
 
 AUDIT_MODEL = "anthropic/claude-opus-5"
 AUDIT_FALLBACK_MODEL = "openai/gpt-5.6-sol"
-SCENARIO_PROMPT_VERSION = "task-sense-scenario-v1"
+SCENARIO_PROMPT_VERSION = "task-sense-scenario-v2"     # v2 (2026-09-13): per-fact `fact_scope` judgement with F2P/P2P bodies in context
 TRIAL_PROMPT_VERSION = "task-sense-trial-v1"
 MAX_FIELD_CHARS = 40_000
+MAX_P2P_IDS = 300            # PASS_TO_PASS ids listed in the payload (the count is always given in full)
+MAX_P2P_BODIES = 40          # PASS_TO_PASS bodies found in the assets that enter the payload
 MAX_TOKENS = 6000
 CHARS_PER_TOKEN = 4.0
 # Anthropic first-party list price for claude-opus-5 (input, output) per million tokens; the fallback model has no price
@@ -41,15 +45,21 @@ SCENARIO_SYSTEM = f"""You are the evaluator of an interactive software-engineeri
 A task is built from a real issue: the agent receives a brief (the natural issue text, or a withheld variant with spans
 removed), can question a simulated stakeholder who knows only the brief, the stakeholder-visible facts and the requirements,
 and is graded by hidden tests the agent never sees. You see everything, including the hidden tests and the oracle diff.
-Decide three things about the task itself and give one sentence of evidence for each:
+Decide four things about the task itself and give one sentence of evidence for each:
 {rubric_text()}
 Rules: judge against the payload only; a test is unfair only if nothing in the brief, facts or requirements lets a careful
 developer arrive at what it checks (name every such test in `unfair`); when `withheld_brief` is null return null for
-plausible_withholding; be concrete and quote the payload where it helps."""
+plausible_withholding; be concrete and quote the payload where it helps. For `fact_scope` judge every entry of
+`stakeholder_visible_facts` (never the author-only ones) and answer: does this fact assert behaviour the hidden FAIL_TO_PASS
+tests (`fail_to_pass`, `fail_to_pass_bodies`) do not require, or that a PASS_TO_PASS test (`pass_to_pass`,
+`pass_to_pass_bodies`) already pins or contradicts? Such a fact is outside the contract (`within_contract` false): an agent
+acting on it changes more than the failing tests ask and can regress a passing test. A parametrised test's sibling ids
+share one body; only the ids in `fail_to_pass` are required. Name the test that makes the fact out of scope in the reason."""
 
 SCENARIO_SCHEMA = ('{"coherent": {"label": true|false, "reason": "one sentence"}, '
                    '"fair_tests": {"label": true|false, "reason": "one sentence", "unfair": [{"test": "test id from fail_to_pass", "why": "one sentence"}]}, '
-                   '"plausible_withholding": {"label": true|false|null, "reason": "one sentence"}}')
+                   '"plausible_withholding": {"label": true|false|null, "reason": "one sentence"}, '
+                   '"fact_scope": [{"fact_id": "id from stakeholder_visible_facts", "within_contract": true|false, "reason": "one sentence naming the test"}]}')
 
 TRIAL_SYSTEM = f"""You are the evaluator of an interactive software-engineering benchmark ({TRIAL_PROMPT_VERSION}).
 The agent received `brief_seen_by_agent` and could ask a simulated stakeholder (`exchanges`, role agent/stakeholder, kinds
@@ -87,14 +97,32 @@ def _clip(text: str | None) -> str | None:
     return text if len(text) <= MAX_FIELD_CHARS else text[:MAX_FIELD_CHARS] + "\n[truncated]"
 
 
+def contract_bodies(fail_to_pass: list[str], pass_to_pass: list[str], test_texts: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """(FAIL_TO_PASS id -> body, PASS_TO_PASS id -> body) for the ids whose test function is in ``test_texts``; sibling
+    parametrisations map to the same body. PASS_TO_PASS bodies are capped at ``MAX_P2P_BODIES``."""
+    bodies = test_bodies(test_texts)
+    f2p = {t: bodies[parse_test_id(t).name] for t in fail_to_pass if parse_test_id(t).name in bodies}
+    p2p: dict[str, str] = {}
+    for t in pass_to_pass:
+        if len(p2p) >= MAX_P2P_BODIES:
+            break
+        name = parse_test_id(t).name
+        if name in bodies:
+            p2p[t] = bodies[name]
+    return f2p, p2p
+
+
 def scenario_payload(b: ScenarioBundle) -> dict:
     """Evaluator-only inputs for the scenario judgement (see the module contract)."""
+    f2p_bodies, p2p_bodies = contract_bodies(b.fail_to_pass, b.pass_to_pass, b.test_assets)
     return {
         "scenario_id": b.scenario_id, "spec_hash": b.spec_hash, "source": b.spec.source.value, "source_ref": b.spec.source_ref,
         "persona": {"role": b.spec.persona.role, "summary": b.spec.persona.summary},
         "natural_brief": _clip(b.natural_brief), "withheld_brief": _clip(b.withheld_brief), "removed_spans": b.removed_spans,
         "stakeholder_visible_facts": b.visible_facts, "author_only_facts": b.author_only_facts, "requirements": b.requirements,
-        "fail_to_pass": b.fail_to_pass, "pass_to_pass_count": len(b.pass_to_pass),
+        "fail_to_pass": b.fail_to_pass, "pass_to_pass": b.pass_to_pass[:MAX_P2P_IDS], "pass_to_pass_count": len(b.pass_to_pass),
+        "fail_to_pass_bodies": {t: _clip(body) for t, body in f2p_bodies.items()},
+        "pass_to_pass_bodies": {t: _clip(body) for t, body in p2p_bodies.items()},
         "hidden_tests": {name: _clip(text) for name, text in b.test_assets.items()},
         "oracle_diff": _clip(b.oracle_diff),
     }
@@ -156,10 +184,17 @@ def _reason(v) -> str:
 
 
 def coerce_scenario(out) -> dict:
-    """{coherent, fair_tests, plausible_withholding: bool|None, reasons: {label: str}, unfair_tests: [str]}."""
+    """{coherent, fair_tests, plausible_withholding: bool|None, reasons: {label: str}, unfair_tests: [str],
+    fact_scope: {fact_id: {within_contract: bool|None, reason: str}}} (first entry per fact id wins; malformed items dropped)."""
     if not isinstance(out, dict):
         raise AuditOutputError(f"scenario judgement is not an object: {type(out).__name__}")
-    result: dict = {"reasons": {}, "unfair_tests": []}
+    result: dict = {"reasons": {}, "unfair_tests": [], "fact_scope": {}}
+    for item in out.get("fact_scope") or []:
+        if not isinstance(item, dict):
+            continue
+        fid = item.get("fact_id")
+        if isinstance(fid, str) and fid and fid not in result["fact_scope"]:
+            result["fact_scope"][fid] = {"within_contract": _bool(item.get("within_contract")), "reason": _reason(item.get("reason"))}
     for key in ("coherent", "fair_tests", "plausible_withholding"):
         raw = out.get(key)
         if isinstance(raw, dict):

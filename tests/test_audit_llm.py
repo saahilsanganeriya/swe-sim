@@ -24,7 +24,9 @@ class FakeChat:
         self.scenario = scenario if scenario is not None else {
             "coherent": {"label": True, "reason": "one symptom, one wanted behaviour"},
             "fair_tests": {"label": False, "reason": "t1 pins a private name", "unfair": [{"test": "t1", "why": "private name"}]},
-            "plausible_withholding": {"label": True, "reason": "the traceback is a natural omission"}}
+            "plausible_withholding": {"label": True, "reason": "the traceback is a natural omission"},
+            "fact_scope": [{"fact_id": "f01", "within_contract": True, "reason": "asserts the ValueError t1 checks"},
+                           {"fact_id": "withheld-001", "within_contract": True, "reason": "the reporter's own traceback"}]}
         self.trial = trial if trial is not None else {
             "questions": [{"seq": 1, "specific": True, "decision_oriented": True, "fishing": False, "redundant": False,
                            "reason": "asks which exception type"}],
@@ -96,6 +98,23 @@ def test_scenario_payload_carries_the_evaluator_only_inputs_and_marks_author_onl
     assert "forbidden_terms" not in p  # the deny-list is worker material, not part of the reading pass
 
 
+def test_scenario_payload_carries_the_contract_ids_and_the_test_bodies_per_side():
+    from test_audit_rubric import F2P_7283, P2P_7283, TEST_PATCH_7283, spec_dict_7283
+    spec = ScenarioSpec.model_validate(spec_dict_7283())
+    b = ScenarioBundle.from_spec(spec.id, spec, test_assets={"test.patch": TEST_PATCH_7283}, oracle_diff="", forbidden_terms=[],
+                                 validation_status="valid", asset_hashes={})
+    p = L.scenario_payload(b)
+    assert p["fail_to_pass"] == F2P_7283 and p["pass_to_pass"] == P2P_7283 and p["pass_to_pass_count"] == len(P2P_7283)
+    assert list(p["fail_to_pass_bodies"]) == F2P_7283 and p["fail_to_pass_bodies"][F2P_7283[0]].startswith("@pytest.mark.parametrize")
+    assert list(p["pass_to_pass_bodies"]) == [P2P_7283[0]]     # the sibling parametrisation shares the body; the rest have none in the assets
+    assert [f["id"] for f in p["stakeholder_visible_facts"]] == ["f01", "f05"] and [f["id"] for f in p["author_only_facts"]] == ["f09"]
+    many = ScenarioBundle.from_spec(spec.id, spec.model_copy(update={"contract": spec.contract.model_copy(update={
+        "pass_to_pass": P2P_7283 + [f"testing/test_unittest.py::test_bulk_{i}" for i in range(L.MAX_P2P_IDS)]})}),
+        test_assets={"test.patch": TEST_PATCH_7283}, oracle_diff="", forbidden_terms=[], validation_status="valid", asset_hashes={})
+    q = L.scenario_payload(many)
+    assert len(q["pass_to_pass"]) == L.MAX_P2P_IDS and q["pass_to_pass_count"] == len(P2P_7283) + L.MAX_P2P_IDS
+
+
 def test_scenario_payload_without_withholding_says_so():
     p = L.scenario_payload(scenario_bundle(ScenarioSpec.model_validate(minimal_spec_dict())))
     assert p["withheld_brief"] is None and p["removed_spans"] == []
@@ -127,8 +146,12 @@ def test_judge_uses_opus_first_with_versioned_prompts_and_the_rubric():
     judge = L.Judge(chat=chat)
     out, model = judge.judge_scenario(scenario_bundle())
     assert model == "anthropic/claude-opus-5" == L.AUDIT_MODEL and out["coherent"] is True and out["fair_tests"] is False
+    assert out["fact_scope"] == {"f01": {"within_contract": True, "reason": "asserts the ValueError t1 checks"},
+                                 "withheld-001": {"within_contract": True, "reason": "the reporter's own traceback"}}
     call = chat.calls[0]
-    assert L.SCENARIO_PROMPT_VERSION in call["system"] and R.RUBRIC["fair_tests"] in call["system"]
+    assert L.SCENARIO_PROMPT_VERSION == "task-sense-scenario-v2" and L.SCENARIO_PROMPT_VERSION in call["system"]
+    assert R.RUBRIC["fair_tests"] in call["system"] and R.RUBRIC["facts_within_contract"] in call["system"]
+    assert "fact_scope" in call["schema"] and "within_contract" in call["schema"]
     payload = json.loads(call["messages"][0]["content"])
     assert "hidden_tests" in payload and payload["fail_to_pass"] == ["t1"]
     out, model = judge.judge_trial(trial_bundle())
@@ -182,7 +205,11 @@ def test_coerce_scenario_accepts_strings_and_fills_unknowns():
     assert out["coherent"] is True and out["fair_tests"] is False and out["plausible_withholding"] is None
     assert out["reasons"]["coherent"] == "ok" and out["reasons"]["fair_tests"] and out["unfair_tests"] == []
     out = L.coerce_scenario({"coherent": True, "fair_tests": {"label": False, "unfair": [{"test": "t1"}, "t2"]}})
-    assert out["coherent"] is True and out["unfair_tests"] == ["t1", "t2"]
+    assert out["coherent"] is True and out["unfair_tests"] == ["t1", "t2"] and out["fact_scope"] == {}
+    out = L.coerce_scenario({"coherent": True, "fact_scope": [{"fact_id": "f05", "within_contract": "false", "reason": " widens the ask "},
+                                                               {"fact_id": None, "within_contract": True}, "junk",
+                                                               {"fact_id": "f01", "within_contract": True}, {"fact_id": "f05", "within_contract": True}]})
+    assert out["fact_scope"] == {"f05": {"within_contract": False, "reason": "widens the ask"}, "f01": {"within_contract": True, "reason": ""}}
     with pytest.raises(L.AuditOutputError):
         L.coerce_scenario([])
 
