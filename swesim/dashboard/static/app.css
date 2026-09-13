@@ -261,3 +261,6 @@ mark.removed { background: var(--mark-wash); color: inherit; border-bottom: 2px 
 .tree .file .name { font-family: var(--font-mono); font-size: var(--fs-0); word-break: break-all; }
 .tree .file .size { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); font-size: var(--fs-0); }
 .preview pre { max-height: 60vh; }
+/* superseded funnel segment (funnel reconciliation, 2026-09-13) */
+.chart .bar.warn rect { fill: var(--warn); }
+.legend .swatch.warn { background: var(--warn); }
