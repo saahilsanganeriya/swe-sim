@@ -243,3 +243,28 @@ def test_ci_build_failure_never_publishes_a_deploy_digest(tmp_path: Path, build_
     result = subprocess.run(["bash", "-eo", "pipefail", "-c", body], cwd=tmp_path, env=env, capture_output=True, text=True)
     assert result.returncode != 0
     assert not output.exists(), "no digest output may reach Terraform after a build failure"
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_local_deploy_checks_open_workflows_before_build(tmp_path: Path, override: bool):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name, body in {"gcloud": "exit 0", "uv": "printf 'TrialWorkflow\\t1\\n'"}.items():
+        tool = fake / name
+        tool.write_text("#!/bin/bash\n" + body + "\n")
+        tool.chmod(0o755)
+    calls = tmp_path / "calls"
+    overrides = tmp_path / "override.mk"
+    overrides.write_text("require-project apply migrate verify-cloud:\n\t@true\n"
+                         "pin-image:\n\t@printf 'build\\n' >> $(CALLS)\n")
+    root = SCRIPTS.parents[1]
+    result = subprocess.run(["make", "--no-print-directory", "-f", str(root / "Makefile"), "-f", str(overrides),
+                             "deploy", "PROJECT=test", "UV=uv", f"PATH={fake}:/usr/bin:/bin", f"CALLS={calls}",
+                             f"EVIDENCE_DIR={tmp_path / 'evidence'}", f"OVERRIDE_OPEN_EXECUTIONS={int(override)}",
+                             f"MAKE=make --no-print-directory -f {root / 'Makefile'} -f {overrides}"],
+                            cwd=root, capture_output=True, text=True)
+    assert (result.returncode == 0) is override, result.stdout + result.stderr
+    assert calls.exists() is override
+    evidence = next((tmp_path / "evidence").glob("open-types-*.txt")).read_text()
+    assert "TrialWorkflow\t1" in evidence
+    assert ("Explicit operator override" in evidence) is override
