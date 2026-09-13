@@ -1,64 +1,55 @@
-"""Thin Temporal client helpers used by the CLI and the console. No secrets in payloads or memos."""
+"""Thin Temporal client helpers used by the CLI, the worker and the console. No secrets in payloads, memos or logs.
+
+Connection settings come from `Settings` (process environment, then the env file named by SWESIM_ENV_FILE): the CLI
+reaches the same namespace as the worker without exporting anything. Temporal Cloud is detected by the presence of
+`TEMPORAL_API_KEY` (read on demand with `swesim.settings.secret`, TLS on, the namespace routing header set);
+`describe_connection` reports only the auth mode.
+"""
 from __future__ import annotations
 
-import os
-from pathlib import Path
 import uuid
+from typing import Mapping
 
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
 
+from swesim.settings import MissingSecret, Settings, get_settings, secret
+from swesim.workflows import queues
 from swesim.workflows.workflows import CandidateWorkflow, CreateTasksWorkflow, PipelineWorkflow, RunMatrixWorkflow, RunTasksWorkflow
 
-TASK_QUEUE = "swesim"
+TASK_QUEUE = queues.AUTHORING  # operator workflows start here; children are started here too
 TYPES = {"create": "CreateTasksWorkflow", "candidate": "CandidateWorkflow", "run": "RunTasksWorkflow",
          "pipeline": "PipelineWorkflow", "matrix": "RunMatrixWorkflow", "trial": "TrialWorkflow"}
 REJECT_DUP = WorkflowIDReusePolicy.REJECT_DUPLICATE
+TEMPORAL_KEYS = ("TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE", "TEMPORAL_API_KEY")  # the variables the connection depends on
 
 
-TEMPORAL_KEYS = ("TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE", "TEMPORAL_API_KEY", "TEMPORAL_TLS_CERT", "TEMPORAL_TLS_KEY")
+def _settings(environ: Mapping[str, str] | None) -> Settings:
+    return get_settings() if environ is None else Settings.from_env(environ)
 
 
-def _connection_env() -> dict:
-    """Process environment first; for the Temporal keys only, fall back to the python-dotenv file named by SWESIM_ENV_FILE
-    (default ~/Documents/.env, becoming ./.env), so the CLI reaches the same namespace as the worker without exporting anything."""
-    e = dict(os.environ)
-    if not all(k in e for k in ("TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE")):
-        try:
-            from dotenv import dotenv_values
-            path = Path(os.environ.get("SWESIM_ENV_FILE", str(Path.home() / "Documents" / ".env")))
-            if path.is_file():
-                for k, v in dotenv_values(path).items():
-                    if k in TEMPORAL_KEYS and v and k not in e:
-                        e[k] = v
-        except ImportError:  # dotenv is a project dependency; keep the client importable without it
-            pass
-    return e
-
-
-def connect_kwargs(env: dict | None = None) -> dict:
-    """Connection settings from the environment. Local dev server by default; Temporal Cloud with `TEMPORAL_API_KEY` (TLS on,
-    address like `us-central1.gcp.api.temporal.io:7233`, namespace like `swesim.abcde`) or mTLS with `TEMPORAL_TLS_CERT` /
-    `TEMPORAL_TLS_KEY` (PEM file paths). The key value never appears in logs: `describe_connection` reports only the mode."""
-    e = _connection_env() if env is None else env
-    kw: dict = {"target_host": e.get("TEMPORAL_ADDRESS", "localhost:7233"), "namespace": e.get("TEMPORAL_NAMESPACE", "default")}
-    if e.get("TEMPORAL_API_KEY"):
-        # Temporal Cloud regional endpoints route by this header; measured 2026-09-13: without it the same key is "Request unauthorized".
-        kw["api_key"] = e["TEMPORAL_API_KEY"]; kw["tls"] = True; kw["rpc_metadata"] = {"temporal-namespace": kw["namespace"]}
-    elif e.get("TEMPORAL_TLS_CERT") and e.get("TEMPORAL_TLS_KEY"):
-        from temporalio.service import TLSConfig
-        kw["tls"] = TLSConfig(client_cert=Path(e["TEMPORAL_TLS_CERT"]).read_bytes(), client_private_key=Path(e["TEMPORAL_TLS_KEY"]).read_bytes())
+def connect_kwargs(environ: Mapping[str, str] | None = None) -> dict:
+    """Connection settings from `Settings` (or from an explicit mapping, for tools and tests). Local dev server by
+    default; Temporal Cloud when `TEMPORAL_API_KEY` is present (TLS on, address like `us-central1.gcp.api.temporal.io:7233`,
+    namespace like `swesim.abcde`). The key never appears in logs: `describe_connection` reports only the mode."""
+    s = _settings(environ)
+    kw: dict = {"target_host": s.temporal_address, "namespace": s.temporal_namespace}
+    try:
+        api_key = secret("TEMPORAL_API_KEY", s, environ)
+    except MissingSecret:
+        return kw
+    # Temporal Cloud regional endpoints route by this header; measured 2026-09-13: without it the same key is "Request unauthorized".
+    kw.update(api_key=api_key, tls=True, rpc_metadata={"temporal-namespace": s.temporal_namespace})
     return kw
 
 
-def describe_connection(env: dict | None = None) -> str:
-    kw = connect_kwargs(env)
-    mode = "api-key" if "api_key" in kw else "mtls" if kw.get("tls") else "plain"
-    return f"temporal={kw['target_host']} namespace={kw['namespace']} auth={mode}"
+def describe_connection(environ: Mapping[str, str] | None = None) -> str:
+    kw = connect_kwargs(environ)
+    return f"temporal={kw['target_host']} namespace={kw['namespace']} auth={'api-key' if 'api_key' in kw else 'plain'}"
 
 
-async def connect() -> Client:
-    return await Client.connect(**connect_kwargs())
+async def connect(environ: Mapping[str, str] | None = None) -> Client:
+    return await Client.connect(**connect_kwargs(environ))
 
 
 def _summary(params: dict) -> dict:
@@ -133,9 +124,9 @@ async def progress(workflow_id: str) -> dict:
 
 
 async def cancel(workflow_id: str) -> None:
-    """Request cancellation; children are cancelled with the parent. A cancelled trial's systemd unit keeps running on the
-    VM and finishes on its own, but no workflow collects it afterwards (its trial id is consumed); a later run uses a new
-    attempt index and is a fresh launch, never a relaunch of the cancelled one."""
+    """Request cancellation; children are cancelled with the parent. A cancelled TrialWorkflow asks its launcher to stop
+    the runtime (`cancel_trial_activity`); its trial id is consumed, so a later run uses a new attempt index and is a
+    fresh launch, never a relaunch of the cancelled one."""
     c = await connect()
     await c.get_workflow_handle(workflow_id).cancel()
 
