@@ -6,8 +6,10 @@ RUN if id agent >/dev/null 2>&1; then echo 'agent user pre-exists in base image;
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && uv --version
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 RUN uv python install {{ agent_python }} && ln -s "$(uv python find {{ agent_python }})" /usr/local/bin/swesim-python && /usr/local/bin/swesim-python -I -c 'import sys; print(sys.version)'
-# Assert the prepared checkout, then record the base file manifest (the verifier image records the same one).
+# Assert the prepared checkout, apply the submodule rule (declared paths empty, placeholders removed), then record the
+# base file manifest (the verifier image runs the same steps and records the same one).
 RUN cd {{ repo_dir_q }} && test "$(git rev-parse HEAD)" = {{ base_commit }} \
+ && {{ submodule_guard }} \
  && mkdir -p /opt/swesim && find . -path ./.git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > /opt/swesim/base-manifest.txt
 # A new base-only git object database removes remote refs, future objects and reflogs.
 RUN cd {{ repo_dir_q }} && rm -rf .git && git init -q && git config user.name swesim && git config user.email swesim@localhost \

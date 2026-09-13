@@ -51,8 +51,36 @@ def test_anthropic_no_text_twice_raises_llmerror_with_evidence(monkeypatch):
     assert len(calls) == 2
 
 
-def test_openai_gpt5_gets_no_temperature_and_max_completion_tokens():
+def test_openai_gpt5_gets_no_temperature_and_reasoning_headroom():
     kw = llm._openai_kwargs("gpt-5.5", 0.0, 123)
-    assert "temperature" not in kw and kw["max_completion_tokens"] == 123
+    assert "temperature" not in kw and kw["max_completion_tokens"] == 123 + llm.OPENAI_REASONING_HEADROOM
+    assert kw["reasoning_effort"] == "low"
     kw = llm._openai_kwargs("gpt-4.1", 0.0, 5)
-    assert kw["temperature"] == 0.0
+    assert kw["temperature"] == 0.0 and kw["max_completion_tokens"] == 5 and "reasoning_effort" not in kw
+
+
+def _fake_openai(monkeypatch, responses, calls):
+    class Choice:
+        def __init__(self, content, finish):
+            self.message = types.SimpleNamespace(content=content); self.finish_reason = finish
+    class Completions:
+        def create(self, **kw):
+            calls.append(kw); content, finish = responses.pop(0); return types.SimpleNamespace(choices=[Choice(content, finish)])
+    class Client:
+        def __init__(self, **kw): self.chat = types.SimpleNamespace(completions=Completions())
+    monkeypatch.setitem(__import__("sys").modules, "openai", types.SimpleNamespace(OpenAI=Client))
+    monkeypatch.setattr(llm, "_secret", lambda key: "x")
+
+
+def test_openai_empty_reasoning_answer_retries_with_minimal_effort(monkeypatch):
+    calls = []
+    _fake_openai(monkeypatch, [("", "length"), ('{"ok": 1}', "stop")], calls)
+    assert llm.chat_json("openai/gpt-5.5", "sys", [{"role": "user", "content": "q"}], "{}", max_tokens=100) == {"ok": 1}
+    assert [c["reasoning_effort"] for c in calls] == ["low", "minimal"]
+
+
+def test_openai_empty_twice_raises(monkeypatch):
+    calls = []
+    _fake_openai(monkeypatch, [("", "length"), ("", "length")], calls)
+    with pytest.raises(llm.LLMError, match="finish_reason=length"):
+        llm.chat_json("openai/gpt-5.5", "sys", [{"role": "user", "content": "q"}], "{}", max_tokens=100)

@@ -50,9 +50,18 @@ def _extract_json(text: str) -> dict:
     return data
 
 
-def _openai_kwargs(name: str, temperature: float | None, max_tokens: int) -> dict:
+OPENAI_REASONING_HEADROOM = 8000   # completion-token headroom for gpt-5/o-series reasoning tokens, on top of the caller's max_tokens
+OPENAI_REASONING_EFFORTS = ("low", "minimal")  # first attempt, then the retry when the answer came back empty (finish_reason length)
+
+
+def _openai_kwargs(name: str, temperature: float | None, max_tokens: int, effort: str | None = None) -> dict:
     kwargs: dict = {"response_format": {"type": "json_object"}, "max_completion_tokens": max_tokens}
     if temperature is not None and not name.startswith(_NO_TEMPERATURE_PREFIXES): kwargs["temperature"] = temperature
+    if name.startswith(_NO_TEMPERATURE_PREFIXES):
+        # Reasoning models spend completion tokens on hidden reasoning first; observed live: gpt-5.5 returned empty
+        # content under a 4000-token cap on the judge prompt. Bound the effort and add headroom.
+        kwargs["max_completion_tokens"] = max_tokens + OPENAI_REASONING_HEADROOM
+        kwargs["reasoning_effort"] = effort or OPENAI_REASONING_EFFORTS[0]
     return kwargs
 
 
@@ -84,5 +93,12 @@ def chat_json(model_id: str, system: str, messages: list[dict], schema_hint: str
         raise LLMError(f"no text block from {model_id}: {last}")
     from openai import OpenAI
     client = OpenAI(api_key=_secret("OPENAI_API_KEY"), timeout=120, max_retries=1)
-    r = client.chat.completions.create(model=name, messages=[{"role": "system", "content": sys_prompt}, *messages], **_openai_kwargs(name, temperature, max_tokens))
-    return _extract_json(r.choices[0].message.content or "")
+    efforts = OPENAI_REASONING_EFFORTS if name.startswith(_NO_TEMPERATURE_PREFIXES) else (None,)
+    last = None
+    for effort in efforts:
+        r = client.chat.completions.create(model=name, messages=[{"role": "system", "content": sys_prompt}, *messages], **_openai_kwargs(name, temperature, max_tokens, effort))
+        text = r.choices[0].message.content or ""
+        if text.strip():
+            return _extract_json(text)
+        last = f"finish_reason={r.choices[0].finish_reason} effort={effort}"
+    raise LLMError(f"no text from {model_id}: {last}")

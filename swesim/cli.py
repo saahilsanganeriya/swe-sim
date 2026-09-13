@@ -109,16 +109,19 @@ def judge(
 
     rows = _rows(candidates)[:limit]
     out = candidates.with_suffix(".judged.jsonl")
-    kept = 0
-    with out.open("w") as fh:
+    tmp = out.with_suffix(".jsonl.tmp")
+    kept = errors = 0
+    with tmp.open("w") as fh:
         for row in rows:
             try:
                 row["judge"] = judge_candidate(row, model)
-            except ValueError as e:
-                row["judge"] = {"keep": False, "error": str(e)}
+            except Exception as e:  # one bad row (provider hiccup, oversize payload) must not abort or wipe the file
+                row["judge"] = {"keep": False, "error": f"{type(e).__name__}: {str(e)[:300]}"}
+                errors += 1
             kept += int(bool(row["judge"].get("keep")))
             fh.write(json.dumps(row) + "\n")
-    typer.echo(json.dumps({"judged": out.as_posix(), "rows": len(rows), "keep": kept}))
+    os.replace(tmp, out)  # the previous judged file survives a crash mid-run
+    typer.echo(json.dumps({"judged": out.as_posix(), "rows": len(rows), "keep": kept, "errors": errors}))
 
 
 @app.command("judge-calibrate")
