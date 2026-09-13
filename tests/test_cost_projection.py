@@ -42,3 +42,17 @@ def test_accounting_summary_is_a_known_total_and_rejects_missing_measurement_as_
     summary = costs.accounting_summary(ws)
     assert summary['known_usd'] == Decimal('0.006000') and summary['unpriced_rows'] == 1
     assert summary['unknown_usage_attempts'] == 1 and summary['complete'] is False and summary['records'] == 2
+
+
+def test_preserved_trial_without_solver_ledger_is_not_claimed_complete(tmp_path):
+    ws = Workspace(tmp_path)
+    atomic_json(ws.root / 'trials' / ('a' * 24) / 'record.json', {'model': 'openai/gpt-5.6-sol', 'status': 'completed', 'cost_usd': None})
+    assert costs.accounting_status(ws)['incomplete_solver_records'] == 1
+    assert costs.accounting_summary(ws)['complete'] is False
+
+
+def test_preserved_draft_without_accounting_is_not_claimed_free(tmp_path):
+    ws = Workspace(tmp_path)
+    atomic_json(ws.root / 'scenarios' / 'x' / 'draft.meta.json', {'model_id': 'openai/gpt-5.6-sol', 'usage': {'recorded': False}})
+    assert costs.accounting_status(ws)['incomplete_draft_records'] == 1
+    assert costs.accounting_summary(ws)['complete'] is False
