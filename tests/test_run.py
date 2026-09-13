@@ -1,5 +1,6 @@
 """Run stage: visible view, per-trial task materialization, run_trial with mocked Harbor and stakeholder."""
 import json, tomllib
+from decimal import Decimal
 
 import pytest
 
@@ -101,7 +102,7 @@ def scene(tmp_path, monkeypatch):
         if cond == "interactive": (tdir / "agent_config.yaml").write_bytes(scaffold.read_bytes())  # compile-time scaffold copy
     calls = {"post": [], "get": [], "run": []}
     H = "a" * 64
-    state = {"transcript_hash": H, "frozen": True, "report": {"transcript_hash": H, "patch_sha256": "p"}, "exception": None}
+    state = {"transcript_hash": H, "frozen": True, "report": {"transcript_hash": H, "patch_sha256": "p"}, "exception": None, "trajectory": None}
 
     def fake_post(url, body, headers):
         calls["post"].append((url, body, headers))
@@ -121,10 +122,15 @@ def scene(tmp_path, monkeypatch):
         if state["exception"] is None:
             (d / "verifier" / "reward.json").write_text(json.dumps({"reward": 1.0, "success": 1, "outcome_code": 1}))
             (d / "verifier" / "report.json").write_text(json.dumps(state["report"]))
+        if state["trajectory"] is not None:                                     # the agent's own trajectory, as Harbor's adapter leaves it
+            (d / "agent").mkdir()
+            name = "mini-swe-agent.trajectory.json" if "messages" in state["trajectory"] else "trajectory.json"
+            (d / "agent" / name).write_text(json.dumps(state["trajectory"]))
         return d
 
     monkeypatch.setattr(run, "_post", fake_post); monkeypatch.setattr(run, "_get", fake_get)
     monkeypatch.setattr(harbor_cli, "run_task", fake_run)
+    monkeypatch.setattr(run, "has_secret", lambda name, settings=None: True)   # every provider key present unless a test says otherwise
     return ws, spec, calls, state
 
 
@@ -192,7 +198,8 @@ def test_run_trial_records_timestamps(scene, monkeypatch):
         start, end = datetime.fromisoformat(d["started_at"]), datetime.fromisoformat(d["finished_at"])
         assert start.tzinfo == timezone.utc and end.tzinfo == timezone.utc and start <= end
     assert status["started_at"] == running["started_at"] == record["started_at"] == rec.started_at and record["finished_at"] == rec.finished_at
-    assert list(record)[-2:] == ["started_at", "finished_at"]            # appended after the frozen TrialRecord fields
+    # appended after the frozen TrialRecord fields, in order: timestamps, then the solver cost (interfaces section 6)
+    assert list(record)[-6:] == ["started_at", "finished_at", "cost_usd", "input_tokens", "output_tokens", "price_source"]
     assert TrialRecord(**record) == rec and run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 0, URL, "secret") == rec
 
 
@@ -312,3 +319,75 @@ def test_interactive_runs_layer_the_stakeholder_scaffold_config(scene, monkeypat
     assert rec.report["agent_config_sha256"] == hashlib.sha256(tpl.read_bytes()).hexdigest()
     rec2 = run_trial(ws, spec, RunConfig(condition="hidden", model="openai/gpt-5.5"), 0, URL, "secret")
     assert "config_file" not in seen[-1] and rec2.report["agent_config_sha256"] is None
+
+
+# ------------------------------------------------------------------ providers, OpenRouter and the solver cost (interfaces sections 6-7)
+
+def _mini_traj(or_costs=None, model="openrouter/deepseek/deepseek-v3.2"):
+    msgs = []
+    for i in range(2):
+        usage = {"prompt_tokens": 1000 * (i + 1), "completion_tokens": 50, "prompt_tokens_details": {"cached_tokens": 800 * i}}
+        if or_costs is not None:
+            usage["cost"] = or_costs[i]
+        msgs.append({"role": "assistant", "content": "a", "extra": {"actions": [], "cost": 0.0, "timestamp": 1.0, "response": {"usage": usage}}})
+        msgs.append({"role": "tool", "content": "o", "extra": {"returncode": 0}})
+    return {"info": {"model_stats": {"instance_cost": 0.0, "api_calls": 2}, "config": {"model": {"model_name": model}}}, "messages": msgs,
+            "trajectory_format": "mini-swe-agent-1.1"}
+
+
+def test_provider_table_and_the_env_each_solver_needs_forwarded():
+    assert run.PROVIDER_HOSTS == {"anthropic": "api.anthropic.com", "openai": "api.openai.com", "openrouter": "openrouter.ai"}
+    assert run.agent_env_names("openrouter/deepseek/deepseek-v3.2") == ("OPENROUTER_API_KEY",)
+    assert run.agent_env_names("anthropic/claude-haiku-4-5-20251001") == ("ANTHROPIC_API_KEY",) and run.agent_env_names("openai/gpt-5.5") == ("OPENAI_API_KEY",)
+    with pytest.raises(ValueError):
+        run.agent_env_names("mistral/x")
+    assert issubclass(run.ProviderKeyMissing, ValueError)                    # configuration, not a transient failure: never retried
+
+
+def test_openrouter_solver_allowlists_openrouter_ai_passes_the_id_verbatim_and_records_the_generation_cost(scene):
+    ws, spec, calls, state = scene
+    state["trajectory"] = _mini_traj(or_costs=(0.000012, 0.00002))
+    rc = RunConfig(condition="hidden", model="openrouter/deepseek/deepseek-v3.2")
+    rec = run_trial(ws, spec, rc, 0, URL, "secret")
+    tdir = ws.root / "trials" / rec.trial_id
+    tc = tomllib.loads((tdir / "task" / "task.toml").read_text())
+    assert "openrouter.ai" in tc["agent"]["allowed_hosts"] and "openrouter.ai" in tc["environment"]["allowed_hosts"]
+    assert "api.openai.com" in tc["agent"]["allowed_hosts"]                    # compiled hosts are kept, the run's provider is added
+    assert calls["run"][0][4] == "openrouter/deepseek/deepseek-v3.2"           # mini-swe-agent/litellm take the id verbatim
+    assert rec.status == "completed" and rec.model == rc.model
+    assert rec.cost_usd == pytest.approx(0.000032) and rec.price_source == "openrouter-generation" and (rec.input_tokens, rec.output_tokens) == (3000, 100)
+    rows = json.loads((tdir / "costs.json").read_text())
+    assert len(rows) == 1 and rows[0]["role"] == "solver" and rows[0]["model"] == rc.model and rows[0]["trial_id"] == rec.trial_id
+    assert rows[0]["usd"] == "0.000032" and rows[0]["price_source"] == "openrouter-generation" and rows[0]["provider"] == "openrouter"
+    record = json.loads((tdir / "record.json").read_text())
+    assert record["cost_usd"] == rec.cost_usd and record["price_source"] == "openrouter-generation" and record["input_tokens"] == 3000
+    assert run_trial(ws, spec, rc, 0, URL, "secret") == rec and len(json.loads((tdir / "costs.json").read_text())) == 1   # idempotent
+
+
+def test_solver_cost_comes_from_the_price_table_when_the_provider_reports_none(scene):
+    ws, spec, calls, state = scene
+    state["trajectory"] = {"schema_version": "ATIF-v1.6", "session_id": "s", "agent": {"name": "mini-swe-agent", "model_name": "openai/gpt-5.5"}, "steps": [],
+                           "final_metrics": {"total_prompt_tokens": 1_000_000, "total_completion_tokens": 100_000, "total_cached_tokens": 0,
+                                             "total_cost_usd": 7.5, "total_steps": 1}}
+    rec = run_trial(ws, spec, RunConfig(condition="hidden", model="openai/gpt-5.5"), 0, URL, "secret")
+    assert rec.cost_usd == 8.0 and rec.price_source == "openai-pricing-page"     # $5 x 1M input + $30 x 100k output; the agent's own 7.5 estimate is not the record
+    rows = json.loads((ws.root / "trials" / rec.trial_id / "costs.json").read_text())
+    assert Decimal(rows[0]["usd"]) == Decimal("8")
+
+
+def test_trial_without_usage_evidence_records_an_unknown_cost_never_zero(scene):
+    ws, spec, calls, state = scene
+    rec = run_trial(ws, spec, RunConfig(condition="hidden", model="openai/gpt-5.5"), 0, URL, "secret")
+    assert rec.cost_usd is None and rec.price_source is None and rec.input_tokens is None and rec.output_tokens is None
+    assert not (ws.root / "trials" / rec.trial_id / "costs.json").exists()
+
+
+def test_missing_provider_key_stops_the_trial_before_any_session_or_launch(scene, monkeypatch):
+    ws, spec, calls, state = scene
+    monkeypatch.setattr(run, "has_secret", lambda name, settings=None: name != "OPENROUTER_API_KEY")
+    rc = RunConfig(condition="interactive", model="openrouter/deepseek/deepseek-v3.2")
+    with pytest.raises(run.ProviderKeyMissing, match="OPENROUTER_API_KEY"):
+        run_trial(ws, spec, rc, 0, URL, "secret")
+    assert calls["post"] == [] and calls["run"] == [] and not (ws.root / "trials").exists()   # nothing created: reconcile has nothing to see
+    rec = run_trial(ws, spec, RunConfig(condition="hidden", model="anthropic/claude-haiku-4-5-20251001"), 0, URL, "secret")
+    assert rec.status == "completed"                                                        # other providers unaffected
