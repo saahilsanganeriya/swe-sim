@@ -34,14 +34,20 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # build.sh archives an arbitrary commit
       - name: Resolve commit
         id: sha
+        env:
+          SHA_INPUT: ${{ inputs.sha }}
         run: |
-          sha=$(git rev-parse --verify "${{ inputs.sha != '' && inputs.sha || github.sha }}^{commit}")
+          sha=$(git rev-parse --verify "${SHA_INPUT:-$GITHUB_SHA}^{commit}")
+          git checkout --detach "$sha"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "- commit: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-python@v5
@@ -50,7 +56,10 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --frozen
+      - run: |
+          uv sync --extra dev --frozen
+          uv run --frozen --offline python -m pytest -q tests --ignore=tests/integration
+          uv run --frozen --offline ruff check --select E9,F swesim tests scripts
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.WIF_PROVIDER }}
@@ -70,15 +79,16 @@ jobs:
           OVERRIDE: ${{ inputs.override_open_executions }}
         run: |
           if ! uv run --frozen swesim workflows open-types --help >/dev/null 2>&1; then
-            echo "::warning::'swesim workflows open-types' is not available in this checkout; the open-executions check was skipped"
-            echo "- open-executions check: **skipped** (command missing)" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            echo "::error::'swesim workflows open-types' is required before a deploy"
+            exit 1
           fi
           TEMPORAL_ADDRESS=$(terraform -chdir=infra output -raw temporal_address)
           TEMPORAL_NAMESPACE=$(terraform -chdir=infra output -raw temporal_namespace)
           TEMPORAL_API_KEY=$(gcloud secrets versions access latest --secret TEMPORAL_API_KEY --project "$GCP_PROJECT")
           echo "::add-mask::$TEMPORAL_API_KEY"
           export TEMPORAL_ADDRESS TEMPORAL_NAMESPACE TEMPORAL_API_KEY
+          printf 'TEMPORAL_ADDRESS=%s\nTEMPORAL_NAMESPACE=%s\nTEMPORAL_API_KEY=%s\n' \
+            "$TEMPORAL_ADDRESS" "$TEMPORAL_NAMESPACE" "$TEMPORAL_API_KEY" >> "$GITHUB_ENV"
           uv run --frozen swesim workflows open-types | tee open-types.txt
           { echo "### Open executions per workflow type"; echo '```'; cat open-types.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           # Any listed type (a non-empty, non-comment line) means open executions exist.
@@ -96,12 +106,19 @@ jobs:
         id: build
         run: |
           digest=$(bash scripts/cloud/build.sh "$GCP_PROJECT" "$GCP_REGION" "${{ steps.sha.outputs.sha }}" | tail -n1)
+          if [[ ! "$digest" =~ @sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::build did not yield a pinned digest; refusing to apply"
+            exit 1
+          fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "- image: \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
       - name: Terraform plan
         run: |
           terraform -chdir=infra plan -input=false -no-color -var "image=${{ steps.build.outputs.digest }}" -out=plan.out | tee plan.txt
           { echo "- plan: $(grep -E '^(Plan:|No changes)' plan.txt | head -n1)"; } >> "$GITHUB_STEP_SUMMARY"
+          terraform -chdir=infra show -json plan.out | \
+            jq -e '[.resource_changes[]? | select(.change.actions != ["no-op"]) | select(.address | startswith("module.run[") | not)] | length == 0' >/dev/null || \
+            { echo "::error::plan changes infrastructure outside module.run; apply from an operator machine first"; exit 1; }
       - name: Terraform apply
         run: |
           terraform -chdir=infra apply -input=false -no-color plan.out

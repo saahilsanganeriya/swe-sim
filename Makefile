@@ -68,7 +68,7 @@ tf-init: require-project
 
 # Non-secret Terraform inputs from the env file + gcloud account + git remote; a copy goes next to the state so the
 # GitHub deploy workflow applies with the same values.
-tfvars: require-project
+tfvars: tf-init
 	$(UV) python scripts/cloud/tfvars_from_env.py $(ENV_FILE_FLAGS) --project $(PROJECT) --region $(REGION) --out $(TFVARS)
 	gcloud storage cp $(TFVARS) gs://$(STATE_BUCKET)/env.auto.tfvars.json --quiet
 
@@ -133,7 +133,10 @@ import-bucket: require-project
 	$(TF) import -input=false module.storage.google_storage_bucket.workspace $(PROJECT)/swesim-$(PROJECT)-workspace
 
 cloud-bootstrap: require-project tf-init tfvars
-	$(MAKE) apply TF_ARGS="-var deploy_workloads=false"
+	state=$$($(TF) state list); \
+	if printf '%s\n' "$$state" | grep -q '^module\.run\['; then \
+	  echo "workloads already exist; preserving them during bootstrap"; \
+	else $(MAKE) apply TF_ARGS="-var deploy_workloads=false"; fi
 	$(MAKE) push-secrets
 	$(MAKE) seed-registry
 	$(MAKE) pin-image
