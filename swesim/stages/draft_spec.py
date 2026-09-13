@@ -8,6 +8,7 @@ draft for the approval gates. The result must validate against `ScenarioSpec` or
 """
 from __future__ import annotations
 
+import ast
 import difflib
 import hashlib
 import json
@@ -1096,15 +1097,19 @@ def _split_hunks(chunk: str) -> tuple[str, list[list[str]]]:
     return "".join(head), hunks
 
 
-def _new_side_lines(hunk: list[str]):
+def _new_side_lines(hunk: list[str], masks: list[list[bool]]):
     """(index, line, code) for the new-side lines of a hunk (context and added), with the string/comment state carried across
     lines so `code` is only what is code on that line."""
-    state = {"quote": None}
+    match = _HUNK.match(hunk[0].rstrip("\n"))
+    if match is None:
+        return
+    lineno = int(match.group(3)) - 1
     for li, line in enumerate(hunk[1:], start=1):
         if line.startswith(("-", "\\")):
             continue
         text = line[1:]
-        mask = _code_mask(text, state)
+        mask = masks[lineno]
+        lineno += 1
         yield li, line, _code_of(text, mask), mask
 
 
@@ -1120,14 +1125,16 @@ def _shift_new_starts(hunks: list[list[str]], delta: int) -> list[list[str]]:
     return out
 
 
-def _incorrect_variants(head: str, hunks: list[list[str]]):
+def _incorrect_variants(head: str, hunks: list[list[str]], gold_text: str):
     """Real incorrect changes derived from one code chunk of the gold patch. First, one added line with a comparison or boolean
     inverted at a code position (never inside a string, docstring or comment), preferring `if`/`elif`/`while`/`return`/
     `assert`/`raise` statements; then, one added non-header statement line dropped (hunk recounted, an emptied hunk removed,
     later new-side starts shifted either way). Yields (method, diff)."""
+    state = {"quote": None}
+    masks = [_code_mask(line, state) for line in gold_text.splitlines(keepends=True)]
     inversions = []
     for hi, hunk in enumerate(hunks):
-        for li, line, code, mask in _new_side_lines(hunk):
+        for li, line, code, mask in _new_side_lines(hunk, masks):
             if not line.startswith("+") or not code:
                 continue
             inverted = _invert_once(line[1:], mask)
@@ -1143,7 +1150,7 @@ def _incorrect_variants(head: str, hunks: list[list[str]]):
             continue
         a, b, c, d, trailer = m.groups()
         b, d = int(b) if b is not None else 1, int(d) if d is not None else 1
-        for li, line, code, _mask in _new_side_lines(hunk):
+        for li, line, code, _mask in _new_side_lines(hunk, masks):
             if not line.startswith("+") or not code or code.startswith(_HEADER_STARTS) or code.endswith(":"):
                 continue
             if li + 1 < len(hunk) and hunk[li + 1].startswith("\\"):
@@ -1158,6 +1165,52 @@ def _incorrect_variants(head: str, hunks: list[list[str]]):
             break
 
 
+def _apply_hunks(base: str, hunks: list[list[str]]) -> str | None:
+    """Reconstruct a file using exact base offsets and context; reject incomplete or inconsistent hunks."""
+    lines = base.splitlines(keepends=True)
+    out: list[str] = []
+    cursor = 0
+    for hunk in hunks:
+        match = _HUNK.match(hunk[0].rstrip("\n"))
+        if match is None:
+            return None
+        start, count, _, new_count, _ = match.groups()
+        old: list[str] = []
+        new: list[str] = []
+        previous = ""
+        for line in hunk[1:]:
+            if line.startswith("\\"):
+                if previous in (" ", "-") and old: old[-1] = old[-1].rstrip("\n")
+                if previous in (" ", "+") and new: new[-1] = new[-1].rstrip("\n")
+                continue
+            if line[:1] in (" ", "-"): old.append(line[1:])
+            if line[:1] in (" ", "+"): new.append(line[1:])
+            previous = line[:1]
+        if len(old) != int(count or 1) or len(new) != int(new_count or 1):
+            return None
+        offset = int(start) - (1 if old else 0)
+        if offset < cursor or lines[offset:offset + len(old)] != old:
+            return None
+        out.extend(lines[cursor:offset]); out.extend(new)
+        cursor = offset + len(old)
+    out.extend(lines[cursor:])
+    return "".join(out)
+
+
+def _executable_ast(text: str) -> str | None:
+    """AST without location data or docstrings; syntax errors cannot establish an executable control."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                node.body = node.body[1:]
+    return ast.dump(tree, include_attributes=False)
+
+
 def fallback_plausible_wrong(gold_patch: str, base_files: dict[str, str | None]) -> tuple[str, str, bool | None] | None:
     """Code-generated stand-in when the model's plausible-wrong patch is unusable after the correction round (ScenarioSpec
     requires one plausible-wrong control). It must be a real incorrect change: from the first CODE chunk of the gold patch
@@ -1167,12 +1220,21 @@ def fallback_plausible_wrong(gold_patch: str, base_files: dict[str, str | None])
     meaningless control."""
     for chunk in (c for c in re.split(r"(?=^diff --git )", gold_patch or "", flags=re.M) if c.strip()):
         m = re.match(r"diff --git a/(\S+)", chunk)
-        if not m or not is_code_path(m.group(1)):
+        if not m or not is_code_path(m.group(1)) or not m.group(1).endswith(".py") or m.group(1) not in base_files:
             continue
         head, hunks = _split_hunks(chunk)
-        for method, diff in _incorrect_variants(head, hunks):
-            ok, _ = verify_diff_applies(base_files, diff)
-            if ok is not False:
+        base = base_files[m.group(1)] or ""
+        gold_text = _apply_hunks(base, hunks)
+        gold_ast = _executable_ast(gold_text) if gold_text is not None else None
+        if gold_ast is None:
+            continue
+        for method, diff in _incorrect_variants(head, hunks, gold_text):
+            modified = _apply_hunks(base, _split_hunks(diff)[1])
+            modified_ast = _executable_ast(modified) if modified is not None else None
+            if modified_ast is None or modified_ast == gold_ast:
+                continue
+            ok, reason = verify_diff_applies(base_files, diff)
+            if ok is True or (ok is None and reason.startswith("no-git:")):
                 return diff, method, ok
     return None
 
@@ -1362,6 +1424,8 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
             files, _ = fetch_base_files(row, paths, base_cache)  # unfetched paths stay out of `files` (never mistaken for absent)
             diff, method = build_control_diff(ctrl, files)
         except DraftViolation as e:
+            control_notes.setdefault("control_attempts", []).append({"control": key, "phase": "final" if lenient else "correction",
+                                                                    "label": ctrl.get("name"), "reason": str(e)})
             if lenient:
                 control_notes.setdefault("controls_dropped", []).append({"control": key, "label": ctrl.get("name"), "reason": str(e)})
                 return None, None
@@ -1370,6 +1434,8 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
             return None, None
         ok, msg = verify_diff_applies(files, diff)
         if ok is False or (ok is None and msg.startswith("unfetched:")):
+            control_notes.setdefault("control_attempts", []).append({"control": key, "phase": "final" if lenient else "correction",
+                                                                    "label": ctrl.get("name"), "reason": msg, "method": method})
             if not lenient:
                 raise DraftViolation(f"{key} patch cannot be applied to the base commit (git apply --check): {msg}. Prefer `files` with the complete "
                                      "modified text of each touched, fetched file so the diff is built for you.")
@@ -1383,7 +1449,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
         problems (fed back in the correction round); plain ValueError for drafter errors (never corrected). Lenient mode
         (after the correction round) drops unusable model controls instead: alternative-correct is optional, plausible-wrong
         is replaced by `fallback_plausible_wrong` because ScenarioSpec requires one."""
-        control_notes.clear()
+        # Keep prior correction-round evidence; final selected controls below replace only their summary fields.
         taken = set(control_diffs)
         pw_rec, pw_bytes = control_asset(d, "plausible_wrong", lenient)
         if pw_rec is None:
@@ -1495,6 +1561,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                                               "fact_filter": fact_filter, "rescue_facts": links.get("rescue_facts", []),
                                               "protected_paths_dropped": protected_dropped, "usage": usage,
                                               "controls": control_notes.get("controls", {}), "controls_dropped": control_notes.get("controls_dropped", []),
+                                              "control_attempts": control_notes.get("control_attempts", []),
                                               "controls_fallback": control_notes.get("controls_fallback", {}),
                                               "oracle_apply": {"verified": oracle_ok, "note": oracle_msg, "base_files_fetched": sorted(base_sources), "base_files_skipped": base_skipped},
                                               "runner": {"order": "definition", "order_source": order_source, "ids": selected},

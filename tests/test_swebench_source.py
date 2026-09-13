@@ -1184,6 +1184,7 @@ def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
     meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
     assert meta["controls"]["plausible_wrong"] == {"name": "keyerror", "label": "keyerror", "rationale": "wrong exception type", "method": "difflib", "verified": True}
     assert meta["controls_dropped"] == [] and meta["controls_fallback"] == {} and meta["oracle_apply"]["verified"] is True and meta["oracle_apply"]["base_files_fetched"] == ["xarray/core/weighted.py"]
+    assert any(a["control"] == "plausible_wrong" and a["phase"] == "correction" for a in meta["control_attempts"])
     # still corrupt after the correction round: plausible-wrong is replaced by a REAL incorrect change (an inverted comparison
     # in the gold's first code chunk), a corrupt alternative-correct is dropped
     gold_two = ("diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n"
@@ -1195,7 +1196,7 @@ def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
     meta = json.loads((tmp_path / "s2" / "draft.meta.json").read_text())
     assert spec.controls.plausible_wrong[0].name == "fallback-inverted-comparison" and spec.controls.alternative_correct == []
     assert meta["controls_fallback"] == {"plausible_wrong": "fallback-inverted-comparison"}
-    assert [(x["control"], x["method"]) for x in meta["controls_dropped"]] == [("plausible_wrong", "model-diff"), ("alternative_correct", "model-diff")]
+    assert [(x["control"], x["method"]) for x in meta["controls_dropped"]] == [("plausible_wrong", "model-diff"), ("alternative_correct", "model-diff")] * 2
     fallback_diff = (tmp_path / "s2" / "assets" / "plausible-wrong.diff").read_text()
     assert "+if dim != 'z':" in fallback_diff and "+    raise ValueError(dim)" in fallback_diff and draft_spec.verify_diff_applies(base, fallback_diff) == (True, "")
     # no comparison to invert: one added code line is dropped, the emptied hunk removed and the following hunk re-based
@@ -1213,12 +1214,9 @@ def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
     # a fetch-bound (unfetched) file: the model control is dropped with the reason, never turned into a bogus new-file diff
     monkeypatch.setattr(draft_spec, "MAX_BASE_FILES", 0)
     outputs = iter([second, second]); calls.clear()
-    p = draft_spec.draft(_row(patch=gold_two), _judged(), "fake/model", tmp_path / "s5")
-    meta = json.loads((tmp_path / "s5" / "draft.meta.json").read_text())
-    assert meta["controls_dropped"][0]["control"] == "plausible_wrong" and "could not be fetched" in meta["controls_dropped"][0]["reason"]
-    assert meta["controls_fallback"] == {"plausible_wrong": "fallback-inverted-comparison"} and meta["oracle_apply"]["verified"] is None
-    assert meta["controls"]["plausible_wrong"]["verified"] is None                                   # honest: the fallback could not be checked either
-    assert "new file mode" not in (tmp_path / "s5" / "assets" / "plausible-wrong.diff").read_text()
+    with pytest.raises(ValueError, match="no usable plausible-wrong control"):
+        draft_spec.draft(_row(patch=gold_two), _judged(), "fake/model", tmp_path / "s5")
+    assert not (tmp_path / "s5" / "scenario.draft.json").exists()
     monkeypatch.setattr(draft_spec, "MAX_BASE_FILES", 8)
     # an oracle that does not apply to its base is a drafter error, not a correction
     outputs = iter([_draft_llm(), _draft_llm()])
