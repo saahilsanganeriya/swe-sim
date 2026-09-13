@@ -41,6 +41,7 @@ PATCH_BATCH = "20260913-bounded-batches"
 PATCH_SEARCH = "20260913-search-attributes"
 PATCH_DIFFICULTY = "20260913-difficulty-screen"
 PATCH_AUDIT = "20260913-automatic-audits"
+PATCH_FRONTIER = "20260913-frontier-admission"
 PATCH_SCORE_K = "20260913-requested-score-k"
 PATCH_FROZEN_RETRY = "20260913-frozen-candidate-retry"
 CHILDREN_PER_RUN = 100
@@ -947,6 +948,13 @@ async def _create_batched(self: CreateTasksWorkflow, p: dict) -> dict:
 async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
     resume = p.get('_continuation') or {}
     if not resume:
+        if _patched(PATCH_FRONTIER):
+            admission = await act('frontier_gate_activity', p, 5, retry=retries.READ)
+            if not admission['allowed']:
+                self.state = {'stage': 'complete', 'stopped_reason': 'frontier-gate', 'admission': admission}
+                await index_workflow('completed', {**params_summary(p), 'stopped_reason': 'frontier-gate'})
+                return {'status': 'blocked', 'scenarios': {}, 'trials': {}, 'admission': admission}
+            p = {**p, 'scenario_ids': admission.get('scenario_ids', p.get('scenario_ids', []))}
         self.state = {'stage': 'probing-models'}
         probe = await act('probe_models_activity', p, 5)
         p = {**p, **(probe.get('substitutions') or {}), **(probe.get('resolved') or {})}

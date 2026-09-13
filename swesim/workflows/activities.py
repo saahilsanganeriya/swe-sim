@@ -663,6 +663,9 @@ async def register_activity(p: dict) -> dict:
 
 def plan_trials(p: dict) -> dict:
     """Precompute trial requests with the actual per-model RunConfig; trial ids are the workflow ids."""
+    admission = _frontier_preflight(p)
+    if not admission["allowed"]:
+        raise ValueError("frontier admission rejected: " + "; ".join(admission["reasons"]))
     spec = _spec(p["scenario_id"]); comp = json.loads((WS.scenario_dir(spec.id) / "compile.json").read_text()); trials = []
     offset = int(p.get("attempt_offset", 0))  # manual retries use fresh attempt indices, never the same trial id
     if p.get("purpose") == "screen":
@@ -698,6 +701,16 @@ def plan_trials(p: dict) -> dict:
         for trial in trials:
             trial["audit_model"] = p["audit_model"]
     return {"scenario_id": spec.id, "trials": trials}
+
+
+def _frontier_preflight(p: dict) -> dict:
+    from swesim.stages.frontier import preflight
+    return preflight(WS, SETTINGS, p)
+
+
+@swesim_activity
+async def frontier_gate_activity(p: dict) -> dict:
+    return await blocking(lambda: _frontier_preflight(p))
 
 
 @swesim_activity
@@ -1067,6 +1080,7 @@ ALL = [probe_models_activity, discover_activity, mine_activity, judge_activity, 
        await_trial_activity, cancel_trial_activity, cleanup_trial_activity, score_activity, export_activity, spend_check_activity, record_cost_activity,
        prepare_trial_plan_activity, prepare_candidate_plan_activity, read_plan_page_activity, checkpoint_workflow_activity]
 ALL.append(difficulty_label_activity)
+ALL.append(frontier_gate_activity)
 
 if __name__ == "__main__":
     raise SystemExit(main())
