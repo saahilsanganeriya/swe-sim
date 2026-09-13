@@ -18,7 +18,7 @@ from swesim.dashboard.public import project
 from urllib.parse import urlencode
 from swesim.stages.score import OUTCOME_NAMES
 from swesim.dashboard.render import (
-    Column, chip, code_block, dash, difficulty_chip, fmt_usd, h, hero, ident, kv, model_chip, table, tier_of, tile, tiles,
+    Column, chip, code_block, dash, difficulty_chip, fmt_usd, h, hero, ident, kv, model_chip, table, tier_of, tile, tiles, when,
 )
 
 # ----------------------------------------------------------------------------- columns
@@ -273,7 +273,7 @@ def candidates_body(page, views: list[dict], funnel_steps: list[dict], hist: dic
         decisions = decision_views(current)
         body.append(f"<h2>Every PR decision · <code>{h(current_key)}</code></h2>")
         if current and current.get("scan_path"):
-            body.append(kv([("scanned", h(str(current.get("discovered_at") or "—"))), ("PRs listed", h(str((current.get("funnel") or {}).get("listed", len(decisions))))),
+            body.append(kv([("scanned", when(current.get("discovered_at"))), ("PRs listed", h(str((current.get("funnel") or {}).get("listed", len(decisions))))),
                             ("scan record", f"<a href='/artifacts?path={h(current['scan_path'])}'><code>{h(current['scan_path'])}</code></a>"),
                             ("sha256", f"<code>{h(current.get('scan_sha256'))}</code>"),
                             ("workflow", ident(current.get("workflow_id"), 24, "/workflows/" + str(current.get("workflow_id"))) if current.get("workflow_id") else "—")]))
@@ -312,8 +312,8 @@ def workflow_body(wid: str, row, job: dict | None, progress: dict | None, error:
     st = (row.status if row else (job or {}).get("status")) or "unknown"
     url = settings.workflow_url(wid, (row.run_id if row else (job or {}).get("run_id")))
     body = [f"<h1>Workflow {ident(wid, 40)}</h1>",
-            f"<p class='lead'>{chip(st)} {dash((row.type if row else (job or {}).get('type')))} · started {dash(row.started_at.isoformat() if row and row.started_at else (job or {}).get('started_at'))}"
-            + (f" · closed {dash(row.closed_at.isoformat() if row and row.closed_at else (job or {}).get('closed_at'))}" if (row and row.closed_at) or (job or {}).get("closed_at") else "")
+            f"<p class='lead'>{chip(st)} {dash((row.type if row else (job or {}).get('type')))} · started {when(row.started_at if row and row.started_at else (job or {}).get('started_at'))}"
+            + (f" · closed {when(row.closed_at if row and row.closed_at else (job or {}).get('closed_at'))}" if (row and row.closed_at) or (job or {}).get("closed_at") else "")
             + (f" · <a class='ext' href='{h(url)}' target='_blank' rel='noopener'>event history in Temporal ↗</a>" if url else " · <span class='muted'>no Temporal UI configured</span>") + "</p>",
             "<div id='banner' class='banner hidden' role='status'></div>"]
     failure = (row.failure if row else None) or (job or {}).get("failure")
@@ -448,8 +448,8 @@ def leaderboard_comparison(views: list[dict]) -> str:
 def db_index_body(tables: list[str], counts: dict[str, int], rebuilds: list, index_enabled: bool) -> str:
     rows = "".join(f"<tr><td><a href='/db/{h(t)}'>{h(t)}</a></td><td class='num'>{h(counts.get(t, '—'))}</td><td><a class='button small' href='/api/db/{h(t)}.csv'>CSV</a></td></tr>" for t in tables)
     last = rebuilds[-1] if rebuilds else None
-    reb = (f"<p>Last index rebuild <span class='mono'>{h(last.rebuild_id)}</span> started {h(last.started_at.isoformat())}"
-           + (f", finished {h(last.finished_at.isoformat())}" if last.finished_at else " (running)") + f" · counts {h(json.dumps(last.counts))}"
+    reb = (f"<p>Last index rebuild <span class='mono'>{h(last.rebuild_id)}</span> started {when(last.started_at)}"
+           + (f", finished {when(last.finished_at)}" if last.finished_at else " (running)") + f" · counts {h(json.dumps(last.counts))}"
            + (f"<details><summary>diff against the files</summary><pre class='code'>{h(json.dumps(last.diff, indent=2))}</pre></details>" if last.diff else "") + "</p>") if last else \
         ("<p class='muted'>No rebuild recorded" + (" (the index is disabled: rows are projected from the files on each request)." if not index_enabled else ".") + "</p>")
     action = ("<div class='card'><strong>Rebuild the index from the files</strong> <span class='muted small'>Projects every record file into rows and reports the diff against the previous rows.</span>"
@@ -460,8 +460,15 @@ def db_index_body(tables: list[str], counts: dict[str, int], rebuilds: list, ind
             + f"<div class='table-wrap'><table><thead><tr><th>table</th><th class='num'>rows</th><th>export</th></tr></thead><tbody>{rows}</tbody></table></div>" + action)
 
 
+def _db_kind(c: str, first: dict | None) -> str:
+    if c == "at" or c.endswith("_at"):  # every timestamp column of the index (interfaces §2) is named this way
+        return "time"
+    v = (first or {}).get(c)
+    return "num" if isinstance(v, (int, float)) and not isinstance(v, bool) else "text"
+
+
 def db_table_body(name: str, page, columns: list[str], where: dict, q: str | None, order_by: str | None) -> str:
-    cols = tuple(Column(c, c, "num" if page.items and isinstance(page.items[0].get(c), (int, float)) and not isinstance(page.items[0].get(c), bool) else "text", filterable=False) for c in columns)
+    cols = tuple(Column(c, c, _db_kind(c, page.items[0] if page.items else None), filterable=False) for c in columns)
     rows = []
     for r in page.items:
         rows.append({c: (json.dumps(v, default=str) if isinstance(v, (dict, list)) else v) for c, v in r.items()})
