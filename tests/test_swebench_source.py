@@ -874,6 +874,7 @@ def test_repeated_selected_phrase_records_every_removed_sentence(monkeypatch):
     res = draft_spec.withhold(dup, "fake/model")
     assert [(r["start"], r["end"]) for r in res["removed"]] == [(2, 20), (34, 52)] and res["withheld_brief"] == "T\nMiddle line.\nLast line."
     assert draft_spec.reconstruct_withheld(dup, [r["excerpt"] for r in res["removed"]]) == res["withheld_brief"]
+    assert draft_spec.reconstruct_withheld(dup, [res["removed"][0]["excerpt"]]) != res["withheld_brief"]
 
 
 def _row(**over):
@@ -894,7 +895,7 @@ def _row(**over):
 
 def _probe_meta():
     """Offline probe metadata as `probe_candidates` attaches it: the measured contract, not SWE-bench's network-era lists."""
-    return {"kind": "image", "probe_dir": "/ws/jobs/probe/pydata--xarray-5362/trial-1", "image_digest": "sha256:" + "e" * 64, "repo_dir": "/testbed",
+    return {"kind": "image", "test_user": "tester", "probe_dir": "/ws/jobs/probe/pydata--xarray-5362/trial-1", "image_digest": "sha256:" + "e" * 64, "repo_dir": "/testbed",
             "statuses": {"base": {}, "test": {F2P: "failed", P2P: "passed"}, "gold": {F2P: "passed", P2P: "passed"}},
             "dropped": {"network_or_env": [], "gold_regressions": []}, "counts": {"fail_to_pass": 1, "pass_to_pass": 1, "network_or_env": 0, "gold_regressions": 0}}
 
@@ -1556,6 +1557,10 @@ def test_draft_requires_offline_probe_metadata(monkeypatch, tmp_path):
     edited = _row(); edited["test_patch"] += "\n"                                                                          # row edited after the probe: the binding no longer matches
     with pytest.raises(ValueError, match="binding mismatch"):
         draft_spec.draft(edited, _judged(), "fake/model", tmp_path / "s2c")
+    for identity in (None, "root"):
+        legacy = _row(); legacy["probe"]["test_user"] = identity
+        with pytest.raises(ValueError, match="grading identity"):
+            draft_spec.draft(legacy, _judged(), "fake/model", tmp_path / "legacy")
     assert calls == [] and not (tmp_path / "s1").exists()                                                                    # refused before any LLM call or file
     # a repo-URL row probed by mine_github_repo carries the same metadata and is accepted without a second Modal run
     repo_row = _row(source="github-repo", instance_id="py-pdf__pypdf-3826", repo="py-pdf/pypdf", image=None, repo_dir="/app", dockerfile="FROM python@sha256:abc\n",
