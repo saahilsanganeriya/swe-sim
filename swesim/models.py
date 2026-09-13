@@ -197,7 +197,7 @@ class PatienceProfile(Strict):
         return self
 
 class StakeholderConfig(Strict):
-    model_id: str = "openai/gpt-5.5"; prompt_version: str = "v1"; temperature: float = 0.0
+    model_id: str = "anthropic/claude-opus-5"; prompt_version: str = "v3"; temperature: float = 0.0  # v3 = v2 prompt + Opus 5 (brief §3.1); v3 trials never pool with v1/v2
     patience_profile: PatienceProfile = Field(default_factory=PatienceProfile)
     review_mode: Literal["behavior", "diff-only"] = "behavior"; max_tool_calls_per_activation: int = Field(2, ge=0, le=4)
 
@@ -207,7 +207,7 @@ class RunConfig(Strict):
     condition: Literal["full", "hidden", "interactive"]
     brief_profile: Literal["natural", "withheld"] = "withheld"
     solver_timeout_sec: int = Field(2400, ge=60)
-    purpose: Literal["calibration", "comparison", "demonstration"] = "demonstration"
+    purpose: Literal["calibration", "comparison", "demonstration", "screen"] = "demonstration"  # screen = difficulty screen (brief §5)
     compiled_hash: str = ""  # required for actual run; contract/environment content hash, excluding condition prose
     agent_config: str = ""   # agent scaffold identity (e.g. "mini-swe-agent.interactive:<sha16>"); empty = the agent's packaged defaults
     stakeholder: StakeholderConfig = Field(default_factory=StakeholderConfig)
