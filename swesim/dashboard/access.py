@@ -53,6 +53,8 @@ def record_action(reader, settings: Settings, row) -> None:
     if callable(fn):
         fn(row)
         return
+    if settings.bucket:
+        raise RuntimeError("hosted operator audit backend is unavailable; console mount is read-only")
     path = layout_for(settings).evidence_dir("console") / "actions.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as fh:

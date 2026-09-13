@@ -155,6 +155,7 @@ class TrialRow(Provenance):
     output_tokens: int | None = None
     stakeholder_model: str | None = None
     stakeholder_prompt_version: str | None = None
+    evaluation_config: dict | None = None
 
 
 class ExchangeRow(Provenance):
@@ -194,6 +195,7 @@ class ScoreRow(Provenance):
     questions_asked: int
     confirmations: int
     computed_at: AwareDatetime
+    requested_k: int | None = Field(default=None, ge=1)
 
 
 class WorkflowRow(Provenance):
@@ -340,6 +342,8 @@ class LeaderboardFilter(Strict):
     scenario_id: list[str] | None = None
     include_saturated: bool = False
     min_n: int = Field(1, ge=1)
+    evaluation_cohort: str | None = None
+    metric_k: int | None = Field(default=None, ge=1, le=10)
 
 
 class WorkflowFilter(PageFilter):
@@ -395,6 +399,8 @@ class LeaderboardRow(Strict):
     confirmations: int
     cost_usd: Decimal | None
     cost_per_success: Decimal | None
+    evaluation_cohort: str = "unknown"
+    cohort_label: str = "unknown"
 
 
 class SpendRow(Strict):

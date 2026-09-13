@@ -34,9 +34,11 @@ from swesim.workflows.client import connect, describe_connection
 from swesim.workflows.workflows import (CandidateWorkflow, CreateTasksWorkflow, PipelineWorkflow, RunMatrixWorkflow, RunTasksWorkflow,
                                         TrialWorkflow)
 
-WORKFLOWS = [TrialWorkflow, RunMatrixWorkflow, PipelineWorkflow, CandidateWorkflow, CreateTasksWorkflow, RunTasksWorkflow]
+from swesim.workflows.operator_actions import OperatorActionWorkflow
+
+WORKFLOWS = [OperatorActionWorkflow, TrialWorkflow, RunMatrixWorkflow, PipelineWorkflow, CandidateWorkflow, CreateTasksWorkflow, RunTasksWorkflow]
 # Activity modules other streams own; each is optional until its stream is merged.
-OPTIONAL_ACTIVITY_MODULES = ("swesim.index.activities", "swesim.audit.activities")
+OPTIONAL_ACTIVITY_MODULES = ("swesim.index.activities", "swesim.audit.activities", "swesim.workflows.operator_actions")
 
 
 def activity_name(fn: Callable) -> str:

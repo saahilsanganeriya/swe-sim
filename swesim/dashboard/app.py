@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import hashlib
 import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -39,7 +40,7 @@ from swesim.dashboard.data import merge_timeline  # noqa: F401 - contract re-exp
 from swesim.dashboard.identity import Identity, identity_from_headers
 from swesim.dashboard.public import PRIVATE_KEYS, project
 from swesim.dashboard.access import all_rows
-from swesim.paths import atomic_json
+from swesim.index.cohorts import cohort_of
 from swesim.settings import Settings, get_settings
 
 app = FastAPI(title="swesim console", docs_url=None, redoc_url=None)
@@ -436,12 +437,17 @@ def _lb_filter(request: Request, reader) -> tuple[R.LeaderboardFilter, dict]:
     requested_models = _lists(request, "model")["model"]
     if requested_models:
         models = [m for m in requested_models if not tiers or m in (models or [])] or ["__no_model__"]
-    f = R.LeaderboardFilter(**lists, model=models, purpose=purpose, include_saturated=include_sat)
+    metric_k = request.query_params.get("metric_k") or None
+    f = R.LeaderboardFilter(**lists, model=models, purpose=purpose, include_saturated=include_sat,
+                           evaluation_cohort=request.query_params.get("evaluation_cohort") or None,
+                           metric_k=int(metric_k) if metric_k else None)
     if difficulty:
         ids = [s.scenario_id for s in all_rows(reader.scenarios, R.ScenarioFilter(difficulty_tier=[difficulty]))]
         f = f.model_copy(update={"scenario_id": ids or ["__no_scenarios__"]})
     current = {k: v or [] for k, v in lists.items()}
-    current.update(tier=tiers or [], include_saturated=include_sat, purpose=purpose, difficulty_tier=[difficulty] if difficulty else [])
+    options = dict(cohort_of(t) for t in all_rows(reader.trials, R.TrialFilter(purpose=[purpose], status=["completed"])))
+    current.update(tier=tiers or [], include_saturated=include_sat, purpose=purpose, difficulty_tier=[difficulty] if difficulty else [],
+                   evaluation_cohort=f.evaluation_cohort, cohort_options=sorted(options.items()), metric_k=f.metric_k)
     return f, current
 
 
@@ -482,43 +488,61 @@ def board_trials(reader, f: R.LeaderboardFilter) -> list:
     for t in all_rows(reader.trials, R.TrialFilter(scenario_id=f.scenario_id, purpose=[f.purpose], status=["completed"],
                                                  condition=f.condition, brief_profile=f.brief_profile, model=f.model, outcome_code=[1, 2, 3, 4])):
         s = scenario_for_trial(t, versions.get(t.scenario_id, []))
+        if f.evaluation_cohort and cohort_of(t)[0] != f.evaluation_cohort:
+            continue
         if s is not None and gate_passes(s, f.include_saturated) and (not f.source or s.source in f.source):
             selected.append(t)
     return selected
 
 
 def board_views(reader, rows: list, eligible: set[str], f: R.LeaderboardFilter) -> list[dict]:
-    """LeaderboardRow cells joined with what the row model does not carry: mean per-scenario pass@k / pass^k from the scores
-    table, the asked-before-implementing rate and a confidence note (Wilson 95% CI on the pass rate)."""
+    """Recompute requested estimators within each admitted spec/config/cohort group."""
+    from swesim.stages.score import pass_at_k, pass_pow_k
     trials = [t for t in board_trials(reader, f) if t.scenario_id in eligible]
-    groups = {}
-    for t in trials:
-        key = (t.scenario_id, t.spec_hash, t.condition, t.brief_profile, t.model, t.run_config_hash)
-        groups.setdefault(key, []).append(t)
-    scores = []
-    for key, attempts in groups.items():
-        sf = R.ScoreFilter(**{name: [value] for name, value in zip(("scenario_id", "spec_hash", "condition", "brief_profile", "model", "run_config_hash"), key)})
-        scores.extend(s for s in reader.scores(sf) if s.n == len(attempts) and s.success_count == sum(bool(t.success) for t in attempts))
     views = []
     for r in rows:
         d = r.model_dump(mode="json")
-        cell_scores = [s for s in scores if s.model == r.model and s.condition == r.condition and s.brief_profile == r.brief_profile and s.scenario_id in eligible]
-        pk = [s.pass_at_k for s in cell_scores if s.pass_at_k is not None]
-        ppk = [s.pass_pow_k for s in cell_scores if s.pass_pow_k is not None]
+        selected = [t for t in trials if (t.model, t.condition, t.brief_profile, cohort_of(t)[0]) ==
+                    (r.model, r.condition, r.brief_profile, r.evaluation_cohort)]
+        groups = {}
+        for t in selected:
+            groups.setdefault((t.scenario_id, t.spec_hash, t.run_config_hash), []).append(t)
+        estimates = []
+        for (sid, spec_hash, config_hash), attempts in groups.items():
+            scores = reader.scores(R.ScoreFilter(scenario_id=[sid], spec_hash=[spec_hash], run_config_hash=[config_hash],
+                                                 condition=[r.condition], brief_profile=[r.brief_profile], model=[r.model]))
+            metric_k = f.metric_k or (scores[0].requested_k if scores else None)
+            if metric_k is not None:
+                n, wins = len(attempts), sum(bool(t.success) for t in attempts)
+                estimates.append((metric_k, pass_at_k(n, wins, metric_k), pass_pow_k(n, wins, metric_k)))
+        ks = {k for k, _, _ in estimates}
+        common_k = next(iter(ks)) if len(ks) == 1 else None
+        pk = [Decimal(str(a)) for _, a, _ in estimates if a is not None] if common_k else []
+        ppk = [Decimal(str(b)) for _, _, b in estimates if b is not None] if common_k else []
+        d["requested_k"] = common_k or f.metric_k
         d["pass_at_k"] = str((sum(pk) / len(pk)).quantize(Decimal("0.001"))) if pk else None
         d["pass_pow_k"] = str((sum(ppk) / len(ppk)).quantize(Decimal("0.001"))) if ppk else None
-        flags = [t.asked_before_implementing for t in trials if t.model == r.model and t.condition == r.condition and t.brief_profile == r.brief_profile and t.asked_before_implementing is not None]
-        d["asked_first_rate"] = f"{sum(1 for x in flags if x) / len(flags):.3f}" if flags else None
+        flags = [t.asked_before_implementing for t in selected if t.asked_before_implementing is not None]
+        d["asked_first_rate"] = f"{sum(bool(x) for x in flags) / len(flags):.3f}" if flags else None
         ci = _wilson(r.success_count, r.n)
         d["confidence"] = f"{ci[0]:.2f}–{ci[1]:.2f}" if ci else None
-        d["confidence_note"] = (f"n={r.n} valid attempt(s) over {r.scenarios} scenario(s); pass rate {r.success_count}/{r.n}" + (f", Wilson 95% CI {ci[0]:.2f}–{ci[1]:.2f} (attempt independence approximation)" if ci else "")
-                                + ("; pass@k is the mean of matching per-spec/config scores (k as scored)" if pk else "; pass@k unavailable: insufficient attempts or no matching score"))
-        d["key"] = f"{r.model}|{r.condition}|{r.brief_profile}"
+        d["confidence_note"] = (f"n={r.n} valid attempts over {r.scenarios} scenarios; {r.cohort_label}. "
+                                f"Mean per-spec/config estimator k={common_k or 'unknown/mixed'}; {len(pk)}/{len(groups)} groups have sufficient n. "
+                                + (f"Wilson 95% CI {ci[0]:.2f}–{ci[1]:.2f}; attempt independence approximation." if ci else ""))
+        d["key"] = f"{r.model}|{r.condition}|{r.brief_profile}|{r.evaluation_cohort}"
         views.append(d)
     return views
 
 
-def leaderboard_charts(trials: list, rows: list) -> tuple[str, str]:
+def leaderboard_charts(trials: list, rows: list, cohort: str | None = None) -> tuple[str, str]:
+    if cohort is None:
+        parts = []
+        for key, label in sorted({cohort_of(t) for t in trials}):
+            matrix, chart = leaderboard_charts([t for t in trials if cohort_of(t)[0] == key],
+                                                [r for r in rows if r.evaluation_cohort == key], key)
+            heading = f"<h3>{render.h(label)}</h3>"
+            parts.append((heading + matrix, heading + chart))
+        return ("".join(p[0] for p in parts), "".join(p[1] for p in parts)) if parts else ("<p class='empty'>No eligible trials.</p>", "")
     eligible = {t.scenario_id for t in trials}
     models = sorted({t.model for t in trials}, key=lambda m: (render.family_of(m)[2] or 99, m))
     by_cell: dict[tuple[str, str, str, str], list] = {}
@@ -535,11 +559,11 @@ def leaderboard_charts(trials: list, rows: list) -> tuple[str, str]:
     for condition, profile in sorted({(t.condition, t.brief_profile) for t in trials}):
         matrices.append(f"<h3>{render.h(condition)} · {render.h(profile)}</h3>" + pages.charts.matrix(
             sorted(eligible), models, lambda sid, model, c=condition, p=profile: cell(sid, model, c, p),
-            chart_id=f"chart-matrix-{condition}-{profile}", title=f"{condition} / {profile}: pass rate per scenario × model",
+            chart_id=f"chart-matrix-{condition}-{profile}-{cohort}", title=f"{condition} / {profile}: pass rate per scenario × model",
             col_label=lambda m: m.split("/")[-1][:18]))
     matrix_html = "".join(matrices) or "<p class='empty'>No eligible scenario has completed trials for this purpose.</p>"
     chart_rows = [{"model": r.model, "condition": r.condition, "pass_rate": float(r.pass_rate) if r.pass_rate is not None else None, "n": r.n} for r in rows]
-    chart_html = pages.charts.grouped_bars(chart_rows, metric="pass_rate", chart_id="chart-lb", title="pass rate per model per condition")
+    chart_html = pages.charts.grouped_bars(chart_rows, metric="pass_rate", chart_id="chart-lb-" + cohort, title="pass rate per model per condition")
     return matrix_html, chart_html
 
 
@@ -555,7 +579,7 @@ def leaderboard(request: Request, reader=Depends(reader_dep), identity: Identity
         sat_ids = {g["scenario_id"] for g in leaderboard_gate(reader, True) if g["eligible"] and g["difficulty_tier"] == "saturated"}
         if sat_ids:
             sat_rows = reader.leaderboard(R.LeaderboardFilter(purpose=f.purpose, condition=f.condition, brief_profile=f.brief_profile, model=f.model, source=f.source,
-                                                              scenario_id=sorted(sat_ids), include_saturated=True))
+                                                              scenario_id=sorted(sat_ids), include_saturated=True, evaluation_cohort=f.evaluation_cohort, metric_k=f.metric_k))
             saturated_views = board_views(reader, sat_rows, sat_ids, f.model_copy(update={"include_saturated": True, "scenario_id": sorted(sat_ids)}))
     views = board_views(reader, rows, eligible, f)
     for key in ("condition", "brief_profile", "model"):
@@ -566,6 +590,17 @@ def leaderboard(request: Request, reader=Depends(reader_dep), identity: Identity
     p = render.Page("Leaderboard", "leaderboard", "leaderboard", crumbs=(("Leaderboard", None),),
                     attrs={"source": "/api/leaderboard?" + str(request.query_params), "chart-target": "leaderboard-charts", "poll-ms": "10000"}, live="updated 0s ago")
     return page(p, pages.leaderboard_body(views, gate, current, matrix_html, chart_html, saturated_views), reader, identity, settings)
+
+
+@app.get("/leaderboard/evidence", response_class=HTMLResponse)
+def leaderboard_evidence(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    f, _ = _lb_filter(request, reader)
+    selected = board_trials(reader, f)
+    offset, limit = _paging(request)
+    body = (f"<h1>Leaderboard evidence</h1><p class='lead'>{len(selected)} admitted attempts in the selected evaluation cohort.</p>"
+            + render.table("leaderboard-evidence", pages.TRIAL_COLUMNS, [pages.trial_view(t) for t in selected[offset:offset + limit]],
+                           key="trial_id", total=len(selected), offset=offset, limit=limit, empty="No admitted attempts match this cell."))
+    return page(render.Page("Leaderboard evidence", "leaderboard", "leaderboard-evidence", crumbs=(("Leaderboard", "/leaderboard"), ("Evidence", None))), body, reader, identity, settings)
 
 
 @app.get("/api/leaderboard")
@@ -588,6 +623,8 @@ def _trends_data(request: Request, reader) -> tuple[dict, dict]:
     f, current = _lb_filter(request, reader)
     query = {k: request.query_params.getlist(k) for k in ("source", "tier", "difficulty_tier", "include_saturated") if request.query_params.get(k)}
     query["purpose"] = f.purpose
+    if f.evaluation_cohort:
+        query["evaluation_cohort"] = f.evaluation_cohort
     scenarios = list(all_rows(reader.scenarios, R.ScenarioFilter(source=f.source, latest_only=True)))
     payload = trends.summarize(board_trials(reader, f), scenarios, query)
     payload["charts"] = render_trends.chart_fragments(payload)
@@ -973,8 +1010,8 @@ def _describe(action: str, params: dict, reader, settings: Settings) -> tuple[di
             errs.append("approval requires the holding workflow id; task creation is executed through Temporal")
         if p["workflow_id"] and not console.WORKFLOW_ID_RE.fullmatch(p["workflow_id"]):
             errs.append("invalid holding workflow id")
-        cli = (f"uv run swesim workflows approve {console._q(p['workflow_id'])} {console._q(sid)} {console._q(p['spec_hash'])} --decision {decision}" if p["workflow_id"]
-               else (f"uv run swesim approve {console._q(sid)}   # supervised approval of the local draft" if decision == "approve" else f"# reject: writes scenarios/{sid}/review.json with decision=reject"))
+        cli_params = {"scenario_id": sid, "decision": decision, "spec_hash": p["spec_hash"], "workflow_id": p["workflow_id"], "note": p["reason"]}
+        cli = "uv run swesim workflows action review --params-json " + console._q(json.dumps(cli_params))
         return p, errs, cli, f"{decision.capitalize()} the held draft {sid} (spec hash {p['spec_hash'][:12]}…).", sid
     if action == "label":
         tid, label = str(params.get("trial_id") or ""), str(params.get("label") or "")
@@ -984,7 +1021,7 @@ def _describe(action: str, params: dict, reader, settings: Settings) -> tuple[di
         if label not in LABELS:
             errs.append(f"label must be one of {list(LABELS)}")
         p = {"trial_id": tid, "label": label, "note": str(params.get("note") or "")[:2000]}
-        cli = f"printf '%s' {console._q(json.dumps({'label': label, 'note': p['note']}))} > {console._q(str(settings.workspace / 'trials' / tid / 'label.json'))}"
+        cli = "uv run swesim workflows action label --params-json " + console._q(json.dumps(p))
         return p, errs, cli, "Record a reviewer label on this episode (evaluator annotation; never changes reward).", tid
     if action == "retry":
         ref = params.get("retry_of") if isinstance(params.get("retry_of"), dict) else params  # the confirm step carries the previewed params
@@ -1008,14 +1045,11 @@ async def _execute(action: str, p: dict, reader, layout, settings: Settings) -> 
         return 200, {"ok": True, **(await console.cancel_job(p["workflow_id"])), "workflow_id": p["workflow_id"]}
     if action == "review":
         status, payload = await console.decide(settings.workspace, settings.registry_path, p["scenario_id"],
-                                               {"decision": p["decision"], "spec_hash": p["spec_hash"], "workflow_id": p["workflow_id"], "note": p["reason"]})
+                                               {"decision": p["decision"], "spec_hash": p["spec_hash"], "workflow_id": p["workflow_id"], "note": p["reason"], "actor": p["_actor"], "request_id": p["_request_id"]})
         return status, payload
     if action == "label":
-        d = layout.trial_dir(p["trial_id"])
-        if not d.is_dir():
-            return 404, {"ok": False, "error": "no such trial"}
-        atomic_json(d / "label.json", {"label": p["label"], "note": p["note"]})
-        return 200, {"ok": True, "saved": True, "message": f"Label {p['label']} saved."}
+        result = await console.submit_record_action("label", {k: p[k] for k in ("trial_id", "label", "note")}, p["_actor"], p["_request_id"])
+        return 200, result
     if action == "retry":
         started = await console.start_create(p, settings)
         return 200, {"ok": True, **started, "params": p}
@@ -1073,7 +1107,7 @@ async def api_action(action: str, request: Request, reader=Depends(reader_dep), 
         audit("rejected", None, True)
         return _json(400, {"ok": False, "errors": errs, "cli": cli})
     try:
-        status, payload = await _execute(action, p, reader, layout, settings)
+        status, payload = await _execute(action, {**p, "_actor": identity.actor, "_request_id": hashlib.sha256(body["token"].encode()).hexdigest()}, reader, layout, settings)
     except console.ConsoleUnavailable as e:
         audit("failed", None, True)
         return _json(502, {"ok": False, "error": str(e), "cli": e.cli, "kind": e.kind})

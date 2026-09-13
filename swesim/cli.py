@@ -431,6 +431,9 @@ def matrix(
 @app.command()
 def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a GitHub repo URL, or 'swebench:A' (pool A), or 'swebench:A:<id1>,<id2>'"),
            judge_model: str = typer.Option(JUDGE_MODEL_DEFAULT), draft_model: str = typer.Option(DRAFT_MODEL_DEFAULT),
+           candidate_snapshot: str | None = typer.Option(None, help="Worker-side immutable candidate snapshot for an exact retry"),
+           candidate_id: str | None = typer.Option(None), source_key: str | None = typer.Option(None),
+           pr: int | None = typer.Option(None, help="Exact PR number; requires one GitHub source"),
            since: str = typer.Option("2026-06-01"), max_candidates: int = typer.Option(20), max_parallel: int = typer.Option(8),
            approval_mode: str = typer.Option("auto", help="auto | hold (review queue; approve with `swesim workflows approve`)"),
            pr_kind: str = typer.Option("bugfix", help="GitHub source band: bugfix (diff 20-600 lines, >=4 comments; the band that produced pypdf-3826) | feature (200-1500 lines, >=8 comments, feature label)"),
@@ -441,12 +444,18 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
     import asyncio
     from swesim.workflows.client import start_create
     sources = []
+    if pr is not None and (pr < 1 or len(source) != 1 or source[0].startswith("swebench:")):
+        raise typer.BadParameter("--pr requires one GitHub repository and a positive PR number")
     for s in source:
         if s.startswith("swebench:"):
             _, pool, *ids = s.split(":", 2)
             sources.append({"kind": "swebench-annotated", "pool": pool or "A", "limit": max_candidates, **({"instance_ids": ids[0].split(",")} if ids else {})})
         else:
-            sources.append({"kind": "github-repo", "repo": s, "since": since, "max_candidates": max_candidates, "pr_kind": pr_kind})
+            sources.append({"kind": "github-repo", "repo": s, "since": since, "max_candidates": max_candidates, "pr_kind": pr_kind, **({"pr": pr} if pr else {})})
+    if any((candidate_snapshot, candidate_id, source_key)):
+        if not all((candidate_snapshot, candidate_id, source_key)):
+            raise typer.BadParameter("frozen retry requires --candidate-snapshot, --candidate-id and --source-key")
+        sources = [{"kind": "frozen-candidate", "candidates_path": candidate_snapshot, "instance_id": candidate_id, "source_key": source_key}]
     params = {"sources": sources, "judge_model": judge_model, "draft_model": draft_model, "max_parallel": max_parallel,
               "approval_mode": approval_mode, "stakeholder_url": _stakeholder_url(stakeholder_url)}
     if pr_kind not in ("bugfix", "feature"):
@@ -517,3 +526,18 @@ def workflows_approve(workflow_id: str, scenario_id: str, spec_hash: str, decisi
 
 if __name__ == "__main__":
     app()
+
+
+@workflows_app.command("action")
+def workflows_action(action: str, params_json: str = typer.Option(...), request_id: str = typer.Option(""), actor: str = typer.Option("operator-cli")) -> None:
+    """Write an episode label or review through a durable CONTROL workflow."""
+    import asyncio
+    import secrets
+    from swesim.workflows.client import operator_action
+    if action not in ("label", "review"):
+        raise typer.BadParameter("action must be label or review")
+    params = json.loads(params_json)
+    if not isinstance(params, dict):
+        raise typer.BadParameter("--params-json must be an object")
+    result = asyncio.run(operator_action({"action": action, "params": params, "actor": actor}, request_id or secrets.token_hex(32)))
+    typer.echo(json.dumps(result))

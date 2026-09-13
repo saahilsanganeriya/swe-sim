@@ -12,6 +12,8 @@ from datetime import UTC
 from decimal import Decimal
 from urllib.parse import urlencode
 
+from swesim.index.cohorts import cohort_of
+
 
 def _rate(numerator, denominator: int) -> float | None:
     return round(float(numerator) / denominator, 6) if denominator else None
@@ -29,9 +31,9 @@ def summarize(trials: list, scenarios: list, query: dict) -> dict:
     groups = defaultdict(list)
     for t in trials:
         if t.finished_at is not None:
-            groups[(t.model, t.condition, t.brief_profile)].append(t)
+            groups[(t.model, t.condition, t.brief_profile, *cohort_of(t))].append(t)
     history, interaction = [], []
-    for (model, condition, profile), rows in sorted(groups.items()):
+    for (model, condition, profile, evaluation_cohort, cohort_label), rows in sorted(groups.items()):
         days = defaultdict(list)
         for t in sorted(rows, key=lambda t: (t.finished_at, t.trial_id)):
             days[t.finished_at.astimezone(UTC).date().isoformat()].append(t)
@@ -44,21 +46,21 @@ def summarize(trials: list, scenarios: list, query: dict) -> dict:
             confirmations = [t.confirmations for t in accumulated if t.confirmations is not None]
             costs = [t.cost_usd for t in accumulated if t.cost_usd is not None]
             usd = sum(costs, Decimal(0))
-            shared = {"model": model, "condition": condition, "brief_profile": profile, "day": day}
+            shared = {"model": model, "condition": condition, "brief_profile": profile, "day": day, "evaluation_cohort": evaluation_cohort, "cohort_label": cohort_label}
             history.append({**shared, "n": len(accumulated), "success_count": successes, "success_known_n": successes_known,
                             "scenarios": len({t.scenario_id for t in accumulated}), "configurations": len({t.run_config_hash for t in accumulated}),
                             "pass_rate": _rate(successes, len(accumulated)) if successes_known == len(accumulated) else None, "questions_per_trial": _rate(sum(questions), len(questions)),
                             "questions_n": len(questions), "confirmations_per_trial": _rate(sum(confirmations), len(confirmations)),
                             "confirmations_n": len(confirmations), "cost_usd": str(usd), "cost_known_n": len(costs),
                             "cost_per_success": _rate(usd, successes) if len(costs) == len(accumulated) == successes_known else None,
-                            "evidence_url": evidence_url(query, model, condition, profile, day)})
+                            "evidence_url": evidence_url({**query, "evaluation_cohort": evaluation_cohort}, model, condition, profile, day)})
             for cohort, asked in (("asked", True), ("did-not-ask", False)):
                 selected = [t for t in accumulated if t.questions_asked is not None and (t.questions_asked > 0) == asked]
                 if selected:
                     wins = sum(bool(t.success) for t in selected)
                     interaction.append({**shared, "cohort": cohort, "n": len(selected), "success_count": wins,
                                         "scenarios": len({t.scenario_id for t in selected}), "pass_rate": _rate(wins, len(selected)) if all(t.success is not None for t in selected) else None,
-                                        "evidence_url": evidence_url(query, model, condition, profile, day, cohort)})
+                                        "evidence_url": evidence_url({**query, "evaluation_cohort": evaluation_cohort}, model, condition, profile, day, cohort)})
     difficulty = Counter(s.difficulty_tier or "unlabelled" for s in scenarios if s.validation_status == "valid")
     distribution = []
     for label in ("informative", "saturated", "broken", "unlabelled"):
