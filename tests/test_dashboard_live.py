@@ -14,6 +14,7 @@ from swesim.dashboard import health as cached_health, trends
 from swesim.settings import Settings
 from swesim.workflows import health
 from test_dashboard import reader_of, site as site
+from test_score import HAIKU
 
 NOW = datetime(2026, 9, 13, 12, tzinfo=UTC)
 
@@ -133,7 +134,9 @@ def test_trend_routes_use_gate_filters_and_serve_table_twins(site):
     assert response.status_code == 200
     data = response.json()
     assert data["history"] and all(r["condition"] == "interactive" for r in data["history"])
-    assert data["charts"] and all("<table" in html and "<svg" in html for html in data["charts"].values())
+    figures = [html for html in data["charts"].values() if "<svg" in html]
+    assert figures and all("<table" in html for html in figures)  # every chart has its table twin (headings and plain tables have no svg)
+    assert data["gradient"]["cohorts"] and data["gradient"]["models"] == [HAIKU]
     assert all("redacted_terms" not in html and "withheld_sentences" not in html for html in data["charts"].values())
     assert site["client"].get("/trends?purpose=calibration").status_code == 200
     evidence = site["client"].get(data["history"][-1]["evidence_url"])
