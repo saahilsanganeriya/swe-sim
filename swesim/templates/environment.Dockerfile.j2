@@ -1,7 +1,9 @@
 {{ base_stage }}
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends curl bash git ca-certificates procps && rm -rf /var/lib/apt/lists/*
+# build-essential: Harbor's mini-swe-agent setup checks for gcc/make and otherwise runs apt-get inside the sandbox, where the
+# strict allowlist blocks it (observed on the python@digest pypdf image: NetworkConnectionError before the agent started).
+RUN apt-get update && apt-get install -y --no-install-recommends curl bash git ca-certificates procps build-essential && rm -rf /var/lib/apt/lists/*
 RUN if id agent >/dev/null 2>&1; then echo 'agent user pre-exists in base image; rejected for this pilot' >&2; exit 1; fi && useradd -m agent
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && uv --version
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
