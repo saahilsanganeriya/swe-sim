@@ -7,6 +7,7 @@ Infrastructure outcomes (collection/simulator/evaluator failure) never count as 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from swesim import harbor_cli
@@ -55,10 +56,53 @@ def evaluate_controls(results: dict[str, dict], controls: dict) -> tuple[bool, l
     return (not failures), failures
 
 
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_NON_DISTINCTIVE = re.compile(r"^(#|import\s|from\s+\S+\s+import\b|\"\"\"|'''|(return|pass|break|continue)\b\s*(None)?\s*$)")
+
+
+def is_distinctive(line: str) -> bool:
+    """An added line worth grepping for: > 30 chars stripped, contains an identifier, not a bare import/return/pass/comment/docstring."""
+    s = line.strip()
+    return len(s) > 30 and not _NON_DISTINCTIVE.match(s) and bool(_IDENT.search(s))
+
+
+def _informative(removed: str) -> bool:
+    s = removed.strip(); return bool(s) and not re.fullmatch(r"[\W_]*", s)
+
+
+def gold_probes(oracle_diff: str, max_probes: int = 6, per_hunk: int = 2) -> list[dict]:
+    """Distinctive added lines paired with their hunk's removed lines: [{"line", "removed": [...], "path"}].
+
+    A base copy of a modified file (e.g. build/lib/...) contains the hunk's removed lines; a leaked post-fix copy does
+    not, so the probe counts a file only when it holds the added line and none of the removed ones. Pure-addition
+    hunks keep the plain grep; the file the patch modifies at its own base path is skipped for them (host side)."""
+    probes: list[dict] = []; path: str | None = None; added: list[str] = []; removed: list[str] = []; open_hunk = False
+
+    def flush():
+        nonlocal added, removed
+        if open_hunk:
+            rem = [r.strip() for r in removed if _informative(r)]
+            for line in [a.strip() for a in added if is_distinctive(a)][:per_hunk]:
+                if len(probes) < max_probes and not any(p["line"] == line for p in probes):
+                    probes.append({"line": line, "removed": rem, "path": path})
+        added, removed = [], []
+
+    for raw in oracle_diff.splitlines():
+        if raw.startswith("+++ "):
+            flush(); target = raw[4:].strip()
+            path = target[2:] if target.startswith("b/") else (None if target == "/dev/null" else target); open_hunk = True; continue
+        if raw.startswith("--- ") or raw.startswith("diff --git "): flush(); open_hunk = False; continue
+        if raw.startswith("@@"): flush(); open_hunk = True; continue
+        if not open_hunk: continue
+        if raw.startswith("+"): added.append(raw[1:])
+        elif raw.startswith("-"): removed.append(raw[1:])
+    flush()
+    return probes
+
+
 def gold_lines(oracle_diff: str) -> list[str]:
-    """Up to three substantial lines the oracle adds; the probe greps the agent image for them."""
-    adds = [line[1:].strip() for line in oracle_diff.splitlines() if line.startswith("+") and not line.startswith("+++") and len(line.strip()) > 20]
-    return adds[:3]
+    """The distinctive added lines the probe greps for (see gold_probes for the pairing)."""
+    return [p["line"] for p in gold_probes(oracle_diff)]
 
 
 def _expected(c: ControlPatch) -> dict:
@@ -91,21 +135,22 @@ def validate_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, 
             failures.append(f"{name}: launch failed: {e}"); launch_failed = True; break  # systemic; do not burn the remaining launches
         trial_dirs[name] = str(td); results[name] = dict(harbor_cli.read_reward(td)); results[name]["report"] = harbor_cli.read_report(td)
         if _exception_info(td): failures.append(f"{name}: control agent failed before a clean submission")
-    probe = {"raw": "", "gold_hits": [], "all_refs": None, "reflog_entries": None, "gold_object_reachable": False, "hits_block_found": False}; probe_txt = ""
+    probes = gold_probes((task / "solution" / "oracle.diff").read_text())
+    probe = {"raw": "", "gold_hits": [], "raw_hits": [], "filtered_hits": [], "probes": probes, "all_refs": None, "reflog_entries": None,
+             "gold_object_reachable": False, "hits_block_found": False}; probe_txt = ""
     if not launch_failed:
         try:
             probe_dir = harbor_cli.run_task(task, PATCH_AGENT, jobs, f"{spec.id}--probe",
-                                            agent_kwargs={"probe": "true", "gold_sha": spec.environment.gold_commit or "",
-                                                          "gold_lines": json.dumps(gold_lines((task / "solution" / "oracle.diff").read_text()))})
+                                            agent_kwargs={"probe": "true", "gold_sha": spec.environment.gold_commit or "", "gold_lines": json.dumps(probes)})
         except harbor_cli.HarborRunError as e:
             failures.append(f"probe: launch failed: {e}")
         else:
             trial_dirs["probe"] = str(probe_dir); p = probe_dir / "agent" / "probe.txt"
             probe_txt = p.read_text() if p.exists() else ""
-            parsed = parse_probe_output(probe_txt)
-            probe = {"raw": probe_txt[-2000:], "gold_hits": parsed["gold_line_hits"], "all_refs": parsed["all_refs"],
-                     "reflog_entries": parsed["reflog_entries"], "gold_object_reachable": parsed["gold_object_reachable"],
-                     "hits_block_found": parsed["hits_block_found"]}
+            parsed = parse_probe_output(probe_txt, probes)
+            probe = {"raw": probe_txt[-2000:], "gold_hits": parsed["gold_line_hits"], "raw_hits": parsed["raw_hits"], "filtered_hits": parsed["filtered_hits"],
+                     "probes": probes, "all_refs": parsed["all_refs"], "reflog_entries": parsed["reflog_entries"],
+                     "gold_object_reachable": parsed["gold_object_reachable"], "hits_block_found": parsed["hits_block_found"]}
     ok, control_failures = evaluate_controls(results, spec.controls.model_dump()); failures.extend(control_failures)
     base = {t["id"]: t["observed"] for t in results.get("nop", {}).get("report", {}).get("per_test", [])}
     gold = {t["id"]: t["observed"] for t in results.get("oracle", {}).get("report", {}).get("per_test", [])}
@@ -114,9 +159,8 @@ def validate_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, 
         failures.append("base must execute every target as failed/error and every regression as passed")
     if set(gold) != wanted or any(gold[t] != "passed" for t in wanted): failures.append("gold exact-id manifest failed")
     if not probe["hits_block_found"]: failures.append("missing reachability evidence")
-    line_hits = [h for h in probe["gold_hits"] if not h.startswith("GOLD_OBJECT_REACHABLE")]
     if probe["gold_object_reachable"]: failures.append("gold commit object reachable in agent image (history not stripped)")
-    if line_hits: failures.append(f"gold patch lines reachable in agent image: {line_hits[:3]}")
+    if probe["gold_hits"]: failures.append(f"gold patch lines reachable in agent image: {probe['gold_hits'][:3]}")  # filtered hits only; raw hits are recorded
     controls_out = {k: {**{kk: vv for kk, vv in v.items() if kk != "report"}, "outcome": OUTCOME_NAMES.get(v.get("outcome_code")), "expected": expected.get(k, {})}
                     for k, v in results.items()}
     out = {"status": "valid" if not failures else "invalid", "failures": failures, "expected_base": base, "expected_gold": gold,

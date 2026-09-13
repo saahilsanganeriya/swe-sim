@@ -1,5 +1,5 @@
 """Validate stage expectation logic and harbor_cli wrapper. Offline: no Harbor process is started."""
-import json, os, subprocess, sys
+import json, os, shutil, subprocess, sys
 from pathlib import Path
 
 import pytest
@@ -9,7 +9,7 @@ from swesim.models import ScenarioSpec, RunConfig, minimal_spec_dict
 from swesim.paths import Workspace
 from swesim.stages import validate
 from swesim.stages.compile import CompileResult
-from swesim.stages.validate import evaluate_controls, gold_lines
+from swesim.stages.validate import evaluate_controls, gold_lines, gold_probes, is_distinctive
 
 
 def test_expectations():
@@ -53,11 +53,49 @@ def test_expectations_edge_cases():
     assert not ok and failures == ["tamper:benign: reward 0.5 != expected 1.0"]
 
 
-def test_gold_lines_picks_long_added_lines():
-    diff = "--- a/x.py\n+++ b/x.py\n@@\n-old\n+short\n+    def new_helper(value, dim):\n+        raise ValueError('dimension mismatch')\n+    return value\n+    another_long_added_line = compute(value)\n+    yet_another_long_added_line = 1\n"
-    lines = gold_lines(diff)
-    assert lines == ["def new_helper(value, dim):", "raise ValueError('dimension mismatch')", "another_long_added_line = compute(value)"]
-    assert gold_lines("") == []
+def test_gold_probes_select_distinctive_lines_and_pair_removed():
+    diff = ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,4 +1,5 @@\n import os\n-from .exceptions import TooManyRedirects, InvalidSchema\n+from .exceptions import (\n"
+            "+    TooManyRedirects, InvalidSchema, ChunkedEncodingError, ContentDecodingError)\n+# a comment that is certainly longer than thirty characters\n"
+            "+    return self.build_response_for_request(request, resp)\n+    third_distinctive_added_line_in_same_hunk = compute(request)\n"
+            "@@ -20,3 +21,5 @@\n context\n+short = 1\n+    if not stream and response.content is not None:\n \n"
+            "--- a/y.py\n+++ b/y.py\n@@ -1 +1,2 @@\n-    old_value = compute(a)\n-)\n-\n+    new_value = compute_with_dimension(a, dim)\n")
+    probes = gold_probes(diff)
+    assert [p["line"] for p in probes] == ["TooManyRedirects, InvalidSchema, ChunkedEncodingError, ContentDecodingError)",
+                                            "return self.build_response_for_request(request, resp)",  # at most two probes per hunk
+                                            "if not stream and response.content is not None:", "new_value = compute_with_dimension(a, dim)"]
+    assert probes[0] == {"line": probes[0]["line"], "removed": ["from .exceptions import TooManyRedirects, InvalidSchema"], "path": "x.py"}
+    assert probes[2]["removed"] == [] and probes[2]["path"] == "x.py"  # pure-addition hunk
+    assert probes[3]["removed"] == ["old_value = compute(a)"] and probes[3]["path"] == "y.py"  # blank / punctuation-only removed lines carry no signal
+    assert gold_lines(diff) == [p["line"] for p in probes] and gold_probes("") == []
+    for bad in ("from .exceptions import (", "    return r", "    return None", "        pass", "# " + "x" * 40, '"""' + "d" * 40, "import os, sys, json, re, pathlib, shutil",
+                "    ) + ((((((((((((((((((((((((((((((((", "", "   "):
+        assert not is_distinctive(bad), bad
+    assert is_distinctive("    raise ValueError('dimension mismatch for input')") and is_distinctive("    return self.build_response(request, resp)")
+
+
+@pytest.mark.skipif(not all(shutil.which(x) for x in ("sh", "grep", "head")), reason="needs sh and grep")
+def test_probe_filters_base_copies_on_fake_tree(tmp_path):
+    from swesim.agents.patch_agent import build_probe_command, parse_probe_output
+    diff = ("--- a/pkg/mod.py\n+++ b/pkg/mod.py\n@@ -1,3 +1,3 @@\n import os\n-    result = compute_legacy_value(payload, strict=True)\n+    result = compute_modern_value(payload, strict=True, dim=dim)\n"
+            "--- a/pkg/other.py\n+++ b/pkg/other.py\n@@ -1,2 +1,3 @@\n import os\n+    registry.register_default_handler(handler_for_dimension)\n")
+    probes = gold_probes(diff)
+    assert [p["path"] for p in probes] == ["pkg/mod.py", "pkg/other.py"] and probes[1]["removed"] == []
+    added, removed, added2 = probes[0]["line"], probes[0]["removed"][0], probes[1]["line"]
+    tree = tmp_path / "repo"
+    files = {"pkg/mod.py": f"import os\n    {added}\n    {removed}\n",        # base path holding both: a base copy (re-added line), not a hit
+             "build/lib/pkg/mod.py": f"    {added}\n    {removed}\n",          # base copy among build products: not a hit
+             "stale/pkg/mod.py": f"    {added}\nother\n",                     # post-fix copy (removed lines absent): a hit
+             "pkg/other.py": f"    {added2}\n",                                # pure-addition hunk at its own base path: skipped
+             "dist/pkg/other.py": f"    {added2}\n",                           # pure-addition hunk, stale copy elsewhere: a hit
+             ".git/objects/leak.py": f"    {added}\n"}                         # never in scope
+    for rel, content in files.items():
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True); (tree / rel).write_text(content)
+    r = subprocess.run(["sh", "-c", build_probe_command(str(tree), probes)], capture_output=True, text=True)
+    parsed = parse_probe_output(r.stdout, probes)
+    assert parsed["hits_block_found"], r.stdout + r.stderr
+    assert {(h["probe"], h["file"]) for h in parsed["raw_hits"]} == {(0, "./pkg/mod.py"), (0, "./build/lib/pkg/mod.py"), (0, "./stale/pkg/mod.py"), (1, "./pkg/other.py"), (1, "./dist/pkg/other.py")}
+    assert {(h["probe"], h["file"]) for h in parsed["filtered_hits"]} == {(0, "./stale/pkg/mod.py"), (1, "./dist/pkg/other.py")}
+    assert parsed["gold_line_hits"] == ["./dist/pkg/other.py", "./stale/pkg/mod.py"]
 
 
 # ---- validate_scenario end to end with fake compile + fake harbor ------------------------------
@@ -70,7 +108,7 @@ def _spec_ws(tmp_path):
 def _fake_compile(tmp_path, spec):
     task = tmp_path / "task-full"; (task / "controls").mkdir(parents=True); (task / "solution").mkdir()
     for c in spec.controls.plausible_wrong + spec.controls.alternative_correct + spec.controls.tamper: (task / "controls" / f"{c.name}.diff").write_text("diff")
-    (task / "solution" / "oracle.diff").write_text("+++ b/x.py\n+    def new_helper(value, dim):\n")
+    (task / "solution" / "oracle.diff").write_text("--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n import os\n-    def new_helper(value):\n+    def new_helper_for_dimension(value, dim):\n")
     cj = tmp_path / "compile.json"; cj.write_text(json.dumps({"compiled_hash": "c" * 64}))
     return lambda ws, s, rc, url: CompileResult({"full": task, "hidden": task, "interactive": task}, "sha256:" + "d" * 64, cj)
 
@@ -110,7 +148,8 @@ def test_validate_scenario_valid(tmp_path, monkeypatch):
     ctl = out["controls"]["tamper:root-conftest"]
     assert ctl["reward"] == 0.0 and ctl["success"] == 0 and ctl["outcome"] == "valid-incorrect" and ctl["expected"]["cls"] == "incorrect-exploit" and "report" not in ctl
     assert out["controls"]["nop"]["outcome"] == "agent-invalid-submission"
-    assert out["probe"]["gold_hits"] == [] and out["probe"]["all_refs"] == 1
+    assert out["probe"]["gold_hits"] == [] and out["probe"]["all_refs"] == 1 and out["probe"]["raw_hits"] == [] and out["probe"]["filtered_hits"] == []
+    assert out["probe"]["probes"] == [{"line": "def new_helper_for_dimension(value, dim):", "removed": ["def new_helper(value):"], "path": "x.py"}]
     assert set(out["trial_dirs"]) == {"nop", "oracle", "plausible-wrong:keyerror", "tamper:root-conftest", "probe"}
     assert out["compiled_hash"] == "c" * 64 and out["image_digest"] == "sha256:" + "d" * 64 and out["spec_hash"] == spec.spec_hash
     assert json.loads((ws.scenario_dir(spec.id) / "validation.json").read_text())["status"] == "valid"
@@ -118,7 +157,7 @@ def test_validate_scenario_valid(tmp_path, monkeypatch):
     assert names == ["nop", "oracle", "plausible-wrong-keyerror", "tamper-root-conftest", "probe"]
     assert launched[0][1] == "nop" and launched[1][1] == "oracle"
     assert launched[2][1] == validate.PATCH_AGENT and launched[2][2]["patch"].endswith("controls/keyerror.diff")
-    assert launched[4][2]["probe"] == "true" and json.loads(launched[4][2]["gold_lines"]) == ["def new_helper(value, dim):"]
+    assert launched[4][2]["probe"] == "true" and json.loads(launched[4][2]["gold_lines"]) == out["probe"]["probes"]
     assert all(jd.parent.parent.name == "c" * 16 for jd in [Path(p) for p in out["trial_dirs"].values()])  # jobs keyed by compiled hash
 
 
@@ -126,15 +165,24 @@ def test_validate_scenario_invalid_reasons(tmp_path, monkeypatch):
     ws, spec = _spec_ws(tmp_path)
     monkeypatch.setattr(validate, "compile_scenario", _fake_compile(tmp_path, spec))
     bad = json.loads(json.dumps(GOOD)); bad["nop"]["per_test"] = [{"id": "t1", "observed": "passed"}, {"id": "t0", "observed": "passed"}]
-    run_task, _ = _fake_harbor(ws.jobs_dir, bad, "REFS=1\nREFLOG=1\nGOLD_SHA_CHECKED=abc\nHITS_BEGIN\nGOLD_OBJECT_REACHABLE:abc\n./pkg/mod.py\nHITS_END\n", exception_for={"tamper-root-conftest"})
+    probe_txt = ("REFS=1\nREFLOG=1\nGOLD_SHA_CHECKED=abc\nHITS_BEGIN\nGOLD_OBJECT_REACHABLE:abc\n"
+                 "RAW 0\t./build/lib/x.py\nRAW 0\t./x.py\nRAW 0\t./stale/x.py\nHIT 0\t./stale/x.py\nHITS_END\n")  # base copies raw only; one post-fix copy
+    run_task, _ = _fake_harbor(ws.jobs_dir, bad, probe_txt, exception_for={"tamper-root-conftest"})
     monkeypatch.setattr(harbor_cli, "run_task", run_task)
     out = validate.validate_scenario(ws, spec, RunConfig.default("full"), "https://x.modal.run")
     assert out["status"] == "invalid"
     assert any("base must execute" in f for f in out["failures"])
-    assert any("gold patch lines reachable" in f and "./pkg/mod.py" in f and "GOLD_OBJECT" not in f for f in out["failures"])
+    assert any("gold patch lines reachable" in f and "./stale/x.py" in f and "build/lib" not in f and "GOLD_OBJECT" not in f for f in out["failures"])
     assert any("gold commit object reachable" in f for f in out["failures"]) and out["probe"]["gold_object_reachable"] is True
+    assert len(out["probe"]["raw_hits"]) == 3 and out["probe"]["filtered_hits"] == [{"probe": 0, "file": "./stale/x.py"}] and out["probe"]["gold_hits"] == ["./stale/x.py"]
     assert any(f.startswith("tamper:root-conftest") and "control agent failed" in f for f in out["failures"])
     assert json.loads((ws.scenario_dir(spec.id) / "validation.json").read_text())["status"] == "invalid"
+    # base copies alone never invalidate: same probe output without the post-fix copy and without the gold object
+    ws3, spec3 = _spec_ws(tmp_path / "c"); monkeypatch.setattr(validate, "compile_scenario", _fake_compile(tmp_path / "c", spec3))
+    run_task, _ = _fake_harbor(ws3.jobs_dir, GOOD, "REFS=1\nREFLOG=1\nGOLD_SHA_CHECKED=abc\nHITS_BEGIN\nRAW 0\t./build/lib/x.py\nRAW 0\t./x.py\nHITS_END\n")
+    monkeypatch.setattr(harbor_cli, "run_task", run_task)
+    out = validate.validate_scenario(ws3, spec3, RunConfig.default("full"), "https://x.modal.run")
+    assert out["status"] == "valid" and len(out["probe"]["raw_hits"]) == 2 and out["probe"]["filtered_hits"] == []
 
 
 def test_validate_scenario_missing_probe_and_launch_failure(tmp_path, monkeypatch):
