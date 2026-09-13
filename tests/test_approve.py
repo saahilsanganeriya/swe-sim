@@ -1,5 +1,6 @@
 """Approval stage: code-owned gates in --auto mode, human freeze otherwise. Offline."""
 import hashlib, json
+import pytest
 
 from swesim.models import ScenarioSpec, minimal_spec_dict
 from swesim.paths import Workspace
@@ -54,17 +55,17 @@ def test_on_request_fact_must_link_f2p(tmp_path):
     assert out["approved"] is False and any("on-request" in r for r in out["reasons"]) and not (sdir / "scenario.json").exists()
 
 
-def test_withholding_leak_gate_is_stricter_than_schema(tmp_path):
+def test_schema_rejects_withholding_leaks_even_with_trailing_space(tmp_path):
     d = minimal_spec_dict(); d["briefs"][0]["text"] = "Import fails\nERROR42 \nmore"
     d["briefs"].append({"profile": "withheld", "text": "Import fails\nsee ERROR42", "provenance": "withheld"})
     d["ledger"].append({"id": "withheld-001", "text": "ERROR42", "kind": "reproduction", "provenance": "original-issue", "source_excerpt": "ERROR42 ",
                         "source_url": "https://example.com/issue", "discovery": "on-request"})
     d["operations"] = [{"type": "withholding", "target": "withheld-001", "rationale": "error_message"}]
-    spec = ScenarioSpec.model_validate(d)  # schema passes: the excerpt with trailing space is not literally present
-    assert any("withheld brief still contains excerpt of withheld-001" in r for r in auto_gates(spec, tmp_path))
+    with pytest.raises(ValueError, match="reconstruct"):
+        ScenarioSpec.model_validate(d)
     ws, sdir, d = _draft(tmp_path, d)
     out = approve_scenario(ws, d["id"], auto=True)
-    assert out["approved"] is False and any("excerpt" in r for r in out["reasons"]) and not (sdir / "scenario.json").exists()
+    assert out["approved"] is False and any("reconstruct" in r for r in out["reasons"]) and not (sdir / "scenario.json").exists()
 
 
 def test_schema_failure_is_reported_not_raised(tmp_path):
@@ -115,8 +116,8 @@ def test_withheld_brief_must_be_the_natural_text_minus_exactly_the_recorded_exce
     d["operations"] = [{"type": "withholding", "target": "withheld-001", "rationale": "Removed category: expected_output"}]
     # the second sentence vanished without a record (the old bug): rejected
     d["briefs"].append({"profile": "withheld", "text": "Numeric export drops values\nThe exporter should keep the column order.\nSeen on 1.2.", "provenance": "withheld"})
-    fails = auto_gates(ScenarioSpec.model_validate(d), tmp_path)
-    assert any(r.startswith("withheld brief is not the natural issue minus exactly the recorded excerpts") for r in fails)
+    with pytest.raises(ValueError, match="reconstruct"):
+        ScenarioSpec.model_validate(d)
     # exactly the recorded excerpt removed: accepted
     d["briefs"][1]["text"] = "Numeric export drops values\nThe exporter should keep the column order.\nExpected values are numeric and preserve all nulls.\nSeen on 1.2."
     assert not any("recorded excerpts" in r for r in auto_gates(ScenarioSpec.model_validate(d), tmp_path))
