@@ -8,15 +8,22 @@ reaches the same namespace as the worker without exporting anything. Temporal Cl
 from __future__ import annotations
 
 import uuid
-from typing import Mapping
+from collections.abc import Mapping
 
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
 
 from swesim.settings import MissingSecret, Settings, get_settings, secret
-from swesim.workflows import queues
-from swesim.workflows.workflows import (CandidateWorkflow, CreateTasksWorkflow, PipelineWorkflow, RunMatrixWorkflow, RunTasksWorkflow,
-                                        params_summary)
+from swesim.workflows import queues, search_attributes
+from swesim.workflows.payloads import check_payload
+from swesim.workflows.workflows import (
+    CandidateWorkflow,
+    CreateTasksWorkflow,
+    PipelineWorkflow,
+    RunMatrixWorkflow,
+    RunTasksWorkflow,
+    params_summary,
+)
 
 TASK_QUEUE = queues.AUTHORING  # operator workflows start here; children are started here too
 TYPES = {"create": "CreateTasksWorkflow", "candidate": "CandidateWorkflow", "run": "RunTasksWorkflow",
@@ -57,8 +64,10 @@ _summary = params_summary  # the memo shown by `list_runs` is the same summary t
 
 
 async def _start(workflow_run, params: dict, prefix: str) -> str:
+    check_payload(params, "workflow input")
     c = await connect(); wid = f"{prefix}-{uuid.uuid4().hex}"
-    await c.start_workflow(workflow_run, params, id=wid, task_queue=TASK_QUEUE, id_reuse_policy=REJECT_DUP, memo={"summary": _summary(params)})
+    await c.start_workflow(workflow_run, params, id=wid, task_queue=TASK_QUEUE, id_reuse_policy=REJECT_DUP, memo={"summary": _summary(params)},
+                           search_attributes=search_attributes.for_params(params))
     return wid
 
 

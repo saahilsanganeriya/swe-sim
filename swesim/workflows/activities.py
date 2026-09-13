@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import importlib
 import inspect
 import json
@@ -37,16 +38,29 @@ from pathlib import Path
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from swesim.models import ID_RE, RunConfig, ScenarioSpec, trial_id
 from swesim import roles
+from swesim.models import ID_RE, RunConfig, ScenarioSpec, trial_id
 from swesim.paths import Workspace, atomic_json
 from swesim.settings import Settings, get_settings, has_secret, secret
-from swesim.workflows import retries, validation
-from swesim.workflows.launchers.base import (Launcher, LaunchFailed, TrialBindingConflict, TrialEvidence, TrialLayout,  # noqa: F401 - re-exported
-                                             WorkspaceLayout, decide_launch, get_launcher, unit_name)
+from swesim.workflows import archive, batching, retries, validation
+from swesim.workflows.launchers.base import (  # noqa: F401 - re-exported
+    Launcher,
+    LaunchFailed,
+    TrialBindingConflict,
+    TrialEvidence,
+    TrialLayout,
+    WorkspaceLayout,
+    decide_launch,
+    get_launcher,
+    unit_name,
+)
 from swesim.workflows.launchers.base import launch_once as _launch_once
 from swesim.workflows.launchers.base import read_evidence as _read_evidence
-from swesim.workflows.launchers.systemd import UnitStateUnavailable, secret_values  # noqa: F401 - re-exported
+from swesim.workflows.launchers.systemd import (  # noqa: F401 - re-exported
+    UnitStateUnavailable,
+    secret_values,
+)
+from swesim.workflows.payloads import check_payload
 
 log = logging.getLogger("swesim.workflows.trials")  # launch decisions; the worker configures stdout logging at INFO
 SETTINGS: Settings = get_settings()
@@ -85,10 +99,13 @@ def swesim_activity(fn):
     @functools.wraps(fn)
     async def wrapper(p: dict) -> dict:
         try:
+            check_payload(p, f"{fn.__name__} input")
             result = await fn(p)
+            result = stamp(result)
+            check_payload(result, f"{fn.__name__} result")
         except ValueError as e:
             raise retries.non_retryable(f"{type(e).__name__}: {str(e)[:1500]}", kind=type(e).__name__) from e
-        return stamp(result)
+        return result
     return activity.defn(name=fn.__name__)(wrapper)
 
 
@@ -123,8 +140,8 @@ async def blocking(fn, every: float | None = None):
         # launch_trial cannot create a Job after the workflow's cancellation cleanup has already run.
         try:
             await asyncio.shield(task)
-        except Exception:
-            pass
+        except Exception as error:  # noqa: BLE001 - cancellation still wins after the thread drains
+            log.debug("cancelled stage ended with %s", type(error).__name__)
         raise
 
 
@@ -198,11 +215,16 @@ async def probe_models_activity(p: dict) -> dict:
 @swesim_activity
 async def discover_activity(p: dict) -> dict:
     """GitHub discovery without probe builds (AUTHORING): `github_repo.discover` -> candidate rows (candidate_to_row + build_recipe)
-    into candidates/github-repo--<owner>__<repo>.jsonl plus the reject histogram (`.rejects.json`) and a `.status` marker when
+    into candidates/github-repo--<owner>__<repo>--<band>.jsonl plus the reject histogram (`.rejects.json`) and a `.status` marker when
     nothing qualified. Probing happens per candidate in `probe_candidate_activity`. Like mine, a rerun rewrites the file: discovery
-    is the freshest PR list the operator asked for."""
+    is the freshest PR list the operator asked for. Returned paths reference immutable per-workflow snapshots."""
     gr = importlib.import_module("swesim.sources.github_repo")
     repo = gr.normalize_repo(p["repo"])
+    band = p.get("kind") or "feature"
+    if band not in ("bugfix", "feature"):
+        raise ValueError("discovery band must be bugfix or feature")
+    if p.get("max_candidates") is not None and int(p["max_candidates"]) < 1:
+        raise ValueError("max_candidates must be positive")
     kwargs = _accepted_kwargs(gr.discover, {k: p[k] for k in ("since", "pr", "max_prs", "kind") if p.get(k) is not None})
     kwargs.setdefault("since", "2026-06-01")
     cands, rejects = await blocking(lambda: gr.discover(repo, **kwargs))
@@ -210,16 +232,28 @@ async def discover_activity(p: dict) -> dict:
     rows = []
     for c in cands[:limit]:
         row = gr.candidate_to_row(c); row.update(gr.build_recipe(repo, c["base_commit"])); rows.append(row)
-    out = WS.candidates_dir / f"github-repo--{repo.replace('/', '__')}.jsonl"; out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(out.name + ".tmp"); tmp.write_text("".join(json.dumps(r) + "\n" for r in rows)); os.replace(tmp, out)
+    source_key = f"github-repo--{repo.replace('/', '__')}--{band}"
+    out = WS.candidates_dir / f"{source_key}.jsonl"; out.parent.mkdir(parents=True, exist_ok=True)
+    candidate_text = "".join(json.dumps(r) + "\n" for r in rows)
+    batching.atomic_text(out, candidate_text)
     rejects = {**dict(rejects), **({"max-candidates-cut": len(cands) - limit} if len(cands) > limit else {})}
     atomic_json(out.with_suffix(".rejects.json"), rejects)
+    rejects_bytes = json.dumps(rejects, sort_keys=True, indent=2, allow_nan=False).encode()
+    rejects_sha256 = hashlib.sha256(rejects_bytes).hexdigest()
+    workflow_id = activity.info().workflow_id if activity.in_activity() else p.get("workflow_id", "direct")
+    snapshot_id = hashlib.sha256(candidate_text.encode() + rejects_bytes).hexdigest()
+    snapshot_dir = batching.directory(WS, workflow_id) / "discovery" / source_key
+    snapshot = snapshot_dir / f"{snapshot_id}.jsonl"
+    batching.atomic_text(snapshot, candidate_text)
+    rejects_snapshot = snapshot.with_suffix(".rejects.json")
+    atomic_json(rejects_snapshot, rejects)
     status = out.with_suffix(".status")
     if not rows:
         status.write_text("no-valid-candidate")
     elif status.exists():
         status.unlink()
-    return {"candidates_path": str(out), "repo": repo, "discovered": len(cands), "written": len(rows), "rejects": rejects}
+    return {"candidates_path": str(snapshot), "canonical_candidates_path": str(out), "source_key": source_key, "band": band, "repo": repo,
+            "discovered": len(cands), "written": len(rows), "rejects": rejects, "rejects_sha256": rejects_sha256, "rejects_path": str(rejects_snapshot)}
 
 
 @swesim_activity
@@ -300,7 +334,7 @@ async def list_candidates_activity(p: dict) -> dict:
     return {"candidates": out}
 
 
-ARCHIVE_FILES = ("scenario.draft.json", "scenario.json", "compile.json", "validation.json", "approval.json", "judge.json", "draft.meta.json")
+ARCHIVE_FILES = ("scenario.draft.json", "scenario.json", "compile.json", "validation.json", "approval.json", "judge.json", "draft.meta.json", "difficulty.json", "audit.json")
 
 
 def scenario_version(sid: str) -> dict:
@@ -325,21 +359,37 @@ def scenario_version(sid: str) -> dict:
 
 
 def archive_scenario(sid: str, previous_version: int) -> dict:
-    """Rebuild: move the previous version's files into workspace/scenarios/<sid>/archive/v<previous>/ (the ARCHIVE_FILES plus
-    any scenario.draft.rejected-*.json). Kept in place: assets/ (the drafter rewrites it), scores.json (recomputed from trial
-    records, which carry their own spec_hash) and workspace/tasks/<sid>__<condition> (compile_scenario rmtree's each task dir
-    before rendering). Idempotent: an archived.json marker makes a rerun a no-op, so a half-built newer version is never
-    archived as the old one."""
+    """Freeze assets and all compiled variants, publish a verified snapshot, then remove old live metadata.
+    Files are copied idempotently using file write-then-rename (flat GCS buckets cannot atomically rename directories).
+    The archive's assets and tasks remain valid against their original spec/build after a new draft overwrites live files.
+    An archived.json marker makes a retry a no-op, so a newer partial draft is never archived as its predecessor.
+    """
     sdir = WS.scenario_dir(sid); target = sdir / "archive" / f"v{int(previous_version)}"; marker = target / "archived.json"
     if marker.exists():
         return {**_read_json(marker), "already_archived": True}
-    target.mkdir(parents=True, exist_ok=True); moved: list[str] = []
-    names = list(ARCHIVE_FILES) + sorted(q.name for q in sdir.glob("scenario.draft.rejected-*.json"))
-    for name in names:
-        src = sdir / name
-        if src.is_file():
-            os.replace(src, target / name); moved.append(name)
+    target.mkdir(parents=True, exist_ok=True)
+    archive.copy_tree(sdir / "assets", target / "assets")
+    task_dirs = {}
+    for condition in ("full", "hidden", "interactive"):
+        old_task = WS.task_dir(sid, condition)
+        if old_task.is_dir():
+            archive.copy_tree(old_task, target / "tasks" / condition)
+            task_dirs[condition] = str(target / "tasks" / condition)
+    names = sorted(set(ARCHIVE_FILES) | {q.name for q in sdir.glob("scenario.draft.rejected-*.json")} |
+                   {q.name for q in target.glob("scenario.draft.rejected-*.json")})
+    for name in [*names, "scores.json", "approval.note.json"]:
+        if (sdir / name).is_file():
+            archive.copy_file(sdir / name, target / name)
+    snapshot_path = target / "snapshot.json"
+    snapshot = {"files": archive.manifest(target), "task_dirs": task_dirs}
+    if snapshot_path.exists() and _read_json(snapshot_path) != snapshot:
+        raise ValueError("completed archive snapshot differs from the preserved files")
+    atomic_json(snapshot_path, snapshot)  # all archive files verified before any live metadata is removed
+    moved = [name for name in names if (target / name).is_file()]
+    for name in moved:
+        (sdir / name).unlink(missing_ok=True)
     record = {"scenario_id": sid, "previous_version": int(previous_version), "archive_dir": str(target), "archived": moved, "at": time.time(),
+              "snapshot_path": str(snapshot_path), "task_dirs": task_dirs,
               "kept": ["assets/", "scores.json", "workspace/tasks/<sid>__<condition> (compile rewrites them)"]}
     atomic_json(marker, record)
     return record
@@ -362,7 +412,7 @@ async def judge_one_activity(p: dict) -> dict:
     from swesim.stages.judge import judge_candidate
 
     src = Path(p["candidates_path"]); sid = scenario_id_for(p["instance_id"])
-    out = src.parent / "judged" / f"{sid}.judged.jsonl"
+    out = WS.candidates_dir / "judged" / f"{sid}.judged.jsonl"
     if out.exists():
         row = json.loads(out.read_text().splitlines()[0]); cost = None  # retained output: judged (and paid for) earlier
     else:
@@ -556,7 +606,7 @@ async def compile_activity(p: dict) -> dict:
     r = await blocking(lambda: compile_scenario(WS, spec, RunConfig.default("interactive"), p["stakeholder_url"]))
     task_dirs = getattr(r, "task_dirs", None) or {}
     return {"compile_path": str(r.compile_json), "image_digest": getattr(r, "image_digest", None), "task_dirs": {k: str(v) for k, v in dict(task_dirs).items()},
-            "controls": validation.control_names(spec)}  # the per-control validation plan (validate_control_activity per name)
+            "compiled_hash": _read_json(Path(r.compile_json)).get("compiled_hash"), "controls": validation.control_names(spec)}
 
 
 @swesim_activity
@@ -582,6 +632,8 @@ async def validate_control_activity(p: dict) -> dict:
     of relaunching. `HarborRunError` propagates and the BUILD class retries this one control; the result carries paths and the
     small reward summary, never report bodies."""
     spec = _spec(p["scenario_id"]); comp = _compile_info(spec.id)
+    if p.get("compiled_hash") and p["compiled_hash"] != comp["compiled_hash"]:
+        raise ValueError("compiled build changed after control planning")
     return await blocking(lambda: validation.run_control(WS, spec, p["control"], comp["compiled_hash"]))
 
 
@@ -590,8 +642,10 @@ async def evaluate_controls_activity(p: dict) -> dict:
     """The verdict over the recorded control runs (`trial_dirs`: control name -> Harbor trial dir): validate.py's rules over each
     dir's reward and report, then scenarios/<sid>/validation.json in validate_scenario's shape."""
     spec = _spec(p["scenario_id"]); comp = _compile_info(spec.id)
+    if p.get("compiled_hash") and p["compiled_hash"] != comp["compiled_hash"]:
+        raise ValueError("compiled build changed after control execution")
     r = await blocking(lambda: validation.assemble_validation(WS, spec, dict(p.get("trial_dirs") or {}), comp.get("compiled_hash"), comp.get("image_digest"),
-                                                              RunConfig.default("full").run_config_hash))
+                                                              comp.get("run_config_hash")))
     return {"status": r["status"], "failures": r.get("failures", []), "validation_path": str(WS.scenario_dir(spec.id) / "validation.json"),
             "controls": {k: v.get("outcome") for k, v in r["controls"].items()}}
 
@@ -609,14 +663,23 @@ def plan_trials(p: dict) -> dict:
     """Precompute trial requests with the actual per-model RunConfig; trial ids are the workflow ids."""
     spec = _spec(p["scenario_id"]); comp = json.loads((WS.scenario_dir(spec.id) / "compile.json").read_text()); trials = []
     offset = int(p.get("attempt_offset", 0))  # manual retries use fresh attempt indices, never the same trial id
+    if p.get("purpose") == "screen":
+        from swesim.stages.difficulty import SCREEN_COUNTS, SCREEN_MODEL
+        models = p.get("models") or [SCREEN_MODEL]
+        if len(models) != 1:
+            raise ValueError("difficulty screen requires one model")
+        p = {**p, "models": models, "conditions": list(SCREEN_COUNTS)}
+        counts = SCREEN_COUNTS
+    else:
+        counts = {cond: p.get("k", 1) for cond in p.get("conditions", ["interactive"])}
     stakeholder_model = p.get("stakeholder_model")  # the probe's resolved stakeholder id; part of every trial's RunConfig and hash
     for cond in p.get("conditions", ["interactive"]):
         for model in p["models"]:
-            for i in range(offset, offset + p.get("k", 1)):
+            for i in range(offset, offset + counts[cond]):
                 profile = p.get("brief_profile", "withheld")
                 if cond == "full" or not any(b.profile == profile for b in spec.briefs):
                     profile = "natural"
-                kwargs = dict(condition=cond, model=model, compiled_hash=comp["compiled_hash"], purpose=p.get("purpose", "demonstration"), brief_profile=profile)
+                kwargs = {"condition": cond, "model": model, "compiled_hash": comp["compiled_hash"], "purpose": p.get("purpose", "demonstration"), "brief_profile": profile}
                 if stakeholder_model:
                     kwargs["stakeholder"] = {"model_id": stakeholder_model}
                 rc = RunConfig(**kwargs)
@@ -624,11 +687,14 @@ def plan_trials(p: dict) -> dict:
                 from swesim.stages.run import scaffold_identity
                 rc = RunConfig.model_validate({**rc.model_dump(), "agent_config": scaffold_identity(WS.task_dir(spec.id, cond), rc)})
                 tid = trial_id(spec.spec_hash, cond, rc.run_config_hash, i)
-                trials.append(dict(trial_id=tid, scenario_id=spec.id, spec_hash=spec.spec_hash, condition=cond, model=model,
-                                   stakeholder_model=rc.stakeholder.model_id, run_config=rc.model_dump(mode="json"),
-                                   run_config_hash=rc.run_config_hash, attempt_index=i, stakeholder_url=p["stakeholder_url"]))
+                trials.append({"trial_id": tid, "scenario_id": spec.id, "spec_hash": spec.spec_hash, "condition": cond, "model": model,
+                                   "stakeholder_model": rc.stakeholder.model_id, "run_config": rc.model_dump(mode="json"),
+                                   "run_config_hash": rc.run_config_hash, "attempt_index": i, "stakeholder_url": p["stakeholder_url"]})
     if len({t["trial_id"] for t in trials}) != len(trials):
         raise ValueError("duplicate matrix entries")
+    if p.get("audit_model"):
+        for trial in trials:
+            trial["audit_model"] = p["audit_model"]
     return {"scenario_id": spec.id, "trials": trials}
 
 
@@ -638,10 +704,85 @@ async def plan_trials_activity(p: dict) -> dict:
 
 
 @swesim_activity
+async def prepare_trial_plan_activity(p: dict) -> dict:
+    path = batching.plan_path(WS, p["workflow_id"], p["scenario_id"])
+    if path.exists():
+        return batching.write_plan(path, [])
+    return await blocking(lambda: batching.trial_plan(WS, path, plan_trials(p)["trials"]))
+
+
+@swesim_activity
+async def prepare_candidate_plan_activity(p: dict) -> dict:
+    path = batching.plan_path(WS, p["workflow_id"], "candidates")
+    if path.exists():
+        return batching.write_plan(path, [])
+    items = []; seen = set(); duplicates = 0
+    for source_index, source in enumerate(p["sources"]):
+        # Freeze the full candidate rows outside history before children begin. A later discovery may rewrite
+        # the canonical source file while this workflow is still judging/probing its original selection.
+        snapshot = path.parent / (str(source_index) + '.candidates.jsonl')
+        if not snapshot.exists():
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            temporary = snapshot.with_suffix('.tmp')
+            temporary.write_text(Path(source["candidates_path"]).read_text())
+            os.replace(temporary, snapshot)
+        rows = [json.loads(line) for line in snapshot.read_text().splitlines() if line.strip()]
+        for row in rows[:source.get("limit") or None]:
+            iid = row["instance_id"]; sid = scenario_id_for(iid)
+            if sid in seen:
+                duplicates += 1
+                continue
+            seen.add(sid)
+            items.append({"instance_id": iid, "scenario_id": sid, "source_key": source["source_key"], "candidates_path": str(snapshot)})
+    return batching.write_plan(path, items, duplicates=duplicates)
+
+
+@swesim_activity
+async def read_plan_page_activity(p: dict) -> dict:
+    return batching.read_page(WS, p["plan_path"], int(p.get("offset", 0)), int(p.get("limit", batching.CHILDREN_PER_RUN)))
+
+
+@swesim_activity
+async def checkpoint_workflow_activity(p: dict) -> dict:
+    return {"checkpoint_path": batching.checkpoint(WS, p["workflow_id"], p["run_id"], p["state"])}
+
+
+@swesim_activity
 async def score_activity(p: dict) -> dict:
     from swesim.stages.score import score_scenario
 
     return {"scores_path": str(await blocking(lambda: score_scenario(WS, p["scenario_id"])))}
+
+
+@swesim_activity
+async def difficulty_label_activity(p: dict) -> dict:
+    from swesim.stages.difficulty import label
+    from swesim.stages.score import normalize_record, summarize
+
+    spec = _spec(p["scenario_id"]); comp = _compile_info(spec.id)
+    if p.get("plan_path"):
+        plan = json.loads(batching.checked_path(WS, p["plan_path"]).read_text())
+        tids = [item["trial_id"] for item in plan["items"]]
+    else:
+        tids = list(p.get("trial_ids") or [])
+    if len(tids) != 3 or len(set(tids)) != 3:
+        raise ValueError("difficulty screen requires its three explicit trial IDs")
+    records = []
+    for tid in tids:
+        directory = trial_dir(tid)
+        record = normalize_record(json.loads((directory / "record.json").read_text()), directory)
+        if record.get("trial_id") != tid or record.get("scenario_id") != spec.id or record.get("spec_hash") != spec.spec_hash or record.get("compiled_hash") != comp["compiled_hash"]:
+            raise ValueError("difficulty evidence does not match the current scenario and compiled build")
+        records.append(record)
+    result = label(list(summarize(records, 1).values()), spec_hash=spec.spec_hash, compiled_hash=comp["compiled_hash"])
+    path = WS.scenario_dir(spec.id) / "difficulty.json"
+    # A retry uses the previously recorded timestamp when it names the identical measurement.
+    previous = _read_json(path)
+    out = result.model_dump(mode="json")
+    if {k: v for k, v in previous.items() if k != "labelled_at"} == {k: v for k, v in out.items() if k != "labelled_at"}:
+        out["labelled_at"] = previous["labelled_at"]
+    atomic_json(path, out)
+    return {"tier": out["tier"], "model": out["model"], "difficulty_path": str(path)}
 
 
 @swesim_activity
@@ -690,6 +831,11 @@ def launch_once(p: dict) -> dict:
 
 @swesim_activity
 async def launch_trial_activity(p: dict) -> dict:
+    if p.get("request_path"):
+        request = json.loads(batching.checked_path(WS, p["request_path"]).read_text())
+        if request["trial_id"] != p["trial_id"]:
+            raise ValueError("trial request path belongs to a different trial")
+        p = {**request, "run_workflow_id": p.get("run_workflow_id")}
     async with LAUNCH_SLOTS:
         out = await blocking(lambda: launch_once(p))
     # One line per launch decision; the Cloud Logging metric `swesim/trial_reconcile` counts `decision=reconcile`.
@@ -838,6 +984,10 @@ async def cancel_trial_activity(p: dict) -> dict:
     if not launch:
         return {"trial_id": tid, "cancelled": False, "reason": "no launch evidence"}
     await blocking(lambda: launcher().cancel(tid, launch))
+    directory = trial_dir(tid)
+    if not (directory / "record.json").exists() and not (directory / "runner-error.json").exists():
+        atomic_json(directory / "status.json", {**_read_json(directory / "status.json"), "trial_id": tid, "status": "cancelled",
+                                                 "finished_at": time.time(), "origin": SETTINGS.origin, "worker_image_digest": SETTINGS.worker_image_digest})
     return {"trial_id": tid, "cancelled": True, "launcher": launcher().name, "handle": launch.get("handle")}
 
 
@@ -846,7 +996,7 @@ async def cleanup_trial_activity(p: dict) -> dict:
     """Release the trial's runtime resource (Cloud Run: delete the Job; systemd/subprocess: nothing) once terminal evidence
     exists and nothing is running. Refuses otherwise: until the record is written the runtime is the evidence."""
     tid = p["trial_id"]; ev = read_evidence(tid); decision = decide_launch(ev)
-    if ev.runtime_state == "running" or decision not in CLEANUP_DECISIONS:
+    if ev.runtime_state == "running" or decision not in CLEANUP_DECISIONS or (decision == "ingest" and not ev.has_record):
         return {"trial_id": tid, "cleaned": False, "reason": f"not terminal: decision={decision} runtime={ev.runtime_state}"}
     launch = _read_json(trial_dir(tid) / "launch.json")
     await blocking(lambda: launcher().cleanup(tid, launch))
@@ -898,7 +1048,9 @@ ALL = [probe_models_activity, discover_activity, mine_activity, judge_activity, 
        scenario_version_activity, archive_scenario_activity, draft_activity,
        auto_approve_activity, precheck_draft_activity, human_approve_activity, verify_approval_activity, compile_activity,
        validate_activity, validate_control_activity, evaluate_controls_activity, register_activity, plan_trials_activity, launch_trial_activity,
-       await_trial_activity, cancel_trial_activity, cleanup_trial_activity, score_activity, export_activity, spend_check_activity, record_cost_activity]
+       await_trial_activity, cancel_trial_activity, cleanup_trial_activity, score_activity, export_activity, spend_check_activity, record_cost_activity,
+       prepare_trial_plan_activity, prepare_candidate_plan_activity, read_plan_page_activity, checkpoint_workflow_activity]
+ALL.append(difficulty_label_activity)
 
 if __name__ == "__main__":
     raise SystemExit(main())
