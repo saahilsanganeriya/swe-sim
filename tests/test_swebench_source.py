@@ -1705,3 +1705,101 @@ def test_llm_view_drops_probe_bookkeeping_and_human_notes_before_budgeting():
     assert not (set(view) & NON_AUTHORING_FIELDS) and "trimmed" not in view and "secret human note" not in json.dumps(view)
     assert view["problem_statement"] == row["problem_statement"] and view["fail_to_pass"] == ["a::b"] and view["test_patch"] == row["test_patch"]
     assert "probe" not in llm_view(row)   # unbudgeted view too
+
+
+# ---------------------------------------------------------------- A-P1-2: requirements are sanitized and grounded like facts
+
+def test_every_stakeholder_visible_discovery_is_sanitized():
+    """repo-derivable and volunteered-at-review facts reach the stakeholder prompt too; only author-only facts are exempt."""
+    from swesim.stages import draft_spec
+    row = _seaborn_row()
+    leak = "The test constructs a pandas Series of booleans and passes it to Continuous()._setup with IntervalProperty()"
+    for disc in ("brief", "on-request", "volunteered-at-review", "repo-derivable"):
+        fact = {"id": "f09", "text": leak, "kind": "behavior", "provenance": "pr-review", "source_excerpt": "raise a ValueError when the dim is missing",
+                "source_url": "https://github.com/pydata/xarray/pull/5362#r1", "discovery": disc, "tests": [SEABORN_F2P] if disc == "on-request" else []}
+        bad = draft_spec.ledger_violations({"ledger": [fact], "requirements": []}, row, require_f2p_link=False)
+        assert any(v.startswith("f09: fact text would tell the agent how the hidden tests are built") for v in bad), disc
+    hidden = {"id": "f09", "text": leak, "kind": "behavior", "provenance": "pr-review", "source_excerpt": "raise a ValueError when the dim is missing",
+              "source_url": "https://github.com/pydata/xarray/pull/5362#r1", "discovery": "author-only", "tests": []}
+    assert draft_spec.ledger_violations({"ledger": [hidden], "requirements": []}, row, require_f2p_link=False) == []
+
+
+def test_requirement_text_is_sanitized_and_requirements_need_grounding():
+    from swesim.stages import draft_spec
+    row = _seaborn_row()
+    safe_fact = {"id": "f01", "text": "Boolean values on a continuous color scale map True to 1 and False to 0", "kind": "behavior", "provenance": "pr-review",
+                 "source_excerpt": "raise a ValueError when the dim is missing", "source_url": "https://github.com/pydata/xarray/pull/5362#r1",
+                 "discovery": "on-request", "tests": [SEABORN_F2P]}
+    # requirement text naming a test-only identifier is a violation (correction round), like a fact
+    d = {"ledger": [safe_fact], "requirements": [{"id": "r01", "text": "Continuous()._setup must accept IntervalProperty input", "fact_id": "f01", "tests": [SEABORN_F2P]}]}
+    bad = draft_spec.ledger_violations(d, row)
+    assert any(v.startswith("r01: requirement text would tell the agent how the hidden tests are built") and "intervalproperty" in v for v in bad)
+    # a requirement without fact_id must quote the thread verbatim (after normalization) ...
+    d = {"ledger": [safe_fact], "requirements": [{"id": "r02", "text": "Bound the backward recovery scan so crafted files fail quickly", "fact_id": None, "tests": [SEABORN_F2P]}]}
+    bad = draft_spec.ledger_violations(d, row)
+    assert any(v.startswith("r02: requirement is ungrounded") and "fact_id" in v and "verbatim" in v for v in bad)
+    d = {"ledger": [safe_fact], "requirements": [{"id": "r02", "text": "The message should say the dimension was NOT found.", "fact_id": None, "tests": [SEABORN_F2P]}]}
+    assert draft_spec.ledger_violations(d, row) == []                                   # verbatim review sentence, case/whitespace-insensitive
+    # ... and a fact_id must point at a stakeholder-visible ledger fact
+    hidden = {**safe_fact, "id": "f02", "discovery": "author-only", "tests": []}
+    d = {"ledger": [safe_fact, hidden], "requirements": [{"id": "r03", "text": "Booleans map to 0 and 1", "fact_id": "f02", "tests": [SEABORN_F2P]}]}
+    assert any(v.startswith("r03: requirement is ungrounded") and "author-only" in v for v in draft_spec.ledger_violations(d, row))
+    d = {"ledger": [safe_fact], "requirements": [{"id": "r04", "text": "Booleans map to 0 and 1", "fact_id": "f77", "tests": [SEABORN_F2P]}]}
+    assert any(v.startswith("r04: requirement is ungrounded") and "f77" in v for v in draft_spec.ledger_violations(d, row))
+    # grounded requirements pass: by fact, by a code-synthesized extra fact, or by verbatim excerpt of the original issue
+    extra = {"id": "tests-001", "text": "x", "kind": "behavior", "provenance": "authored", "source_excerpt": "assert mapped == [1, 0, 0]", "source_url": "u", "discovery": "on-request", "tests": [SEABORN_F2P]}
+    d = {"ledger": [safe_fact], "requirements": [{"id": "r05", "text": "Booleans map to 0 and 1", "fact_id": "f01", "tests": [SEABORN_F2P]},
+                                                {"id": "r06", "text": "Booleans map to 0 and 1", "fact_id": "tests-001", "tests": [SEABORN_F2P]},
+                                                {"id": "r07", "text": "plotting boolean color data must not raise", "fact_id": None, "tests": []}]}
+    assert draft_spec.ledger_violations(d, row, extra_facts=[extra]) == []
+
+
+def test_requirement_of_a_demoted_fact_is_rewritten_from_the_thread_or_dropped():
+    """A demoted fact's information must not survive through requirement text (A-P1-2)."""
+    from swesim.stages import draft_spec
+    row = _seaborn_row()
+    leak = "The test asserts Continuous()._setup(series, IntervalProperty()) returns [1, 0, 0]"
+    thread_fact = {"id": "f09", "text": leak, "kind": "behavior", "provenance": "pr-review", "source_excerpt": "raise a ValueError when the dim is missing",
+                   "source_url": "https://github.com/pydata/xarray/pull/5362#r1", "discovery": "on-request", "tests": [SEABORN_F2P]}
+    reqs = [{"id": "r01", "text": "Booleans map to 0 and 1", "fact_id": "f09", "tests": [SEABORN_F2P], "source_url": "https://github.com/pydata/xarray/pull/5362#r1"},   # safe text, fact demoted
+            {"id": "r02", "text": "Continuous()._setup must return [1, 0, 0] for IntervalProperty", "fact_id": "f09", "tests": [SEABORN_F2P]},   # unsafe text
+            {"id": "r03", "text": "plotting boolean color data must not raise", "fact_id": None, "tests": []}]                                        # grounded by the issue
+    d = {"ledger": [thread_fact], "requirements": [dict(r) for r in reqs]}
+    log = []
+    bad = draft_spec.ledger_violations(d, row, demote_unsafe=True, filter_log=log)
+    assert thread_fact["discovery"] == "author-only" and all(_is_gate(v) for v in bad)
+    assert [r["id"] for r in d["requirements"]] == ["r01", "r03"]
+    r01 = d["requirements"][0]
+    assert r01["fact_id"] is None and r01["text"] == "raise a ValueError when the dim is missing" and r01["tests"] == [SEABORN_F2P]   # rewritten from the thread excerpt
+    actions = {(x.get("requirement_id"), x["action"]) for x in log if "requirement_id" in x}
+    assert ("r01", "rewritten-from-thread") in actions and ("r02", "dropped") in actions
+    dropped = next(x for x in log if x.get("requirement_id") == "r02")
+    assert any("intervalproperty" in r for r in dropped["reasons"])
+    assert draft_spec.unsafe_fact_text(r01["text"], row) == [] and all(draft_spec.unsafe_fact_text(r["text"], row) == [] for r in d["requirements"])
+    # a demoted fact whose excerpt is not human text (authored: the tests) cannot rewrite the requirement: dropped
+    authored = {"id": "f10", "text": leak, "kind": "behavior", "provenance": "authored", "source_excerpt": "mapped = Continuous()._setup(s, p)(s)",
+                "source_url": "https://github.com/pydata/xarray/pull/5362", "authored_rationale": "tests only", "discovery": "on-request", "tests": [SEABORN_F2P]}
+    d = {"ledger": [authored], "requirements": [{"id": "r01", "text": "Booleans map to 0 and 1", "fact_id": "f10", "tests": [SEABORN_F2P]}]}
+    log = []
+    draft_spec.ledger_violations(d, row, demote_unsafe=True, filter_log=log)
+    assert d["requirements"] == [] and ("r01", "dropped") in {(x.get("requirement_id"), x["action"]) for x in log if "requirement_id" in x}
+
+
+def test_draft_never_writes_an_ungrounded_or_unsafe_requirement(monkeypatch, tmp_path):
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    d = _draft_llm()
+    d["requirements"] += [{"id": "r02", "text": "Bound the recovery scan so crafted files fail quickly", "fact_id": None, "tests": [F2P], "source_url": None},   # model prose, no fact
+                          {"id": "r03", "text": "The message should say the dimension was not found.", "fact_id": None, "tests": [F2P], "source_url": None}]   # verbatim review text
+    calls = _patch_llm(monkeypatch, d, _withhold_llm())
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    author = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
+    assert len(author) == 2 and "r02: requirement is ungrounded" in author[1]["messages"][-1]["content"]      # the model got one round to fix it
+    assert [r.id for r in spec.requirements] == ["r01", "r03"]                                                  # then the ungrounded one was dropped
+    by = {f.id: f for f in spec.ledger}
+    for r in spec.requirements:
+        assert (r.fact_id and by[r.fact_id].discovery != "author-only") or draft_spec._norm(r.text) in draft_spec._corpora(_row())["pr-review"]
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert ("r02", "dropped") in {(x.get("requirement_id"), x["action"]) for x in meta["fact_filter"] if "requirement_id" in x}
+    assert "verbatim" in draft_spec.SYSTEM and "fact_id" in draft_spec.SYSTEM
