@@ -50,6 +50,19 @@ fi
 [ -f "$REGISTRY" ] && "${GC[@]}" storage cp "$REGISTRY" "gs://$BUCKET/registry.json"
 [ -f "$WORKSPACE/dataset.json" ] && "${GC[@]}" storage cp "$WORKSPACE/dataset.json" "gs://$BUCKET/dataset.json"
 
-$PYTHON -m swesim.index.cli migrate
-$PYTHON -m swesim.index.cli rebuild --origin vm-systemd
+if [ "$($PYTHON -c 'from swesim.settings import get_settings; print(int(get_settings().index_enabled))')" = 1 ]; then
+  $PYTHON -m swesim.index.cli migrate
+  $PYTHON -m swesim.index.cli rebuild --origin vm-systemd
+else
+  # The production database is reachable through the Cloud Run SQL socket. A laptop needs no database credential.
+  cloud_cfg=$($PYTHON -c 'import json
+from pathlib import Path
+d = json.loads(Path("infra/outputs.json").read_text())
+for key in ("project", "region", "index_maintenance_job"): print(d[key]["value"])')
+  project=$(printf '%s\n' "$cloud_cfg" | sed -n 1p)
+  region=$(printf '%s\n' "$cloud_cfg" | sed -n 2p)
+  job=$(printf '%s\n' "$cloud_cfg" | sed -n 3p)
+  "${GC[@]}" run jobs execute "$job" --project "$project" --region "$region" --args=migrate --wait
+  "${GC[@]}" run jobs execute "$job" --project "$project" --region "$region" --args=rebuild,--origin=vm-systemd --wait
+fi
 echo "import_vm: $WORKSPACE -> gs://$BUCKET; index rebuilt with origin vm-systemd"
