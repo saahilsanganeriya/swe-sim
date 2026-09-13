@@ -167,7 +167,7 @@ def _fake_compile(tmp_path, spec, oracle_diff=ORACLE_DIFF):
 def _fake_harbor(jobs_root: Path, rewards: dict, probe_txt: str | None, exception_for=()):
     launched = []
 
-    def run_task(task_dir, agent, jobs_dir, job_name, model=None, agent_kwargs=None, env_provider="modal", timeout_sec=10800):
+    def run_task(task_dir, agent, jobs_dir, job_name, model=None, agent_kwargs=None, env_provider="modal", timeout_sec=10800, **kw):
         name = job_name.split("--", 1)[1]; launched.append((name, agent, agent_kwargs))
         td = jobs_dir / job_name / "trial"; (td / "verifier").mkdir(parents=True); (td / "agent").mkdir()
         (td / "result.json").write_text(json.dumps({"exception_info": {"exception_type": "X"} if name in exception_for else None}))
@@ -353,3 +353,95 @@ def test_read_reward_and_report(tmp_path):
     assert harbor_cli.read_reward(td) == {} and harbor_cli.read_report(td) == {}
     (td / "verifier" / "reward.json").write_text('{"reward": 1, "success": 1}'); (td / "verifier" / "report.json").write_text('{"per_test": []}')
     assert harbor_cli.read_reward(td) == {"reward": 1, "success": 1} and harbor_cli.read_report(td) == {"per_test": []}
+
+
+# ---- harbor_cli: bounded fresh attempts after an abandoned job dir (P2-17) ----------------------
+
+def _abandon(job_dir: Path) -> Path:
+    """What a worker-pool roll leaves behind: Harbor created the job and trial dirs, nobody wrote result.json."""
+    (job_dir / "trial-interrupted" / "agent").mkdir(parents=True); (job_dir / "trial-interrupted" / "agent" / "log.txt").write_text("killed mid-run")
+    return job_dir
+
+
+def test_run_task_starts_a_fresh_attempt_after_an_abandoned_job_and_records_lineage(tmp_path, monkeypatch):
+    jobs = tmp_path / "jobs"; monkeypatch.setattr(harbor_cli, "harbor_executable", lambda: "/bin/harbor")
+    fake_run, seen = _fake_run_factory(jobs); monkeypatch.setattr(harbor_cli.subprocess, "run", fake_run)
+    original = _abandon(jobs / "probe-x"); before = sorted(str(p.relative_to(original)) for p in original.rglob("*"))
+    td = harbor_cli.run_task(tmp_path / "task", "nop", jobs, "probe-x", max_fresh_attempts=3, image_digest="sha256:" + "a" * 64)
+    assert td == jobs / "probe-x--attempt-1" / "trial0"
+    assert seen["cmd"][seen["cmd"].index("--job-name") + 1] == "probe-x--attempt-1" and seen["cmd"][seen["cmd"].index("--jobs-dir") + 1] == str(jobs)
+    # the abandoned directory is evidence: never deleted, never overwritten
+    assert sorted(str(p.relative_to(original)) for p in original.rglob("*")) == before and not harbor_cli._terminal_trials(original)
+    lineage = json.loads(harbor_cli.lineage_path(jobs, "probe-x").read_text())
+    assert harbor_cli.lineage_path(jobs, "probe-x").parent == jobs and lineage["job_name"] == "probe-x"
+    [entry] = lineage["attempts"]
+    assert entry["attempt"] == 1 and entry["job_dir"] == str(jobs / "probe-x--attempt-1") and entry["previous_dir"] == str(original)
+    assert "abandoned" in entry["reason"] and entry["at"].endswith("+00:00") and entry["worker_image_digest"] == "sha256:" + "a" * 64
+    # a later call reuses the attempt's terminal result instead of launching again; the lineage is unchanged
+    monkeypatch.setattr(harbor_cli.subprocess, "run", lambda *a, **k: pytest.fail("a terminal result is reused, never relaunched"))
+    assert harbor_cli.run_task(tmp_path / "task", "nop", jobs, "probe-x", max_fresh_attempts=3) == td
+    assert json.loads(harbor_cli.lineage_path(jobs, "probe-x").read_text()) == lineage
+
+
+def test_run_task_fresh_attempts_are_opt_in_and_terminal_results_win(tmp_path, monkeypatch):
+    jobs = tmp_path / "jobs"; monkeypatch.setattr(harbor_cli, "harbor_executable", lambda: "/bin/harbor")
+    monkeypatch.setattr(harbor_cli.subprocess, "run", lambda *a, **k: pytest.fail("launch-once callers never relaunch"))
+    _abandon(jobs / "graded")
+    with pytest.raises(harbor_cli.HarborRunError, match="reconcile, do not relaunch"):  # default: unknown state only reconciles
+        harbor_cli.run_task(tmp_path / "task", "nop", jobs, "graded")
+    assert not harbor_cli.lineage_path(jobs, "graded").exists() and not (jobs / "graded--attempt-1").exists()
+    # the original has a unique terminal result: it is reused even when attempts are allowed and a stale attempt dir exists
+    done = jobs / "done" / "trialA"; done.mkdir(parents=True); (done / "result.json").write_text("{}"); _abandon(jobs / "done--attempt-1")
+    assert harbor_cli.run_task(tmp_path / "task", "nop", jobs, "done", max_fresh_attempts=3) == done
+    # two terminal results is an anomaly, not an abandonment: reconcile by hand
+    two = jobs / "two"; (two / "a").mkdir(parents=True); (two / "b").mkdir(); (two / "a" / "result.json").write_text("{}"); (two / "b" / "result.json").write_text("{}")
+    with pytest.raises(harbor_cli.HarborRunError, match="reconcile, do not relaunch"):
+        harbor_cli.run_task(tmp_path / "task", "nop", jobs, "two", max_fresh_attempts=3)
+    assert not (jobs / "two--attempt-1").exists()
+
+
+def test_run_task_fourth_abandonment_raises_with_the_lineage(tmp_path, monkeypatch):
+    jobs = tmp_path / "jobs"; monkeypatch.setattr(harbor_cli, "harbor_executable", lambda: "/bin/harbor")
+    launched = []
+    def interrupted(cmd, capture_output, text, timeout, env):  # every launch dies before result.json, like a pool roll
+        launched.append(cmd[cmd.index("--job-name") + 1]); _abandon(jobs / launched[-1])
+        raise subprocess.TimeoutExpired(cmd="harbor", timeout=1)
+    monkeypatch.setattr(harbor_cli.subprocess, "run", interrupted)
+    _abandon(jobs / "flaky")
+    for n in (1, 2, 3):
+        with pytest.raises(harbor_cli.HarborRunError, match="deadline"):
+            harbor_cli.run_task(tmp_path / "task", "nop", jobs, "flaky", max_fresh_attempts=3, image_digest=f"sha256:{n}")
+        assert launched[-1] == f"flaky--attempt-{n}"
+    lineage = json.loads(harbor_cli.lineage_path(jobs, "flaky").read_text())
+    assert [e["attempt"] for e in lineage["attempts"]] == [1, 2, 3]
+    assert [e["previous_dir"] for e in lineage["attempts"]] == [str(jobs / "flaky"), str(jobs / "flaky--attempt-1"), str(jobs / "flaky--attempt-2")]
+    assert [e["worker_image_digest"] for e in lineage["attempts"]] == ["sha256:1", "sha256:2", "sha256:3"]
+    with pytest.raises(harbor_cli.HarborRunError, match="reconcile, do not relaunch") as info:  # the 4th occurrence: bounded
+        harbor_cli.run_task(tmp_path / "task", "nop", jobs, "flaky", max_fresh_attempts=3)
+    msg = str(info.value)
+    assert len(launched) == 3 and not (jobs / "flaky--attempt-4").exists()
+    assert str(jobs / "flaky") in msg and str(jobs / "flaky--attempt-3") in msg and str(harbor_cli.lineage_path(jobs, "flaky")) in msg and "sha256:3" in msg
+    assert json.loads(harbor_cli.lineage_path(jobs, "flaky").read_text()) == lineage  # nothing new is recorded when nothing new runs
+    for d in ("flaky", "flaky--attempt-1", "flaky--attempt-2", "flaky--attempt-3"):
+        assert (jobs / d / "trial-interrupted" / "agent" / "log.txt").read_text() == "killed mid-run"
+
+
+def test_run_task_never_treats_a_job_live_in_this_worker_as_abandoned(tmp_path, monkeypatch):
+    jobs = tmp_path / "jobs"; monkeypatch.setattr(harbor_cli, "harbor_executable", lambda: "/bin/harbor")
+    inner = {}
+    def fake_run(cmd, capture_output, text, timeout, env):
+        job = jobs / cmd[cmd.index("--job-name") + 1]; _abandon(job)  # Harbor has created the dir; the result is pending
+        with pytest.raises(harbor_cli.HarborRunError, match="running in this worker") as info:  # a concurrent caller in the same process
+            harbor_cli.run_task(tmp_path / "task", "nop", jobs, "live", max_fresh_attempts=3)
+        inner["msg"] = str(info.value); (job / "trial0").mkdir(); (job / "trial0" / "result.json").write_text("{}")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    monkeypatch.setattr(harbor_cli.subprocess, "run", fake_run)
+    assert harbor_cli.run_task(tmp_path / "task", "nop", jobs, "live", max_fresh_attempts=3) == jobs / "live" / "trial0"
+    assert "reconcile" in inner["msg"] and not (jobs / "live--attempt-1").exists() and not harbor_cli.lineage_path(jobs, "live").exists()
+    assert not harbor_cli._LIVE  # the registry is released after the launch, success or not
+
+
+def test_job_dirs_lists_the_original_and_every_attempt_for_ownership_checks(tmp_path):
+    dirs = harbor_cli.job_dirs(tmp_path, "sid--nop")
+    assert dirs == [tmp_path / "sid--nop", *(tmp_path / f"sid--nop--attempt-{n}" for n in (1, 2, 3))]
+    assert harbor_cli.MAX_FRESH_ATTEMPTS == 3

@@ -1,6 +1,7 @@
 """Split controls retain the actual reports and use the legacy verdict rules."""
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -171,3 +172,66 @@ def test_discovery_bands_and_immutable_snapshots_do_not_overwrite_history(tmp_pa
     assert json.loads(Path(first['rejects_path']).read_text()) == {'too-small': 3}
     assert hashlib.sha256(Path(first['rejects_path']).read_bytes()).hexdigest() == first['rejects_sha256']
     assert Path(first['canonical_candidates_path']).with_suffix('.status').read_text() == 'no-valid-candidate'
+
+
+def _fake_harbor_process(rewards: dict, probe_txt: str):
+    """Harbor as a subprocess (the real `harbor_cli.run_task` runs): writes what `_fake_harbor` writes into `--jobs-dir/--job-name`."""
+    launched = []
+
+    def run(cmd, capture_output, text, timeout, env):
+        jobs = Path(cmd[cmd.index('--jobs-dir') + 1]); job = cmd[cmd.index('--job-name') + 1]; launched.append(job)
+        name = job.split('--', 1)[1].split('--attempt-')[0]
+        td = jobs / job / 'trial'; (td / 'verifier').mkdir(parents=True); (td / 'agent').mkdir()
+        (td / 'result.json').write_text(json.dumps({'exception_info': None}))
+        if name == 'probe':
+            (td / 'agent' / 'probe.txt').write_text(probe_txt)
+        else:
+            r = rewards[name]; (td / 'verifier' / 'reward.json').write_text(json.dumps({k: v for k, v in r.items() if k != 'per_test'}))
+            (td / 'verifier' / 'report.json').write_text(json.dumps({'per_test': r.get('per_test', [])}))
+        return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+    return run, launched
+
+
+def _abandoned(job_dir: Path) -> Path:
+    (job_dir / 'trial' / 'agent').mkdir(parents=True); return job_dir  # Harbor created the dirs; the roll killed it before result.json
+
+
+def _control_fixture(tmp_path, monkeypatch):
+    ws, spec = _spec_ws(tmp_path)
+    compiled = _fake_compile(tmp_path, spec)(ws, spec, RunConfig.default('full'), 'https://example.test')
+    (ws.scenario_dir(spec.id) / 'compile.json').write_text(json.dumps({'compiled_hash': 'c' * 64, 'spec_hash': spec.spec_hash}))
+    monkeypatch.setattr(V, 'verify_compiled_artifacts', lambda *args: None)
+    monkeypatch.setattr(ws.__class__, 'task_dir', lambda self, sid, cond: compiled.task_dirs[cond])
+    monkeypatch.setattr(harbor_cli, 'harbor_executable', lambda: '/bin/harbor')
+    run, launched = _fake_harbor_process(GOOD, CLEAN_PROBE); monkeypatch.setattr(harbor_cli.subprocess, 'run', run)
+    return ws, spec, compiled, launched
+
+
+def test_run_control_takes_a_fresh_attempt_after_an_abandoned_job_and_the_verdict_accepts_it(tmp_path, monkeypatch):
+    """P2-17: a worker-pool roll left the nop control's job dir without a result; the retried control runs attempt-1 next to it,
+    keeps the lineage, and evaluate_controls accepts the attempt's trial dir as this control's evidence."""
+    ws, spec, compiled, launched = _control_fixture(tmp_path, monkeypatch)
+    jobs = V.jobs_dir(ws, spec.id, 'c' * 64); nop = V.job_name(spec.id, 'nop')
+    original = _abandoned(jobs / nop)
+    paths = {name: V.run_control(ws, spec, name, 'c' * 64)['trial_dir'] for name in V.control_names(spec)}
+    assert Path(paths['nop']) == jobs / f'{nop}--attempt-1' / 'trial'
+    assert launched[0] == f'{nop}--attempt-1' and len(launched) == len(V.control_names(spec))
+    lineage = json.loads(harbor_cli.lineage_path(jobs, nop).read_text())
+    assert [(e['attempt'], e['previous_dir']) for e in lineage['attempts']] == [(1, str(original))]
+    assert (original / 'trial' / 'agent').is_dir() and not (original / 'trial' / 'result.json').exists()  # evidence kept as it was
+    rc_hash = RunConfig.default('full').run_config_hash
+    result = V.assemble_validation(ws, spec, paths, 'c' * 64, compiled.image_digest, rc_hash)
+    assert result['status'] == 'valid' and result['trial_dirs']['nop'] == paths['nop']
+    with pytest.raises(ValueError, match='does not belong'):  # an attempt dir of another control is still foreign evidence
+        V.assemble_validation(ws, spec, {**paths, 'oracle': paths['nop']}, 'c' * 64, compiled.image_digest, rc_hash)
+
+
+def test_run_control_fourth_abandonment_raises_the_harbor_error_with_lineage(tmp_path, monkeypatch):
+    ws, spec, compiled, launched = _control_fixture(tmp_path, monkeypatch)
+    jobs = V.jobs_dir(ws, spec.id, 'c' * 64); oracle = V.job_name(spec.id, 'oracle')
+    for d in harbor_cli.job_dirs(jobs, oracle):
+        _abandoned(d)
+    with pytest.raises(harbor_cli.HarborRunError, match='reconcile, do not relaunch') as info:
+        V.run_control(ws, spec, 'oracle', 'c' * 64)
+    assert launched == [] and str(jobs / f'{oracle}--attempt-3') in str(info.value) and not (jobs / f'{oracle}--attempt-4').exists()
+    assert not (ws.scenario_dir(spec.id) / 'validation.json').exists()

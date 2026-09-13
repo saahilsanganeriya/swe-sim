@@ -5,9 +5,11 @@ per-control progress.
 Contract
 - `control_names(spec)` / `control_plan(spec, task_dir)` list the runs validate_scenario makes, in its order: nop, oracle,
   plausible-wrong:<n>, alt-correct:<n>, tamper:<n>, then the reachability `probe`; the plan carries each run's agent and kwargs.
-- `run_control(ws, spec, name, compiled_hash)` launches exactly one of them through `harbor_cli.run_task` (which reconciles an
-  existing job dir instead of relaunching) under the jobs dir validate_scenario uses (`jobs/validate/<sid>/<compiled_hash[:16]>`)
-  and returns paths and the small reward summary; `HarborRunError` propagates (retryable infrastructure).
+- `run_control(ws, spec, name, compiled_hash)` launches exactly one of them through `harbor_cli.run_task` under the jobs dir
+  validate_scenario uses (`jobs/validate/<sid>/<compiled_hash[:16]>`) and returns paths and the small reward summary; a job dir
+  with a terminal result is reused, an abandoned one (no result, no live Harbor process in this worker) gets a bounded fresh
+  attempt in `<job_name>--attempt-<n>` with its lineage in `<job_name>.attempts.json` (P2-17); `HarborRunError` propagates
+  (retryable infrastructure; after the last allowed attempt its message carries the lineage).
 - `assemble_validation(...)` reproduces validate_scenario's verdict from the recorded trial dirs (evaluate_controls, the base and
   gold manifests, the reachability probe) and writes the same validation.json (plus `validated_by`). The rules come from
   `swesim.stages.validate` where they are public; `expected_for` and `exception_info` mirror its two private helpers until
@@ -84,7 +86,8 @@ def job_name(scenario_id: str, control: str) -> str:
 
 
 def run_control(ws: Workspace, spec: ScenarioSpec, name: str, compiled_hash: str) -> dict:
-    """One control run; the same job dir as validate_scenario, so a rerun reconciles instead of relaunching."""
+    """One control run; the same job dir as validate_scenario, so a rerun reuses a terminal result and an abandoned launch gets a
+    bounded fresh attempt beside it (harbor_cli.MAX_FRESH_ATTEMPTS) instead of an unrecoverable reconcile error."""
     task = ws.task_dir(spec.id, "full")
     compiled = json.loads((ws.scenario_dir(spec.id) / "compile.json").read_text())
     if compiled.get("compiled_hash") != compiled_hash or compiled.get("spec_hash") != spec.spec_hash:
@@ -93,7 +96,8 @@ def run_control(ws: Workspace, spec: ScenarioSpec, name: str, compiled_hash: str
     control = next((c for c in control_plan(spec, task) if c.name == name), None)
     if control is None:
         raise ValueError(f"{name!r} is not a control of {spec.id}; controls: {control_names(spec)}")
-    td = harbor_cli.run_task(task, control.agent, jobs_dir(ws, spec.id, compiled_hash), job_name(spec.id, name), agent_kwargs=control.agent_kwargs)
+    td = harbor_cli.run_task(task, control.agent, jobs_dir(ws, spec.id, compiled_hash), job_name(spec.id, name), agent_kwargs=control.agent_kwargs,
+                             max_fresh_attempts=harbor_cli.MAX_FRESH_ATTEMPTS)
     reward = harbor_cli.read_reward(td) if name != PROBE else {}
     return {"control": name, "trial_dir": str(td), "compiled_hash": compiled_hash, "spec_hash": spec.spec_hash,
             "outcome_code": reward.get("outcome_code"), "reward": reward.get("reward"),
@@ -131,8 +135,9 @@ def assemble_validation(ws: Workspace, spec: ScenarioSpec, trial_dirs: dict[str,
     if compiled.get("compiled_hash") != compiled_hash or compiled.get("spec_hash") != spec.spec_hash:
         raise ValueError("control results differ from the compiled scenario and build")
     verify_compiled_artifacts(task, compiled, "full")
-    for name, td in trial_dirs.items():
-        if name not in control_names(spec) or not Path(td).resolve().is_relative_to((jobs_dir(ws, spec.id, compiled_hash) / job_name(spec.id, name)).resolve()):
+    for name, td in trial_dirs.items():  # the control's original job dir or one of its bounded fresh attempts
+        owners = harbor_cli.job_dirs(jobs_dir(ws, spec.id, compiled_hash), job_name(spec.id, name)) if name in control_names(spec) else []
+        if not any(Path(td).resolve().is_relative_to(d.resolve()) for d in owners):
             raise ValueError("control trial directory does not belong to this control and compiled build")
     results: dict[str, dict] = {}; failures: list[str] = []
     for name in control_names(spec):
