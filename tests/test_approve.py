@@ -1,6 +1,5 @@
 """Approval stage: code-owned gates in --auto mode, human freeze otherwise. Offline."""
 import hashlib, json
-from pathlib import Path
 
 from swesim.models import ScenarioSpec, minimal_spec_dict
 from swesim.paths import Workspace

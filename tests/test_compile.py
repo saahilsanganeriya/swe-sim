@@ -11,7 +11,7 @@ from swesim.stages import compile as comp
 VERIFIER_FILES = ("grader.py", "policy.py", "parsers.py", "run_pytest.py")
 SHIM_FILES = ("ask-user", "confirm-behavior", "request-review")
 GRADE_CONFIG_FIELDS = {"artifacts_dir", "pristine_dir", "work_dir", "expected_tests", "groups", "protected", "runner",
-                       "test_user", "verifier_out", "test_timeout_sec", "target_dir", "contract_patch"}
+                       "test_user", "verifier_out", "test_timeout_sec", "target_dir", "contract_patch", "base_manifest"}
 URL = "https://x.modal.run"
 
 
@@ -363,10 +363,12 @@ def test_collector_is_stdlib_only_and_never_runs_git():
 
 def test_collector_archives_tree_and_writes_receipt(tmp_path):
     c = _collector(); repo = _tree(tmp_path / "app"); out = tmp_path / "collect"
-    receipt = c.collect(repo, out, stakeholder_url="", token="", kill=lambda: None)
+    manifest = tmp_path / "base-manifest.txt"; manifest.write_text("pristine image file hashes\n")
+    receipt = c.collect(repo, out, stakeholder_url="", token="", kill=lambda: None, base_manifest=manifest)
     assert set(receipt) >= set(c.RECEIPT_KEYS)
     assert receipt["status"] == "ok" and receipt["rc"] == 0 and receipt["user"] == "root" and receipt["freeze_status"] == "n/a" and receipt["transcript_hash"] is None
     assert receipt["bytes"] == 30 and receipt["sha256"] == hashlib.sha256((out / "app.tar").read_bytes()).hexdigest()
+    assert receipt["base_manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
     assert json.loads((out / "collect.status").read_text()) == receipt
     with tarfile.open(out / "app.tar") as t:
         names = {m.name: m for m in t.getmembers()}
@@ -455,12 +457,29 @@ def test_collector_main_reads_cleared_env(tmp_path, monkeypatch):
     c = _collector(); repo = _tree(tmp_path / "app"); out = tmp_path / "collect"
     monkeypatch.setattr(c, "OUT", out)
     monkeypatch.setattr(c, "kill_agent_processes", lambda: None)
+    manifest = tmp_path / "base-manifest.txt"; manifest.write_text("pristine image file hashes\n")
+    monkeypatch.setattr(c, "BASE_MANIFEST", manifest)
     monkeypatch.setenv("SWESIM_REPO_DIR", str(repo)); monkeypatch.setenv("SWESIM_STAKEHOLDER_URL", ""); monkeypatch.setenv("SWESIM_SESSION_TOKEN", "")
     c.main()
     assert json.loads((out / "collect.status").read_text())["status"] == "ok"
     monkeypatch.delenv("SWESIM_REPO_DIR")
     c.main()  # missing env is a collection failure, not a crash without a receipt
     assert json.loads((out / "collect.status").read_text())["status"] == "collection-failure"
+
+
+def test_collector_missing_base_manifest_fails_and_still_freezes(tmp_path, monkeypatch):
+    c = _collector(); repo = _tree(tmp_path / "app"); out = tmp_path / "collect"
+    calls = []
+
+    def freeze(*args):
+        calls.append(args)
+        return "ok", "f" * 64, {}
+
+    monkeypatch.setattr(c, "freeze", freeze)
+    receipt = c.collect(repo, out, "https://s.modal.run", "tok", kill=lambda: None, base_manifest=tmp_path / "missing")
+    assert receipt["status"] == "collection-failure" and receipt["rc"] == 1
+    assert receipt["base_manifest_sha256"] is None and "base manifest" in receipt["error"]
+    assert calls and receipt["freeze_status"] == "ok"
 
 
 # ---- llm client helpers (offline) --------------------------------------------------------------

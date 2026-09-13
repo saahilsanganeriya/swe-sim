@@ -1,4 +1,4 @@
-import json, os, tarfile, io, shutil, subprocess, sys
+import json, os, tarfile, shutil, subprocess, sys
 from pathlib import Path
 import pytest
 from swesim.verifier import grader
@@ -13,6 +13,12 @@ def _pristine(tmp_path):
     (p / "tests" / "test_mod.py").write_text("from pkg.mod import f\ndef test_new():\n    assert f(2) == 4\ndef test_old():\n    assert f(0) == 0\n")
     return p
 
+def _base_manifest(tmp_path):
+    path = tmp_path / "verifier-base-manifest.txt"
+    path.write_text("trusted base file hashes\n")
+    return path
+
+
 def _cfg(tmp_path, pristine, artifacts):
     out = tmp_path / "verifier_out"; out.mkdir(exist_ok=True)
     return grader.GradeConfig(artifacts_dir=artifacts, pristine_dir=pristine, work_dir=tmp_path / "work",
@@ -21,16 +27,41 @@ def _cfg(tmp_path, pristine, artifacts):
         protected=["tests/**", "**/conftest.py", "**/sitecustomize.py", "**/usercustomize.py", "**/*.pth"],
         runner={"kind": "pytest-ra", "command": sys.executable + " -I " + str(Path(grader.__file__).with_name("run_pytest.py")) + " -rA -p no:cacheprovider --junitxml={junit_path} tests",
                 "single_command": sys.executable + " -I " + str(Path(grader.__file__).with_name("run_pytest.py")) + " -rA -p no:cacheprovider --junitxml={junit_path} {nodeid}"},
-        test_user=None, verifier_out=out)
+        test_user=None, verifier_out=out, base_manifest=_base_manifest(tmp_path))
 
 def _artifacts(tmp_path, tree):
     a = tmp_path / "artifacts"; a.mkdir(exist_ok=True); _tar_tree(tree, a / "app.tar")
-    (a / "collect.status").write_text(json.dumps({"status":"ok", "rc":0, "sha256":grader.sha256_file(a / "app.tar"), "user":"root"})); return a
+    (a / "collect.status").write_text(json.dumps({"status":"ok", "rc":0, "sha256":grader.sha256_file(a / "app.tar"), "user":"root",
+                                                "base_manifest_sha256": grader.sha256_file(_base_manifest(tmp_path))})); return a
+
+@pytest.mark.parametrize("evidence", ["different", "missing", "missing-verifier"])
+def test_base_manifests_must_match_before_submission_tests(tmp_path, monkeypatch, evidence):
+    pristine = _pristine(tmp_path)
+    artifacts = _artifacts(tmp_path, pristine)
+    cfg = _cfg(tmp_path, pristine, artifacts)
+    manifest = tmp_path / "base-manifest.txt"
+    manifest.write_text("base image file hashes\n")
+    cfg.base_manifest = manifest
+    receipt = json.loads((artifacts / "collect.status").read_text())
+    receipt["base_manifest_sha256"] = grader.sha256_file(manifest) if evidence == "missing-verifier" else "0" * 64
+    if evidence == "missing": receipt.pop("base_manifest_sha256")
+    if evidence == "missing-verifier": manifest.unlink()
+    (artifacts / "collect.status").write_text(json.dumps(receipt))
+
+    def never_run(*args, **kwargs):
+        raise AssertionError("submission tests ran before base parity was established")
+
+    monkeypatch.setattr(grader, "_run_tests", never_run)
+    result = grader.grade(cfg)
+    assert result.reward["success"] == 0 and result.reward["reward"] == 0
+    assert "base manifest" in result.report["error"]
+    assert result.report["outcome"] == ("collection-failure" if evidence == "missing" else "evaluator-failure")
+
 
 def test_correct_patch_scores_success(tmp_path):
     pristine = _pristine(tmp_path); tree = tmp_path / "tree"; shutil.copytree(pristine, tree)
     (tree / "pkg" / "mod.py").write_text("def f(x):\n    return x * 2\n")
-    res = grader.grade(_cfg(tmp_path, pristine, _artifacts(tmp_path, tree)))
+    grader.grade(_cfg(tmp_path, pristine, _artifacts(tmp_path, tree)))
     r = json.loads((tmp_path / "verifier_out" / "reward.json").read_text())
     assert r["success"] == 1 and r["reward"] == 1.0 and r["outcome_code"] == 1
 
@@ -125,7 +156,8 @@ def test_symlink_member_is_rejected_and_signaled_but_source_still_graded(tmp_pat
     with tarfile.open(tar, "w") as t:
         t.add(tree, arcname=".")
         ti = tarfile.TarInfo("./pkg/secret"); ti.type = tarfile.SYMTYPE; ti.linkname = "/tests/test.patch"; t.addfile(ti)
-    (a / "collect.status").write_text(json.dumps({"status": "ok", "rc": 0, "sha256": grader.sha256_file(tar), "user": "root"}))
+    (a / "collect.status").write_text(json.dumps({"status": "ok", "rc": 0, "sha256": grader.sha256_file(tar), "user": "root",
+                                                "base_manifest_sha256": grader.sha256_file(_base_manifest(tmp_path))}))
     res = grader.grade(_cfg(tmp_path, p, a))
     assert res.reward["outcome_code"] == 1 and res.reward["integrity_signal_count"] == 2
     assert res.report["rejected_members"] == [["./pkg/secret", "non-regular"]]
@@ -241,7 +273,8 @@ def test_submission_diff_marks_missing_trailing_newline(tmp_path):
 def test_corrupt_archive_is_agent_invalid_submission(tmp_path):
     p = _pristine(tmp_path); a = tmp_path / "artifacts"; a.mkdir()
     (a / "app.tar").write_bytes(b"not a tar archive at all" * 40)
-    (a / "collect.status").write_text(json.dumps({"status": "ok", "rc": 0, "sha256": grader.sha256_file(a / "app.tar"), "user": "root"}))
+    (a / "collect.status").write_text(json.dumps({"status": "ok", "rc": 0, "sha256": grader.sha256_file(a / "app.tar"), "user": "root",
+                                                "base_manifest_sha256": grader.sha256_file(_base_manifest(tmp_path))}))
     res = grader.grade(_cfg(tmp_path, p, a))
     assert res.reward["outcome_code"] == 3 and "invalid_tree" in res.report
 
