@@ -449,6 +449,61 @@ def test_run_tasks_frontier_gate_blocks_or_binds_every_planning_step(monkeypatch
     asyncio.run(scenario())
 
 
+def test_operator_workflows_write_running_first_and_a_terminal_row_on_every_exit(monkeypatch):
+    """P1-6: the running row precedes any probe/gate; failure, cancellation and invalid input end as recorded rows with the reason;
+    continue-as-new is not a failure (its `continued_as_new` row is written by `_continue`)."""
+    from types import SimpleNamespace
+    async def scenario():
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="run-1", run_id="r1", workflow_type="RunTasksWorkflow"))
+        calls = []
+        def fake(raise_on_gate):
+            async def act(name, p, minutes=10, **kw):
+                calls.append((name, p))
+                if name == "frontier_gate_activity": raise raise_on_gate
+                return {}
+            return act
+        params = {"scenario_ids": ["s1"], "models": ["m"], "stakeholder_url": "https://s"}
+        monkeypatch.setattr(W, "act", fake(RuntimeError("control pool down")))
+        with pytest.raises(RuntimeError): await W.RunTasksWorkflow().run(params)
+        names = [n for n, _ in calls]
+        assert names.index("index_workflow_activity") < names.index("frontier_gate_activity")          # running before the gate/probe
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert [r["status"] for r in rows] == ["running", "failed"] and rows[-1]["workflow_id"] == "run-1" and rows[-1]["run_id"] == "r1"
+        assert "RuntimeError: control pool down" in rows[-1]["failure"] and rows[0]["failure"] is None and rows[0]["params_summary"]["models"] == ["m"]
+        # cancellation: a cancelled row (no failure text), then the cancellation propagates
+        calls.clear(); monkeypatch.setattr(W, "act", fake(asyncio.CancelledError()))
+        with pytest.raises(asyncio.CancelledError): await W.RunTasksWorkflow().run(params)
+        assert [(p["status"], p["failure"]) for n, p in calls if n == "index_workflow_activity"] == [("running", None), ("cancelled", None)]
+        # continue-as-new passes through: no failed row from the wrapper
+        class _CAN(W.workflow.ContinueAsNewError): pass
+        calls.clear(); monkeypatch.setattr(W, "act", fake(_CAN()))
+        with pytest.raises(_CAN): await W.RunTasksWorkflow().run(params)
+        assert [p["status"] for n, p in calls if n == "index_workflow_activity"] == ["running"]
+        # CreateTasksWorkflow: invalid input is a recorded failed execution, not one that never appears
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="create-1", run_id="r1", workflow_type="CreateTasksWorkflow"))
+        calls.clear(); monkeypatch.setattr(W, "act", fake(RuntimeError("unused")))
+        with pytest.raises(W.ApplicationError, match="sources is empty"): await W.CreateTasksWorkflow().run({"sources": []})
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert [r["status"] for r in rows] == ["running", "failed"] and "sources is empty" in rows[-1]["failure"] and rows[-1]["workflow_id"] == "create-1"
+        # ... and a probe outage on a valid request
+        calls.clear()
+        async def probe_down(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "probe_models_activity": raise RuntimeError("provider probe timed out")
+            return {}
+        monkeypatch.setattr(W, "act", probe_down)
+        with pytest.raises(RuntimeError): await W.CreateTasksWorkflow().run({"sources": [{"kind": "swebench-annotated", "pool": "A"}], "judge_model": "j", "draft_model": "d"})
+        names = [n for n, _ in calls]
+        assert names.index("index_workflow_activity") < names.index("probe_models_activity")
+        assert [p["status"] for n, p in calls if n == "index_workflow_activity"] == ["running", "failed"]
+        # executions started before the patch replay without the wrapper's rows
+        monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_LIFECYCLE)
+        calls.clear(); monkeypatch.setattr(W, "act", fake(RuntimeError("control pool down")))
+        with pytest.raises(RuntimeError): await W.RunTasksWorkflow().run(params)
+        assert not [n for n, _ in calls if n == "index_workflow_activity"]
+    asyncio.run(scenario())
+
+
 def test_candidate_hooks_carry_source_key_and_scenario_and_tolerate_failure(monkeypatch):
     from types import SimpleNamespace
     async def scenario():
