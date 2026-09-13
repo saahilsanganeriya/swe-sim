@@ -302,11 +302,17 @@ def render_markdown(report: dict) -> str:
     out += [f"- `{e['trial_id']}` ({e['model']}, {e['scenario_id']}): {e['reason']}" for e in report["excluded"]]
     u = report.get("llm_usage")
     if u:
-        out += ["", "## Model usage", "",
+        if u.get("usage_complete"):
+            cost = f"${u['cost_usd']:.2f}" if u.get("cost_usd") is not None else "unknown cost"
+            out += ["", "## Model usage", "",
+                    f"{u['calls']} successful calls ({u['failed_calls']} failed), {u['input_tokens']} provider-reported input and "
+                    f"{u['output_tokens']} output tokens; {cost} from the shared price table."]
+        else:
+            out += ["", "## Model usage", "",
                 f"{u['calls']} successful calls ({u['failed_calls']} failed), ~{u['estimated_input_tokens']} input and ~{u['estimated_output_tokens']} "
                 f"output tokens, estimated ${u['estimated_cost_usd']:.2f}. {u['price_source']}."]
-        for model, m in u["by_model"].items():
-            out.append(f"- {model}: {m['calls']} calls, ~{m['estimated_input_tokens']} in / ~{m['estimated_output_tokens']} out tokens, ~${m['estimated_cost_usd']:.2f}")
+            for model, m in u["by_model"].items():
+                out.append(f"- {model}: {m['calls']} calls, ~{m['estimated_input_tokens']} in / ~{m['estimated_output_tokens']} out tokens, ~${m['estimated_cost_usd']:.2f}")
     return "\n".join(out) + "\n"
 
 

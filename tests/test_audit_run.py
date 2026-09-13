@@ -319,11 +319,13 @@ def test_activities_read_the_settings_workspace_and_are_idempotent(tmp_path, mon
     from swesim.settings import reset_settings
     reset_settings()
     fake = FakeChat()
-    monkeypatch.setattr(L, "chat_json", fake)
-    out = asyncio.run(ACT.audit_transcript_activity({"trial_id": tid}))
+    monkeypatch.setattr(L, "chat_json_with_usage", fake)
+    params = {"trial_id": tid, "audit_model": L.AUDIT_FALLBACK_MODEL}
+    out = asyncio.run(ACT.audit_transcript_activity(params))
+    assert fake.calls[0]["model"] == L.AUDIT_FALLBACK_MODEL
     assert out["trial_id"] == tid and out["asked_before_implementing"] is True and out["written"] is True
     assert Path(out["path"]) == ws.root / "trials" / tid / "audit.json" and out["llm_calls"] == 1
-    again = asyncio.run(ACT.audit_transcript_activity({"trial_id": tid}))
+    again = asyncio.run(ACT.audit_transcript_activity(params))
     assert again["written"] is False and len(fake.calls) == 1
     s = asyncio.run(ACT.audit_scenario_activity({"scenario_id": spec.id}))
     assert s["scenario_id"] == spec.id and s["coherent"] is True and s["fair_tests"] is False and s["written"] is True
