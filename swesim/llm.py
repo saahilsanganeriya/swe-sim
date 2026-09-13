@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 
+from swesim.costs import Usage
 from swesim.roles import ModelIdError, parse_model_id
 from swesim.settings import MissingSecret, Settings
 from swesim.settings import secret as _settings_secret
@@ -17,6 +19,12 @@ from swesim.settings import secret as _settings_secret
 
 class LLMError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    data: dict      # the parsed JSON object
+    usage: Usage    # tokens summed over every attempt the call made (a fallback attempt is billed too)
 
 
 class MissingCredential(LLMError, MissingSecret):
@@ -67,9 +75,34 @@ def _openai_kwargs(name: str, temperature: float | None, max_tokens: int, effort
     return kwargs
 
 
-def chat_json(model_id: str, system: str, messages: list[dict], schema_hint: str, temperature: float | None = None, max_tokens: int = 4000,
-              *, settings: Settings | None = None) -> dict:
-    """messages: [{"role": "user"|"assistant", "content": str}]. Returns parsed JSON. Provider by id prefix.
+def _int(obj, name: str) -> int:
+    return int(getattr(obj, name, 0) or 0)
+
+
+def _anthropic_usage(r) -> Usage:
+    """Anthropic reports cache reads and writes beside `input_tokens`; every prompt token counts as input, reads as cached."""
+    u = getattr(r, "usage", None)
+    if u is None:
+        return Usage(calls=1)
+    read = _int(u, "cache_read_input_tokens")
+    return Usage(input_tokens=_int(u, "input_tokens") + read + _int(u, "cache_creation_input_tokens"), output_tokens=_int(u, "output_tokens"),
+                 cached_tokens=read, calls=1)
+
+
+def _openai_usage(r) -> Usage:
+    u = getattr(r, "usage", None)
+    if u is None:
+        return Usage(calls=1)
+    details = getattr(u, "prompt_tokens_details", None)
+    cached = getattr(details, "cached_tokens", None) if details is not None else None
+    return Usage(input_tokens=_int(u, "prompt_tokens"), output_tokens=_int(u, "completion_tokens"),
+                 cached_tokens=None if cached is None else int(cached), calls=1)
+
+
+def chat_json_with_usage(model_id: str, system: str, messages: list[dict], schema_hint: str, temperature: float | None = None,
+                         max_tokens: int = 4000, *, settings: Settings | None = None) -> ChatResult:
+    """messages: [{"role": "user"|"assistant", "content": str}]. Returns the parsed JSON object with the usage of every
+    attempt the call made. Provider by id prefix (roles: Anthropic or OpenAI).
 
     `temperature` is accepted for callers' config compatibility but only forwarded where the provider supports it
     (see _NO_TEMPERATURE_PREFIXES); it is never forwarded to the Anthropic SDK. `settings` selects the env file the
@@ -82,6 +115,7 @@ def chat_json(model_id: str, system: str, messages: list[dict], schema_hint: str
         raise LLMError(f"pipeline roles run on {ROLE_PROVIDERS} only; {model_id!r} is a {mid.provider} id")
     name = mid.api_name
     sys_prompt = system + "\n\nRespond with a single JSON object only, matching this schema:\n" + schema_hint
+    used = Usage()
     if mid.provider == "anthropic":
         import anthropic
         client = anthropic.Anthropic(api_key=_secret("ANTHROPIC_API_KEY", settings), timeout=120, max_retries=1)
@@ -101,9 +135,10 @@ def chat_json(model_id: str, system: str, messages: list[dict], schema_hint: str
                     last = f"{type(e).__name__}: {str(e)[:200]} thinking={a['thinking']['type']}"
                     continue
                 raise
+            used = used + _anthropic_usage(r)
             text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
             if text.strip():
-                return _extract_json(text)
+                return ChatResult(_extract_json(text), used)
             last = f"stop_reason={r.stop_reason} blocks={[getattr(b, 'type', '?') for b in r.content]} thinking={a['thinking']['type']}"
         raise LLMError(f"no text block from {model_id}: {last}")
     from openai import OpenAI
@@ -112,8 +147,15 @@ def chat_json(model_id: str, system: str, messages: list[dict], schema_hint: str
     last = None
     for effort in efforts:
         r = client.chat.completions.create(model=name, messages=[{"role": "system", "content": sys_prompt}, *messages], **_openai_kwargs(name, temperature, max_tokens, effort))
+        used = used + _openai_usage(r)
         text = r.choices[0].message.content or ""
         if text.strip():
-            return _extract_json(text)
+            return ChatResult(_extract_json(text), used)
         last = f"finish_reason={r.choices[0].finish_reason} effort={effort}"
     raise LLMError(f"no text from {model_id}: {last}")
+
+
+def chat_json(model_id: str, system: str, messages: list[dict], schema_hint: str, temperature: float | None = None, max_tokens: int = 4000,
+              *, settings: Settings | None = None) -> dict:
+    """`chat_json_with_usage(...).data`: the parsed JSON object for callers that do not record cost."""
+    return chat_json_with_usage(model_id, system, messages, schema_hint, temperature, max_tokens, settings=settings).data
