@@ -881,14 +881,19 @@ SECTION_9 = Section("frontier", "Frontier admission gate", (
           Decision("The frontier gate stays, but the operator can proceed past a refusal with a recorded reason.",
                    "Difficulty is model-dependent, so a count of informative screens cannot decide when frontier models run; the operator decides and the record says who and why.",
                    "A frontier run, at frontier prices, on a task the cheap tiers had not proven.", "2026-09-13 14:50 PDT", LEDGER),
-          Decision("Evaluated set: the Tier A–C comparison (deepseek-v3.2, gpt-5-mini, glm-5.3, deepseek-v4.1-flash) plus a top tier of gpt-5.6-sol, "
-                   "deepseek-v4-pro, claude-opus-5 and claude-sonnet-5 under the recorded override; claude-fable-5-1 and gpt-6-astra are not evaluated.",
+          Decision("Evaluated set: the Tier A–C comparison (deepseek-v3.2, gpt-5-mini, glm-5.3, deepseek-v4.1-flash) plus a top tier of gpt-5.5 and "
+                   "deepseek-v4-pro under the recorded override; claude-fable-5-1 and gpt-6-astra are not evaluated.",
                    "Operator directive: Opus 5 or cheaper. The gradient needs a top that last-generation models cannot reach, not the newest frontier.",
                    "The top of the gradient is Opus-class.", "2026-09-13 14:45 PDT", LEDGER),
-          Decision("A solver the probe cannot reach is never substituted: while the Anthropic workspace usage limit is reached (2026-09-13 21:42Z) the "
-                   "Anthropic pair waits and the top tier runs on gpt-5.6-sol and deepseek-v4-pro.",
+          Decision("A solver the probe cannot reach is never substituted: the Anthropic pair was unreachable (workspace usage limit, 2026-09-13 21:42Z), "
+                   "and the operator ruled the top tier falls back to OpenAI models.",
                    "A substituted solver would be attributed to the wrong model; pipeline roles fall back along their chains, solvers never do.",
-                   "Fewer top-tier cells until the limit is raised.", "2026-09-13", S(OPS, "After the 3d3c432 deploy")))),
+                   "Fewer Anthropic cells in the gradient.", "2026-09-13", S(OPS, "After the 3d3c432 deploy")),
+          Decision("gpt-5.6-sol and gpt-5.6-luna cannot run as solvers on the mini-swe-agent scaffold: they refuse function tools over chat completions "
+                   "(400, Responses API required), so their twelve outcome-3 rows are a scaffold incompatibility, not a capability result. The top tier is "
+                   "gpt-5.5 and deepseek-v4-pro.",
+                   "The scaffold speaks chat completions through litellm; the probe only proves a plain completion, so a solver must also prove a tool call.",
+                   "A Responses-API path for the scaffold is deferred; gpt-5.6 stays out of the gradient.", "2026-09-13", S(OPS, "gpt-5.6 solvers cannot drive the scaffold")))),
 ))
 
 # ----------------------------------------------------------------------------- 10. decisions log
@@ -975,8 +980,9 @@ DECISIONS: tuple[Decision, ...] = (
     Decision("Task creation and graded runs go through Temporal only; stage commands refuse to run without SWESIM_DIRECT=1.",
              "One durable path with retries, receipts and search attributes; direct stage runs leave no workflow history.",
              "Debugging a single stage takes an explicit opt-in.", "2026-09-13", S(CLAUDE_MD, "Execution rule (user directive, 2026-09-13)")),
-    Decision("Evaluated set: Tier A–C comparison plus gpt-5.6-sol, deepseek-v4-pro, claude-opus-5, claude-sonnet-5; no claude-fable-5-1, no gpt-6-astra.",
-             "Operator directive: Opus 5 or cheaper.", "The top of the gradient is Opus-class.", "2026-09-13 14:45 PDT", LEDGER),
+    Decision("Evaluated set: Tier A–C comparison plus a top tier of gpt-5.5 and deepseek-v4-pro; no claude-fable-5-1, no gpt-6-astra; the Anthropic pair "
+             "was unreachable and the gpt-5.6 models cannot drive the scaffold.",
+             "Operator directive: Opus 5 or cheaper, then fall back to OpenAI models.", "The top of the gradient is gpt-5.5-class.", "2026-09-13", LEDGER),
     Decision("Solvers are never substituted; pipeline roles fall back along their chains.",
              "Attribution: a trial's model must be the model that ran.", "Cells wait when a provider limit is reached (Anthropic, 2026-09-13 21:42Z).", "2026-09-13", LEDGER),
     Decision("Brief profiles are separate leaderboard rows; hosted runs default to withheld.",
