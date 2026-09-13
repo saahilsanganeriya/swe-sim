@@ -6,8 +6,9 @@ Contract
   `git remote get-url origin`), `--project` (default `GCP_PROJECT` from the env files, then `gcloud config get project`)
   and `--region` (default `SWESIM_GCP_REGION` from the env files, then us-central1).
 - Output keys: `project`, `region`, `temporal_address`, `temporal_namespace`, `stakeholder_url`, `iap_members`
-  (`["user:<account>"]`), `evaluators` (`[<account>]`), `github_repository` (`owner/name`), and `spend_cap_usd` only when
-  `SWESIM_SPEND_CAP_USD` is set.
+  (`["user:<account>"]`), `evaluators` (`[<account>]`), `github_repository` (`owner/name`), `spend_cap_usd` only when
+  `SWESIM_SPEND_CAP_USD` is set, and `iap_programmatic_clients` only when `SWESIM_IAP_PROGRAMMATIC_CLIENTS` is set (an
+  explicit opt-in for organization-owned OAuth clients; Terraform rejects any other client at plan time).
 - No secret ever reaches the output: `build_tfvars` reads a fixed allow-list of keys and refuses (by construction, tested)
   every name in `swesim.settings.SECRET_NAMES`. Values are written to the file, never printed.
 """
@@ -78,7 +79,11 @@ def build_tfvars(values: Mapping[str, str], *, account: str, repo_url: str | Non
     for env_key, tf_key in NON_SECRET_KEYS.items():
         value = values.get(env_key, "")
         if tf_key == "iap_programmatic_clients":
-            out[tf_key] = [item.strip() for item in value.split(",") if item.strip()]
+            # Explicit opt-in (organization OAuth clients only, see infra/variables.tf): the key is written only when set,
+            # so a cleared env file clears the tfvars too. Terraform refuses non-organization clients at plan time.
+            clients = [item.strip() for item in value.split(",") if item.strip()]
+            if clients:
+                out[tf_key] = clients
         elif tf_key == "spend_cap_usd":
             if value:
                 out[tf_key] = float(value)

@@ -62,6 +62,16 @@ variable "iap_programmatic_clients" {
   default = []
 }
 
+variable "iap_client_projects" {
+  description = "Project numbers (same organization) whose OAuth clients are accepted in iap_programmatic_clients besides project_number."
+  type        = list(string)
+  default     = []
+}
+
+variable "project_number" {
+  type = string
+}
+
 variable "iap_resource_name" {
   type = string
 }

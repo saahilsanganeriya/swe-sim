@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -171,11 +172,19 @@ def test_build_tfvars_has_the_terraform_inputs_and_no_secret(tmp_path: Path):
         "temporal_address": "region.gcp.api.temporal.io:7233", "temporal_namespace": "ns.abcde",
         "stakeholder_url": "https://stakeholder.example",
         "iap_members": ["user:op@example.com"], "evaluators": ["op@example.com"],
-        "iap_programmatic_clients": [],
         "github_repository": "acme/swesim",
     }
     assert not (set(doc) & SECRET_NAMES)
     assert "should-never-appear" not in str(doc) and "nor-this" not in str(doc)
+
+
+def test_iap_programmatic_clients_are_an_explicit_opt_in():
+    """Absent or empty -> no key at all (a cleared env file clears the tfvars); set -> the list, for Terraform to vet."""
+    base = dict(account="op@example.com", repo_url=None, project="p", region="r")
+    assert "iap_programmatic_clients" not in tfvars_from_env.build_tfvars({}, **base)
+    assert "iap_programmatic_clients" not in tfvars_from_env.build_tfvars({"SWESIM_IAP_PROGRAMMATIC_CLIENTS": " , "}, **base)
+    doc = tfvars_from_env.build_tfvars({"SWESIM_IAP_PROGRAMMATIC_CLIENTS": "123-abc.apps.googleusercontent.com, 456-def.apps.googleusercontent.com"}, **base)
+    assert doc["iap_programmatic_clients"] == ["123-abc.apps.googleusercontent.com", "456-def.apps.googleusercontent.com"]
 
 
 def test_build_tfvars_spend_cap_only_when_set_and_project_required():
@@ -214,7 +223,7 @@ def test_bootstrap_never_disables_existing_workloads(tmp_path: Path, state: str,
         path.chmod(0o755)
     override = tmp_path / "override.mk"
     calls = tmp_path / "calls"
-    override.write_text("require-project tf-init tfvars open-executions deploy-stakeholder push-secrets seed-registry pin-image migrate verify-cloud:\n\t@true\n"
+    override.write_text("require-project tf-init tfvars open-executions deploy-stakeholder push-secrets bootstrap-namespace seed-registry pin-image write-pin migrate verify-cloud:\n\t@true\n"
                         "apply:\n\t@printf '%s\\n' '$(TF_ARGS)' >> $(CALLS)\n")
     root = SCRIPTS.parents[1]
     env = {**os.environ, "TEST_STATE": state}
@@ -256,7 +265,7 @@ def test_local_deploy_checks_open_workflows_before_build(tmp_path: Path, overrid
         tool.chmod(0o755)
     calls = tmp_path / "calls"
     overrides = tmp_path / "override.mk"
-    overrides.write_text("require-project apply migrate verify-cloud:\n\t@true\n"
+    overrides.write_text("require-project apply write-pin migrate verify-cloud:\n\t@true\n"
                          "pin-image:\n\t@printf 'build\\n' >> $(CALLS)\n")
     root = SCRIPTS.parents[1]
     result = subprocess.run(["make", "--no-print-directory", "-f", str(root / "Makefile"), "-f", str(overrides),
@@ -290,3 +299,261 @@ def test_make_propagates_cloud_failures_with_legacy_make(tmp_path: Path, target:
                             cwd=root, capture_output=True, text=True)
     assert result.returncode != 0, result.stdout + result.stderr
     assert not after.exists(), "a failed apply cannot continue as a successful deployment"
+
+
+# ----------------------------------------------------------------------------------------------- pin guard (F4)
+pin_guard = _load("pin_guard")
+
+DIGEST_A = "r/worker@sha256:" + "a" * 64
+DIGEST_B = "r/worker@sha256:" + "b" * 64
+TAG = "r/worker:latest"
+
+
+def _running(image: str, console: str | None = None) -> dict[str, str]:
+    out = {f"pool/swesim-{q}": image for q in ("authoring", "build", "trials", "control")}
+    out["service/swesim-console"] = console or image
+    return out
+
+
+@pytest.mark.parametrize("pin,running,ok,code", [
+    (None, {}, True, "no-workloads"),                         # bootstrap: nothing deployed
+    (None, _running(TAG), True, "unpinned"),                  # bootstrap apply rolled :latest, no pin yet
+    (DIGEST_A, _running(DIGEST_A), True, "match"),
+    (None, _running(DIGEST_A), False, "pin-missing"),         # fresh clone: apply would roll the pools to :latest
+    (DIGEST_A, _running(DIGEST_B), False, "mismatch"),        # stale laptop pin after a CI deploy (F4)
+    (DIGEST_B, _running(DIGEST_A), False, "mismatch"),        # a new build not yet applied
+    (DIGEST_A, _running(DIGEST_A, console=DIGEST_B), False, "mixed"),
+    (DIGEST_A, None, False, "unknown"),
+    (DIGEST_A, _running(pin_guard.UNKNOWN), False, "unknown"),
+])
+def test_pin_guard_decides_from_the_pin_and_the_running_images(pin, running, ok, code):
+    d = pin_guard.decide(pin, running)
+    assert (d.ok, d.code) == (ok, code), d.message
+    if not ok:
+        assert "pull-pin" in d.message or "gcloud" in d.message or "roll back" in d.message
+        forced = pin_guard.decide(pin, running, force=True)
+        assert forced.ok and forced.code == "forced" and code in forced.message
+
+
+def test_pin_guard_unknown_and_empty_are_distinct():
+    assert pin_guard.decide(DIGEST_A, {}).code == "no-workloads"
+    assert pin_guard.decide(DIGEST_A, None).code == "unknown"
+    assert pin_guard.decide(DIGEST_A, {}).ok and not pin_guard.decide(DIGEST_A, None).ok
+
+
+def test_pin_file_round_trip_and_refusals(tmp_path: Path):
+    pin = tmp_path / "image.auto.tfvars.json"
+    assert pin_guard.read_pin(pin) is None
+    pin_guard.write_pin(pin, DIGEST_A)
+    assert pin_guard.read_pin(pin) == DIGEST_A
+    assert json.loads(pin.read_text()) == {"image": DIGEST_A}
+    with pytest.raises(ValueError):
+        pin_guard.write_pin(pin, TAG)                          # a failed build can never pin a tag
+    with pytest.raises(ValueError):
+        pin_guard.write_pin(pin, "")
+    pin.write_text('{"other": 1}\n')
+    with pytest.raises(ValueError):
+        pin_guard.read_pin(pin)                                # malformed is an error, not "no pin"
+
+
+def _gcloud_json(names_images: dict[str, str]) -> str:
+    return json.dumps([{"metadata": {"name": n}, "spec": {"template": {"spec": {"containers": [{"image": i}]}}}} for n, i in names_images.items()])
+
+
+def test_pin_guard_parses_gcloud_lists_and_ignores_foreign_workloads():
+    pools = _gcloud_json({"swesim-trials": DIGEST_A, "other-pool": TAG, "swesim-build": DIGEST_A})
+    services = _gcloud_json({"swesim-console": DIGEST_A, "unrelated": TAG})
+    assert pin_guard.parse_workloads(pools, services, console="swesim-console") == {
+        "pool/swesim-trials": DIGEST_A, "pool/swesim-build": DIGEST_A, "service/swesim-console": DIGEST_A}
+    assert pin_guard.parse_workloads("", "", console="swesim-console") == {}
+    assert pin_guard.parse_workloads(json.dumps([{"metadata": {"name": "swesim-x"}}]), "[]", console="c") == {"pool/swesim-x": pin_guard.UNKNOWN}
+
+
+def test_pin_guard_running_images_is_none_when_gcloud_fails():
+    def failing(args):
+        return _proc(1, b"", b"ERROR: (gcloud.run.worker-pools.list) PERMISSION_DENIED")
+    assert pin_guard.running_images("p", "r", console="c", run=failing) is None
+    calls: list[list[str]] = []
+
+    def ok(args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="[]", stderr="")
+    assert pin_guard.running_images("p", "r", console="c", run=ok) == {}
+    assert [c[2:4] for c in calls] == [["worker-pools", "list"], ["services", "list"]]
+    assert all("--project" in c and "p" in c and "--format=json" in c for c in calls)
+
+
+def test_pin_guard_main_exit_codes(tmp_path: Path, capsys):
+    pin = tmp_path / "image.auto.tfvars.json"
+    pin_guard.write_pin(pin, DIGEST_A)
+
+    def running_b(args):
+        body = _gcloud_json({"swesim-trials": DIGEST_B}) if args[2] == "worker-pools" else "[]"
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=body, stderr="")
+    common = ["--pin-file", str(pin), "check", "--project", "p", "--region", "r"]
+    assert pin_guard.main(common, run=running_b) == 1
+    assert "pin-guard: mismatch" in capsys.readouterr().err
+    assert pin_guard.main([*common, "--force"], run=running_b) == 0
+    assert "pin-guard: forced" in capsys.readouterr().out
+    assert pin_guard.main(["--pin-file", str(pin), "write", "--image", TAG]) == 2
+    assert pin_guard.read_pin(pin) == DIGEST_A, "a refused write leaves the pin untouched"
+    assert pin_guard.main(["--pin-file", str(pin), "write", "--image", DIGEST_B]) == 0
+    assert pin_guard.read_pin(pin) == DIGEST_B
+
+
+@pytest.mark.parametrize("force,applies", [(0, False), (1, True)])
+def test_make_apply_refuses_a_stale_pin_unless_forced(tmp_path: Path, force: int, applies: bool):
+    """The real `apply` recipe with fake cloud tools: pin A on disk, the pools run B."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    pools = _gcloud_json({"swesim-trials": DIGEST_B, "swesim-build": DIGEST_B})
+    (fake / "gcloud").write_text("#!/bin/bash\ncase \"$*\" in *worker-pools*list*) printf '%s' \"$POOLS\" ;; *services*list*) printf '[]' ;; *) exit 0 ;; esac\n")
+    (fake / "terraform").write_text("#!/bin/bash\ntouch \"$TF_CALLED\"\n")
+    for tool in ("gcloud", "terraform"):
+        (fake / tool).chmod(0o755)
+    pin = tmp_path / "image.auto.tfvars.json"
+    pin_guard.write_pin(pin, DIGEST_A)
+    called = tmp_path / "tf-called"
+    override = tmp_path / "override.mk"
+    override.write_text("outputs:\n\t@true\n")
+    root = SCRIPTS.parents[1]
+    env = {**os.environ, "POOLS": pools, "TF_CALLED": str(called)}
+    result = subprocess.run(["make", "--no-print-directory", "-f", str(root / "Makefile"), "-f", str(override), "apply",
+                             "PROJECT=test", "TF=terraform", f"PIN_FILE={pin}", f"FORCE_PIN={force}", f"PATH={fake}:/usr/bin:/bin",
+                             f"EVIDENCE_DIR={tmp_path / 'evidence'}", f"MAKE=make --no-print-directory -f {root / 'Makefile'} -f {override}"],
+                            cwd=root, env=env, capture_output=True, text=True)
+    assert (result.returncode == 0) is applies, result.stdout + result.stderr
+    assert called.exists() is applies, "terraform apply must not run while the pin disagrees with the pools"
+    assert ("pin-guard: mismatch" in result.stderr) is not applies
+    assert ("pin-guard: forced" in result.stdout) is applies
+
+
+def test_make_deploy_forces_its_own_pin_and_writes_it_back(tmp_path: Path):
+    """`make deploy` passes FORCE_PIN=1 to its apply (it just built the pin) and rewrites the pin from Terraform afterwards."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name, body in {"gcloud": "exit 0", "uv": "exit 0"}.items():
+        (fake / name).write_text("#!/bin/bash\n" + body + "\n")
+        (fake / name).chmod(0o755)
+    calls = tmp_path / "calls"
+    override = tmp_path / "override.mk"
+    override.write_text("require-project open-executions pin-image migrate verify-cloud:\n\t@true\n"
+                        "apply:\n\t@printf 'apply FORCE_PIN=%s\\n' '$(FORCE_PIN)' >> $(CALLS)\n"
+                        "write-pin:\n\t@printf 'write-pin\\n' >> $(CALLS)\n")
+    root = SCRIPTS.parents[1]
+    result = subprocess.run(["make", "--no-print-directory", "-f", str(root / "Makefile"), "-f", str(override), "deploy",
+                             "PROJECT=test", f"PATH={fake}:/usr/bin:/bin", f"CALLS={calls}",
+                             f"MAKE=make --no-print-directory -f {root / 'Makefile'} -f {override}"],
+                            cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert calls.read_text().splitlines() == ["apply FORCE_PIN=1", "write-pin"]
+
+
+# ----------------------------------------------------------------------------------------------- namespace bootstrap (P2-14)
+bootstrap_namespace = _load("bootstrap_namespace")
+
+
+class FakeOperatorService:
+    """ListSearchAttributes/AddSearchAttributes as a namespace would answer them; `refuse` makes add (or both) raise."""
+
+    def __init__(self, present: set[str], refuse_add=None, refuse_list=None):
+        self.present = set(present)
+        self.refuse_add, self.refuse_list = refuse_add, refuse_list
+        self.added: list[dict] = []
+
+    async def list_search_attributes(self, request):
+        if self.refuse_list is not None:
+            raise self.refuse_list
+        from types import SimpleNamespace
+        return SimpleNamespace(custom_attributes={n: 1 for n in self.present}, system_attributes={"WorkflowType": 1})
+
+    async def add_search_attributes(self, request):
+        if self.refuse_add is not None:
+            raise self.refuse_add
+        self.added.append(dict(request.search_attributes))
+        self.present |= set(request.search_attributes)
+
+
+class FakeClient:
+    """`count_workflows` answers like visibility: INVALID_ARGUMENT for an unregistered attribute, 0 for a registered one."""
+
+    def __init__(self, ops: FakeOperatorService, namespace: str = "swesim.test", query_error=None):
+        self.operator_service, self.namespace, self.query_error = ops, namespace, query_error
+        self.queries: list[str] = []
+
+    async def count_workflows(self, query: str) -> int:
+        from temporalio.service import RPCStatusCode
+        self.queries.append(query)
+        if self.query_error is not None:
+            raise self.query_error
+        if query.split(" ")[0] not in self.operator_service.present:
+            raise _rpc(RPCStatusCode.INVALID_ARGUMENT)
+        return 0
+
+
+def _rpc(status):
+    from temporalio.service import RPCError
+    return RPCError("refused by the namespace", status, b"")
+
+
+def test_bootstrap_namespace_is_idempotent():
+    import asyncio
+    from swesim.workflows.search_attributes import KEYS
+    ops = FakeOperatorService(present=set(KEYS))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops)))
+    assert outcome.code == 0 and "all 6 present" in outcome.summary and ops.added == []
+
+
+def test_bootstrap_namespace_registers_only_the_missing_keywords():
+    import asyncio
+    from temporalio.api.enums.v1 import IndexedValueType
+    from swesim.workflows.search_attributes import KEYS
+    ops = FakeOperatorService(present={"swesim_scenario_id", "swesim_model"})
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops), "swesim.abcde"))
+    assert outcome.code == 0
+    assert set(outcome.attributes) == set(KEYS) - {"swesim_scenario_id", "swesim_model"}
+    assert len(ops.added) == 1 and set(ops.added[0]) == set(outcome.attributes)
+    assert set(ops.added[0].values()) == {IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD}
+    assert asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops), "swesim.abcde")).code == 0 and len(ops.added) == 1
+
+
+@pytest.mark.parametrize("status_name", ["PERMISSION_DENIED", "UNIMPLEMENTED"])
+def test_bootstrap_namespace_prints_the_exact_operator_step_when_cloud_refuses(status_name: str):
+    import asyncio
+    from temporalio.service import RPCStatusCode
+    ops = FakeOperatorService(present={"swesim_status"}, refuse_add=_rpc(getattr(RPCStatusCode, status_name)))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops, "swesim.abcde")))
+    assert outcome.code == 2 and "swesim_status" not in outcome.attributes and len(outcome.attributes) == 5
+    lines: list[str] = []
+    assert bootstrap_namespace.report(outcome, "swesim.abcde", out=lines.append) == 2
+    text = "\n".join(lines)
+    assert "tcld namespace search-attributes add --namespace swesim.abcde" in text
+    assert "--search-attribute swesim_purpose=Keyword" in text and "swesim_status=Keyword" not in text
+    assert "Custom Search Attributes" in text and status_name in text
+
+
+def test_bootstrap_namespace_verifies_by_visibility_probe_when_cloud_refuses_even_listing():
+    """Temporal Cloud (measured): ListSearchAttributes is PERMISSION_DENIED too; the probe decides, read-only."""
+    import asyncio
+    from temporalio.service import RPCStatusCode
+    from swesim.workflows.search_attributes import KEYS
+    denied = _rpc(RPCStatusCode.PERMISSION_DENIED)
+    present = FakeClient(FakeOperatorService(present=set(KEYS), refuse_add=denied, refuse_list=denied), "swesim.abcde")
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(present))
+    assert outcome.code == 0 and "verified by visibility" in outcome.summary and len(present.queries) == 6
+    partial = FakeClient(FakeOperatorService(present={"swesim_model"}, refuse_add=denied, refuse_list=denied))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(partial))
+    assert outcome.code == 2 and set(outcome.attributes) == set(KEYS) - {"swesim_model"} and "5 missing" in outcome.summary
+    unverifiable = FakeClient(FakeOperatorService(present=set(), refuse_add=denied, refuse_list=denied), query_error=_rpc(RPCStatusCode.UNAVAILABLE))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(unverifiable))
+    assert outcome.code == 2 and outcome.attributes == KEYS and "6 unverifiable" in outcome.summary and "0 missing" in outcome.summary
+
+
+def test_bootstrap_namespace_other_rpc_errors_are_failures_not_operator_steps():
+    import asyncio
+    from temporalio.service import RPCStatusCode
+    ops = FakeOperatorService(present=set(), refuse_list=_rpc(RPCStatusCode.UNAVAILABLE))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops)))
+    assert outcome.code == 1 and "UNAVAILABLE" in outcome.summary and outcome.attributes == ()
+    lines: list[str] = []
+    assert bootstrap_namespace.report(outcome, "ns", out=lines.append) == 1 and len(lines) == 1

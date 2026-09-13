@@ -40,6 +40,8 @@ Environment on the pools/console follows interfaces §9 exactly (`SWESIM_WORKSPA
 | `region` | `us-central1` | Region for everything |
 | `image` | `""` → `<artifact_repo>/worker:latest` | Digest reference the pools/console run; `make deploy` passes the digest |
 | `iap_members` | `[]` | IAM members allowed through IAP (`user:...`, `group:...`) |
+| `iap_programmatic_clients` | `[]` | Opt-in, **organization OAuth clients only**: client IDs whose tokens IAP accepts for programmatic console requests. IAP rejects any client not owned by a project of this project's organization ("not in the same organization as resource"), so the run module refuses such clients at plan time; Google's public clients (`32555940559…`, `764086051850-…`) never pass. Set `SWESIM_IAP_PROGRAMMATIC_CLIENTS` in the env file (comma-separated) and re-run `make tfvars`; clearing it clears the key. |
+| `iap_programmatic_client_projects` | `[]` | Project numbers in the same organization whose OAuth clients may appear above besides this project's own |
 | `evaluators` | `[]` | Emails that see evaluator-only material (`SWESIM_EVALUATORS`) |
 | `temporal_address`, `temporal_namespace` | `""` | Temporal Cloud endpoint and namespace (non-secret) |
 | `stakeholder_url` | `""` | Stakeholder service base URL (Modal) |
@@ -82,20 +84,36 @@ make cloud-bootstrap PROJECT=<id> REGION=us-central1 SWESIM_ENV_FILE=<path> [EXT
 `cloud-bootstrap` is idempotent and runs, in order: `scripts/cloud/bootstrap.sh` (enable APIs, create the state bucket,
 `terraform init`), `make tfvars`, `terraform apply -var deploy_workloads=false` on a stack without workloads (an existing
 `module.run` is preserved),
-`make push-secrets` (values streamed to Secret Manager on stdin; prints `NAME: updated|unchanged`), `make seed-registry`
+`make push-secrets` (values streamed to Secret Manager on stdin; prints `NAME: updated|unchanged`),
+`make bootstrap-namespace` (`scripts/cloud/bootstrap_namespace.py`: the six Keyword search attributes every swesim
+workflow carries, registered idempotently through the SDK's OperatorService; Temporal Cloud refuses that path, so on a
+fresh Cloud namespace the script prints the exact `tcld namespace search-attributes add …` command and the UI step for
+the missing ones and exits 2 — do it once, re-run, and it exits 0), `make seed-registry`
 (the tracked `registry.json` into an empty bucket, never overwriting), `make pin-image` (`scripts/cloud/build.sh`:
 Cloud Build of `git archive HEAD`, reused when that sha already has an image, digest written to the git-ignored
-`infra/image.auto.tfvars.json`), `terraform apply` (now pinned to the digest), `make migrate` (`swesim index migrate`
+`infra/image.auto.tfvars.json`), `terraform apply` (now pinned to the digest), `make write-pin` (the applied digest read
+back from Terraform, written to the pin file and published to the state bucket), `make migrate` (`swesim index migrate`
 when the command exists and Cloud SQL is reachable, otherwise a notice), and `scripts/cloud/verify_cloud.sh`. Because the
 digest lives in `image.auto.tfvars.json`, a later plain `make apply` keeps the pools on it (it never reverts to `:latest`);
 `-var image=...` on the command line still overrides.
 
+**The pin guard.** `make apply` first runs `scripts/cloud/pin_guard.py`, which compares the pin file with the image the
+four pools and the console run and refuses the apply when they disagree: a stale laptop file after a GitHub deploy
+(`mismatch`), no pin file on a fresh clone while the pools run a digest (`pin-missing`, the apply would roll them to
+`:latest`), pools that disagree with each other (`mixed`), or gcloud unable to list them (`unknown`). `make pull-pin`
+adopts the pin the last deploy published to `gs://<project>-swesim-tfstate/image.auto.tfvars.json` (`make push-pin`
+uploads the local one); `FORCE_PIN=1` records the disagreement and applies anyway. `make deploy` and `make
+cloud-bootstrap` set `FORCE_PIN=1` for the apply that follows their own `pin-image` — rolling is their purpose — and then
+run `write-pin`, so the laptop file, the bucket copy and the pools always name the digest that was applied. Both deploy
+paths publish the same object, so either side can pick up where the other left off.
+
 Later deploys:
 
 ```bash
-make deploy SHA=<sha>        # build that commit -> terraform apply -var image=<digest> -> verify-cloud
+make deploy SHA=<sha>        # build that commit -> terraform apply pinned to its digest -> write-pin -> migrate -> verify-cloud
 make push-secrets            # after rotating a value in the env file (only changed secrets get a new version)
-make plan | make apply       # any Terraform change; every plan/apply output lands in workspace/evidence/cloud/
+make pull-pin                # adopt the digest the last deploy (laptop or GitHub) published before a plain apply
+make plan | make apply       # any Terraform change; apply is refused while the pin disagrees with the pools (FORCE_PIN=1 overrides)
 make pull                    # mirror the record (without trials/*/task/) into the laptop workspace
 ```
 
@@ -108,6 +126,8 @@ The CI deployer applies changes inside `module.run` only. A plan that changes IA
 other infrastructure is rejected before apply; an authenticated project operator applies those changes with `make apply`.
 The deploy checks out and tests the requested commit, requires a pinned build digest, and uses the same Temporal
 connection for its open-execution check and final verification. A missing open-execution command stops deployment.
+After the apply it publishes the applied digest as `gs://<project>-swesim-tfstate/image.auto.tfvars.json`; a laptop
+runs `make pull-pin` before its next plain `make apply` (the pin guard refuses a stale pin otherwise).
 
 `workflow_dispatch` (inputs `sha`, `override_open_executions`) or a `v*` tag: authenticates with WIF as
 `swesim-deployer`, fetches `env.auto.tfvars.json` from the state bucket, runs the open-executions check
@@ -167,6 +187,7 @@ infra/
   modules/run       worker pools, console service, IAP bindings
   modules/logging   log-based metrics and the crash-loop alert
 scripts/cloud/
-  bootstrap.sh build.sh push_secrets.py tfvars_from_env.py verify_cloud.sh pull.sh   (import_vm.sh: storage stream)
+  bootstrap.sh build.sh push_secrets.py tfvars_from_env.py pin_guard.py bootstrap_namespace.py verify_cloud.sh pull.sh
+  (import_vm.sh: storage stream)
 Dockerfile.worker  cloudbuild.yaml  .dockerignore  .gcloudignore  Makefile  .github/workflows/{ci,deploy}.yml
 ```

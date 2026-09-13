@@ -56,10 +56,30 @@ variable "spend_cap_usd" {
   nullable    = true
 }
 
+# Programmatic (non-browser) console access through IAP is an explicit opt-in, ORGANIZATION OAUTH CLIENTS ONLY: IAP accepts
+# a client only when the project that owns it is in the same organization as this project, so list clients created in
+# this project (<project_number>-<id>.apps.googleusercontent.com) or in another project of the organization whose number
+# is in `iap_programmatic_client_projects`. Google's public clients (the gcloud SDK's 32555940559 and 764086051850
+# clients, Google's own apps) fail with "not in the same organization as resource"; the run module refuses them at plan
+# time (a precondition) instead of failing the apply. Empty = browser sign-in only; `iap_members` still gates every request.
 variable "iap_programmatic_clients" {
   type        = list(string)
   default     = []
-  description = "OAuth client IDs allowed to authenticate programmatic console requests; the IAP user access policy still applies."
+  description = "Opt-in: organization-owned OAuth client IDs whose tokens IAP accepts for programmatic console requests (see the comment above). Empty by default."
+  validation {
+    condition     = alltrue([for c in var.iap_programmatic_clients : can(regex("^[0-9]+-[a-z0-9]+\\.apps\\.googleusercontent\\.com$", c))])
+    error_message = "Every iap_programmatic_clients entry must be an OAuth client created in a GCP project, <project_number>-<id>.apps.googleusercontent.com; Google's public clients such as 32555940559.apps.googleusercontent.com are not organization OAuth clients and IAP rejects them."
+  }
+}
+
+variable "iap_programmatic_client_projects" {
+  type        = list(string)
+  default     = []
+  description = "Project numbers, in this project's organization, whose OAuth clients may appear in iap_programmatic_clients besides this project's own. Never list a Google-owned project number (32555940559, 764086051850)."
+  validation {
+    condition     = alltrue([for n in var.iap_programmatic_client_projects : can(regex("^[0-9]+$", n))])
+    error_message = "iap_programmatic_client_projects holds project numbers (digits only)."
+  }
 }
 
 variable "pool_instances" {

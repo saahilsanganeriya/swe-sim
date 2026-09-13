@@ -123,6 +123,12 @@ jobs:
         run: |
           terraform -chdir=infra apply -input=false -no-color plan.out
           terraform -chdir=infra output -json > infra/outputs.json
+      # One authoritative pin: the digest this apply rolled out, read back from Terraform, published next to the state so a
+      # laptop `make pull-pin` adopts it and a plain `make apply` there cannot roll the pools back (pin guard, F4).
+      - name: Publish the deployed pin
+        run: |
+          python3 scripts/cloud/pin_guard.py --pin-file infra/image.auto.tfvars.json write --image "$(terraform -chdir=infra output -raw image)"
+          gcloud storage cp infra/image.auto.tfvars.json "gs://$GCP_PROJECT-swesim-tfstate/image.auto.tfvars.json" --quiet
       - name: Migrate index
         run: |
           gcloud run jobs execute "$(terraform -chdir=infra output -raw index_maintenance_job)" \
