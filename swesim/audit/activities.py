@@ -12,8 +12,6 @@ Contract
 """
 from __future__ import annotations
 
-import asyncio
-
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -21,6 +19,7 @@ from swesim.audit import run as RUN
 from swesim.audit.llm_audit import Judge
 from swesim.audit.record import AuditInputError
 from swesim.paths import Workspace
+from swesim.roles import ROLE_CHAINS
 from swesim.settings import get_settings
 
 
@@ -41,15 +40,32 @@ def _required_id(p, key: str) -> str:
     return value
 
 
+def _judge(p: dict) -> Judge:
+    chain = tuple(ROLE_CHAINS["audit_model"])
+    configured = p.get("audit_model") or chain[0]
+    return Judge(models=(configured, *(model for model in chain if model != configured)))
+
+
+def _record_usage(layout, judge: Judge, trial_id: str | None = None) -> None:
+    """Persist real audit usage in the workflow/trial spend ledger; direct unit calls have no workflow context."""
+    if not activity.in_activity():
+        return
+    from swesim.costs import record_cost
+    for model, usage in judge.measured_usage().items():
+        record_cost(layout, trial_id, activity.info().workflow_id, "audit", model, usage)
+
+
 @activity.defn
 async def audit_scenario_activity(p: dict) -> dict:
     sid = _required_id(p, "scenario_id")
     layout = layout_from_settings()
-    judge = Judge()
+    judge = _judge(p)
+    from swesim.workflows.activities import blocking
     try:
-        audit, written = await asyncio.to_thread(RUN.audit_scenario_result, layout, sid, judge=judge)
+        audit, written = await blocking(lambda: RUN.audit_scenario_result(layout, sid, judge=judge))
     except AuditInputError as e:
         raise ApplicationError(str(e), type="AuditInputError", non_retryable=True) from e
+    await blocking(lambda: _record_usage(layout, judge))
     return {"scenario_id": sid, "path": str(RUN.scenario_audit_path(layout, sid)), "written": written, "coherent": audit.coherent,
             "fair_tests": audit.fair_tests, "plausible_withholding": audit.plausible_withholding, "model": audit.model,
             "rubric_version": audit.rubric_version, "llm_calls": judge.usage()["calls"]}
@@ -59,11 +75,13 @@ async def audit_scenario_activity(p: dict) -> dict:
 async def audit_transcript_activity(p: dict) -> dict:
     tid = _required_id(p, "trial_id")
     layout = layout_from_settings()
-    judge = Judge()
+    judge = _judge(p)
+    from swesim.workflows.activities import blocking
     try:
-        audit, written = await asyncio.to_thread(RUN.audit_trial_result, layout, tid, judge=judge)
+        audit, written = await blocking(lambda: RUN.audit_trial_result(layout, tid, judge=judge))
     except AuditInputError as e:
         raise ApplicationError(str(e), type="AuditInputError", non_retryable=True) from e
+    await blocking(lambda: _record_usage(layout, judge, tid))
     return {"trial_id": tid, "path": str(RUN.trial_audit_path(layout, tid)), "written": written, "legacy": audit.legacy,
             "stakeholder_version": audit.stakeholder_version, "asked_before_implementing": audit.asked_before_implementing,
             "useful_question_rate": audit.useful_question_rate, "questions": len(audit.questions), "replies": len(audit.replies),

@@ -109,9 +109,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--region", default=None)
     parser.add_argument("--account", default=None, help="Google account for IAP + evaluator access (default: gcloud config)")
     parser.add_argument("--repo-url", default=None, help="git remote URL (default: `git remote get-url origin`)")
+    parser.add_argument("--stakeholder-url-file", type=Path, default=Path(".stakeholder_url"),
+                        help="URL output from the Modal deploy, used when absent from the env file")
     args = parser.parse_args(argv)
 
     values = read_env_files(args.env_file)
+    if not values.get("SWESIM_STAKEHOLDER_URL") and args.stakeholder_url_file.is_file():
+        values["SWESIM_STAKEHOLDER_URL"] = args.stakeholder_url_file.read_text().strip()
     project = args.project or values.get("GCP_PROJECT") or _gcloud_config("project")
     region = args.region or values.get("SWESIM_GCP_REGION") or "us-central1"
     account = args.account or _gcloud_config("account")

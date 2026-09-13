@@ -11,7 +11,7 @@ Contract
 - `advisory_lock(key)` is `pg_advisory_xact_lock(hashtext(key))` held for a transaction on Postgres and a
   process-local lock on SQLite. It replaces `registry.json.lock`, which GCS FUSE cannot honour across instances.
 - `rebuild_from_layout()` projects every file into rows first (reads outside the transaction), then truncates the
-  file-backed tables (scenarios, candidates, trials, exchanges, scores, costs) and inserts the projection in one
+  file-backed tables (scenarios, candidates, discoveries, trials, exchanges, scores, costs) and inserts the projection in one
   transaction, so readers never see a half-built index. Tables the files cannot rebuild (workflows: Temporal state;
   operator_actions: the console's audit; index_rebuilds) are kept. The returned `IndexRebuildRow` carries the row
   counts after the rebuild, the per-table diff against before, and every skipped id with its reason.
@@ -45,7 +45,7 @@ from swesim.storage.layout import Layout
 
 log = logging.getLogger(__name__)
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
-REBUILT_TABLES: tuple[str, ...] = ("exchanges", "costs", "scores", "trials", "candidates", "scenarios")  # delete order (children first)
+REBUILT_TABLES: tuple[str, ...] = ("exchanges", "costs", "scores", "trials", "candidates", "discoveries", "scenarios")  # delete order (children first)
 BATCH = 500
 RANGES: dict[str, tuple[str, str]] = {"started_from": ("started_at", ">="), "started_to": ("started_at", "<="),
                                       "judged_from": ("judged_at", ">="), "judged_to": ("judged_at", "<="),
@@ -53,7 +53,7 @@ RANGES: dict[str, tuple[str, str]] = {"started_from": ("started_at", ">="), "sta
 CONTROL_FIELDS: frozenset[str] = frozenset({"offset", "limit", "order_by", "desc", "q", "latest_only", "min_n", "where"})
 DEFAULT_ORDER: dict[str, str] = {"scenarios": "scenario_id", "candidates": "instance_id", "trials": "started_at", "scores": "scenario_id",
                                  "workflows": "started_at", "costs": "at", "operator_actions": "at", "index_rebuilds": "started_at",
-                                 "exchanges": "seq"}
+                                 "exchanges": "seq", "discoveries": "discovered_at"}
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -196,6 +196,12 @@ class IndexStore:
     def upsert_candidates(self, rows: Iterable[M.CandidateRow]) -> int:
         return self._upsert(S.candidates, rows)
 
+    def upsert_discovery(self, row: M.DiscoveryRow) -> None:
+        """Preserve the first immutable observation; replaying its activity cannot rewrite history."""
+        with self.engine.begin() as conn:
+            stmt = self._insert(S.discoveries).values(**row.model_dump(mode="python"))
+            conn.execute(stmt.on_conflict_do_nothing(index_elements=S.PRIMARY_KEYS["discoveries"]))
+
     def upsert_trial(self, row: M.TrialRow) -> None:
         self._upsert(S.trials, [row])
 
@@ -243,7 +249,7 @@ class IndexStore:
         origin = origin or settings.origin
         started = M.utcnow()
         registry = P.project_registry(layout, registry_path)
-        skipped: dict[str, list[dict]] = {"scenarios": [], "candidates": [], "trials": [], "scores": []}
+        skipped: dict[str, list[dict]] = {"scenarios": [], "candidates": [], "discoveries": [], "trials": [], "scores": []}
         scenario_rows: list[M.ScenarioRow] = []
         score_rows: list[M.ScoreRow] = []
         for sid in P.scenario_ids(layout, registry):
@@ -261,6 +267,12 @@ class IndexStore:
                 candidate_rows.extend(P.project_candidates(layout, key, registry=registry, origin=origin, now=started))
             except ValueError as e:
                 skipped["candidates"].append({"id": key, "reason": str(e)[:300]})
+        discovery_rows: list[M.DiscoveryRow] = []
+        for key in P.discovery_source_keys(layout):
+            try:
+                discovery_rows.extend(P.project_discoveries(layout, key, origin=origin))
+            except ValueError as e:
+                skipped["discoveries"].append({"id": key, "reason": str(e)[:300]})
         trial_rows: list[M.TrialRow] = []
         exchange_rows: list[M.ExchangeRow] = []
         cost_rows: list[M.CostRow] = []
@@ -283,6 +295,7 @@ class IndexStore:
                 conn.execute(sa.delete(S.TABLES[name]))
             self._upsert(S.scenarios, scenario_rows, conn)
             self._upsert(S.candidates, candidate_rows, conn)
+            self._upsert(S.discoveries, discovery_rows, conn)
             self._upsert(S.trials, trial_rows, conn)
             self._upsert(S.exchanges, exchange_rows, conn)
             self._upsert(S.scores, score_rows, conn)
@@ -292,7 +305,7 @@ class IndexStore:
                 rebuild_id=str(ULID()), started_at=started, finished_at=M.utcnow(),
                 counts={**after, "skipped": skipped, "projected": {"scenarios": len(scenario_rows), "candidates": len(candidate_rows),
                                                                    "trials": len(trial_rows), "exchanges": len(exchange_rows),
-                                                                   "scores": len(score_rows), "costs": len(cost_rows)}},
+                                                                   "scores": len(score_rows), "costs": len(cost_rows), "discoveries": len(discovery_rows)}},
                 diff={name: {"before": before[name], "after": after[name], "delta": after[name] - before[name]} for name in after},
                 origin=origin, worker_image_digest=settings.worker_image_digest)
             self._upsert(S.index_rebuilds, [row], conn)
@@ -364,6 +377,19 @@ class IndexStore:
 
     def candidates(self, f: M.CandidateFilter) -> M.Page[M.CandidateRow]:
         return self._page(S.candidates, M.CandidateRow, f, self._conditions(S.candidates, f), DEFAULT_ORDER["candidates"])
+
+    def reject_histogram(self, source_key: str | None = None) -> dict[str, int]:
+        """Read only indexed evidence; one latest discovery snapshot per source and one gate per rejected candidate."""
+        table = S.discoveries
+        rank = sa.func.row_number().over(partition_by=table.c.source_key,
+                                        order_by=(table.c.discovered_at.desc(), table.c.discovery_id.desc())).label("snapshot_rank")
+        latest = sa.select(table, rank).subquery()
+        discovery = sa.select(*(latest.c[col.name] for col in table.columns)).where(latest.c.snapshot_rank == 1)
+        candidates = sa.select(S.candidates).where(S.candidates.c.status == "rejected", S.candidates.c.gate.is_not(None))
+        if source_key is not None:
+            discovery = discovery.where(latest.c.source_key == source_key)
+            candidates = candidates.where(S.candidates.c.source_key == source_key)
+        return R.reject_histogram(self._rows(discovery, M.DiscoveryRow), self._rows(candidates, M.CandidateRow))
 
     def funnel(self, source_key: str | None = None) -> list[M.FunnelStep]:
         t = S.candidates

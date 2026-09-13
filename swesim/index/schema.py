@@ -110,12 +110,13 @@ metadata = sa.MetaData()
 ROW_MODELS: dict[str, type[BaseModel]] = {
     "scenarios": M.ScenarioRow, "candidates": M.CandidateRow, "trials": M.TrialRow, "exchanges": M.ExchangeRow,
     "scores": M.ScoreRow, "workflows": M.WorkflowRow, "costs": M.CostRow, "operator_actions": M.OperatorActionRow,
-    "index_rebuilds": M.IndexRebuildRow,
+    "index_rebuilds": M.IndexRebuildRow, "discoveries": M.DiscoveryRow,
 }
 PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "scenarios": ("scenario_id", "version"), "candidates": ("instance_id", "source_key"), "trials": ("trial_id",),
     "exchanges": ("trial_id", "seq"), "scores": ("scenario_id", "spec_hash", "condition", "brief_profile", "model", "run_config_hash"),
     "workflows": ("workflow_id", "run_id"), "costs": ("cost_id",), "operator_actions": ("action_id",), "index_rebuilds": ("rebuild_id",),
+    "discoveries": ("source_key", "discovery_id"),
 }
 INDEXES: dict[str, dict[str, tuple[str, ...]]] = {
     "scenarios": {"ix_scenarios_validation_status": ("validation_status",), "ix_scenarios_source": ("source",)},
@@ -129,6 +130,7 @@ INDEXES: dict[str, dict[str, tuple[str, ...]]] = {
     "costs": {"ix_costs_trial_id": ("trial_id",), "ix_costs_workflow_id": ("workflow_id",), "ix_costs_provider_model": ("provider", "model"), "ix_costs_at": ("at",)},
     "operator_actions": {"ix_operator_actions_at": ("at",)},
     "index_rebuilds": {"ix_index_rebuilds_started_at": ("started_at",)},
+    "discoveries": {"ix_discoveries_source_observed": ("source_key", "discovered_at")},
 }
 
 TABLES: dict[str, sa.Table] = {
@@ -137,3 +139,4 @@ TABLES: dict[str, sa.Table] = {
 scenarios, candidates, trials, exchanges, scores, workflows, costs, operator_actions, index_rebuilds = (
     TABLES["scenarios"], TABLES["candidates"], TABLES["trials"], TABLES["exchanges"], TABLES["scores"], TABLES["workflows"],
     TABLES["costs"], TABLES["operator_actions"], TABLES["index_rebuilds"])
+discoveries = TABLES["discoveries"]

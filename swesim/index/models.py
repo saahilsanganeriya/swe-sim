@@ -14,13 +14,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Generic, Literal, TypeVar
+import hashlib
+import json
+from typing import Annotated, Generic, Literal, TypeVar
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, model_validator
 
 from swesim.models import Strict
 from swesim.settings import Launcher, Origin
-from swesim.storage.layout import Condition
+from swesim.storage.layout import Condition, SEGMENT_RE
 
 ValidationStatus = Literal["drafting", "approved", "compiling", "validating", "valid", "invalid", "rejected", "archived"]
 DifficultyTier = Literal["saturated", "informative", "broken"]
@@ -34,6 +36,8 @@ ExchangeKind = Literal["ask", "confirm", "review", "system"]
 WorkflowStatus = Literal["running", "completed", "failed", "cancelled", "terminated", "timed_out", "continued_as_new"]
 CostRole = Literal["solver", "judge", "drafter", "stakeholder", "withholder", "audit", "probe", "validation"]
 ActionResult = Literal["accepted", "rejected", "failed"]
+DiscoveryBand = Literal["bugfix", "feature"]
+DiscoveryIdentity = Literal["workflow", "legacy"]
 FUNNEL_ORDER: tuple[str, ...] = ("mined", "judged", "probed", "drafted", "approved", "compiled", "validated", "registered")
 
 
@@ -88,6 +92,36 @@ class CandidateRow(Provenance):
     judged_at: AwareDatetime | None
     scenario_id: str | None
     version: int | None
+
+
+def discovery_identity(source_key: str, artifact_sha256: str, workflow_id: str | None, run_id: str | None) -> str:
+    """Content/run identity; legacy observations carry explicit null workflow and run ids."""
+    data = {"source_key": source_key, "artifact_sha256": artifact_sha256, "workflow_id": workflow_id, "run_id": run_id}
+    return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+class DiscoveryRow(Provenance):
+    """One immutable discovery observation; table discoveries, pk (source_key, discovery_id)."""
+
+    source_key: str = Field(pattern=SEGMENT_RE.pattern)
+    discovery_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source: str
+    repo: str | None
+    band: DiscoveryBand | None
+    identity_kind: DiscoveryIdentity
+    rejects: dict[Annotated[str, Field(min_length=1)], Annotated[int, Field(strict=True, ge=0)]]
+    artifact_path: str
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    discovered_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _identity(self):
+        if bool(self.workflow_id) != bool(self.run_id):
+            raise ValueError("discovery workflow and run ids must both be recorded or both unknown")
+        kind = "workflow" if self.workflow_id else "legacy"
+        if self.identity_kind != kind or self.discovery_id != discovery_identity(self.source_key, self.artifact_sha256, self.workflow_id, self.run_id):
+            raise ValueError("discovery identity does not match its source artifact and workflow")
+        return self
 
 
 class TrialRow(Provenance):
