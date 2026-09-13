@@ -6,10 +6,11 @@ RUN if id tester >/dev/null 2>&1; then echo 'tester user pre-exists in base imag
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && uv --version
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 RUN uv python install {{ agent_python }} && ln -s "$(uv python find {{ agent_python }})" /usr/local/bin/swesim-python && /usr/local/bin/swesim-python -I -c 'import sys; print(sys.version)'
-# Assert the prepared checkout; the pilot rejects symlinks, submodules and LFS pointer fixtures; record the same base manifest as the agent image.
+# Assert the prepared checkout; declared submodule paths must be empty (deinit'ed and removed so paths match the agent image);
+# the pilot rejects populated submodules, symlinks and LFS pointer fixtures; record the same base manifest as the agent image.
 RUN cd {{ repo_dir_q }} && test "$(git rev-parse HEAD)" = {{ base_commit }} \
+ && {{ submodule_guard }} \
  && test -z "$(find . \( -path ./.git -o -path ./.venv -o -name node_modules -o -name __pycache__ -o -name .pytest_cache \) -prune -o -type l -print | head -1)" \
- && test ! -e .gitmodules \
  && test -z "$(grep -rlI --exclude-dir=.git --exclude-dir=.venv 'version https://git-lfs.github.com/spec' . | head -1)" \
  && mkdir -p /opt/swesim && find . -path ./.git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > /opt/swesim/base-manifest.txt
 # The untouched base the grader diffs against. Installed build products stay in place under {{ repo_dir }}.

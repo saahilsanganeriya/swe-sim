@@ -36,6 +36,22 @@ TEST_TIMEOUT_SEC = 600  # per pytest invocation inside the grader; the verifier 
 # [[verifier.collect]] hook budget: two 240 s freeze attempts (collect.py FREEZE_*) plus killing and archiving the tree.
 COLLECT_TIMEOUT_SEC = 600.0
 ARTIFACTS_DIR = "/var/swesim-collect"
+# Optional local checkout of the base commit inside the scenario dir; when present, submodule rules are enforced at
+# compile time and recorded in compile.json. Otherwise the Dockerfile guard below enforces them at image build.
+CHECKOUT_DIRNAME = "checkout"
+# Shell guard run in both images after the HEAD assertion and before the base manifest. Declared submodule paths
+# must be absent or empty directories (the approved Dockerfile clones without --recurse-submodules; pypdf's
+# `sample-files` is the motivating case, its test command excludes the dependent tests). Populated paths fail the
+# build; empty placeholders are deinit'ed and removed so both images record the same tree.
+SUBMODULE_GUARD = (
+    "if [ -e .gitmodules ]; then "
+    "for p in $(git config -f .gitmodules --get-regexp '^submodule\\..*\\.path$' | awk '{print $2}'); do "
+    "if [ -e \"$p\" ] && { [ ! -d \"$p\" ] || [ -n \"$(ls -A \"$p\")\" ]; }; then echo \"populated submodule path rejected: $p\" >&2; exit 1; fi; done; "
+    "git submodule deinit --all -f >/dev/null 2>&1 || true; "
+    "for p in $(git config -f .gitmodules --get-regexp '^submodule\\..*\\.path$' | awk '{print $2}'); do { [ -d \"$p\" ] && rmdir \"$p\"; } || true; done; "
+    "fi"
+)
+_SUBMODULE_FETCH = re.compile(r"git\s+clone[^\n]*--recurs|git\s+submodule\s+(update|init|foreach|add)\b")
 # Always protected, in addition to the contract's declared paths and its test files (global constraints).
 DEFAULT_PROTECTED = ["**/conftest.py", "**/sitecustomize.py", "**/usercustomize.py", "**/*.pth", "pytest.ini", "tox.ini",
                      "setup.cfg", "pyproject.toml", ".github/**", ".gitattributes", ".gitignore",
@@ -87,6 +103,38 @@ def verify_assets(sdir: Path, spec: ScenarioSpec) -> None:
         if len(data) != asset.bytes or hashlib.sha256(data).hexdigest() != asset.sha256: raise ValueError(f"asset {name}: digest mismatch for {asset.path}")
 
 
+def inspect_submodules(checkout: Path) -> dict:
+    """Parse <checkout>/.gitmodules; a declared path is `populated` when it exists as anything but an empty directory."""
+    gm = Path(checkout) / ".gitmodules"
+    declared: list[str] = []
+    if gm.is_file():
+        in_submodule = False
+        for line in gm.read_text(errors="replace").splitlines():
+            header = re.match(r"^\s*\[(\w+)", line)
+            if header: in_submodule = header.group(1) == "submodule"; continue
+            m = re.match(r"^\s*path\s*=\s*(.+?)\s*$", line)
+            if in_submodule and m and m.group(1) not in declared: declared.append(m.group(1))
+    populated = []
+    for rel in declared:
+        target = Path(checkout) / rel
+        if target.is_symlink() or (target.exists() and not (target.is_dir() and not any(target.iterdir()))): populated.append(rel)
+    return {"declared": declared, "populated": populated}
+
+
+def check_submodules(checkout: Path) -> dict:
+    """Same rule as SUBMODULE_GUARD, evaluated on a local checkout: raise when a declared submodule path is populated."""
+    info = inspect_submodules(checkout)
+    if info["populated"]:
+        raise ValueError(f"populated submodule path(s) in checkout: {info['populated']}; the pilot requires a checkout without --recurse-submodules")
+    return info
+
+
+def _submodules_record(sdir: Path) -> dict:
+    co = sdir / CHECKOUT_DIRNAME
+    if co.is_dir(): return {**check_submodules(co), "evidence": "checkout"}
+    return {"declared": [], "populated": [], "evidence": "build-time"}
+
+
 def _base_stage(spec: ScenarioSpec, sdir: Path, resolve_digest: bool) -> tuple[str, str | None]:
     env = spec.environment
     if env.kind == "prebuilt-image":
@@ -98,6 +146,8 @@ def _base_stage(spec: ScenarioSpec, sdir: Path, resolve_digest: bool) -> tuple[s
     text = (sdir / spec.assets[env.dockerfile_asset].path).read_text()
     match = re.search(r"^FROM\s+\S+@(sha256:[a-f0-9]{64})", text, re.M)
     if not match: raise ValueError("approved Dockerfile must pin its base digest (FROM image@sha256:...)")
+    if _SUBMODULE_FETCH.search(text):
+        raise ValueError("approved Dockerfile must not fetch submodules (--recurse-submodules/--recursive/git submodule update); declared submodule paths stay empty for this pilot")
     return text.rstrip("\n"), match.group(1)
 
 
@@ -166,6 +216,7 @@ def compile_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, s
     if len(names) != len(set(names)): raise ValueError(f"duplicate control name across control lists: {sorted(n for n in names if names.count(n) > 1)}")
     if not run_config.agent_version: raise ValueError("run_config.agent_version must pin the pre-baked mini-swe-agent version")
     base_stage, digest = _base_stage(spec, sdir, resolve_digest)
+    submodules = _submodules_record(sdir)
     hosts = _hosts(run_config, stakeholder_url)
     natural, selected = _select_briefs(spec, run_config)
     chash = compiled_hash(spec, digest, run_config.agent_version)
@@ -178,7 +229,7 @@ def compile_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, s
         ctx = dict(spec=spec, run_config=run_config, condition=condition, task_name=f"{spec.id}--{condition}", image_digest=digest,
                    agent_hosts=hosts, stakeholder_url=stakeholder_url, session_token=session_token if condition == "interactive" else "",
                    trial_id=trial_id, collect_command=_collect_command(spec, stakeholder_url), verifier_timeout=VERIFIER_TIMEOUT_SEC,
-                   collect_timeout=COLLECT_TIMEOUT_SEC,
+                   collect_timeout=COLLECT_TIMEOUT_SEC, submodule_guard=SUBMODULE_GUARD,
                    repo_dir=repo_dir, repo_dir_q=shlex.quote(repo_dir), base_commit=spec.environment.base_commit, base_stage=base_stage,
                    agent_python=AGENT_PYTHON, agent_version=run_config.agent_version, compiled_hash=chash,
                    brief=natural.text if condition == "full" else selected.text, brief_profile="natural" if condition == "full" else selected.profile,
@@ -206,6 +257,6 @@ def compile_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, s
         out[condition] = tdir
     cj = sdir / "compile.json"
     cj.write_text(json.dumps({"compiled_hash": chash, "spec_hash": spec.spec_hash, "run_config_hash": run_config.run_config_hash,
-                              "image_digest": digest, "brief_profile": selected.profile, "agent_hosts": hosts,
+                              "image_digest": digest, "brief_profile": selected.profile, "agent_hosts": hosts, "submodules": submodules,
                               "task_dirs": {k: str(v) for k, v in out.items()}}, indent=2))
     return CompileResult(out, digest, cj)
