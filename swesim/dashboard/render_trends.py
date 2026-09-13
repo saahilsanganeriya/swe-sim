@@ -15,17 +15,17 @@ METRICS = (
 def chart_fragments(data: dict) -> dict[str, str]:
     """Stable chart IDs let the browser preserve each chart/table choice during refresh."""
     fragments = {}
-    pairs = sorted({(row["condition"], row["brief_profile"]) for row in data["history"]})
-    for condition, profile in pairs:
-        selected = [row for row in data["history"] if row["condition"] == condition and row["brief_profile"] == profile]
-        cohort = [row for row in data["interaction"] if row["condition"] == condition and row["brief_profile"] == profile]
-        for metric, label, nkey, unit, maximum in METRICS:
-            cid = f"trend-{condition}-{profile}-{metric}"
-            title = f"{condition} · {profile}: {label}"
+    pairs = sorted({(row["condition"], row["brief_profile"], row["evaluation_cohort"], row["cohort_label"]) for row in data["history"]})
+    for condition, profile, evaluation, cohort_label in pairs:
+        selected = [row for row in data["history"] if row["condition"] == condition and row["brief_profile"] == profile and row["evaluation_cohort"] == evaluation]
+        cohort = [row for row in data["interaction"] if row["condition"] == condition and row["brief_profile"] == profile and row["evaluation_cohort"] == evaluation]
+        for metric, metric_label, nkey, unit, maximum in METRICS:
+            cid = f"trend-{condition}-{profile}-{evaluation}-{metric}"
+            title = f"{condition} · {profile}: {metric_label} · {cohort_label}"
             fragments[cid] = f"<h2>{h(title)}</h2>" + charts.history(selected, metric=metric, chart_id=cid, title=title,
                                                                    sample_key=nkey, unit=unit, ymax=maximum)
-        cid = f"trend-{condition}-{profile}-asking"
-        title = f"{condition} · {profile}: asked versus did not ask"
+        cid = f"trend-{condition}-{profile}-{evaluation}-asking"
+        title = f"{condition} · {profile}: asked versus did not ask · {cohort_label}"
         fragments[cid] = f"<h2>{h(title)}</h2>" + charts.history(cohort, metric="pass_rate", chart_id=cid, title=title, ymax=1.0)
     difficulty = charts.hbars([(row["label"], row["n"]) for row in data["difficulty"]], "trend-difficulty", "Difficulty distribution")
     links = "<p class='small'>" + " · ".join(f"<a href='{h(row['evidence_url'])}'>{h(row['label'])}: {row['n']}</a>" for row in data["difficulty"]) + "</p>"
@@ -36,6 +36,7 @@ def chart_fragments(data: dict) -> dict[str, str]:
 def body(data: dict, current: dict) -> str:
     select = pages._filter_select
     filters = ("<form class='toolbar' action='/trends' method='get'>"
+               + pages.cohort_select(current)
                + select("purpose", ["comparison", "calibration", "demonstration", "screen"], [current["purpose"]], "purpose")
                + select("condition", ["full", "hidden", "interactive"], current.get("condition"), "condition")
                + select("brief_profile", ["natural", "withheld"], current.get("brief_profile"), "brief profile")
@@ -48,8 +49,8 @@ def body(data: dict, current: dict) -> str:
             "Each purpose, condition and brief profile remains separate.</p>" + filters
             + f"<p class='note' id='trend-coverage'>{coverage(data)}</p>"
             + "<p class='muted small'>Rates are descriptive, not causal: asking cohorts differ in their tasks and behavior. Questions and confirmations use known observations only. "
-            "Cost per solved attempt is unknown until every included attempt has a cost and at least one succeeds. Configurations may differ across the model's admitted attempts; "
-            "the evidence rows retain their frozen configuration hashes.</p>"
+            "Cost per solved attempt is unknown until every included attempt has a cost and at least one succeeds. "
+            "Origins, stakeholder versions, scaffolds and solver settings remain in separate evaluation cohorts.</p>"
             + "<div id='trend-charts' data-live-charts>" + "".join(data["charts"].values()) + "</div>")
 
 

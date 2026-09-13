@@ -164,3 +164,20 @@ def test_health_page_and_api_are_independent_of_index_availability(site, monkeyp
     monkeypatch.setattr(app_module.access, "reader_for", lambda *args: pytest.fail("health page queried unavailable index"))
     assert site["client"].get("/health").status_code == 200
     cached_health.reset()
+
+
+def test_leaderboard_displays_and_selects_requested_metric_k(site):
+    from swesim.stages.score import score_scenario
+    from swesim.dashboard import access
+    directory=site['ws'].scenario_dir(site['spec'].id)
+    (directory/'difficulty.json').write_text(json.dumps({'tier':'informative'}))
+    (directory/'audit.json').write_text(json.dumps({'coherent':True,'fair_tests':True}))
+    score_scenario(site['ws'],site['spec'].id,k=2)
+    access.reset()
+    default=site['client'].get('/api/leaderboard?purpose=calibration').json()['items']
+    assert default and all(row['requested_k']==2 for row in default)
+    selected=site['client'].get('/api/leaderboard?purpose=calibration&metric_k=1').json()['items']
+    assert selected and all(row['requested_k']==1 for row in selected)
+    cohort=selected[0]['evaluation_cohort']
+    evidence=site['client'].get('/leaderboard/evidence?purpose=calibration&evaluation_cohort='+cohort)
+    assert evidence.status_code==200 and site['done'][:12] in evidence.text

@@ -28,6 +28,7 @@ QUEUE_OF: dict[str, str] = {
     "index_scenario_activity": CONTROL, "index_candidate_activity": CONTROL, "index_trial_activity": CONTROL,
     "index_score_activity": CONTROL, "index_workflow_activity": CONTROL, "index_rebuild_activity": CONTROL,
     "index_discovery_activity": CONTROL,
+    "read_candidate_source_activity": CONTROL,
     "prepare_operator_action_activity": CONTROL, "commit_operator_action_activity": CONTROL,
     "record_cost_activity": CONTROL, "spend_check_activity": CONTROL,
     "prepare_trial_plan_activity": CONTROL, "prepare_candidate_plan_activity": CONTROL,

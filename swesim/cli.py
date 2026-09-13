@@ -431,6 +431,8 @@ def matrix(
 @app.command()
 def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a GitHub repo URL, or 'swebench:A' (pool A), or 'swebench:A:<id1>,<id2>'"),
            judge_model: str = typer.Option(JUDGE_MODEL_DEFAULT), draft_model: str = typer.Option(DRAFT_MODEL_DEFAULT),
+           candidate_snapshot: str | None = typer.Option(None, help="Worker-side immutable candidate snapshot for an exact retry"),
+           candidate_id: str | None = typer.Option(None), source_key: str | None = typer.Option(None),
            pr: int | None = typer.Option(None, help="Exact PR number; requires one GitHub source"),
            since: str = typer.Option("2026-06-01"), max_candidates: int = typer.Option(20), max_parallel: int = typer.Option(8),
            approval_mode: str = typer.Option("auto", help="auto | hold (review queue; approve with `swesim workflows approve`)"),
@@ -450,6 +452,10 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
             sources.append({"kind": "swebench-annotated", "pool": pool or "A", "limit": max_candidates, **({"instance_ids": ids[0].split(",")} if ids else {})})
         else:
             sources.append({"kind": "github-repo", "repo": s, "since": since, "max_candidates": max_candidates, "pr_kind": pr_kind, **({"pr": pr} if pr else {})})
+    if any((candidate_snapshot, candidate_id, source_key)):
+        if not all((candidate_snapshot, candidate_id, source_key)):
+            raise typer.BadParameter("frozen retry requires --candidate-snapshot, --candidate-id and --source-key")
+        sources = [{"kind": "frozen-candidate", "candidates_path": candidate_snapshot, "instance_id": candidate_id, "source_key": source_key}]
     params = {"sources": sources, "judge_model": judge_model, "draft_model": draft_model, "max_parallel": max_parallel,
               "approval_mode": approval_mode, "stakeholder_url": _stakeholder_url(stakeholder_url)}
     if pr_kind not in ("bugfix", "feature"):

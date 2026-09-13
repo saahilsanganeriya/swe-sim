@@ -184,6 +184,8 @@ def _flag(value) -> bool:
 
 def create_sources(p: dict) -> list[dict]:
     """The ``sources`` list CreateTasksWorkflow expects (same shape as ``swesim create --source``)."""
+    if p.get("frozen_candidate"):
+        return [{"kind": "frozen-candidate", **p["frozen_candidate"]}]
     if p["source"] == "github-repo":
         return [{"kind": "github-repo", "repo": r, "since": p["since"], "max_candidates": p["max_candidates_per_repo"], "pr_kind": p.get("pr_kind", "bugfix"), **({"pr": p["pr"]} if p.get("pr") else {})} for r in p["repos"]]
     src = {"kind": "swebench-annotated", "pool": "A", "limit": p["limit"]}
@@ -257,6 +259,9 @@ def _q(value) -> str:
 def cli_for_create(p: dict) -> str:
     base = (f"--judge-model {_q(p['judge_model'])} --draft-model {_q(p['draft_model'])} --approval-mode {_q(p['approval_mode'])} "
             f"--max-parallel {_q(p['max_parallel'])}" + (f" --pr {p['pr']}" if p.get("pr") else "") + (" --rebuild" if p.get("rebuild") else ""))
+    frozen = p.get("frozen_candidate")
+    if frozen:
+        base += f" --candidate-snapshot {_q(frozen['candidates_path'])} --candidate-id {_q(frozen['instance_id'])} --source-key {_q(frozen['source_key'])}"
     if p["source"] == "github-repo":
         srcs = "".join(f" --source {_q(r)}" for r in p["repos"]) or " --source <repo-url>"
         return f"uv run swesim create{srcs} --since {_q(p['since'])} --max-candidates {_q(p['max_candidates_per_repo'])} --pr-kind {_q(p.get('pr_kind', 'bugfix'))} {base}"
@@ -410,6 +415,8 @@ def validate_retry(body: dict, candidate: dict | None) -> tuple[dict, list[str]]
         errors.append("candidate has no recorded PR number; retry cannot identify its source")
     errors.extend(errs)
     params["retry_of"] = {"instance_id": candidate["instance_id"], "source_key": candidate["source_key"]}
+    if candidate.get("candidates_path"):
+        params["frozen_candidate"] = {**params["retry_of"], "candidates_path": candidate["candidates_path"]}
     return params, errors
 
 

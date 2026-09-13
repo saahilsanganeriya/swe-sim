@@ -401,7 +401,7 @@ def summarize(records: list[dict], k: int) -> dict:
     return out
 
 
-def score_scenario(ws: Workspace, scenario_id: str, k: int = 3) -> Path:
+def score_scenario(ws: Workspace, scenario_id: str, k: int | None = 3) -> Path:
     """Write ``workspace/scenarios/<id>/scores.json`` for every finished trial of the scenario."""
     out = ws.scenario_dir(scenario_id) / "scores.json"  # validates the id
     recs = load_trial_records(ws, scenario_id)
@@ -410,5 +410,15 @@ def score_scenario(ws: Workspace, scenario_id: str, k: int = 3) -> Path:
             continue  # no record: reported as an unresolved attempt, never as a scored trial
         if rec.get("trial_id") and not (rec.get("spec_hash") and rec.get("run_config_hash")):
             raise ValueError(f"missing frozen lineage for trial {rec['trial_id']}")
-    atomic_json(out, summarize(recs, k))
+    if k is None:
+        # Workflow scoring honors the frozen estimator request of every configuration.
+        groups = {}
+        for rec in recs:
+            groups.setdefault(int((rec.get("run_config") or {}).get("k") or 3), []).append(rec)
+        scores = {}
+        for metric_k, records in groups.items():
+            scores.update(summarize(records, metric_k))
+    else:
+        scores = summarize(recs, k)
+    atomic_json(out, scores)
     return out

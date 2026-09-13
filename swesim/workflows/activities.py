@@ -679,7 +679,7 @@ def plan_trials(p: dict) -> dict:
                 profile = p.get("brief_profile", "withheld")
                 if cond == "full" or not any(b.profile == profile for b in spec.briefs):
                     profile = "natural"
-                kwargs = {"condition": cond, "model": model, "compiled_hash": comp["compiled_hash"], "purpose": p.get("purpose", "demonstration"), "brief_profile": profile}
+                kwargs = {"condition": cond, "model": model, "compiled_hash": comp["compiled_hash"], "k": int(p.get("metric_k") or (1 if p.get("purpose") == "screen" else p.get("k", 1))), "purpose": p.get("purpose", "demonstration"), "brief_profile": profile}
                 if stakeholder_model:
                     kwargs["stakeholder"] = {"model_id": stakeholder_model}
                 rc = RunConfig(**kwargs)
@@ -751,7 +751,7 @@ async def checkpoint_workflow_activity(p: dict) -> dict:
 async def score_activity(p: dict) -> dict:
     from swesim.stages.score import score_scenario
 
-    return {"scores_path": str(await blocking(lambda: score_scenario(WS, p["scenario_id"])))}
+    return {"scores_path": str(await blocking(lambda: score_scenario(WS, p["scenario_id"], k=p.get("k"))))}
 
 
 @swesim_activity

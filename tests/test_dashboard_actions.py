@@ -280,7 +280,7 @@ def test_cancel_review_retry_and_rebuild_flows(site, monkeypatch):
     page = c.get(f"/review/{sid}").text
     assert "awaiting approval" in page and "data-action='review'" in page and c.get("/api/counts").json()["review_pending"] == 1
     pv, res = run_action(c, "review", {"scenario_id": sid, "spec_hash": spec_hash, "workflow_id": "create-abc", "decision": "approve", "reason": "looks right"})
-    assert pv.json()["cli"].startswith(f"uv run swesim workflows approve create-abc {sid} {spec_hash} --decision approve")
+    assert pv.json()["cli"].startswith("uv run swesim workflows action review --params-json") and spec_hash in pv.json()["cli"]
     assert res.status_code == 200 and res.json()["via"] == "control workflow" and client.calls[-1] == ("approve_candidate", "create-abc", sid, spec_hash, "approve", "looks right")
     assert json.loads((sdir / "review.json").read_text())["decision"] == "approve"
     stale, res2 = run_action(c, "review", {"scenario_id": sid, "spec_hash": "0" * 64, "workflow_id": "create-abc", "decision": "reject", "reason": "no"})

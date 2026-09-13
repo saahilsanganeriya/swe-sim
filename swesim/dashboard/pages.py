@@ -247,6 +247,8 @@ LB_COLUMNS = (
     Column("model", "model", "model"),
     Column("condition", "condition", "text"),
     Column("brief_profile", "brief", "text"),
+    Column("cohort_label", "evaluation cohort", "text"),
+    Column("requested_k", "k", "num"),
     Column("n", "n", "num"),
     Column("scenarios", "scenarios", "num"),
     Column("success_count", "solved", "num"),
@@ -262,6 +264,13 @@ LB_COLUMNS = (
 )
 
 
+def cohort_select(current: dict) -> str:
+    options = "<option value=''>All cohorts, shown separately</option>" + "".join(
+        f"<option value='{h(key)}'{' selected' if key == current.get('evaluation_cohort') else ''}>{h(label)}</option>"
+        for key, label in current.get('cohort_options', []))
+    return f"<label>Evaluation cohort<select name='evaluation_cohort'>{options}</select></label>"
+
+
 def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_html: str, chart_html: str, saturated_views: list[dict]) -> str:
     eligible = [g for g in gate if g["eligible"]]
     checks = "".join(f"<tr><td><a href='/scenario/{h(g['scenario_id'])}'>{h(g['scenario_id'])}</a> <span class='mono muted'>v{h(g['version'])}</span></td><td>{chip(g['validation_status'])}</td>"
@@ -269,6 +278,8 @@ def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_
                      f"<td>{chip('coherent + fair', 'good') if g['checks']['task_sense'] else chip('not audited' if not g['task_sense'] else 'fails audit', 'neutral' if not g['task_sense'] else 'critical')}</td>"
                      f"<td>{chip('on board', 'good') if g['eligible'] else chip('excluded', 'neutral')}</td></tr>" for g in gate)
     form = ("<form class='toolbar' method='get' action='/leaderboard'>"
+            + cohort_select(current)
+            + _filter_select("metric_k", list(range(1, 11)), [current.get("metric_k")] if current.get("metric_k") else [], "estimator k (default: recorded)")
             + _filter_select("purpose", ["comparison", "calibration", "demonstration", "screen"], [current.get("purpose") or "comparison"], "purpose (never pooled)")
             + _filter_select("brief_profile", ["natural", "withheld"], current.get("brief_profile"), "brief profile")
             + _filter_select("source", ["github-repo", "swebench-annotated", "authored"], current.get("source"), "scenario source")
@@ -298,21 +309,21 @@ def leaderboard_comparison(views: list[dict]) -> str:
     conditions = ("full", "hidden", "interactive")
     grouped = {}
     for row in views:
-        grouped.setdefault((row["model"], row["brief_profile"]), {})[row["condition"]] = row
+        grouped.setdefault((row["model"], row["brief_profile"], row.get("evaluation_cohort", "unknown")), {})[row["condition"]] = row
     if not grouped:
         return ""
     header = "".join(f"<th scope='colgroup' colspan='3'>{condition}</th>" for condition in conditions)
     subheader = "".join("<th scope='col'>n</th><th scope='col'>pass@k</th><th scope='col'>pass^k</th>" for _ in conditions)
     body = []
-    for (model, profile), cells in sorted(grouped.items()):
-        row = [f"<tr><th scope='row'>{model_chip(model)}</th><td>{h(profile)}</td>"]
+    for (model, profile, cohort), cells in sorted(grouped.items()):
+        row = [f"<tr><th scope='row'>{model_chip(model)}<div class='small muted'>{h(next(iter(cells.values())).get('cohort_label', cohort))}</div></th><td>{h(profile)}</td>"]
         for condition in conditions:
             cell = cells.get(condition)
             if cell is None:
                 row.append("<td class='num'>0</td><td class='num'>—</td><td class='num'>—</td>")
                 continue
-            query = urlencode({"model": model, "condition": condition, "brief_profile": profile, "purpose": cell["purpose"], "status": "completed"})
-            row.append(f"<td class='num'><a href='/trials?{h(query)}'>{h(cell['n'])}</a></td>")
+            query = urlencode({"model": model, "condition": condition, "brief_profile": profile, "purpose": cell["purpose"], "evaluation_cohort": cohort, "status": "completed"})
+            row.append(f"<td class='num'><a href='/leaderboard/evidence?{h(query)}'>{h(cell['n'])}</a></td>")
             row.extend(f"<td class='num' title='{h(cell['confidence_note'])}'>{dash(cell.get(key))}</td>" for key in ("pass_at_k", "pass_pow_k"))
         body.append("".join(row) + "</tr>")
     return ("<div class='table-wrap'><table id='condition-comparison'><caption>Models by condition; a dash means no matching score or insufficient attempts.</caption>"

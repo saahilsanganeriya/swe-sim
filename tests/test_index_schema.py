@@ -135,11 +135,11 @@ def test_migration_creates_the_metadata_exactly_and_is_idempotent(tmp_path: Path
     insp = sa.inspect(store.engine)
     assert set(S.TABLES) <= set(insp.get_table_names()) and "alembic_version" in insp.get_table_names()
     with store.engine.connect() as conn:
-        assert conn.execute(sa.text("select version_num from alembic_version")).scalar_one() == "0002_discoveries"
+        assert conn.execute(sa.text("select version_num from alembic_version")).scalar_one() == "0003_measurement_cohorts"
         diff = compare_metadata(MigrationContext.configure(conn), S.metadata)
     assert diff == [], diff
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == ["0002_discoveries"]
+    assert script.get_heads() == ["0003_measurement_cohorts"]
 
 
 def test_discovery_migration_preserves_existing_v1_rows(tmp_path: Path):
@@ -149,7 +149,10 @@ def test_discovery_migration_preserves_existing_v1_rows(tmp_path: Path):
         config.attributes["connection"] = connection
         command.upgrade(config, "0001_index_v1")
     row = _trial()
-    store.upsert_trial(row)
+    # Insert through the historical table shape before upgrading, not today's model metadata.
+    historical = sa.Table("trials", sa.MetaData(), autoload_with=store.engine)
+    with store.engine.begin() as connection:
+        connection.execute(historical.insert().values(**{k: v for k, v in row.model_dump().items() if k in historical.c}))
     store.migrate()
     assert store.trial(row.trial_id).scenario_id == row.scenario_id
     assert store.table("discoveries", M.TableFilter()).total == 0

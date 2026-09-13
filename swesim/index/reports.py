@@ -18,6 +18,7 @@ from collections import Counter
 from decimal import ROUND_HALF_EVEN, Decimal
 
 from swesim.index import models as M
+from swesim.index.cohorts import cohort_of
 
 AGENT_OUTCOMES: frozenset[int] = frozenset({1, 2, 3, 4})
 _Q6 = Decimal("0.000001")
@@ -79,6 +80,8 @@ def scenario_for_trial(t: M.TrialRow, versions: list[M.ScenarioRow]) -> M.Scenar
     for s in versions:
         if s.spec_hash and s.spec_hash == t.spec_hash:
             return s
+    if t.spec_hash:
+        return None
     if t.version is not None:
         for s in versions:
             if s.version == t.version:
@@ -90,7 +93,7 @@ def compute_leaderboard(trials: Iterable[M.TrialRow], scenarios: Iterable[M.Scen
     by_sid: dict[str, list[M.ScenarioRow]] = {}
     for s in scenarios:
         by_sid.setdefault(s.scenario_id, []).append(s)
-    cells: dict[tuple[str, str, str], dict] = {}
+    cells: dict[tuple[str, str, str, str], dict] = {}
     for t in trials:
         if t.purpose != f.purpose or t.status != "completed" or t.outcome_code not in AGENT_OUTCOMES:
             continue
@@ -101,7 +104,11 @@ def compute_leaderboard(trials: Iterable[M.TrialRow], scenarios: Iterable[M.Scen
         s = scenario_for_trial(t, by_sid.get(t.scenario_id, []))
         if s is None or not gate_passes(s, f.include_saturated) or (f.source and s.source not in f.source):
             continue
-        cell = cells.setdefault((t.model, t.condition, t.brief_profile), {
+        cohort, label = cohort_of(t)
+        if f.evaluation_cohort and cohort != f.evaluation_cohort:
+            continue
+        cell = cells.setdefault((t.model, t.condition, t.brief_profile, cohort), {
+            "cohort_label": label,
             "provider": t.provider, "n": 0, "scenarios": set(), "success": 0, "reward": Decimal(0), "questions": 0, "confirmations": 0,
             "cost": Decimal(0), "cost_known": False})
         cell["n"] += 1
@@ -114,12 +121,12 @@ def compute_leaderboard(trials: Iterable[M.TrialRow], scenarios: Iterable[M.Scen
             cell["cost"] += t.cost_usd
             cell["cost_known"] = True
     rows: list[M.LeaderboardRow] = []
-    for (model, condition, brief_profile), c in cells.items():
+    for (model, condition, brief_profile, cohort), c in cells.items():
         if c["n"] < f.min_n:
             continue
         cost = c["cost"] if c["cost_known"] else None
         rows.append(M.LeaderboardRow(
-            model=model, provider=c["provider"], condition=condition, brief_profile=brief_profile, purpose=f.purpose, n=c["n"],
+            evaluation_cohort=cohort, cohort_label=c["cohort_label"], model=model, provider=c["provider"], condition=condition, brief_profile=brief_profile, purpose=f.purpose, n=c["n"],
             scenarios=len(c["scenarios"]), success_count=c["success"], pass_rate=q6(Decimal(c["success"]) / Decimal(c["n"])),
             mean_reward=q6(c["reward"] / Decimal(c["n"])), questions_asked=c["questions"], confirmations=c["confirmations"],
             cost_usd=cost, cost_per_success=q6(cost / Decimal(c["success"])) if cost is not None and c["success"] else None))

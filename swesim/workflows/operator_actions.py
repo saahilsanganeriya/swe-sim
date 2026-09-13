@@ -117,25 +117,69 @@ async def commit_operator_action_activity(p: dict) -> dict:
 
 @workflow.defn
 class OperatorActionWorkflow:
+    def __init__(self) -> None:
+        self.state = {"stage": "starting"}
+
+    @workflow.query
+    def progress(self) -> dict:
+        return self.state
+
     @workflow.run
     async def run(self, p: dict) -> dict:
         from swesim.workflows.workflows import act, hook, index_workflow
         from swesim.workflows import retries
         await index_workflow('running', {'action': p['action'], 'request_id': p['request_id']})
         try:
+            self.state = {'stage': 'validating', 'action': p['action']}
             prepared = await act('prepare_operator_action_activity', p, retry=retries.READ)
             if prepared['signal_target']:
+                self.state['stage'] = 'signalling'
                 q = prepared['request']['params']
                 await workflow.get_external_workflow_handle(prepared['signal_target']).signal('approve', {
                     'scenario_id': q['scenario_id'], 'spec_hash': q['spec_hash'], 'decision': q['decision'], 'note': q.get('note', '')})
+            self.state['stage'] = 'writing'
             result = await act('commit_operator_action_activity', prepared, retry=retries.READ)
             field = 'trial_id' if p['action'] == 'label' else 'scenario_id'
             await hook('index_trial_activity' if field == 'trial_id' else 'index_scenario_activity', {field: p['params'][field]})
             await index_workflow('completed', {'action': p['action'], 'request_id': p['request_id']})
+            self.state['stage'] = 'complete'
             return result
         except Exception:
+            self.state['stage'] = 'failed'
             await index_workflow('failed', {'action': p['action'], 'request_id': p['request_id']}, 'Operator action failed; see workflow history')
             raise
 
 
 ALL = [prepare_operator_action_activity, commit_operator_action_activity]
+
+
+@activity.defn
+async def read_candidate_source_activity(p: dict) -> dict:
+    """Select the exact recorded candidate from an immutable workflow snapshot, without rediscovery."""
+    from swesim.workflows import batching
+    from swesim.paths import Workspace
+    from swesim.storage.layout import SEGMENT_RE
+    import hashlib
+    try:
+        s = get_settings()
+        ws = Workspace(s.workspace, s.registry_path)
+        path = batching.checked_path(ws, p['candidates_path'])
+        if not SEGMENT_RE.fullmatch(p['source_key']) or not isinstance(p.get('instance_id'), str):
+            raise ValueError('invalid frozen candidate identity')
+        raw = path.read_bytes()
+        rows = [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
+        selected = [row for row in rows if row.get('instance_id') == p['instance_id']]
+        if len(selected) != 1:
+            raise ValueError('frozen source must contain exactly one matching candidate')
+        wid = activity.info().workflow_id if activity.in_activity() else 'direct'
+        selected_text = json.dumps(selected[0], sort_keys=True) + '\n'
+        digest = hashlib.sha256(selected_text.encode()).hexdigest()
+        out = batching.directory(ws, wid) / 'retry' / (digest + '.jsonl')
+        batching.atomic_text(out, selected_text)
+        return {'candidates_path': str(out), 'source_key': p['source_key'], 'written': 1, 'discovered': 1,
+                'source_snapshot_sha256': hashlib.sha256(raw).hexdigest(), 'retried_instance_id': p['instance_id']}
+    except (KeyError, ValueError) as error:
+        raise ApplicationError(str(error), type='OperatorInputError', non_retryable=True) from error
+
+
+ALL.append(read_candidate_source_activity)

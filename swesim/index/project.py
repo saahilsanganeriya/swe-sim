@@ -546,6 +546,7 @@ def project_trial(layout: Layout, trial_id: str, *, origin: str | None = None, n
     run_id = _first(rec, request, launch, key="run_id")
     row_origin = _first(rec, launch, request, key="origin", allowed=ORIGINS) or origin
     stakeholder = _dict(rc.get("stakeholder"))
+    from swesim.index.cohorts import semantic_config
     # Money and tokens: costs.json (every role) when it has records, else the record's own solver account.
     costs, tokens_in, tokens_out, cost_usd = project_costs(trial_id, d / "costs.json", origin=row_origin, now=now, workflow_id=workflow_id)
     if not costs:
@@ -569,6 +570,7 @@ def project_trial(layout: Layout, trial_id: str, *, origin: str | None = None, n
         cost_usd=cost_usd, input_tokens=tokens_in, output_tokens=tokens_out,
         stakeholder_model=_str(stakeholder.get("model_id")) or _str(request.get("stakeholder_model")),
         stakeholder_prompt_version=_str(stakeholder.get("prompt_version")),
+        evaluation_config=semantic_config(rc, report),
         created_at=now, updated_at=now, workflow_id=workflow_id, run_id=run_id,
         worker_image_digest=_first(rec, launch, key="worker_image_digest") or _first(launch, key="image_digest"), origin=row_origin)
     exchanges = project_exchanges(trial_id, transcript, audit, origin=row_origin, now=now, workflow_id=workflow_id, run_id=run_id)
@@ -704,7 +706,7 @@ def project_scores(layout: Layout, scenario_id: str, *, origin: str | None = Non
         rows.append(M.ScoreRow(
             scenario_id=scenario_id, spec_hash=spec_hash, condition=g["condition"], brief_profile=g["brief_profile"], model=g["model"],
             run_config_hash=g["run_config_hash"], n=_int(g.get("n")) or 0, success_count=_int(g.get("success_count")) or 0,
-            pass_at_k=dec(g.get("pass_at_k")), pass_pow_k=dec(g.get("pass_pow_k")), mean_reward=dec(g.get("mean_reward")),
+            requested_k=_int(g.get("requested_k")), pass_at_k=dec(g.get("pass_at_k")), pass_pow_k=dec(g.get("pass_pow_k")), mean_reward=dec(g.get("mean_reward")),
             questions_asked=_sum_ints(g.get("questions_asked")), confirmations=_sum_ints(g.get("confirmations")), computed_at=computed_at,
             created_at=now, updated_at=now, origin=origin))
     return rows

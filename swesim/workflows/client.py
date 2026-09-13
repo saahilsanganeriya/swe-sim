@@ -164,16 +164,27 @@ async def list_runs(kind: str = "all", limit: int = 50) -> list[dict]:
 
 async def operator_action(params: dict, request_id: str) -> dict:
     """Submit one confirmation-bound mutation; repeat confirmation reads its original result."""
+    import hashlib
+    import json
     from temporalio.exceptions import WorkflowAlreadyStartedError
     from swesim.workflows.operator_actions import OperatorActionWorkflow
     check_payload(params, "operator action input")
     c = await connect()
     wid = "operator-" + request_id
+    binding = hashlib.sha256(json.dumps(params, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     try:
         handle = await c.start_workflow(OperatorActionWorkflow.run, {**params, "request_id": request_id},
                                         id=wid, task_queue=queues.CONTROL, id_reuse_policy=REJECT_DUP,
-                                        memo={"summary": {"action": params["action"]}},
+                                        memo={"summary": {"action": params["action"]}, "request_sha256": binding},
                                         search_attributes=search_attributes.for_params(params))
     except WorkflowAlreadyStartedError:
         handle = c.get_workflow_handle(wid)
-    return {**(await handle.result()), "workflow_id": wid}
+        memo = await (await handle.describe()).memo()
+        if memo.get("request_sha256") != binding:
+            raise ValueError("request ID already binds different operator parameters")
+    import asyncio
+    try:
+        result = await asyncio.wait_for(handle.result(), timeout=15)
+    except asyncio.TimeoutError:
+        result = {"ok": True, "pending": True, "saved": False, "message": "Action queued. Its workflow tracks completion."}
+    return {**result, "workflow_id": wid}
