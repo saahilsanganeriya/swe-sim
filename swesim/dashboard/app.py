@@ -35,7 +35,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 
 from swesim.dashboard import access, actions, console, data, origin, pages, render, render_console, render_episode, render_scenario
-from swesim.dashboard import health as health_cache, render_explainer, render_trends, trends
+from swesim.dashboard import gradient, health as health_cache, render_explainer, render_trends, trends
 from swesim.dashboard import rows as R
 from swesim.dashboard.data import merge_timeline  # noqa: F401 - contract re-export (tests/test_contracts.py)
 from swesim.dashboard.identity import Identity, identity_from_headers
@@ -703,8 +703,12 @@ def _trends_data(request: Request, reader) -> tuple[dict, dict]:
     query["purpose"] = f.purpose
     if f.evaluation_cohort:
         query["evaluation_cohort"] = f.evaluation_cohort
+    if f.source and not query.get("source"):
+        query["source"] = list(f.source)
     scenarios = list(all_rows(reader.scenarios, R.ScenarioFilter(source=f.source, latest_only=True)))
-    payload = trends.summarize(board_trials(reader, f, current["difficulty_labels"]), scenarios, query)
+    trials = board_trials(reader, f, current["difficulty_labels"])
+    payload = trends.summarize(trials, scenarios, query)
+    payload["gradient"] = gradient.summarize(trials, scenarios, query)
     payload["charts"] = render_trends.chart_fragments(payload)
     payload["coverage"] = render_trends.coverage(payload)
     payload["generated_at"] = datetime.now(UTC).isoformat()
@@ -742,6 +746,22 @@ def trend_evidence(request: Request, reader=Depends(reader_dep), identity: Ident
             + render.table("trend-evidence", pages.TRIAL_COLUMNS, trial_views(reader, selected[offset:offset + limit]), key="trial_id",
                            total=len(selected), offset=offset, limit=limit, empty="No admitted trials match this measurement."))
     return page(render.Page("Trend evidence", "trends", "trend-evidence", crumbs=(("Trends", "/trends"), ("Evidence", None))), body, reader, identity, settings)
+
+
+@app.get("/trends/integrity", response_class=HTMLResponse)
+def trend_integrity(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    """The admitted trials of the selected cell (model, purpose, cohort, facet) whose grader report carries an integrity signal."""
+    f, current = _lb_filter(request, reader)
+    selected = [t for t in board_trials(reader, f, current["difficulty_labels"]) if t.integrity_signal_count]
+    selected.sort(key=lambda t: (-(t.integrity_signal_count or 0), t.trial_id))
+    offset, limit = _paging(request)
+    who = f" for <span class='mono'>{render.h(f.model[0])}</span>" if f.model and len(f.model) == 1 else ""
+    body = (f"<h1>Integrity-flagged trials</h1><p class='lead' data-count-line>{len(selected)} admitted {render.h(f.purpose)} attempts{who} carry at least one integrity signal "
+            f"({sum(t.integrity_signal_count or 0 for t in selected)} signals) · showing {render.h(origin.subset_text(current.get('pool')))}. Open a trial for the grader's signals.</p>"
+            + render.table("integrity-evidence", pages.TRIAL_COLUMNS, trial_views(reader, selected[offset:offset + limit]), key="trial_id",
+                           total=len(selected), offset=offset, limit=limit, keep=origin.keep_query(request.query_params.multi_items()),
+                           empty="No admitted trial of this selection carries an integrity signal."))
+    return page(render.Page("Integrity-flagged trials", "trends", "trend-integrity", crumbs=(("Trends", "/trends"), ("Integrity", None))), body, reader, identity, settings)
 
 
 @app.get("/explainer", response_class=HTMLResponse)

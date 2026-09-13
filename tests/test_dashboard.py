@@ -490,8 +490,8 @@ def test_no_evaluator_only_material_on_any_non_evaluator_route(site):
             assert sentinel not in body, (route, name)
         if route.startswith("/api/") or route.endswith(".csv"):
             for key in EVALUATOR_JSON_KEYS:
-                if key == '"tier"' and "/api/leaderboard" in route:
-                    continue  # model tier labels (A–E) are public; the stakeholder tier is the gated one and lives only in exchange meta
+                if key == '"tier"' and any(prefix in route for prefix in ("/api/leaderboard", "/api/trends", "/api/home")):
+                    continue  # model tier labels (A–E, brief §3.2) are public; the stakeholder tier is the gated one and lives only in exchange meta
                 assert key not in body or json.loads(body if not route.endswith(".csv") else "{}").get("evaluator") is True, (route, key)
     # gated file routes refuse, and ?evaluator=1 changes nothing
     tid, sid = site["done"], site["spec"].id
