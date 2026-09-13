@@ -971,6 +971,15 @@ def test_scenario_version_helper(ws):
     atomic_json(ws.registry_path, {"scenarios": {"other": {"id": "other", "version": 9}}})
     assert A.scenario_version(sid) == {"scenario_id": sid, "exists": False, "version": None, "next": 1}
     assert asyncio.run(A.scenario_version_activity({"scenario_id": sid}))["next"] == 1
+    # A rebuild to v2 that was rejected at a gate (or ended invalid) consumed `create:<sid>@v2`: the registry still says v1 and
+    # scenario.json is archived, but the v2 draft on disk (or its rejected copy, or the archive dir) must push `next` to 3.
+    atomic_json(ws.registry_path, {"scenarios": {sid: {"id": sid, "version": 1, "spec_hash": "x"}}})
+    (sdir / "archive" / "v1").mkdir(parents=True)
+    assert A.scenario_version(sid)["next"] == 2
+    atomic_json(sdir / "scenario.draft.rejected-1.json", {**minimal_spec_dict(), "version": 2})
+    assert A.scenario_version(sid) == {"scenario_id": sid, "exists": True, "version": 2, "next": 3}
+    (sdir / "scenario.draft.rejected-1.json").unlink(); (sdir / "archive" / "v2").mkdir()
+    assert A.scenario_version(sid)["next"] == 3
 
 
 def test_archive_scenario_moves_exactly_the_listed_files_and_is_idempotent(ws):

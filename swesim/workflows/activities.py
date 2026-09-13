@@ -252,12 +252,17 @@ ARCHIVE_FILES = ("scenario.draft.json", "scenario.json", "compile.json", "valida
 
 
 def scenario_version(sid: str) -> dict:
-    """Highest known version of a scenario: max(scenario.json version, registry version). `next` is version + 1, or 1 when
-    neither scenario.json nor a registry entry exists."""
+    """Highest known version of a scenario: max over scenario.json, the registry entry, any draft on disk (scenario.draft.json
+    and scenario.draft.rejected-*.json: a rebuild that was rejected or ended invalid consumed its `create:<sid>@v<n>` id) and
+    archive/v<n> directories. `next` is version + 1, or 1 when nothing exists."""
     sdir = WS.scenario_dir(sid); versions: list[int] = []
-    spec_file = sdir / "scenario.json"
-    if spec_file.exists():
-        versions.append(int((_read_json(spec_file) or {}).get("version") or 1))
+    for name in ("scenario.json", "scenario.draft.json", *sorted(q.name for q in sdir.glob("scenario.draft.rejected-*.json"))):
+        f = sdir / name
+        if f.exists():
+            versions.append(int((_read_json(f) or {}).get("version") or 1))
+    for d in sdir.glob("archive/v*"):
+        if d.is_dir() and d.name[1:].isdigit():
+            versions.append(int(d.name[1:]))
     scenarios = (_read_json(WS.registry_path) or {}).get("scenarios") or {}
     for key, entry in scenarios.items():
         entry = entry if isinstance(entry, dict) else {}
