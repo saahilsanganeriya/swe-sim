@@ -2449,3 +2449,92 @@ def test_trial_workflow_passes_its_identity_to_the_launcher(monkeypatch):
         launch = next(p for n, p in calls if n == "launch_trial_activity")
         assert (launch["trial_workflow_id"], launch["run_id"], launch["run_workflow_id"]) == ("t1", "r-1", "run-1")
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------- frontier override (operator directive, 2026-09-13)
+
+def test_run_tasks_frontier_override_proceeds_past_a_refused_gate_and_records_it(monkeypatch):
+    """A refused frontier gate blocks the run unless params carry `frontier_override: {actor, reason}`: the gate still runs and
+    records its decision, the run proceeds on the requested scenarios with `admission.overridden` and the override in every
+    workflow row's params_summary, `stopped_reason` stays None, and every planning step carries the override with the recorded
+    decision. Without the field (or with an empty reason) the refusal is unchanged; an allowed gate is never "overridden";
+    executions started before the patch replay as refusals."""
+    from types import SimpleNamespace
+    async def scenario():
+        calls = []
+        decision = {"allowed": False, "scenario_ids": [], "reasons": ["Requires 15 current audited scenarios with at least two outcomes per arm on every core Tier A–C baseline."],
+                    "evidence_path": "/ws/evidence/sweep/frontier-abc.json", "identity": "abc", "excluded_scenarios": {"s1": "Saturated scenarios are excluded by default."}}
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "frontier_gate_activity": return dict(decision)
+            if name == "probe_models_activity": return {"resolved": {}, "solver_unavailable": []}
+            if name == "spend_check_activity": return {"spend_usd": 1.0, "cap_usd": 100.0, "exceeded": False}
+            if name == "prepare_trial_plan_activity": return {"plan_path": p["scenario_id"], "total": 1}
+            if name == "read_plan_page_activity":
+                return {"items": [{"trial_id": p["plan_path"] + "-t0", "scenario_id": p["plan_path"], "model": "openai/gpt-5.5", "condition": "hidden", "attempt_index": 0}], "total": 1, "next_offset": 1}
+            if name == "checkpoint_workflow_activity": return {"checkpoint_path": "/checkpoint/test"}
+            return {}
+        async def child(fn, arg, **kw): return {"trial_id": arg["trial_id"], "status": "completed"}
+        monkeypatch.setattr(W, "act", act); monkeypatch.setattr(W.workflow, "execute_child_workflow", child)
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="run-1", run_id="r1", workflow_type="RunTasksWorkflow"))
+        params = {"scenario_ids": ["s1", "s2"], "models": ["openai/gpt-5.5"], "conditions": ["hidden"], "k": 1, "stakeholder_url": "https://s"}
+        r = await W.RunTasksWorkflow().run(params)                                                   # no override: the refusal is unchanged
+        assert r["status"] == "blocked" and r["stopped_reason"] == "frontier-gate" and not [n for n, _ in calls if n == "prepare_trial_plan_activity"]
+        calls.clear()
+        override = {"actor": "saahil", "reason": "demo run before the 15-scenario evidence exists"}
+        w = W.RunTasksWorkflow(); r = await w.run({**params, "frontier_override": override})
+        assert r["status"] == "complete" and r["stopped_reason"] is None and set(r["scenarios"]) == {"s1", "s2"}
+        assert r["admission"]["overridden"] is True and r["admission"]["override"] == override and r["admission"]["reasons"] == decision["reasons"]
+        names = [n for n, _ in calls]
+        assert names.index("frontier_gate_activity") < names.index("probe_models_activity")           # the gate still ran first
+        prepared = [p for n, p in calls if n == "prepare_trial_plan_activity"]
+        assert [p["scenario_id"] for p in prepared] == ["s1", "s2"]
+        assert all(p["admission"] == {"evidence_path": decision["evidence_path"], "identity": "abc", "overridden": True} for p in prepared)
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert rows and all(row["params_summary"]["frontier_override"] == override for row in rows) and rows[-1]["status"] == "completed"
+        assert w.progress()["stopped_reason"] is None and w.progress()["admission"]["overridden"] is True
+        calls.clear()                                                                                  # a malformed override is no override
+        r = await W.RunTasksWorkflow().run({**params, "frontier_override": {"actor": "x", "reason": " "}})
+        assert r["status"] == "blocked" and "frontier_override" not in [p for n, p in calls if n == "index_workflow_activity"][0]["params_summary"]
+        decision.update(allowed=True, scenario_ids=["s2"]); calls.clear()                              # an allowed gate is not overridden
+        r = await W.RunTasksWorkflow().run({**params, "frontier_override": override})
+        assert r["status"] == "complete" and set(r["scenarios"]) == {"s2"} and "overridden" not in [p for n, p in calls if n == "prepare_trial_plan_activity"][0]["admission"]
+        assert "overridden" not in r.get("admission", {}) or r["admission"].get("overridden") is not True
+        decision.update(allowed=False, scenario_ids=[]); monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_OVERRIDE)
+        r = await W.RunTasksWorkflow().run({**params, "frontier_override": override})                 # pre-patch executions replay as refusals
+        assert r["status"] == "blocked"
+    asyncio.run(scenario())
+
+
+def test_frontier_gate_records_an_operator_override_and_planning_honours_it(ws):
+    """The gate's decision file gains an `override` block (actor, reason, at) when the request carries one and the gate refused
+    (the decision itself is untouched); `plan_trials` under `admission.overridden` plans from that recorded override (same
+    policy keys, a file under evidence/sweep named by its request) and refuses a forged flag whose file records no override."""
+    from swesim.workflows import client as C
+    spec = frozen_scenario(ws)
+    base = {"scenario_ids": [spec.id], "models": ["openai/gpt-5.5"], "conditions": ["hidden"], "k": 1, "purpose": "comparison", "stakeholder_url": "https://s"}
+    refused = asyncio.run(A.frontier_gate_activity(dict(base)))
+    assert refused["allowed"] is False and "override_recorded" not in refused
+    assert "override" not in json.loads(Path(refused["evidence_path"]).read_text())
+    forged = {"evidence_path": refused["evidence_path"], "identity": refused["identity"], "overridden": True}
+    with pytest.raises(ValueError, match="records no operator override"): A.plan_trials({**base, "scenario_id": spec.id, "admission": forged})
+    override = {"actor": "saahil", "reason": "demo before evidence"}
+    gated = asyncio.run(A.frontier_gate_activity({**base, "frontier_override": override}))
+    assert gated["allowed"] is False and gated["override_recorded"] is True and gated["evidence_path"] == refused["evidence_path"]
+    record = json.loads(Path(gated["evidence_path"]).read_text())
+    assert record["decision"]["allowed"] is False and record["override"]["actor"] == "saahil" and record["override"]["reason"] == "demo before evidence" and record["override"]["at"]
+    ref = {"evidence_path": gated["evidence_path"], "identity": gated["identity"], "overridden": True}
+    out = A.plan_trials({**base, "scenario_id": spec.id, "admission": ref})
+    assert len(out["trials"]) == 1 and out["admission"] == {"identity": gated["identity"], "evidence_path": gated["evidence_path"], "overridden": True}
+    with pytest.raises(ValueError, match="frontier admission rejected"):                   # without the flag the recorded refusal still refuses
+        A.plan_trials({**base, "scenario_id": spec.id, "admission": {k: ref[k] for k in ("evidence_path", "identity")}})
+    with pytest.raises(ValueError, match="different request"): A.plan_trials({**base, "k": 3, "scenario_id": spec.id, "admission": ref})
+    with pytest.raises(ValueError, match="under evidence/sweep"): A.plan_trials({**base, "scenario_id": spec.id, "admission": {**ref, "evidence_path": str(ws.root / "frontier-x.json")}})
+    # an allowed gate ignores the field (Tier A–C: nothing to override, no file)
+    passed = asyncio.run(A.frontier_gate_activity({**base, "models": ["openrouter/deepseek/deepseek-v3.2"], "frontier_override": override}))
+    assert passed["allowed"] is True and "override_recorded" not in passed
+    # the request shape the CLI flag builds
+    assert C.override_request(" demo ", actor="me") == {"actor": "me", "reason": "demo"} and C.override_request("x")["actor"]
+    with pytest.raises(ValueError): C.override_request("  ")
+    assert W.frontier_override_of({"frontier_override": override}) == override and W.frontier_override_of({"frontier_override": {"actor": "a"}}) is None
+    assert W.frontier_override_of({"frontier_override": "yes"}) is None and W.frontier_override_of({}) is None

@@ -164,6 +164,18 @@ async def list_runs(kind: str = "all", limit: int = 50) -> list[dict]:
     return out
 
 
+def override_request(reason: str, actor: str | None = None) -> dict:
+    """The `frontier_override` params entry the CLI flag builds (`swesim run-tasks --frontier-override "<reason>"`): `{"actor",
+    "reason"}`; the actor defaults to the CLI user (`getpass.getuser()`: the process's login name, a stdlib lookup, not a settings
+    field). An empty reason is a ValueError: an override without a reason is never recorded."""
+    import getpass
+
+    text = (reason or "").strip()
+    if not text:
+        raise ValueError("a frontier override needs a reason")
+    return {"actor": (actor or "").strip() or getpass.getuser(), "reason": text}
+
+
 # Temporal's `WorkflowExecutionStatus` names -> the index's `WorkflowStatus` (interfaces §2). RUNNING is left alone.
 TEMPORAL_STATUS: dict[str, str] = {"COMPLETED": "completed", "FAILED": "failed", "CANCELED": "cancelled", "TERMINATED": "terminated",
                                    "TIMED_OUT": "timed_out", "CONTINUED_AS_NEW": "continued_as_new"}

@@ -865,6 +865,8 @@ def plan_trials(p: dict) -> dict:
         for trial in trials:
             trial["audit_model"] = p["audit_model"]
     provenance = {k: admission[k] for k in ("identity", "evidence_path") if admission.get(k)}  # the decision these trials were planned under
+    if admission.get("overridden"):
+        provenance["overridden"] = True
     return {"scenario_id": spec.id, "trials": trials, **({"admission": provenance} if provenance else {})}
 
 
@@ -874,10 +876,58 @@ def _frontier_preflight(p: dict) -> dict:
     return preflight(WS, SETTINGS, p)
 
 
+def _override_of(p: dict) -> dict | None:
+    """A well-formed operator override on the run's params (`{"actor", "reason"}`, both non-empty strings); None otherwise."""
+    o = p.get("frontier_override")
+    if not isinstance(o, dict) or not all(isinstance(o.get(k), str) and o[k].strip() for k in ("actor", "reason")):
+        return None
+    return {"actor": o["actor"].strip(), "reason": o["reason"].strip()}
+
+
+def _record_override(evidence_path: str, override: dict, workflow_id: str | None) -> None:
+    """Write the operator's override into the recorded frontier decision (an `override` block beside the untouched `decision`), so
+    the file says who proceeded past the refusal and why; `_verify_override` reads it back at every planning step."""
+    path = Path(evidence_path)
+    record = json.loads(path.read_text())
+    record["override"] = {**override, "at": datetime.now(timezone.utc).isoformat(), "workflow_id": workflow_id}
+    atomic_json(path, record)
+
+
+def _verify_override(p: dict, ref: dict) -> dict:
+    """The recorded frontier decision a workflow carries with `overridden`: the same file checks `frontier.verify_admission` makes
+    (a decision under evidence/sweep, named by its own request, binding the same policy keys), except that the decision may be a
+    refusal when the file records an operator `override` (actor, reason) — written by `frontier_gate_activity` when the run's
+    params carried one. A forged flag over a file without that block is refused. The requested scenarios are not narrowed."""
+    from swesim.stages import frontier as F
+
+    ref_path = ref.get("evidence_path")
+    path = Path(str(ref_path or "")).resolve(); root = WS.layout.evidence_dir("sweep").resolve()
+    if not ref_path or not path.is_relative_to(root) or not path.name.startswith("frontier-"):
+        raise ValueError("frontier admission evidence must be a recorded decision under evidence/sweep")
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise ValueError(f"frontier admission evidence unreadable: {type(e).__name__}") from e
+    decision, recorded, override = record.get("decision") or {}, record.get("request") or {}, record.get("override")
+    if path.name != f"frontier-{F.identity_of(recorded)}.json":
+        raise ValueError("frontier admission evidence does not match its recorded request")
+    if not isinstance(override, dict) or not (override.get("actor") and override.get("reason")):
+        raise ValueError("frontier admission evidence records no operator override; the refusal stands")
+    mine = F.request_of(p)
+    diff = [k for k in F.POLICY_KEYS if recorded.get(k) != mine.get(k)]
+    if diff:
+        raise ValueError(f"frontier admission was recorded for a different request ({', '.join(diff)} differ)")
+    return {**decision, "allowed": True, "overridden": True, "override": override, "evidence_path": str(path), "identity": F.identity_of(recorded), "verified": True}
+
+
 def _frontier_admission(p: dict) -> dict:
     """The admission `plan_trials` enforces (`frontier.admission_for_plan`); refuses with a ValueError (non-retryable) unless the
-    request is admitted and the planned scenario is among the admitted ids."""
+    request is admitted and the planned scenario is among the admitted ids — or the workflow carries a recorded operator override
+    (`admission.overridden`, verified by `_verify_override`), which plans the scenarios as requested."""
     from swesim.stages.frontier import admission_for_plan, frontier_requested
+    ref = p.get("admission")
+    if isinstance(ref, dict) and ref.get("overridden") and frontier_requested(p):
+        return _verify_override(p, ref)
     admission = admission_for_plan(WS, SETTINGS, p)
     if not admission.get("allowed"):
         raise ValueError("frontier admission rejected: " + "; ".join(admission.get("reasons") or ["no admission"]))
@@ -891,8 +941,16 @@ def _frontier_admission(p: dict) -> dict:
 async def frontier_gate_activity(p: dict) -> dict:
     """RunTasksWorkflow's admission gate (CONTROL): the durable decision for the whole request. Tier A–C requests pass through;
     a Tier D/E request returns `allowed`, the admitted `scenario_ids`, `reasons`, the forecast and `evidence_path`/`identity`
-    that later planning verifies (`plan_trials`)."""
-    return await blocking(lambda: _frontier_preflight(p))
+    that later planning verifies (`plan_trials`). A refused request whose params carry an operator `frontier_override`
+    gets the override recorded in the decision file (`override_recorded`); the decision itself is untouched — the workflow
+    decides to proceed (`RunTasksWorkflow`, behind its patch) and planning verifies the recorded override."""
+    result = await blocking(lambda: _frontier_preflight(p))
+    override = _override_of(p)
+    if override and not result.get("allowed") and result.get("evidence_path"):
+        info = _activity_info()
+        await blocking(lambda: _record_override(result["evidence_path"], override, p.get("workflow_id") or (info.workflow_id if info else None)))
+        return {**result, "override_recorded": True}
+    return result
 
 
 @swesim_activity
