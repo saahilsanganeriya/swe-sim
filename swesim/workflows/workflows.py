@@ -4,7 +4,8 @@ Task creation and task running are separate:
 - CreateTasksWorkflow(sources, ...) : probe models once, mine each source, fan out one CandidateWorkflow per candidate
   (id `create:<scenario_id>`, REJECT_DUPLICATE) bounded by `max_parallel`; `progress` lists every candidate's stage.
 - CandidateWorkflow(candidate)      : judge -> draft -> approval (auto gates, or "hold": wait for a reviewer's `approve`
-  signal after schema/asset/leak pre-checks) -> compile -> validate -> register.
+  signal after schema/asset/leak pre-checks) -> compile -> validate -> register. Every terminal decision (a rejection
+  at any gate, validated/registered, an infrastructure error) leaves a receipt: `index_candidate_event_activity` (P1-7).
 - RunTasksWorkflow(scenario_ids, models, ...): plan_trials per scenario, TrialWorkflow children (id = trial id,
   REJECT_DUPLICATE) bounded by `max_parallel_trials`, then score + export per scenario; `progress` lists every trial.
 - PipelineWorkflow                  : the original single-candidate composition, built from the same pieces.
@@ -45,6 +46,7 @@ PATCH_FRONTIER = "20260913-frontier-admission"
 PATCH_SCORE_K = "20260913-requested-score-k"
 PATCH_FROZEN_RETRY = "20260913-frozen-candidate-retry"
 PATCH_LIFECYCLE = "20260913-lifecycle-bookkeeping"  # operator workflows: running row before any probe/gate; failed/cancelled rows on exit
+PATCH_RECEIPTS = "20260913-candidate-receipts"      # index_candidate_event_activity at every terminal candidate decision (P1-7)
 CHILDREN_PER_RUN = 100
 HOOK_MINUTES = 2
 CONTROL_MINUTES = 60                           # one Harbor control run on Modal (validate_scenario's whole set had 180)
@@ -149,6 +151,34 @@ async def index_workflow(status: str, summary: dict, failure: str | None = None)
 
 def _indexed(*results: dict) -> bool:
     return all(bool(r.get("indexed", True)) for r in results)
+
+
+# The index's funnel stage (swesim.index.models.FunnelStage) a CandidateWorkflow stage name belongs to: the error receipt names the
+# stage the candidate was in when the infrastructure failed. Anything unknown is "failed".
+FUNNEL_OF_STAGE = {"judging": "judged", "probing": "probed", "archiving": "probed", "drafting": "drafted", "pre-checking": "drafted",
+                   "re-drafting": "drafted", "approving": "approved", "auto-approving": "approved", "awaiting-approval": "approved",
+                   "compiling": "compiled", "validating": "validated", "registering": "registered"}
+
+
+def _now_iso() -> str | None:
+    """`workflow.now()` as ISO text (deterministic on replay); None for a body run as a plain coroutine, where the activity stamps its own time."""
+    return workflow.now().isoformat() if workflow.in_workflow() else None
+
+
+async def candidate_receipt(p: dict, phase: str, stage: str, status: str, gate: str | None, reasons: list, *, terminal: bool = True,
+                            result_status: str | None = None, scenario_id: str | None = None, spec_hash: str | None = None) -> dict:
+    """`index_candidate_event_activity` (interfaces §2, P1-7): the immutable receipt of the gate a candidate stopped or passed at, so a
+    rejected or errored candidate is never shown as kept because its files reached a later stage. `p` carries source_key /
+    instance_id / candidates_path / version; `stage` is an index funnel stage, `status` kept | rejected | error | pending. A `hook`:
+    a failing receipt never fails the workflow. Executions started before the patch replay without the command."""
+    if not _patched(PATCH_RECEIPTS):
+        return {"indexed": False, "reason": "execution predates the candidate receipts"}
+    ident = _workflow_identity() or {}
+    return await hook("index_candidate_event_activity", {
+        "source_key": p.get("source_key"), "instance_id": p.get("instance_id"), "candidates_path": p.get("candidates_path"),
+        "scenario_id": scenario_id, "version": p.get("version") or 1, "spec_hash": spec_hash,
+        "phase": phase, "stage": stage, "status": status, "gate": gate, "reasons": [str(r) for r in (reasons or [])], "terminal": terminal,
+        "result_status": result_status, "occurred_at": _now_iso(), "workflow_id": ident.get("workflow_id"), "run_id": ident.get("run_id")})
 
 
 async def _lifecycle(p: dict, body):
@@ -443,7 +473,9 @@ class RunTasksWorkflow:
 @workflow.defn
 class CandidateWorkflow:
     """judge -> draft -> approval -> compile -> validate -> register for one candidate row.
-    Reports every stage to its parent (CreateTasksWorkflow.candidate_stage) and answers `progress` itself."""
+    Reports every stage to its parent (CreateTasksWorkflow.candidate_stage) and answers `progress` itself. Every terminal path
+    (a rejection at any gate, validated/registered, an infrastructure error) leaves one decision receipt (`_receipt`) before
+    the terminal bookkeeping, so the index never shows a rejected candidate as kept."""
 
     def __init__(self) -> None:
         self.state: dict = {"stage": "starting", "refusals": []}
@@ -492,6 +524,15 @@ class CandidateWorkflow:
         await index_workflow("failed" if failure else "completed", {**params_summary(self.params), "status": result.get("status")}, failure)
         return result
 
+    async def _receipt(self, phase: str, stage: str, status: str, gate: str | None, reasons: list, *, terminal: bool = True,
+                       result_status: str | None = None) -> dict:
+        """The candidate's decision receipt for the gate it stopped or passed at (`candidate_receipt`), called once per terminal path
+        after `_done` so it names the final scenario id and spec hash; `progress` shows whether it was indexed."""
+        r = await candidate_receipt(self.params, phase, stage, status, gate, reasons, terminal=terminal, result_status=result_status,
+                                    scenario_id=self.state.get("scenario_id"), spec_hash=self.state.get("spec_hash"))
+        self.state["receipt"] = r
+        return r
+
     async def _control(self, name: str, status: str) -> None:
         """Per-control validation progress (the console shows it through `progress`)."""
         self.state["controls"] = {**self.state.get("controls", {}), name: status}
@@ -507,7 +548,9 @@ class CandidateWorkflow:
             await act("draft_activity", {**p, **judged, "instance_id": iid, "force": True, "reject_reasons": pre.get("reasons", [])}, 30)
             pre = await act("precheck_draft_activity", {"scenario_id": sid}, 5, retry=retries.READ)
         if not pre["ok"]:
-            return sid, None, self._done(sid, "rejected", list(pre.get("reasons", [])), pre.get("spec_hash"))
+            done = self._done(sid, "rejected", list(pre.get("reasons", [])), pre.get("spec_hash"))
+            await self._receipt("precheck", "drafted", "rejected", "precheck", done["reasons"])
+            return sid, None, done
         draft_hash = pre["spec_hash"]; refusal = None
         while True:
             # Every (re-)entry into the wait tells the parent the state, plus the refusal that caused a re-entry.
@@ -515,7 +558,9 @@ class CandidateWorkflow:
             try:
                 await workflow.wait_condition(lambda: bool(self.decisions), timeout=HOLD_TIMEOUT)
             except TimeoutError:
-                return sid, None, self._done(sid, "approval-timeout", ["no reviewer decision within the hold window"], draft_hash)
+                done = self._done(sid, "approval-timeout", ["no reviewer decision within the hold window"], draft_hash)
+                await self._receipt("hold", "approved", "rejected", "approval-timeout", done["reasons"])
+                return sid, None, done
             d = self.decisions.pop(0)
             if d.get("scenario_id") not in (None, sid):
                 refusal = f"decision for {d.get('scenario_id')} ignored by {sid}"
@@ -525,7 +570,9 @@ class CandidateWorkflow:
                 # Both decisions are bound to the reviewed draft; a stale hash means the reviewer saw something else.
                 refusal = f"{d.get('decision')} refused: signalled spec_hash differs from the draft on disk"
             elif d.get("decision") == "reject":
-                return sid, None, self._done(sid, "rejected-by-human", [d.get("note") or "rejected by reviewer"], draft_hash)
+                done = self._done(sid, "rejected-by-human", [d.get("note") or "rejected by reviewer"], draft_hash)
+                await self._receipt("human-review", "approved", "rejected", "human-review", done["reasons"])
+                return sid, None, done
             else:
                 try:
                     # The activity re-reads the draft on disk, compares its hash to the signalled one and writes approval.json
@@ -551,14 +598,18 @@ class CandidateWorkflow:
             await self._stage("judging", instance_id=iid)
             judged = await act("judge_one_activity", p, 30); sid = judged.get("scenario_id")
             if not judged.get("keep"):
-                return await self._finish(self._done(sid, "rejected", list(judged.get("reasons") or ["judge did not keep the candidate"]), None))
+                done = self._done(sid, "rejected", list(judged.get("reasons") or ["judge did not keep the candidate"]), None)
+                await self._receipt("judge", "judged", "rejected", "judge", done["reasons"])
+                return await self._finish(done)
             # Measure FAIL_TO_PASS / PASS_TO_PASS on base and gold (Harbor on Modal) for every source kind: SWE-bench's
             # published lists do not always reproduce offline. One attempt; harbor_cli reconciles an existing job.
             await self._stage("probing", scenario_id=sid)
             probed = await act("probe_candidate_activity", {"judged_path": judged["judged_path"], "instance_id": iid, "scenario_id": sid,
                                                             "max_builds": p.get("max_builds", 1)}, 160, retry=retries.BUILD)  # probe_tests' Harbor deadline is 150 min
             if not probed.get("fail_to_pass"):
-                return await self._finish(self._done(sid, "not-reproducible-offline", [probed.get("reason") or "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold"], None))
+                done = self._done(sid, "not-reproducible-offline", [probed.get("reason") or "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold"], None)
+                await self._receipt("probe", "probed", "rejected", "probe", done["reasons"])
+                return await self._finish(done)
             judged = {**judged, "judged_path": probed["judged_path"]}  # the probed row (measured lists) is what draft reads
             if p.get("rebuild") and p.get("previous_version"):
                 # Rebuild as version p["version"]: the previous version's spec/compile/validation/approval/judge/draft-meta files
@@ -573,18 +624,27 @@ class CandidateWorkflow:
             else:
                 draft, approved = await draft_and_auto_approve(self._stage, p, judged, iid); sid = draft["scenario_id"]
                 if not approved["approved"]:
-                    return await self._finish(self._done(sid, "rejected", list(approved.get("reasons", [])), None))
+                    done = self._done(sid, "rejected", list(approved.get("reasons", [])), None)
+                    await self._receipt("auto-approval", "approved", "rejected", "auto-approval", done["reasons"])
+                    return await self._finish(done)
             built = await build_scenario(self._stage, p, sid, approved["spec_hash"], split=_patched(PATCH_SPLIT), set_control=self._control)
             if built.get("audit") is not None:
                 self.state["audit"] = built["audit"]
-            return await self._finish(self._done(sid, built["status"], built["reasons"], built["spec_hash"]))
+            done = self._done(sid, built["status"], built["reasons"], built["spec_hash"])
+            if built["status"] == "valid":
+                await self._receipt("register", "registered", "kept", None, [])
+            else:  # build_scenario reports invalid validation; a compile failure is an exception and takes the error receipt below
+                await self._receipt("validate", "validated", "rejected", "validation", done["reasons"], result_status=built["status"])
+            return await self._finish(done)
         except Exception as e:
             _raise_if_cancelled(e)
             # Infrastructure failure (LLM, Harbor, a lost parent): FAIL the child so `create:<sid>` can be started again
             # (ALLOW_DUPLICATE_FAILED_ONLY); the parent records `error` from the cause and siblings are unaffected.
             stage = self.state.get("stage")
             failure = f"candidate {iid} failed at stage {stage}: {_err(e)}"
-            await self._finish(self._done(sid, "error", [f"{stage}: {_err(e)}"], None), failure)
+            done = self._done(sid, "error", [f"{stage}: {_err(e)}"], None)
+            await self._receipt("error", FUNNEL_OF_STAGE.get(stage, "failed"), "error", stage, done["reasons"])
+            await self._finish(done, failure)
             raise ApplicationError(failure, non_retryable=True) from e
 
 
@@ -795,6 +855,9 @@ class PipelineWorkflow:
         self.state = {"stage": "mining", "resolved": probe.get("resolved") or {}, "substitutions": probe.get("substitutions") or {},
                       "notes": probe.get("notes") or [], "needs_human": probe.get("needs_human") or []}
         mined = await act("mine_activity", p, 180)
+        # The receipts' source: mine_activity names the source key or, older, only the candidates file (named after the key).
+        source = {"source_key": mined.get("source_key") or str(mined.get("candidates_path") or "").rsplit("/", 1)[-1].removesuffix(".jsonl") or None,
+                  "candidates_path": mined.get("candidates_path"), "version": 1}
         self.state = {"stage": "judging", **mined}
         judged = await act("judge_activity", {**p, **mined}, 60)
         out: list[dict] = []
@@ -812,7 +875,10 @@ class PipelineWorkflow:
             if _auto(p):
                 draft, approved = await draft_and_auto_approve(self._set_stage, p, judged, iid); sid = draft["scenario_id"]
                 if not approved["approved"]:
-                    out.append({"scenario_id": sid, "status": "auto-approval-rejected", "reasons": approved.get("reasons", [])})
+                    reasons = list(approved.get("reasons", []))
+                    await candidate_receipt({**source, "instance_id": iid}, "auto-approval", "approved", "rejected", "auto-approval", reasons,
+                                            scenario_id=sid, spec_hash=approved.get("spec_hash"))
+                    out.append({"scenario_id": sid, "status": "auto-approval-rejected", "reasons": reasons})
                     counts["rejected"] += 1
                     continue
                 self.approvals[sid] = approved["spec_hash"]
@@ -823,6 +889,8 @@ class PipelineWorkflow:
                     # No Boolean is read from wait_condition: the signal payload and approval.json carry the truth.
                     await workflow.wait_condition(lambda sid=sid: sid in self.approvals, timeout=APPROVAL_TIMEOUT)
                 except TimeoutError:
+                    await candidate_receipt({**source, "instance_id": iid}, "hold", "approved", "rejected", "approval-timeout",
+                                            ["no reviewer decision within the hold window"], scenario_id=sid, spec_hash=draft.get("spec_hash"))
                     _search_status("completed")
                     return {"status": "awaiting-approval-timeout", "scenarios": out, "pending": draft, **counts}
             built = await build_scenario(self._set_stage, p, sid, self.approvals[sid])

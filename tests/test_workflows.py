@@ -533,6 +533,180 @@ def test_candidate_hooks_carry_source_key_and_scenario_and_tolerate_failure(monk
     asyncio.run(scenario())
 
 
+# ---------------------------------------------------------------- candidate decision receipts (P1-7): one per terminal path
+
+CAND = {"instance_id": "a__1", "candidates_path": "/c/x.jsonl", "source_key": "github-repo:x/a", "judge_model": "j", "draft_model": "d"}
+CAND_IDENT = {"workflow_id": "create:a--1", "run_id": "r1"}
+CAND_ACTS = {"judge_one_activity": {"judged_path": "j", "instance_id": "a__1", "scenario_id": "a--1", "keep": True, "reasons": []},
+             "probe_candidate_activity": {"judged_path": "j", "fail_to_pass": ["t"], "pass_to_pass": [], "reproducible": True},
+             "draft_activity": {"scenario_id": "a--1", "draft_path": "d"},
+             "auto_approve_activity": {"approved": True, "spec_hash": "h", "reasons": []},
+             "precheck_draft_activity": {"ok": True, "spec_hash": "h", "reasons": []},
+             "verify_approval_activity": {"scenario_id": "a--1", "spec_hash": "h"},
+             "compile_activity": {"compile_path": "c", "controls": []},
+             "validate_activity": {"status": "valid", "failures": []}}
+
+
+def _candidate_acts(monkeypatch, receipts: list, over: dict | None = None, receipt_error: BaseException | None = None):
+    """Every CandidateWorkflow activity kept/valid unless `over` says otherwise (a BaseException value is raised);
+    index_candidate_event_activity payloads land in `receipts`."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_type="CandidateWorkflow", **CAND_IDENT))
+    async def act(name, p, minutes=10, **kw):
+        if name == "index_candidate_event_activity":
+            receipts.append(p)
+            if receipt_error is not None: raise receipt_error
+            return {"indexed": True, "rows": 2, "event_id": "e" * 64}
+        if name.startswith("index_") or name == "audit_scenario_activity": return {"indexed": True}
+        r = {**CAND_ACTS, **(over or {})}.get(name, {})
+        if isinstance(r, BaseException): raise r
+        return dict(r)
+    monkeypatch.setattr(W, "act", act)
+
+
+def _receipt(phase, stage, status, gate, reasons, *, scenario_id="a--1", spec_hash=None, result_status=None) -> dict:
+    """The exact payload `candidate_receipt` sends: ids from the params, the decision, the workflow identity. A body run as a plain
+    coroutine has no `workflow.now()`, so `occurred_at` is None and the activity stamps its own time."""
+    return {"source_key": "github-repo:x/a", "instance_id": "a__1", "candidates_path": "/c/x.jsonl", "scenario_id": scenario_id, "version": 1,
+            "spec_hash": spec_hash, "phase": phase, "stage": stage, "status": status, "gate": gate, "reasons": reasons, "terminal": True,
+            "result_status": result_status, "occurred_at": None, **CAND_IDENT}
+
+
+@pytest.mark.parametrize("over,mode,status,expected", [
+    ({"judge_one_activity": {**CAND_ACTS["judge_one_activity"], "keep": False, "reasons": ["no non-derivable gap"]}}, "auto", "rejected",
+     _receipt("judge", "judged", "rejected", "judge", ["no non-derivable gap"])),
+    ({"judge_one_activity": {**CAND_ACTS["judge_one_activity"], "keep": False, "reasons": []}}, "auto", "rejected",
+     _receipt("judge", "judged", "rejected", "judge", ["judge did not keep the candidate"])),
+    ({"probe_candidate_activity": {"judged_path": "j", "fail_to_pass": [], "reason": "no test fails on base"}}, "auto", "not-reproducible-offline",
+     _receipt("probe", "probed", "rejected", "probe", ["no test fails on base"])),
+    ({"precheck_draft_activity": {"ok": False, "spec_hash": "p", "reasons": ["schema: brief missing"]}}, "hold", "rejected",
+     _receipt("precheck", "drafted", "rejected", "precheck", ["schema: brief missing"], spec_hash="p")),
+    ({"auto_approve_activity": {"approved": False, "spec_hash": "h", "reasons": ["controls incomplete"]}}, "auto", "rejected",
+     _receipt("auto-approval", "approved", "rejected", "auto-approval", ["controls incomplete"])),
+    ({"validate_activity": {"status": "invalid", "failures": ["oracle earned 0"]}}, "auto", "invalid",
+     _receipt("validate", "validated", "rejected", "validation", ["oracle earned 0"], spec_hash="h", result_status="invalid")),
+    ({}, "auto", "valid", _receipt("register", "registered", "kept", None, [], spec_hash="h")),
+], ids=["judge-reject", "judge-reject-default-reason", "probe-not-reproducible", "precheck-reject", "auto-approval-reject", "validation-invalid", "registered"])
+def test_candidate_workflow_leaves_one_decision_receipt_per_terminal_path(monkeypatch, tmp_path, over, mode, status, expected):
+    from swesim.index import activities as IA
+    from swesim.settings import Settings
+    async def scenario():
+        receipts = []; _candidate_acts(monkeypatch, receipts, over)
+        w = W.CandidateWorkflow()
+        r = await w.run({**CAND, "approval_mode": mode})
+        assert r["status"] == status
+        assert receipts == [expected]                                                     # exactly one receipt, the whole payload
+        assert w.progress()["receipt"] == {"indexed": True, "rows": 2, "event_id": "e" * 64}
+        # the payload is what the activity's contract accepts (stage/status literals, required ids), without Temporal
+        settings = Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env"), "SWESIM_WORKSPACE": str(tmp_path / "record")})
+        row = IA.candidate_event_row(receipts[0], settings)
+        assert (row.stage, row.status, row.gate, row.terminal, row.workflow_id, row.run_id) == (expected["stage"], expected["status"], expected["gate"], True, "create:a--1", "r1")
+    asyncio.run(scenario())
+
+
+def test_hold_mode_timeout_and_human_rejection_leave_receipts(monkeypatch):
+    async def scenario():
+        receipts = []; _candidate_acts(monkeypatch, receipts)
+        async def timeout(predicate, timeout): raise TimeoutError()
+        monkeypatch.setattr(W.workflow, "wait_condition", timeout)
+        w = W.CandidateWorkflow(); r = await w.run({**CAND, "approval_mode": "hold"})
+        assert r["status"] == "approval-timeout"
+        assert receipts == [_receipt("hold", "approved", "rejected", "approval-timeout", ["no reviewer decision within the hold window"], spec_hash="h")]
+        receipts.clear(); w = W.CandidateWorkflow()
+        async def reject(predicate, timeout):
+            w.approve({"scenario_id": "a--1", "spec_hash": "h", "decision": "reject", "note": "not grounded"}); assert predicate()
+        monkeypatch.setattr(W.workflow, "wait_condition", reject)
+        r = await w.run({**CAND, "approval_mode": "hold"})
+        assert r["status"] == "rejected-by-human"
+        assert receipts == [_receipt("human-review", "approved", "rejected", "human-review", ["not grounded"], spec_hash="h")]
+    asyncio.run(scenario())
+
+
+def test_infrastructure_error_leaves_an_error_receipt_naming_the_funnel_stage(monkeypatch):
+    from temporalio.exceptions import ApplicationError
+    from swesim.index import models as IM
+    async def scenario():
+        receipts = []; _candidate_acts(monkeypatch, receipts, {"probe_candidate_activity": RuntimeError("modal down")})
+        with pytest.raises(ApplicationError, match="failed at stage probing"):
+            await W.CandidateWorkflow().run(dict(CAND))
+        assert receipts == [_receipt("error", "probed", "error", "probing", ["probing: RuntimeError: modal down"])]
+    asyncio.run(scenario())
+    assert set(W.FUNNEL_OF_STAGE.values()) <= set(IM.FunnelStage.__args__) and W.FUNNEL_OF_STAGE.get("starting", "failed") == "failed"
+    assert {W.FUNNEL_OF_STAGE[s] for s in ("pre-checking", "re-drafting")} == {"drafted"} and {W.FUNNEL_OF_STAGE[s] for s in ("auto-approving", "awaiting-approval")} == {"approved"}
+
+
+def test_receipt_failure_never_changes_the_outcome_and_pre_patch_executions_skip_it(monkeypatch):
+    async def scenario():
+        receipts = []
+        _candidate_acts(monkeypatch, receipts, {"judge_one_activity": {**CAND_ACTS["judge_one_activity"], "keep": False}}, receipt_error=RuntimeError("index down"))
+        w = W.CandidateWorkflow(); r = await w.run(dict(CAND))
+        assert r["status"] == "rejected" and len(receipts) == 1                         # the outcome ignores the failing receipt
+        assert w.progress()["receipt"]["indexed"] is False and "index down" in w.progress()["receipt"]["reason"]
+        monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_RECEIPTS)         # an execution started before the patch
+        receipts.clear()
+        r = await W.candidate_receipt(CAND, "judge", "judged", "rejected", "judge", ["x"])
+        assert r == {"indexed": False, "reason": "execution predates the candidate receipts"} and receipts == []
+    asyncio.run(scenario())
+
+
+def test_pipeline_inline_decisions_leave_receipts_naming_the_mined_source(monkeypatch):
+    async def scenario():
+        receipts = []
+        async def act(name, p, minutes=10, **kw):
+            if name == "index_candidate_event_activity": receipts.append(p); return {"indexed": True}
+            if name == "auto_approve_activity": return {"approved": False, "spec_hash": "h", "reasons": ["controls incomplete"]}
+            if name == "mine_activity": return {"candidates_path": "/c/swebench-annotated:a.jsonl"}
+            return dict(BIG)
+        monkeypatch.setattr(W, "act", act)
+        r = await W.PipelineWorkflow().run({"max_candidates_tried": 1})
+        assert r["scenarios"][0]["status"] == "auto-approval-rejected"
+        assert receipts == [{"source_key": "swebench-annotated:a", "instance_id": "a", "candidates_path": "/c/swebench-annotated:a.jsonl", "scenario_id": "aaa",
+                             "version": 1, "spec_hash": "h", "phase": "auto-approval", "stage": "approved", "status": "rejected", "gate": "auto-approval",
+                             "reasons": ["controls incomplete"], "terminal": True, "result_status": None, "occurred_at": None, "workflow_id": None, "run_id": None}]
+        receipts.clear()
+        async def wait_timeout(predicate, timeout): raise TimeoutError()
+        monkeypatch.setattr(W.workflow, "wait_condition", wait_timeout)
+        r = await W.PipelineWorkflow().run({"approval_mode": "signal"})
+        assert r["status"] == "awaiting-approval-timeout"
+        assert [(p["phase"], p["stage"], p["status"], p["gate"], p["reasons"], p["scenario_id"], p["source_key"]) for p in receipts] == \
+               [("hold", "approved", "rejected", "approval-timeout", ["no reviewer decision within the hold window"], "aaa", "swebench-annotated:a")]
+    asyncio.run(scenario())
+
+
+def test_env_candidate_receipt_reaches_the_real_index_activity_and_the_record(tmp_path, monkeypatch):
+    """CandidateWorkflow -> index_candidate_event_activity (swesim.index.activities.ALL on the control queue) -> the immutable receipt
+    snapshot in the record, carrying the child's workflow/run ids and `workflow.now()`. The SQL index is disabled here: the record alone
+    keeps the decision."""
+    from temporalio import activity
+    from swesim.index import activities as IA
+    from swesim.settings import reset_settings
+    from swesim.storage import history as H
+    from swesim.storage.layout import Layout
+    for key in ("SWESIM_DATABASE_URL", "SWESIM_REGISTRY", "SWESIM_BUCKET"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SWESIM_ENV_FILE", str(tmp_path / "none.env")); monkeypatch.setenv("SWESIM_WORKSPACE", str(tmp_path / "record"))
+    reset_settings(); IA.reset_store()
+    @activity.defn(name="judge_one_activity")
+    async def judge(p): return {"judged_path": "j", "instance_id": p["instance_id"], "scenario_id": "a--1", "keep": False, "reasons": ["no non-derivable gap"]}
+    async def scenario(env):
+        async with workers(env, workflows=[W.CandidateWorkflow], activities=[judge, *IA.ALL]):
+            handle = await env.client.start_workflow(W.CandidateWorkflow.run, dict(CAND), id="create:a--1", task_queue=Q.AUTHORING)
+            r = await handle.result()
+            assert r["status"] == "rejected"
+            receipt = (await handle.query(W.CandidateWorkflow.progress))["receipt"]
+            assert receipt["indexed"] is False and receipt["reason"] == "index disabled" and len(receipt["event_id"]) == 64
+            rows = H.read_rows(Layout(root=tmp_path / "record"), "candidate_events")
+            assert [row.event_id for row in rows] == [receipt["event_id"]]
+            row = rows[0]
+            assert (row.source_key, row.instance_id, row.scenario_id, row.phase, row.stage, row.status, row.gate, row.reasons, row.terminal) == \
+                   ("github-repo:x/a", "a__1", "a--1", "judge", "judged", "rejected", "judge", ["no non-derivable gap"], True)
+            assert row.workflow_id == "create:a--1" and row.run_id == handle.result_run_id and row.occurred_at.tzinfo is not None
+    try:
+        _run_in_env(scenario)
+    finally:
+        reset_settings(); IA.reset_store()
+
+
 # ---------------------------------------------------------------- fixtures for activities
 
 @pytest.fixture
