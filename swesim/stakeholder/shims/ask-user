@@ -1,0 +1,59 @@
+#!/usr/local/bin/swesim-python -I
+# swesim stakeholder shim. Installed root-owned on the agent's PATH as both `ask-user` and `request-review`;
+# the basename selects the endpoint. Standard library only. The shim does not enforce anything: budget,
+# request-id binding and freeze live on the service, which the agent could also reach directly over HTTP.
+# Every failure is one readable line on stderr with exit 1; never a traceback.
+import json, os, pathlib, subprocess, sys, uuid, urllib.error, urllib.request
+
+base = os.environ.get('SWESIM_STAKEHOLDER_URL', '').rstrip('/'); token = os.environ.get('SWESIM_SESSION_TOKEN', '')
+if not token or not base:
+    print('No stakeholder is available in this task.'); raise SystemExit(0)
+kind = 'ask' if pathlib.Path(sys.argv[0]).name == 'ask-user' else 'review'
+body = {'request_id': uuid.uuid4().hex}
+if kind == 'ask':
+    question = ' '.join(sys.argv[1:]).strip()
+    if not question: raise SystemExit('usage: ask-user "your question for the stakeholder"')
+    body['question'] = question
+else:
+    repo = os.environ.get('SWESIM_REPO_DIR', '')
+    if not repo or not os.path.isdir(repo): raise SystemExit('request-review: SWESIM_REPO_DIR is not set to a directory')
+    git = ['/usr/bin/git', '-c', 'core.hooksPath=/dev/null']
+    try:
+        subprocess.run(git + ['add', '-N', '.'], cwd=repo, check=True, capture_output=True)
+        diff = subprocess.run(git + ['--no-pager', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', 'HEAD'],
+                              cwd=repo, capture_output=True, check=True).stdout
+    except subprocess.CalledProcessError as e:
+        tail = (e.stderr or b'').decode('utf-8', 'replace').strip().splitlines()
+        raise SystemExit('request-review: git failed' + (' (' + tail[-1] + ')' if tail else ''))
+    except OSError as e:
+        raise SystemExit('request-review: cannot run git: ' + str(e))
+    if len(diff) > 200000: raise SystemExit('Review diff exceeds 200KB; submit a smaller explicit review snapshot')
+    text = diff.decode('utf-8', 'replace')
+    if not text.strip(): raise SystemExit('No changes to review yet (git diff HEAD is empty).')
+    files = {}; total = 0
+    for line in text.splitlines():                      # changed files, bounded and text-only, for read_changed_file
+        if not line.startswith('+++ b/'): continue
+        rel = line[6:].split('\t')[0]
+        try: data = (pathlib.Path(repo) / rel).read_bytes()
+        except OSError: continue
+        if len(data) > 65536 or b'\0' in data or total + len(data) > 200000: continue
+        try: files[rel] = data.decode('utf-8')
+        except UnicodeDecodeError: continue
+        total += len(data)
+    body.update(diff=text, files=files)
+req = urllib.request.Request(base + '/' + kind, data=json.dumps(body).encode(),
+                             headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token})
+try:
+    with urllib.request.urlopen(req, timeout=180) as response: data = json.load(response)
+    print(data['reply']); print('[availability remaining: ' + str(data['patience_remaining']) + ']')
+except urllib.error.HTTPError as e:
+    try: detail = json.loads(e.read().decode('utf-8', 'replace')).get('detail', '')
+    except Exception: detail = ''
+    if e.code == 410: print('Stakeholder session closed.')
+    elif e.code == 503: raise SystemExit('Stakeholder is temporarily unavailable; try again with a fresh question.')
+    elif 400 <= e.code < 500: raise SystemExit('Stakeholder rejected the request (HTTP ' + str(e.code) + '): ' + str(detail))
+    else: raise SystemExit('Stakeholder transport failed: HTTP ' + str(e.code))
+except OSError as e:                                    # URLError, TimeoutError, connection reset
+    raise SystemExit('Stakeholder transport failed: ' + str(getattr(e, 'reason', None) or e))
+except (ValueError, KeyError):
+    raise SystemExit('Stakeholder transport failed: malformed reply')
