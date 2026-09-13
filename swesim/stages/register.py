@@ -41,10 +41,11 @@ def register_scenario(ws: Workspace, spec: ScenarioSpec) -> dict:
             previous = reg["scenarios"].get(spec.id)
             if previous and previous.get("spec_hash") != spec.spec_hash and int(previous.get("version", 0)) >= spec.version:
                 raise ValueError(f"increment scenario version: {spec.id} v{previous.get('version')} already registered with other content")
-            entry = dict(id=spec.id, version=spec.version, spec_hash=spec.spec_hash, source=spec.source.value,
-                         source_ref=spec.source_ref, validation_status="valid", validation_path=str(sdir / "validation.json"),
-                         conditions=conditions, compiled_hash=comp.get("compiled_hash"), image_digest=comp.get("image_digest"),
-                         calibration_runs=[], comparison_runs=[], demonstration_runs=[])
+            entry = {"id": spec.id, "version": spec.version, "spec_hash": spec.spec_hash, "source": spec.source.value,
+                     "source_ref": spec.source_ref, "validation_status": "valid",
+                     "validation_path": str(sdir / "validation.json"), "conditions": conditions,
+                     "compiled_hash": comp.get("compiled_hash"), "image_digest": comp.get("image_digest"),
+                     "calibration_runs": [], "comparison_runs": [], "demonstration_runs": []}
             for r in load_trial_records(ws):
                 if r.get("spec_hash") != spec.spec_hash or not r.get("trial_id"):
                     continue

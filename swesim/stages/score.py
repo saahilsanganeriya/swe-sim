@@ -11,6 +11,7 @@ insufficient samples (n < k, or n == 0) are ``null``; k is never silently reduce
 """
 from __future__ import annotations
 
+import contextlib
 import json
 from math import comb
 from pathlib import Path
@@ -91,21 +92,18 @@ def normalize_record(rec: dict, trial_dir: Path | None = None) -> dict:
         if out.get(key) in (None, "") and rc.get(key) not in (None, ""):
             out[key] = rc[key]
     if not out.get("run_config_hash") and rc:
-        try:
+        # A drifted run_config dump must not crash the loader; score_scenario rejects the missing lineage.
+        with contextlib.suppress(Exception):
             from swesim.models import RunConfig
             out["run_config_hash"] = RunConfig.model_validate(rc).run_config_hash
-        except Exception:  # noqa: BLE001 - a drifted dump must not crash the loader; scoring rejects it below
-            pass
     if trial_dir is not None:
         spec_json = _read_json(trial_dir / "spec.json") if not (out.get("spec_hash") and out.get("scenario_id")) else None
         if spec_json:
             out.setdefault("scenario_id", spec_json.get("id"))
             if not out.get("spec_hash"):
-                try:
+                with contextlib.suppress(Exception):  # unreadable frozen spec: lineage stays missing
                     from swesim.models import ScenarioSpec
                     out["spec_hash"] = ScenarioSpec.model_validate(spec_json).spec_hash
-                except Exception:  # noqa: BLE001
-                    pass
         for name in ("reward", "report", "transcript"):
             if not out.get(name):
                 out[name] = _read_json(trial_dir / f"{name}.json", default=out.get(name) or {})

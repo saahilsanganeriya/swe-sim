@@ -10,8 +10,15 @@ from swesim.models import RunConfig, ScenarioSpec, minimal_spec_dict, trial_id
 from swesim.paths import Workspace
 from swesim.stages.export import export_scenario
 from swesim.stages.register import register_scenario
-from swesim.stages.score import (OUTCOME_NAMES, load_trial_records, normalize_record, pass_at_k, pass_pow_k,
-                                 score_scenario, summarize)
+from swesim.stages.score import (
+    OUTCOME_NAMES,
+    load_trial_records,
+    normalize_record,
+    pass_at_k,
+    pass_pow_k,
+    score_scenario,
+    summarize,
+)
 
 COMPILED = "c" * 64
 IMAGE = "sha256:" + "d" * 64
@@ -392,7 +399,7 @@ def test_export_without_trajectory_or_binding_is_not_training_eligible(tmp_path)
     rec["report"]["simulator_validity"] = "ok"
     p.write_text(json.dumps(rec))
     export_scenario(ws, spec.id)
-    read = lambda t: json.loads((ws.root / "exports" / f"{t}.episode.json").read_text())  # noqa: E731
+    read = lambda t: json.loads((ws.root / "exports" / f"{t}.episode.json").read_text())
     assert read(no_traj)["training_eligible"] is False and read(no_traj)["policy_visible"]["agent_trajectory"] == {}
     assert read(no_traj)["policy_visible"]["stakeholder_replies"] == []
     assert read(unbound)["training_eligible"] is False
