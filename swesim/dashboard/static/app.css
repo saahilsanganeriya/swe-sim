@@ -165,6 +165,20 @@ pre.diff .ln.hunk { color: var(--accent-ink); } pre.diff .ln.meta { color: var(-
 /* charts (SVG) */
 .chart-wrap { margin: var(--s-3) 0; }
 .chart-wrap figcaption { margin-top: var(--s-1); }
+.history-chart { max-width: 100%; height: auto; }
+.history-line { fill: none; stroke: var(--fam-other); stroke-width: 2; pointer-events: none; }
+.history-point { fill: var(--fam-other); }
+.history-line.fam-1, .history-point.fam-1 { --series: var(--fam-1); }
+.history-line.fam-2, .history-point.fam-2 { --series: var(--fam-2); }
+.history-line.fam-3, .history-point.fam-3 { --series: var(--fam-3); }
+.history-line.fam-4, .history-point.fam-4 { --series: var(--fam-4); }
+.history-line.fam-5, .history-point.fam-5 { --series: var(--fam-5); }
+.history-line.fam-6, .history-point.fam-6 { --series: var(--fam-6); }
+.history-line.fam-7, .history-point.fam-7 { --series: var(--fam-7); }
+.history-line.fam-8, .history-point.fam-8 { --series: var(--fam-8); }
+.history-line { stroke: var(--series, var(--fam-other)); }
+.history-point { fill: var(--series, var(--fam-other)); }
+.health-panel { margin: var(--s-4) 0; }
 .chart .grid { stroke: var(--line); stroke-width: 1; }
 .chart .axis { stroke: var(--line-2); stroke-width: 1; }
 .chart .tick, .chart .cat, .chart .lbl { fill: var(--ink-2); font: var(--fs-0) var(--font-sans); }

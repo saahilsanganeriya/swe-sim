@@ -9,6 +9,7 @@ from swesim.index.models import (  # noqa: F401 - re-exports are the point of th
     CandidateRow,
     CostFilter,
     CostRow,
+    DiscoveryRow,
     EVALUATOR_ONLY_EXCHANGE_COLUMNS,
     FUNNEL_ORDER,
     ExchangeRow,
@@ -31,8 +32,8 @@ from swesim.index.models import (  # noqa: F401 - re-exports are the point of th
     WorkflowRow,
 )
 
-TABLES: tuple[str, ...] = ("scenarios", "candidates", "trials", "exchanges", "scores", "workflows", "costs", "operator_actions", "index_rebuilds")
-ROW_OF: dict[str, type] = {"scenarios": ScenarioRow, "candidates": CandidateRow, "trials": TrialRow, "exchanges": ExchangeRow, "scores": ScoreRow,
+TABLES: tuple[str, ...] = ("scenarios", "candidates", "discoveries", "trials", "exchanges", "scores", "workflows", "costs", "operator_actions", "index_rebuilds")
+ROW_OF: dict[str, type] = {"scenarios": ScenarioRow, "candidates": CandidateRow, "discoveries": DiscoveryRow, "trials": TrialRow, "exchanges": ExchangeRow, "scores": ScoreRow,
                            "workflows": WorkflowRow, "costs": CostRow, "operator_actions": OperatorActionRow, "index_rebuilds": IndexRebuildRow}
 # Evaluator-only keys (brief §2.5, Codex B-P2-6): never present in a non-evaluator response; the leak test enumerates the routes.
 EVALUATOR_ONLY_KEYS: frozenset[str] = frozenset(EVALUATOR_ONLY_EXCHANGE_COLUMNS) | frozenset(
