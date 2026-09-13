@@ -919,7 +919,8 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     assert "{{" not in r.command and "}}" not in r.command and r.command.count("{") == 2  # {junit_path} + the literal brace in F2P
     assert r.single_command.endswith("{nodeid}") and r.test_files == ["xarray/tests/test_weighted.py"]
     assert spec.environment.test_command == r.command
-    assert spec.contract.test_assets == ["test.patch"] and spec.contract.protected_paths == ["xarray/tests/data/w.nc", "xarray/tests/test_weighted.py"]
+    assert spec.contract.test_assets == ["test.patch"] and spec.contract.protected_paths == ["xarray/tests/data/w.nc", "xarray/tests/test_weighted.py"]   # test files + a test-tree extra
+    assert not (set(spec.contract.protected_paths) & draft_spec.patch_paths(_row()["patch"]))                                   # never a gold-patched file
     # briefs / withholding provenance
     assert [b.profile for b in spec.briefs] == ["natural", "withheld"] and spec.briefs[0].text == ISSUE
     ops = [o for o in spec.operations if o.type == "withholding"]
@@ -1026,6 +1027,34 @@ def test_llm_view_trims_pass_to_pass_but_spec_keeps_it(monkeypatch, tmp_path):
     spec = ScenarioSpec.model_validate_json(p.read_text())
     assert spec.contract.pass_to_pass == p2p and all(t in spec.contract.runner.command for t in p2p)
     assert json.loads(calls[0]["messages"][0]["content"].split("\n\n", 1)[1])["candidate"]["pass_to_pass_count"] == 300
+
+
+def test_protected_paths_are_code_owned_and_never_shield_gold_files(monkeypatch, tmp_path):
+    """pytest-dev--pytest-7283 / seaborn-3190: the model's protected_paths_extra named the source files the gold patch modifies,
+    so the oracle control was graded agent-invalid-submission. Only test-tree paths untouched by the gold patch may be added."""
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    d = _draft_llm(); d["protected_paths_extra"] = ["xarray/core/weighted.py", "docs/whats-new.rst", "xarray/tests/data/w.nc", "src/_pytest/unittest.py", "", None]
+    _patch_llm(monkeypatch, d, _withhold_llm())
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert spec.contract.protected_paths == ["xarray/tests/data/w.nc", "xarray/tests/test_weighted.py"]
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert [(x["path"], x["reason"]) for x in meta["protected_paths_dropped"]] == [
+        ("xarray/core/weighted.py", "touched by the gold patch"), ("docs/whats-new.rst", "not a test-tree path"),
+        ("src/_pytest/unittest.py", "not a test-tree path"), ("", "not a path"), (None, "not a path")]
+    assert draft_spec.patch_paths(_row()["patch"]) == {"xarray/core/weighted.py"}
+    assert draft_spec.patch_paths("diff --git a/old/name.py b/new/name.py\n--- a/old/name.py\n+++ b/new/name.py\n") == {"old/name.py", "new/name.py"}
+    # hard invariant: a hidden test file the gold patch also modifies is a drafter error, not a correction round
+    calls = _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    shared = "diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n@@ -1 +1,2 @@\n x\n+z\n"
+    with pytest.raises(ValueError, match="drafter error: protected_paths would shield.*xarray/core/weighted.py"):
+        draft_spec.draft(_row(test_patch=_row()["test_patch"] + shared), _judged(), "fake/model", tmp_path / "s2")
+    assert not (tmp_path / "s2" / "scenario.draft.json").exists()
+    assert len([c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]) == 1                       # one authoring call, no correction round
+    assert draft_spec.protected_paths_for(["tests/test_a.py"], ["tests/fixtures/a.json", "pkg/a.py"], {"pkg/a.py"}) == (["tests/fixtures/a.json", "tests/test_a.py"], [{"path": "pkg/a.py", "reason": "touched by the gold patch"}])
+    with pytest.raises(ValueError, match="drafter error"):
+        draft_spec.protected_paths_for(["src/_pytest/unittest.py"], [], {"src/_pytest/unittest.py"})
 
 
 def test_draft_requires_offline_probe_metadata(monkeypatch, tmp_path):

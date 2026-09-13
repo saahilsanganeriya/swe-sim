@@ -44,8 +44,10 @@ comments, annotator-note = the annotation notes, original-issue = the problem st
 repository. provenance=authored is only for decisions that nothing in the discussion states and only the merged tests or
 patch pin: source_excerpt verbatim from test_patch or patch, source_url the PR URL, authored_rationale saying why no thread
 statement exists, discovery on-request, tests = the FAIL_TO_PASS ids whose code the excerpt comes from. Code also adds such
-facts from the judge's tests-resolved gaps. If the judge marked structural_tests, also write one alternative-correct patch (a
-different implementation the tests should still accept); otherwise set alternative_correct to null."""
+facts from the judge's tests-resolved gaps. protected_paths_extra may name only test-tree fixture or data files the hidden tests
+read; the hidden test files are protected by code and source files the fix modifies are never protected. If the judge marked
+structural_tests, also write one alternative-correct patch (a different implementation the tests should still accept);
+otherwise set alternative_correct to null."""
 SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "original-issue"}],
 "ledger": [{"id": "f01", "text": "...", "kind": "behavior|interface|constraint|reproduction|context",
   "provenance": "original-issue|issue-thread|pr-thread|pr-review|annotator-note|authored", "source_excerpt": "...", "source_url": "...",
@@ -57,7 +59,7 @@ SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "ori
 "groups": [{"id": "g01", "weight": 0.5, "tests": ["nodeid"]}],
 "plausible_wrong": {"name": "...", "rationale": "...", "diff": "unified diff text"},
 "alternative_correct": {"name": "...", "rationale": "...", "diff": "unified diff text"} | null,
-"protected_paths_extra": ["paths the fix's tests depend on"]}"""
+"protected_paths_extra": ["test-tree fixture or data files the hidden tests read (never source files; code drops anything else)"]}"""
 
 WITHHOLD_CATEGORIES = {"reproduction", "error_message", "expected_output", "location", "version", "proposed_fix"}
 WITHHOLD_DISCOVERY = {"on-request", "repo-derivable"}  # a removed reporter statement is never author-only
@@ -489,6 +491,44 @@ def tests_resolved_facts(row: dict, judged: dict) -> list[dict]:
     return out
 
 
+_DIFF_PATHS = re.compile(r"^diff --git a/(\S+) b/(\S+)", re.M)
+_PLUS_PATH = re.compile(r"^\+\+\+ b/(\S+)", re.M)
+
+
+def patch_paths(patch: str | None) -> set[str]:
+    """Every path a unified diff touches (both sides of each `diff --git` header and the `+++ b/` lines)."""
+    out: set[str] = set()
+    for a, b in _DIFF_PATHS.findall(patch or ""):
+        out.update({a, b})
+    out.update(_PLUS_PATH.findall(patch or ""))
+    return out
+
+
+def protected_paths_for(test_files: list[str], extras: list, gold_paths: set[str]) -> tuple[list[str], list[dict]]:
+    """Code-owned protected paths: the hidden test files, plus model-proposed extras only when they are test-tree paths
+    (`github_repo._TEST_PATH`) that the gold patch does not touch; everything else is dropped with a reason. Then the hard
+    invariant: no path the gold patch modifies may be protected — the oracle control would be graded an invalid submission —
+    and a violation is a drafter error, never a correction round."""
+    from swesim.sources.github_repo import _TEST_PATH
+
+    kept, dropped = set(test_files), []
+    for p in extras or []:
+        if not isinstance(p, str) or not p.strip():
+            dropped.append({"path": p, "reason": "not a path"})
+            continue
+        p = p.strip()
+        if p in gold_paths:
+            dropped.append({"path": p, "reason": "touched by the gold patch"})
+        elif not _TEST_PATH.search(p):
+            dropped.append({"path": p, "reason": "not a test-tree path"})
+        else:
+            kept.add(p)
+    shielded = sorted(kept & gold_paths)
+    if shielded:
+        raise ValueError(f"drafter error: protected_paths would shield files the gold patch modifies: {shielded}")
+    return sorted(kept), dropped
+
+
 def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None) -> tuple[dict, list[str]]:
     """One LLM authoring call, validated by `ledger_violations`, one correction round, then a code-owned fallback that links
     on-request facts without tests to the FAIL_TO_PASS tests sharing content words with them (`auto_link_tests`), then fail.
@@ -565,6 +605,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
         alt = None
 
     test_files = test_files_from_patch(row["test_patch"])
+    protected, protected_dropped = protected_paths_for(test_files, d.get("protected_paths_extra") or [], patch_paths(row["patch"]))
     base_files = {p: threads.base_text(row["repo"], row["base_commit"], p) for p in [*test_files, "conftest.py", "sitecustomize.py"]}
     control_diffs = tamper.all_controls(base_files)
     for name, diff in control_diffs.items():
@@ -608,7 +649,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
             "briefs": [{"profile": "natural", "text": row["problem_statement"], "provenance": "original-issue"}],
             "ledger": [*d["ledger"], *synthesized], "operations": d.get("operations") or [], "persona": d["persona"], "requirements": d.get("requirements") or [],
             "contract": {"fail_to_pass": row["fail_to_pass"], "pass_to_pass": row["pass_to_pass"], "test_assets": ["test.patch"],
-                         "protected_paths": sorted(set(test_files) | set(d.get("protected_paths_extra") or [])),
+                         "protected_paths": protected,
                          "runner": {"kind": "pytest-ra", "command": runner_cmd, "single_command": prefix + "{nodeid}", "test_files": test_files,
                                     "nodeid_map": nodeid_map}},
             "checks": d.get("checks") or [], "controls": controls, "groups": _normalize_groups(d["groups"]),
@@ -647,6 +688,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                                          "keep": judged.get("keep"), **judged})
     atomic_json(out_dir / "draft.meta.json", {"model_id": model_id, "prompt_version": DRAFT_PROMPT_VERSION, "pipeline_version": pipeline_version,
                                               "created_at": spec["created_at"], "spec_hash": parsed.spec_hash, "auto_linked": auto_linked,
+                                              "protected_paths_dropped": protected_dropped,
                                               "probe": ({k: probe.get(k) for k in ("kind", "probe_dir", "image_digest", "counts", "dropped", "swebench")} if probe.get("statuses")
                                                         else {"unmeasured": True}),
                                               "withholding": {"removed": [{**r, "fact_id": f"withheld-{i + 1:03d}"} for i, r in enumerate(withheld["removed"])],
