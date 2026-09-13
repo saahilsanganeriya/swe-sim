@@ -4,11 +4,18 @@ Every call returns one JSON document (never `--paginate`, whose output is severa
 Paging is explicit and bounded. GitHub has two limits: the hourly core quota (primary; `x-ratelimit-remaining: 0`,
 "API rate limit exceeded") and the secondary (burst/abuse) limit, triggered by concurrent or rapid requests while the
 quota is untouched ("You have exceeded a secondary rate limit", sometimes with `retry-after`). Against the secondary
-limit every gh call in this process goes through one lock and is paced `GH_PACING_SEC` apart. Nothing here sleeps
-through either limit: a refused call raises `RateLimited` (a `DiscoveryUnavailable`) carrying `secondary`, the
-`retry_after` GitHub named, if any, and a reset time read from the response headers (`gh api -i` output) or from one
-uncounted `gh api rate_limit` call; the owner of the clock (the discovery activity, which heartbeats while it waits)
-decides how long to wait and resumes. `rate_limit_status()` exposes the core quota, cached for 30 s.
+limit every gh call in this process goes through one lock and is paced `GH_PACING_SEC` apart.
+
+Several quota buckets: every call takes its credential from the process-wide `TokenPool` (`swesim.sources.github_auth`;
+`GH_TOKEN`, extra `GH_TOKEN_n`, a GitHub App installation), handed to the gh subprocess as `GH_TOKEN` in its environment
+and never on its command line or in a log. The pool gives the token with the most quota left. When GitHub refuses a call
+under one token, that token is set aside until its reset and the same call is retried at once with another token that
+has quota (no Temporal attempt is spent); only when every token is out does a refused call raise `RateLimited` (a
+`DiscoveryUnavailable`) carrying `secondary`, the `retry_after` GitHub named, if any, the soonest reset (read from the
+response headers of `gh api -i` output or from one uncounted `gh api rate_limit` call under that token) and which
+`source` that is; the owner of the clock (the discovery activity, which heartbeats while it waits) decides how long to
+wait and resumes. Nothing here sleeps through either limit. `rate_limit_status()` reads each token's core quota (cached
+30 s per token) and reports the best one, or the soonest reset when all are empty.
 """
 from __future__ import annotations
 
@@ -21,12 +28,18 @@ import threading
 import time
 from urllib.parse import quote, urlencode
 
+from swesim.settings import child_environment, get_settings
+from swesim.sources import github_auth
+
 log = logging.getLogger(__name__)
 RATE_LIMIT_STATUS_TTL = 30.0
 SECONDARY_LIMIT_WAIT = 120.0  # horizon for a secondary (burst) limit without retry-after, and when the quota cannot be read; the activity doubles it
+TOKEN_ERROR_SET_ASIDE_SEC = 300.0  # a source whose token could not be minted (network, refused) is skipped this long
 GH_PACING_SEC = 0.25  # minimum spacing between two gh calls of this process (tests set 0)
 _GH_LOCK = threading.Lock()
 _last_call_end = 0.0  # time.monotonic() when the previous gh process ended
+_POOL: github_auth.TokenPool | None = None  # built from Settings on the first gh call; tests install a fake
+_POOL_LOCK = threading.Lock()
 _RATE_LIMIT = re.compile(r"rate limit|HTTP 429|abuse detection", re.I)
 _SECONDARY = re.compile(r"secondary|abuse detection", re.I)
 _HEADER_REMAINING = re.compile(r"^x-ratelimit-remaining:\s*(\d+)\s*$", re.I | re.M)
@@ -68,11 +81,16 @@ class RateLimited(DiscoveryUnavailable):
     (None when it could not be read)."""
 
     def __init__(self, reset_at: float, remaining: int | None, *, secondary: bool = False, retry_after: float | None = None,
-                 repo: str = "", where: str = "", error_class: str = "CalledProcessError"):
+                 repo: str = "", where: str = "", error_class: str = "CalledProcessError", source: str = "", exhausted: tuple[str, ...] = ()):
         self.reset_at, self.remaining, self.secondary, self.retry_after = float(reset_at), remaining, secondary, retry_after
+        self.source, self.exhausted = source, tuple(exhausted)  # the token bucket this horizon belongs to; every bucket, when all are out
         super().__init__("rate-limit", repo, where, error_class)
         named = f"retry-after {int(retry_after)}s" if retry_after is not None else f"resets at epoch {int(self.reset_at)}"
-        self.args = (f"{self.args[0]}; {'secondary limit' if secondary else 'quota exhausted'}, {named}",)
+        who = f" {source}" if source else ""
+        text = f"{self.args[0]}; {'secondary limit' if secondary else 'quota exhausted'}{who}, {named}"
+        if self.exhausted:
+            text += f"; every GitHub token exhausted ({', '.join(self.exhausted)}), {source or 'the soonest'} frees up first"
+        self.args = (text,)
 
     @property
     def authoritative(self) -> bool:
@@ -81,41 +99,73 @@ class RateLimited(DiscoveryUnavailable):
 
     def located(self, repo: str, where: str) -> "RateLimited":
         return RateLimited(self.reset_at, self.remaining, secondary=self.secondary, retry_after=self.retry_after, repo=repo, where=where,
-                           error_class=self.error_class)
+                           error_class=self.error_class, source=self.source, exhausted=self.exhausted)
 
     def wait_seconds(self, now: float | None = None) -> float:
         return max(0.0, self.reset_at - (_now() if now is None else now))
 
 
-_status_cache: tuple[float, tuple[int, int, float]] | None = None
+def pool() -> github_auth.TokenPool:
+    """The process-wide token pool, built from `Settings` on first use (`github_auth.pool_from_settings`)."""
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = github_auth.pool_from_settings(get_settings())
+        return _POOL
 
 
-def _run_gh(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
+def _run_gh(cmd: list[str], timeout: float, token: str | None = None) -> subprocess.CompletedProcess:
     """One gh process at a time per worker process, at least `GH_PACING_SEC` apart: GitHub's secondary limit is about
-    concurrency and bursts, not the hourly quota, and a worker running several scans must still look like one client."""
+    concurrency and bursts, not the hourly quota, and a worker running several scans must still look like one client.
+    `token` reaches gh as `GH_TOKEN` in the child's environment only (None: gh's own credential store)."""
     global _last_call_end
+    env = child_environment(GH_TOKEN=token) if token is not None else None
     with _GH_LOCK:
         pause = GH_PACING_SEC - (time.monotonic() - _last_call_end)
         if pause > 0:
             time.sleep(pause)
         try:
-            return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
+            return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout, env=env)
         finally:
             _last_call_end = time.monotonic()
 
 
-def rate_limit_status(*, fresh: bool = False) -> tuple[int, int, float]:
-    """(remaining, limit, reset_at) of the core REST quota from one `gh api rate_limit` call (GitHub does not count it),
-    cached for `RATE_LIMIT_STATUS_TTL` seconds unless `fresh`. gh failures and malformed payloads propagate."""
-    global _status_cache
+def _read_quota(p: github_auth.TokenPool, name: str, now: float) -> None:
+    """One `gh api rate_limit` call under `name`'s token (GitHub does not count it), recorded in the pool. gh failures and
+    malformed payloads propagate; a token that cannot be produced sets the source aside and raises `TokenError`."""
+    try:
+        token = p.token(name)
+    except github_auth.TokenError as error:
+        log.warning("gh api rate_limit: no token from %s (%s: %s); set aside for %.0fs", name, error.kind, error, TOKEN_ERROR_SET_ASIDE_SEC)
+        p.set_aside(name, now + TOKEN_ERROR_SET_ASIDE_SEC)
+        raise
+    core = json.loads(_run_gh(["gh", "api", "rate_limit"], timeout=60, token=token).stdout)["resources"]["core"]
+    p.record_status(name, int(core["remaining"]), int(core["limit"]), float(core["reset"]), now)
+
+
+def rate_limit_status(*, fresh: bool = False, source: str | None = None) -> tuple[int, int, float]:
+    """(remaining, limit, reset_at) of the core REST quota. Without `source`: every token's quota is read (each reading
+    cached for `RATE_LIMIT_STATUS_TTL` seconds unless `fresh`) and the token with the most calls left is reported, or
+    `(0, limit, soonest reset)` when all are empty. With `source`: that one token's reading. gh failures and malformed
+    payloads propagate; a token that cannot be minted is skipped when another can answer, else its `TokenError` is
+    raised as `DiscoveryUnavailable`."""
+    p = pool()
     now = _now()
-    if not fresh and _status_cache is not None and 0 <= now - _status_cache[0] < RATE_LIMIT_STATUS_TTL:
-        return _status_cache[1]
-    proc = _run_gh(["gh", "api", "rate_limit"], timeout=60)
-    core = json.loads(proc.stdout)["resources"]["core"]
-    status = (int(core["remaining"]), int(core["limit"]), float(core["reset"]))
-    _status_cache = (now, status)
-    return status
+    names = (source,) if source is not None else p.names
+    failed: github_auth.TokenError | None = None
+    for name in names:
+        if fresh or p.stale(name, now, ttl=RATE_LIMIT_STATUS_TTL):
+            try:
+                _read_quota(p, name, now)
+            except github_auth.TokenError as error:
+                failed = error
+    if source is not None:
+        if failed is not None:
+            raise DiscoveryUnavailable(failed.kind, "", "", "TokenError") from failed
+        return p.reading(source, now)
+    if failed is not None and not any(state["available"] for state in p.summary(now)):
+        raise DiscoveryUnavailable(failed.kind, "", "", "TokenError") from failed
+    return p.status(now)
 
 
 def _error_text(error: subprocess.CalledProcessError) -> str:
@@ -141,40 +191,82 @@ def is_rate_limit_error(error: BaseException) -> bool:
     return headers is not None and headers[0] == 0 and status is not None and int(status.group(1)) in (403, 429)
 
 
-def rate_limited(error: BaseException) -> RateLimited | None:
+def rate_limited(error: BaseException, source: str | None = None) -> RateLimited | None:
     """`error` as GitHub's rate limit with its reset time, or None when it is not a rate-limit failure. The reset comes
     from the response headers when the call printed them (`retry-after`, or `x-ratelimit-reset` with the quota at 0),
-    else from one `rate_limit_status(fresh=True)` call; an unreadable quota gets the secondary-limit horizon."""
+    else from one `rate_limit_status(fresh=True, source=source)` call under the token that was refused (`source`, the
+    pool name; None reads the pool's best, which is right only for a one-token pool); an unreadable quota gets the
+    secondary-limit horizon."""
     if not is_rate_limit_error(error):
         return None
     text = _error_text(error)
     headers = rate_limit_headers(text)
     retry_after = _HEADER_RETRY_AFTER.search(text)
+    who = source or ""
     if retry_after:
         pause = float(retry_after.group(1))
-        return RateLimited(_now() + pause, headers[0] if headers else None, secondary=True, retry_after=pause)
+        return RateLimited(_now() + pause, headers[0] if headers else None, secondary=True, retry_after=pause, source=who)
     if headers is not None and headers[0] == 0:
-        return RateLimited(headers[1], 0)
+        return RateLimited(headers[1], 0, source=who)
     try:
-        remaining, _limit, reset_at = rate_limit_status(fresh=True)
-    except (subprocess.SubprocessError, ValueError, KeyError, TypeError):
-        return RateLimited(_now() + SECONDARY_LIMIT_WAIT, None, secondary=bool(_SECONDARY.search(text)))
+        remaining, _limit, reset_at = rate_limit_status(fresh=True, source=source)
+    except (subprocess.SubprocessError, ValueError, KeyError, TypeError, DiscoveryUnavailable):
+        return RateLimited(_now() + SECONDARY_LIMIT_WAIT, None, secondary=bool(_SECONDARY.search(text)), source=who)
     if remaining == 0:
-        return RateLimited(reset_at, 0)
-    return RateLimited(_now() + SECONDARY_LIMIT_WAIT, remaining, secondary=True)
+        return RateLimited(reset_at, 0, source=who)
+    return RateLimited(_now() + SECONDARY_LIMIT_WAIT, remaining, secondary=True, source=who)
+
+
+def _all_exhausted(p: github_auth.TokenPool, pick: github_auth.Selection, last: RateLimited | None = None) -> RateLimited:
+    """Every token is out: the `RateLimited` for the one that frees up soonest (`pick`, from `pool.select`). When that is
+    the token GitHub just refused (`last`), its own horizon travels on (retry-after, the quota it read)."""
+    if last is not None and last.source == pick.name:
+        return RateLimited(last.reset_at, last.remaining, secondary=last.secondary, retry_after=last.retry_after, source=pick.name, exhausted=p.names)
+    return RateLimited(pick.reset_at, pick.remaining, secondary=pick.secondary, source=pick.name, exhausted=p.names)
 
 
 def _gh_text(path: str, accept: str | None = None) -> str:
+    """One `gh api` call under the pool's best token. A token GitHub refuses is set aside until its reset and the call
+    is retried at once with another token that has quota; a token that cannot be produced is set aside for
+    `TOKEN_ERROR_SET_ASIDE_SEC`. With every token out the call raises `RateLimited` naming the soonest reset (or
+    `DiscoveryUnavailable` when no token could be produced at all) for the activity to wait on."""
     cmd = ["gh", "api", path] + (["-H", f"Accept: {accept}"] if accept else [])
-    try:
-        return _run_gh(cmd, timeout=120).stdout
-    except subprocess.CalledProcessError as e:
-        limited = rate_limited(e)
-        if limited is None:
-            raise
-        log.warning("gh api %s: rate limited (%s, remaining=%s); quota resets in %.0fs", path, "secondary" if limited.secondary else "primary",
-                    limited.remaining, limited.wait_seconds())
-        raise limited from e
+    p = pool()
+    tried: set[str] = set()
+    last: RateLimited | None = None
+    while True:
+        now = _now()
+        pick = p.select(now)
+        if not pick.available:
+            raise _all_exhausted(p, pick, last)
+        if pick.name in tried:  # one try per token per call; only reachable when a refusal named a horizon already in the past
+            raise last if last is not None else _all_exhausted(p, pick)
+        tried.add(pick.name)
+        try:
+            token = p.token(pick.name)
+        except github_auth.TokenError as error:
+            log.warning("gh api %s: no token from %s (%s: %s); set aside for %.0fs", path, pick.name, error.kind, error, TOKEN_ERROR_SET_ASIDE_SEC)
+            p.set_aside(pick.name, now + TOKEN_ERROR_SET_ASIDE_SEC)
+            if p.select(now).available:
+                continue
+            raise DiscoveryUnavailable(error.kind, "", "", "TokenError") from error
+        try:
+            out = _run_gh(cmd, timeout=120, token=token).stdout
+        except subprocess.CalledProcessError as e:
+            limited = rate_limited(e, source=pick.name)
+            if limited is None:
+                raise
+            last = limited
+            p.record_limited(pick.name, max(limited.reset_at, now + 1.0), remaining=limited.remaining, secondary=limited.secondary)
+            following = p.select(_now())
+            log.warning("gh api %s: %s rate limited (%s, remaining=%s, resets in %.0fs); %s", path, pick.name,
+                        "secondary" if limited.secondary else "primary", limited.remaining, limited.wait_seconds(),
+                        f"retrying with {following.name}" if following.available else "every token is out")
+            if following.available:
+                continue
+            raise _all_exhausted(p, following, limited) from e
+        p.record_call(pick.name)
+        return out
 
 
 def unavailable_kind(error: BaseException) -> str | None:

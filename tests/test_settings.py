@@ -63,3 +63,30 @@ def test_env_example_is_generated_from_the_variable_table():
         assert f"\n{name}=\n" in text  # secrets are blank in the example
     tracked = Path(__file__).resolve().parents[1] / ".env.example"
     assert tracked.read_text() == text, "run: uv run python -c 'from swesim.settings import render_env_example as r; open(\".env.example\",\"w\").write(r())'"
+
+
+def test_github_app_and_extra_token_settings_parse_from_the_env_file(tmp_path):
+    f = tmp_path / ".env"
+    f.write_text("GH_APP_ID=1234567\nGH_APP_INSTALLATION_ID=987654321\nGH_APP_PRIVATE_KEY_PATH=~/Documents/app.pem\nSWESIM_GH_EXTRA_TOKENS=5\n"
+                 "GH_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n")
+    s = S.Settings.from_env({"SWESIM_ENV_FILE": str(f)})
+    assert s.gh_app_id == 1234567 and s.gh_app_installation_id == 987654321
+    assert s.gh_app_private_key_path == Path("~/Documents/app.pem").expanduser() and s.gh_extra_tokens == 5
+    assert "GH_APP_PRIVATE_KEY" not in s.model_dump() and "GH_APP_PRIVATE_KEY" in S.SECRET_NAMES  # the key content is a secret, never a field
+    assert S.secret("GH_APP_PRIVATE_KEY", s, environ={}).startswith("-----BEGIN")
+    defaults = S.Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env")})
+    assert defaults.gh_app_id is None and defaults.gh_app_installation_id is None and defaults.gh_app_private_key_path is None
+    assert defaults.gh_extra_tokens == 3
+    with pytest.raises(Exception):
+        S.Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env"), "SWESIM_GH_EXTRA_TOKENS": "-1"})
+    names = {v.name for v in S.ENV_VARS}
+    assert {"GH_APP_ID", "GH_APP_INSTALLATION_ID", "GH_APP_PRIVATE_KEY_PATH", "GH_APP_PRIVATE_KEY", "SWESIM_GH_EXTRA_TOKENS"} <= names
+    assert all(v.where for v in S.ENV_VARS if v.name.startswith("GH_APP"))  # a stranger can find every value
+
+
+def test_child_environment_is_the_process_environment_plus_overrides(monkeypatch):
+    monkeypatch.setenv("SWESIM_CHILD_ENV_PROBE", "base")
+    env = S.child_environment(GH_TOKEN="child-only")
+    assert env["SWESIM_CHILD_ENV_PROBE"] == "base" and env["GH_TOKEN"] == "child-only"
+    import os
+    assert os.environ.get("GH_TOKEN") != "child-only"  # a copy: the process environment is untouched

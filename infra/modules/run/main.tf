@@ -25,7 +25,14 @@ locals {
     var.spend_cap_usd != null ? { SWESIM_SPEND_CAP_USD = tostring(var.spend_cap_usd) } : {},
   ) : k => v if v != "" }
 
-  worker_secret_env  = ["TEMPORAL_API_KEY", "SWESIM_WORKER_SECRET", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GH_TOKEN", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "SWESIM_DATABASE_URL"]
+  # Worker pools only: the optional GitHub App (swesim/sources/github_auth.py) as two plain ids plus its private key from
+  # Secret Manager, all omitted when the App is not configured (a stack without an App never references the secret).
+  gh_app_env = var.gh_app_id != null ? { GH_APP_ID = var.gh_app_id, GH_APP_INSTALLATION_ID = var.gh_app_installation_id } : {}
+  worker_env = merge(local.common_env, local.gh_app_env)
+  worker_secret_env = concat(
+    ["TEMPORAL_API_KEY", "SWESIM_WORKER_SECRET", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GH_TOKEN", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "SWESIM_DATABASE_URL"],
+    var.gh_app_id != null ? ["GH_APP_PRIVATE_KEY"] : [],
+  )
   console_secret_env = ["TEMPORAL_API_KEY", "SWESIM_WORKER_SECRET", "SWESIM_DATABASE_URL"] # no provider keys on the console
 
   # The image runs as uid/gid 1000 (Dockerfile.worker); the FUSE mount must present files to that user.
@@ -55,7 +62,7 @@ resource "google_cloud_run_v2_worker_pool" "pool" {
         limits = { cpu = var.worker_cpu, memory = var.worker_memory }
       }
       dynamic "env" {
-        for_each = merge(local.common_env, { SWESIM_TASK_QUEUE = each.value.queue })
+        for_each = merge(local.worker_env, { SWESIM_TASK_QUEUE = each.value.queue })
         content {
           name  = env.key
           value = env.value

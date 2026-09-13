@@ -169,6 +169,8 @@ def test_gh_raises_rate_limited_instead_of_sleeping(monkeypatch):
             return CompletedProcess(cmd, 0, stdout=json.dumps({"resources": {"core": {"limit": 5000, "remaining": 5000, "reset": now + 3000}}}), stderr="")
         raise CalledProcessError(1, cmd, output="", stderr="gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)")
     monkeypatch.setattr(subprocess, "run", secondary)
+    from swesim.sources import github_auth
+    monkeypatch.setattr(threads, "_POOL", github_auth.TokenPool([github_auth.StaticSource("GH_TOKEN", "fake-test-token")]))  # a separate scenario: the pool must not remember the exhaustion above
     with pytest.raises(threads.RateLimited) as exc:
         threads._gh("repos/o/r")
     assert exc.value.secondary is True and exc.value.remaining == 5000 and exc.value.reset_at == now + threads.SECONDARY_LIMIT_WAIT

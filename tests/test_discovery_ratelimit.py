@@ -26,7 +26,6 @@ def frozen_clock(monkeypatch):
     """threads' wall clock is `clock["now"]`; a real sleep anywhere in these paths is a test failure."""
     clock = {"now": NOW}
     monkeypatch.setattr(threads, "_now", lambda: clock["now"])
-    monkeypatch.setattr(threads, "_status_cache", None)
     monkeypatch.setattr(time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError(f"real sleep({s}) in a rate-limit test")))
     return clock
 
@@ -224,7 +223,7 @@ class LimitedOnce:
         return self.payload(q) if callable(self.payload) else self.payload
 
 
-def test_scan_resumes_at_the_refused_pr_and_finishes_like_an_uninterrupted_one(monkeypatch):
+def test_scan_resumes_at_the_refused_pr_and_finishes_like_an_uninterrupted_one(monkeypatch, frozen_clock):
     routes = _routes(); routes["rate_limit"] = rate_limit_payload(remaining=5000)
     routes["repos/o/r/pulls/42"] = LimitedOnce(routes["repos/o/r/pulls/42"])
     gh = FakeGH(routes); monkeypatch.setattr(subprocess, "run", gh)
@@ -233,8 +232,14 @@ def test_scan_resumes_at_the_refused_pr_and_finishes_like_an_uninterrupted_one(m
         scan.run()
     e = exc.value
     assert e.secondary and e.where == "PR 42" and e.repo == "o/r" and e.remaining == 5000 and e.retry_after is None
+    assert e.source == "GH_TOKEN" and e.exhausted == ("GH_TOKEN",)  # the only token is out until the horizon
     assert not scan.done and scan.listed and scan.cursor == 41 and 42 not in {o.pr_number for o in scan.observations}
     assert len(scan.observations) == 41 and all(o.status != "pending" for o in scan.observations)
+    calls_before = len(gh.calls)
+    with pytest.raises(G.RateLimited):
+        scan.run()  # before the horizon the token is known to be out: refused again without a gh call
+    assert len(gh.calls) == calls_before
+    frozen_clock["now"] = e.reset_at  # the owner waits the horizon out, then resumes
     assert scan.run() is True and scan.done
     kept, rejects, record = G.finish_scan(scan)
     assert [c["pr"] for c in kept] == [42] and rejects == {"diff-too-small": 1, "no-linked-issue": 1, "linked-target-is-pr": 1}
@@ -245,7 +250,7 @@ def test_scan_resumes_at_the_refused_pr_and_finishes_like_an_uninterrupted_one(m
         G.finish_scan(G.begin_scan("o/r", "2026-06-01"))
 
 
-def test_scan_resumes_at_the_refused_list_page(monkeypatch):
+def test_scan_resumes_at_the_refused_list_page(monkeypatch, frozen_clock):
     routes = _routes(); routes["rate_limit"] = rate_limit_payload(remaining=5000)
     routes["repos/o/r/pulls"] = LimitedOnce(routes["repos/o/r/pulls"])
     gh = FakeGH(routes); monkeypatch.setattr(subprocess, "run", gh)
@@ -253,6 +258,7 @@ def test_scan_resumes_at_the_refused_list_page(monkeypatch):
     with pytest.raises(G.RateLimited) as exc:
         scan.run()
     assert exc.value.where == "list page 1" and scan.page == 1 and not scan.listed and scan.observations == [] and scan.summaries == []
+    frozen_clock["now"] = exc.value.reset_at
     assert scan.run() and gh.list_pages() == ["1", "1", "2"]
     assert [c["pr"] for c in scan.cands] == [42] and len(scan.observations) == 105
 
