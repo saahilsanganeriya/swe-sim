@@ -1,0 +1,13 @@
+[Unit]
+Description=swesim episode viewer (loopback only; reach it through the SSH tunnel)
+
+[Service]
+WorkingDirectory=/opt/swesim
+EnvironmentFile=/etc/swesim/env
+Environment=SWESIM_WORKSPACE=/opt/swesim/workspace
+ExecStart=/opt/swesim/.venv/bin/uvicorn swesim.dashboard.app:app --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

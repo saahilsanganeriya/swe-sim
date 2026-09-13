@@ -1,0 +1,10 @@
+[Unit]
+Description=swesim persistent Temporal development server (loopback only; reach it through the SSH tunnel)
+
+[Service]
+ExecStart=/usr/local/bin/temporal server start-dev --db-filename /var/lib/swesim/temporal.db --ip 127.0.0.1 --port 7233 --ui-port 8233 --log-level warn
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
