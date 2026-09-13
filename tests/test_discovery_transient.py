@@ -18,7 +18,6 @@ def gh_route_error(stderr: str):
 
 @pytest.fixture(autouse=True)
 def no_rate_limit_sleeps(monkeypatch):
-    monkeypatch.setattr(threads, "RATE_LIMIT_RETRIES", 0)
     monkeypatch.setattr(threads.time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("discovery must not sleep in tests")))
 
 

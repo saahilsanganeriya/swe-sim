@@ -86,15 +86,20 @@ def _patched(name: str) -> bool:
     return workflow.patched(name) if workflow.in_workflow() else True
 
 
-async def act(name: str, p: dict, minutes: int = 10, *, retry: RetryPolicy = retries.LLM):
+DISCOVERY_MINUTES = 120           # discover_activity waits GitHub's rate limits out inside the attempt: up to an hourly quota window plus the scan
+DISCOVERY_HEARTBEAT_MINUTES = 3   # it heartbeats every 30 s while scanning and while waiting
+
+
+async def act(name: str, p: dict, minutes: int = 10, *, retry: RetryPolicy = retries.LLM, heartbeat_minutes: int = 2):
     """One activity on its queue (`queues.queue_for`) with its retry class. Call sites pick the class: LLM for judge /
     draft / approve / stakeholder-bound work, BUILD for probe / compile / validate, READ for polls and local reads,
-    ONCE for launch. The pre-patch shape (inherited queue, one attempt) is kept for replay."""
+    ONCE for launch, DISCOVERY for the GitHub scan (with its longer heartbeat timeout). The pre-patch shape (inherited
+    queue, one attempt) is kept for replay; timeouts and retry policies are not part of Temporal's determinism check."""
     try:
         check_payload(p, f"{name} input")
     except ValueError as e:
         raise ApplicationError(str(e), non_retryable=True) from e
-    timeouts = {"start_to_close_timeout": timedelta(minutes=minutes), "heartbeat_timeout": timedelta(minutes=2)}
+    timeouts = {"start_to_close_timeout": timedelta(minutes=minutes), "heartbeat_timeout": timedelta(minutes=heartbeat_minutes)}
     if _patched(PATCH_QUEUES):
         if name == "launch_trial_activity" and _patched(PATCH_SPLIT):
             timeouts["cancellation_type"] = workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
@@ -800,7 +805,8 @@ class CreateTasksWorkflow:
             try:
                 if src.get("kind") == "github-repo" and _patched(PATCH_SPLIT):
                     # Discovery only (GitHub API); every candidate is probed in its own CandidateWorkflow (probe_candidate_activity).
-                    mined = await act("discover_activity", {**p, **_mine_params(src)}, 30)
+                    mined = await act("discover_activity", {**p, **_mine_params(src)}, DISCOVERY_MINUTES, retry=retries.DISCOVERY,
+                                      heartbeat_minutes=DISCOVERY_HEARTBEAT_MINUTES)
                     self.state["sources"][key].update(discovered=mined.get("discovered"), rejects=mined.get("rejects", {}))
                 else:
                     mined = await act("mine_activity", {**p, **_mine_params(src)}, 180)
@@ -1015,8 +1021,10 @@ async def _create_batched(self: CreateTasksWorkflow, p: dict) -> dict:
                 if src.get('kind') == 'frozen-candidate' and _patched(PATCH_FROZEN_RETRY):
                     name = 'read_candidate_source_activity'
                     mined = await act(name, src, 5, retry=retries.READ)
+                elif name == 'discover_activity':
+                    mined = await act(name, {**p, **_mine_params(src)}, DISCOVERY_MINUTES, retry=retries.DISCOVERY, heartbeat_minutes=DISCOVERY_HEARTBEAT_MINUTES)
                 else:
-                    mined = await act(name, {**p, **_mine_params(src)}, 30 if name == 'discover_activity' else 180)
+                    mined = await act(name, {**p, **_mine_params(src)}, 180)
                 source_key = mined.get('source_key') or mined['candidates_path'].rsplit('/', 1)[-1].removesuffix('.jsonl')
                 sources.append({'source_key': source_key, 'candidates_path': mined['candidates_path'], 'limit': src.get('max_candidates') or src.get('limit')})
                 self.state['sources'][key] = {'status': 'mined', 'candidates_path': mined['candidates_path'],
