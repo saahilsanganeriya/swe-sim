@@ -173,8 +173,10 @@ def _step(v: float | None) -> int:
     return 1 + min(6, int(v * 7)) if v > 0 else 1
 
 
-def matrix(rows: list[str], cols: list[str], cell_of, *, chart_id: str = "chart-matrix", title: str = "per-scenario matrix", col_label=None) -> str:
-    """``cell_of(row, col) -> (value 0..1 or None, n, tooltip)``. Sequential blue steps; value printed in the cell (ink by step)."""
+def matrix(rows: list[str], cols: list[str], cell_of, *, chart_id: str = "chart-matrix", title: str = "per-scenario matrix", col_label=None,
+           row_label=None, row_html=None) -> str:
+    """``cell_of(row, col) -> (value 0..1 or None, n, tooltip)``. Sequential blue steps; value printed in the cell (ink by step).
+    ``row_label(row)`` is the plain text of the SVG row label; ``row_html(row)`` the pre-escaped first cell of the table twin."""
     if not rows or not cols:
         return "<p class='empty'>No cells yet.</p>"
     pad_l, pad_t, cw, ch = 220, 70, 74, 26
@@ -186,7 +188,8 @@ def matrix(rows: list[str], cols: list[str], cell_of, *, chart_id: str = "chart-
     trows = []
     for i, r in enumerate(rows):
         yy = pad_t + i * ch
-        parts.append(f"<text class='cat' x='{pad_l - 8}' y='{yy + ch - 8}' text-anchor='end'>{_h(r if len(str(r)) <= 30 else str(r)[:29] + '…')}</text>")
+        lab = str(row_label(r) if row_label else r)
+        parts.append(f"<text class='cat' x='{pad_l - 8}' y='{yy + ch - 8}' text-anchor='end'>{_h(lab if len(lab) <= 34 else lab[:33] + '…')}</text>")
         cells = []
         for j, c in enumerate(cols):
             v, n, tip = cell_of(r, c)
@@ -196,7 +199,7 @@ def matrix(rows: list[str], cols: list[str], cell_of, *, chart_id: str = "chart-
             parts.append(f"<g class='bar' tabindex='0'><title>{_h(tip)}</title><rect class='cell s{step}' x='{pad_l + j * cw}' y='{yy}' width='{cw}' height='{ch}'/>"
                          f"<text class='cellv{' dark' if step >= 5 else ''}' x='{pad_l + j * cw + cw / 2:.1f}' y='{yy + ch - 8}' text-anchor='middle'>{_h(txt)}</text></g>")
             cells.append(f"<td class='num'>{_h(txt)}" + (f" <span class='muted'>(n={n})</span>" if n else "") + "</td>")
-        trows.append(f"<tr><td>{_h(r)}</td>{''.join(cells)}</tr>")
+        trows.append(f"<tr><td>{row_html(r) if row_html else _h(lab)}</td>{''.join(cells)}</tr>")
     parts.append("</svg>")
     legend = "<ul class='legend'>" + "".join(f"<li><i class='swatch' style='background:var(--seq-{s})'></i>{lo:.2f}–{hi:.2f}</li>" for s, lo, hi in
                                               ((100, 0.0, 0.14), (200, 0.14, 0.29), (300, 0.29, 0.43), (400, 0.43, 0.57), (500, 0.57, 0.71), (600, 0.71, 0.86), (700, 0.86, 1.0))) + "</ul>"

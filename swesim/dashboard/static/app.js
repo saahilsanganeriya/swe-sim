@@ -26,7 +26,8 @@
     running: "run", launched: "run", pending: "run", requested: "run", drafting: "run", compiling: "run", validating: "run", planned: "run", "awaiting-approval": "run", open: "run",
     failed: "critical", invalid: "critical", "launch-failed": "critical", "runner-error": "critical", error: "critical", "unit-failed": "critical", rejected: "critical", terminated: "critical", timed_out: "critical", broken: "critical",
     unresolved: "serious", cancelled: "serious", review_needed: "serious",
-    archived: "neutral", saturated: "neutral", continued_as_new: "neutral", unknown: "neutral", mined: "neutral" };
+    archived: "neutral", saturated: "neutral", continued_as_new: "neutral", unknown: "neutral", mined: "neutral",
+    novel: "info", "swe-bench a": "neutral", authored: "neutral" };
   const ICON = { good: "●", run: "◐", critical: "✕", serious: "◇", neutral: "○", "": "○" };
   function chip(text, kind) {
     if (text === null || text === undefined || text === "") return el("span", "muted", "—");

@@ -63,6 +63,9 @@ pre { background: var(--surface); border: 1px solid var(--line); border-radius: 
 .chip.serious { color: var(--serious-ink); background: var(--serious-wash); border-color: transparent; }
 .chip.neutral { color: var(--ink-3); }
 .chip.info { color: var(--accent-ink); background: var(--accent-wash); border-color: transparent; }
+.chip.origin { height: 18px; padding: 0 var(--s-1); font-weight: 600; letter-spacing: 0.01em; vertical-align: middle; }
+h1 .chip.origin { font-size: var(--fs-0); }
+.facet-bar { display: flex; flex-wrap: wrap; gap: var(--s-2); align-items: center; margin: var(--s-2) 0 var(--s-3); }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 .id { display: inline-flex; align-items: center; gap: 2px; white-space: nowrap; }
 .id .copy { background: none; border: 0; color: var(--ink-3); cursor: pointer; padding: 0 2px; font-size: var(--fs-0); line-height: 1; }
