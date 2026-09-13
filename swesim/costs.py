@@ -16,18 +16,33 @@ Contract
 - `record_cost` appends one `CostRecord` to `trials/<tid>/costs.json` or `costs/<workflow_id>.json`. An explicit
   idempotency key identifies a billed event, so distinct equal-token calls count separately and retries count once.
   Legacy callers retain token-tuple deduplication. `usd` is quantized to 6 decimals (numeric(12,6)).
+- Served provider (OpenRouter routes a model id to one of several upstreams, whose price and behaviour differ): the
+  native trajectory carries OpenRouter's top-level `provider` per response (litellm's ModelResponse keeps the key), so
+  `Usage.served_providers` lists every upstream that served a call and `usd_for`/`record_cost` surface it in the price
+  source as `"<key> (served by DeepInfra, Fireworks)"`. `price_source_key` and `served_providers_of` parse it back; the
+  bare `"unknown"` sentinel never carries the detail (knowing who served a call does not price it). ATIF and Harbor
+  summaries do not name the upstream, so records priced from them carry no detail.
+- `accounting_summary(layout)` is the spend total a reader may show, with its completeness alongside it:
+  `known_usd` (Decimal: the sum of priced ledger rows, deduplicated on `cost_id`), `unpriced_rows` (rows whose price
+  is unknown), `unknown_usage_attempts` (paid attempts whose usage was never measured: audit receipts without usage,
+  stakeholder events without usage), `complete` (True only when every ledger file was readable, every row priced and
+  `accounting_status` found no incomplete audit, stakeholder, solver or draft record), plus `records` and
+  `unreadable_cost_files`. A legacy record (VM-era `record.json` with `cost_usd` but no ledger, a draft without
+  recorded usage, an audit without a receipt) makes the summary incomplete; it never contributes a zero. Readers must
+  present `known_usd` together with `complete`; "$0.00, complete" and "$0.00, incomplete" mean different things.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable
 from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, TypedDict, get_args
 
-from pydantic import field_serializer
+from pydantic import field_serializer, model_serializer
 from ulid import ULID
 
 from swesim.models import Strict
@@ -150,6 +165,7 @@ class Usage(Strict):
     reported_cost_usd: Decimal | None = None    # the provider's own charge, summed over every call (only when every call reported one)
     reported_cost_source: str | None = None     # "openrouter-generation" when reported_cost_usd came from OpenRouter
     agent_reported_cost_usd: Decimal | None = None   # the agent's own estimate (mini-swe-agent/litellm); informational, never the record's usd
+    served_providers: tuple[str, ...] = ()      # every upstream OpenRouter named as serving a call, first appearance first; () when none did
 
     def __add__(self, other: "Usage") -> "Usage":
         def both(a: Decimal | None, b: Decimal | None) -> Decimal | None:
@@ -161,7 +177,31 @@ class Usage(Strict):
                      cached_tokens=None if self.cached_tokens is None and other.cached_tokens is None else (self.cached_tokens or 0) + (other.cached_tokens or 0),
                      calls=self.calls + other.calls, reported_cost_usd=reported,
                      reported_cost_source=self.reported_cost_source if reported is not None else None,
-                     agent_reported_cost_usd=both(self.agent_reported_cost_usd, other.agent_reported_cost_usd))
+                     agent_reported_cost_usd=both(self.agent_reported_cost_usd, other.agent_reported_cost_usd),
+                     served_providers=_distinct((*self.served_providers, *other.served_providers)))
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_served_providers(self, handler):
+        """Serialised usage names `served_providers` only when an upstream was named: payloads written before the field
+        existed (judge calibration, stakeholder events, audit receipts) stay byte-identical and validate back to `()`."""
+        data = handler(self)
+        if not data.get("served_providers"):
+            data.pop("served_providers", None)
+        return data
+
+
+def _distinct(names: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(names))
+
+
+def _served_provider(response: dict) -> str | None:
+    """OpenRouter's top-level `provider` (the upstream that served the generation), made safe for the price-source detail;
+    None when the response names none (Anthropic/OpenAI) or the value is not a string."""
+    name = response.get("provider")
+    if not isinstance(name, str):
+        return None
+    cleaned = " ".join(re.sub(r"[(),]", "", name).split())
+    return cleaned or None
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -179,14 +219,18 @@ def _from_mini_swe_agent(traj: dict) -> Usage:
     inp = out = cached = calls = 0
     generation_costs: list[Any] = []
     agent_costs: list[Any] = []
+    served: list[str] = []
     for m in traj.get("messages") or []:
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
         extra = m.get("extra") or {}
-        usage = ((extra.get("response") or {}).get("usage")) or {}
+        response = extra.get("response") or {}
+        usage = response.get("usage") or {}
         if usage.get("prompt_tokens") is None or usage.get("completion_tokens") is None:
             raise MissingUsage("native trajectory lacks token usage for an assistant response")
         calls += 1
+        if (provider := _served_provider(response)) is not None:
+            served.append(provider)
         inp += int(usage.get("prompt_tokens") or 0)
         out += int(usage.get("completion_tokens") or 0)
         cached += int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
@@ -199,7 +243,8 @@ def _from_mini_swe_agent(traj: dict) -> Usage:
     if agent is None:
         agent = _decimal(((traj.get("info") or {}).get("model_stats") or {}).get("instance_cost"))
     return Usage(input_tokens=inp, output_tokens=out, cached_tokens=cached, calls=calls, reported_cost_usd=reported,
-                 reported_cost_source="openrouter-generation" if reported is not None else None, agent_reported_cost_usd=agent)
+                 reported_cost_source="openrouter-generation" if reported is not None else None, agent_reported_cost_usd=agent,
+                 served_providers=_distinct(served))
 
 
 def _from_atif(traj: dict) -> Usage:
@@ -299,11 +344,40 @@ def read_costs(path: Path) -> list[CostRecord]:
     return [CostRecord.model_validate(r) for r in json.loads(path.read_text())]
 
 
+_SERVED_DETAIL = re.compile(r"^(?P<key>\S+)(?: \(served by (?P<served>[^()]*)\))?$")
+
+
+def with_served_providers(price_source: str, served: Iterable[str]) -> str:
+    """`"<key> (served by A, B)"`: the price source with the upstreams that served the calls; the bare key when none is
+    known or the price is unknown (the detail never dresses up the `unknown` sentinel)."""
+    names = _distinct(n for n in served if n)
+    if not names or price_source == "unknown":
+        return price_source
+    return f"{price_source} (served by {', '.join(names)})"
+
+
+def price_source_key(price_source: str) -> str:
+    """The `PRICE_SOURCES` key (or "unknown") of a recorded price source, with any served-provider detail stripped."""
+    m = _SERVED_DETAIL.match(price_source)
+    return m.group("key") if m else price_source
+
+
+def served_providers_of(price_source: str) -> tuple[str, ...]:
+    """The upstreams a recorded price source names as having served the calls; () when it names none."""
+    m = _SERVED_DETAIL.match(price_source)
+    if not m or not m.group("served"):
+        return ()
+    return _distinct(n.strip() for n in m.group("served").split(",") if n.strip())
+
+
 def usd_for(model_id: str, usage: Usage) -> tuple[Decimal | None, str]:
-    """The provider's own charge when the usage carries one, else the price table; (None, "unknown") when neither."""
+    """The provider's own charge when the usage carries one, else the price table; (None, "unknown") when neither.
+    The price source carries the served upstream(s) when the usage names them (`with_served_providers`)."""
     if usage.reported_cost_usd is not None and usage.reported_cost_source:
-        return usage.reported_cost_usd, usage.reported_cost_source
-    return cost_of(model_id, usage.input_tokens, usage.output_tokens, usage.cached_tokens or 0)
+        usd, source = usage.reported_cost_usd, usage.reported_cost_source
+    else:
+        usd, source = cost_of(model_id, usage.input_tokens, usage.output_tokens, usage.cached_tokens or 0)
+    return usd, with_served_providers(source, usage.served_providers)
 
 
 def _event_id(trial_id, workflow_id, role, model_id, key: str) -> str:
