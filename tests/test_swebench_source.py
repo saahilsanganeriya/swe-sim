@@ -763,8 +763,15 @@ def _row(**over):
                           "+        ds.weighted(w).mean('z')\n+def test_new(): pass\n"),
            "image": sb.image_for("pydata__xarray-5362"), "repo_dir": "/testbed",
            "annotation": {"underspecified": "2.0", "underspecified_notes": "n", "false_negative": "0.0", "false_negative_notes": "", "difficulty": "15 min - 1 hour"},
-           "thread": _thread("pydata/xarray", 5362)}
+           "thread": _thread("pydata/xarray", 5362), "probe": _probe_meta()}
     row.update(over); return row
+
+
+def _probe_meta():
+    """Offline probe metadata as `probe_candidates` attaches it: the measured contract, not SWE-bench's network-era lists."""
+    return {"kind": "image", "probe_dir": "/ws/jobs/probe/pydata--xarray-5362/trial-1", "image_digest": "sha256:" + "e" * 64, "repo_dir": "/testbed",
+            "statuses": {"base": {}, "test": {F2P: "failed", P2P: "passed"}, "gold": {F2P: "passed", P2P: "passed"}},
+            "dropped": {"network_or_env": [], "gold_regressions": []}, "counts": {"fail_to_pass": 1, "pass_to_pass": 1, "network_or_env": 0, "gold_regressions": 0}}
 
 
 def _thread(repo, pr):
@@ -970,6 +977,23 @@ def test_llm_view_trims_pass_to_pass_but_spec_keeps_it(monkeypatch, tmp_path):
     spec = ScenarioSpec.model_validate_json(p.read_text())
     assert spec.contract.pass_to_pass == p2p and all(t in spec.contract.runner.command for t in p2p)
     assert json.loads(calls[0]["messages"][0]["content"].split("\n\n", 1)[1])["candidate"]["pass_to_pass_count"] == 300
+
+
+def test_draft_requires_offline_probe_metadata(monkeypatch, tmp_path):
+    """SWE-bench's FAIL_TO_PASS/PASS_TO_PASS were produced with network access; drafting needs the offline-measured contract."""
+    from swesim.stages import draft_spec
+    calls = _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    with pytest.raises(ValueError, match="no offline probe metadata"):
+        draft_spec.draft(_row(probe=None), _judged(), "fake/model", tmp_path / "s1")
+    with pytest.raises(ValueError, match="no offline probe metadata"):
+        draft_spec.draft(_row(probe={"error": "unreliable base/gold probe"}), _judged(), "fake/model", tmp_path / "s2")   # a failed probe is not a measurement
+    assert calls == [] and not (tmp_path / "s1").exists()                                                                    # refused before any LLM call or file
+    p = draft_spec.draft(_row(probe=None), _judged(), "fake/model", tmp_path / "s3", require_probe=False)
+    meta = json.loads((tmp_path / "s3" / "draft.meta.json").read_text())
+    assert p.exists() and meta["probe"] == {"unmeasured": True}
+    draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s4")
+    meta = json.loads((tmp_path / "s4" / "draft.meta.json").read_text())
+    assert meta["probe"]["kind"] == "image" and meta["probe"]["probe_dir"].endswith("trial-1") and meta["probe"]["counts"]["fail_to_pass"] == 1
 
 
 def test_draft_trims_an_oversized_candidate_for_the_model_but_grounds_against_the_full_row(monkeypatch, tmp_path):

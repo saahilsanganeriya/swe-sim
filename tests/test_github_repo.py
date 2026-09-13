@@ -263,6 +263,7 @@ def test_probe_tests_builds_probe_task_and_derives_f2p_p2p(monkeypatch, tmp_path
     assert (root / "tests" / "test.patch").read_text() == "TP" and (root / "tests" / "oracle.diff").read_text() == "OP"
     cfg = json.loads((root / "tests" / "probe_config.json").read_text())
     assert cfg["command"].startswith("/usr/local/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} ") and cfg["command"].endswith("tests/test_stream.py") and ".pdf" not in cfg["command"]
+    assert cfg["repo_dir"] == "/app" and cfg["kind"] == "dockerfile" and out["probe"]["kind"] == "dockerfile" and out["dropped"] == {"network_or_env": [], "gold_regressions": []}
     toml = (root / "task.toml").read_text()
     assert 'environment_mode="separate"' in toml and 'network_mode="no-network"' in toml and (root / "instruction.md").exists()
     assert out["probe_dir"] == str(seen["jobs_dir"] / "o--r-42" / "trial-1")
@@ -278,13 +279,111 @@ def test_probe_tests_rejects_unreliable_or_uncovered_probes(monkeypatch, tmp_pat
     _setup_probe(monkeypatch, tmp_path, {"base": ok, "test": ok, "gold": {**gold, "statuses": {"t::a": "passed"}}})
     with pytest.raises(ValueError, match="unreliable"):
         gr.probe_tests(_probe_row(), Workspace(tmp_path / "ws2"))
-    _setup_probe(monkeypatch, tmp_path, {"base": ok, "test": gold, "gold": gold})  # nothing fails before gold: no target failure
-    with pytest.raises(ValueError, match="target failure"):
-        gr.probe_tests(_probe_row(), Workspace(tmp_path / "ws3"))
+    _setup_probe(monkeypatch, tmp_path, {"base": ok, "test": gold, "gold": gold})  # nothing fails before gold: measured F2P is empty, the caller rejects
+    out = gr.probe_tests(_probe_row(), Workspace(tmp_path / "ws3"))
+    assert out["fail_to_pass"] == [] and out["pass_to_pass"] == ["t::a", "t::b"] and out["probe"]["counts"]["fail_to_pass"] == 0
     only_f = {"statuses": {"t::b": "failed"}, "exit_code": 1, "error": None, "tail": ""}
     _setup_probe(monkeypatch, tmp_path, {"base": only_f, "test": only_f, "gold": {"statuses": {"t::b": "passed"}, "exit_code": 0, "error": None, "tail": ""}})
-    with pytest.raises(ValueError, match="regression coverage"):
-        gr.probe_tests(_probe_row(), Workspace(tmp_path / "ws4"))
+    out = gr.probe_tests(_probe_row(), Workspace(tmp_path / "ws4"))                # no regression coverage is recorded, not fatal
+    assert out["fail_to_pass"] == ["t::b"] and out["pass_to_pass"] == [] and out["dropped"] == {"network_or_env": [], "gold_regressions": []}
+
+
+def _swebench_probe_row():
+    tp = ("diff --git a/xarray/tests/test_weighted.py b/xarray/tests/test_weighted.py\n--- a/xarray/tests/test_weighted.py\n+++ b/xarray/tests/test_weighted.py\n"
+          "@@ -1 +1,2 @@\n x\n+def test_new(): pass\ndiff --git a/xarray/tests/data/w.nc b/xarray/tests/data/w.nc\nBinary files differ\n")
+    f = "xarray/tests/test_weighted.py::"
+    return {"instance_id": "pydata__xarray-5362", "repo": "pydata/xarray", "base_commit": "a" * 40, "image": "swebench/sweb.eval.x86_64.pydata_1776_xarray-5362:latest",
+            "repo_dir": "/testbed", "test_patch": tp, "patch": "OP", "fail_to_pass": [f + "test_new", f + "test_needs_network"], "pass_to_pass": [f + "test_old", f + "test_flaky"]}
+
+
+def _swebench_statuses():
+    f = "xarray/tests/test_weighted.py::"
+    test = {f + "test_new": "failed", f + "test_old": "passed", f + "test_needs_network": "failed", f + "test_flaky": "passed", f + "test_extra": "passed"}
+    gold = {f + "test_new": "passed", f + "test_old": "passed", f + "test_needs_network": "error", f + "test_flaky": "failed", f + "test_extra": "passed"}
+    return {"base": {"statuses": {}, "exit_code": 4, "error": "no tests collected", "tail": ""},
+            "test": {"statuses": test, "exit_code": 1, "error": None, "tail": ""}, "gold": {"statuses": gold, "exit_code": 1, "error": None, "tail": ""}}
+
+
+def test_probe_tests_measures_swebench_image_rows_offline(monkeypatch, tmp_path):
+    from swesim.paths import Workspace
+    ws = Workspace(tmp_path / "ws")
+    seen = _setup_probe(monkeypatch, tmp_path, _swebench_statuses())
+    row = _swebench_probe_row()
+    out = gr.probe_tests(row, ws)
+    f = "xarray/tests/test_weighted.py::"
+    assert out["fail_to_pass"] == [f + "test_new"] and out["pass_to_pass"] == [f + "test_old", f + "test_extra"]
+    assert out["dropped"] == {"network_or_env": [f + "test_needs_network"], "gold_regressions": [f + "test_flaky"]}
+    assert out["probe"]["swebench"] == {"fail_to_pass_not_reproduced": [f + "test_needs_network"], "pass_to_pass_not_reproduced": [f + "test_flaky"], "fail_to_pass_new": []}
+    assert out["probe"]["kind"] == "image" and out["test_python"] == gr.SWEBENCH_PYTHON and out["probe"]["repo_dir"] == "/testbed"
+    assert out["statuses"]["test"][f + "test_new"] == "failed" and out["statuses"]["gold"][f + "test_new"] == "passed" and out["statuses"]["base"] == {}
+    root = ws.root / "probes" / "pydata--xarray-5362"
+    assert out["dockerfile"] == "FROM swebench/sweb.eval.x86_64.pydata_1776_xarray-5362@sha256:" + "e" * 64 + "\nWORKDIR /testbed\n"   # pinned by digest, no rebuild
+    assert (root / "environment" / "Dockerfile").read_text() == out["dockerfile"] and (root / "tests" / "Dockerfile").read_text().endswith("COPY . /tests/\n")
+    cfg = json.loads((root / "tests" / "probe_config.json").read_text())
+    assert cfg["command"] == gr.SWEBENCH_PYTHON + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} xarray/tests/test_weighted.py"   # all tests of the touched .py files
+    assert cfg["repo_dir"] == "/testbed" and cfg["kind"] == "image" and cfg["test_timeout_sec"] == gr.PROBE_TIMEOUT_SEC
+    assert (root / "tests" / "test.sh").read_text().endswith(gr.SWEBENCH_PYTHON + " -I /tests/probe.py\n")
+    probe_py = (root / "tests" / "probe.py").read_text()
+    assert "probe.get('repo_dir'" in probe_py and "cwd=repo" in probe_py and "'/app'" not in probe_py.replace("probe.get('repo_dir','/app')", "")
+    assert seen["agent"] == "nop" and seen["job_name"] == "pydata--xarray-5362" and out["probe"]["probe_dir"] == str(seen["jobs_dir"] / "pydata--xarray-5362" / "trial-1")
+    # without a Docker Hub answer the image tag is used as-is
+    monkeypatch.setattr(gr, "_compile_imports", lambda: (lambda image: None, tmp_path / "verifier"))
+    out = gr.probe_tests(_swebench_probe_row(), Workspace(tmp_path / "ws2"))
+    assert out["dockerfile"].startswith("FROM swebench/sweb.eval.x86_64.pydata_1776_xarray-5362:latest\n") and out["probe"]["image_digest"] is None
+    with pytest.raises(ValueError, match="no python test files"):
+        gr.probe_tests({**_swebench_probe_row(), "test_patch": "diff --git a/docs/x.rst b/docs/x.rst\n"}, Workspace(tmp_path / "ws3"))
+
+
+def test_classify_probe_buckets():
+    before = {"a": "failed", "b": "passed", "c": "failed", "d": "passed", "e": "error"}
+    after = {"a": "passed", "b": "passed", "c": "failed", "d": "error", "e": "passed"}
+    assert gr.classify_probe(before, after) == {"fail_to_pass": ["a", "e"], "pass_to_pass": ["b"], "dropped": {"network_or_env": ["c"], "gold_regressions": ["d"]}}
+    assert gr.probe_kind({"image": "x:latest"}) == "image" and gr.probe_kind({"install_command": "pip install -e ."}) == "dockerfile"
+
+
+def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_rows(monkeypatch, tmp_path):
+    from swesim.paths import Workspace
+    from swesim.stages.mine import probe_candidates
+    f = "xarray/tests/test_weighted.py::"
+    rows = [{**_swebench_probe_row(), "instance_id": "pydata__xarray-1", "judge": {"keep": True, "gaps": []}},
+            {**_swebench_probe_row(), "instance_id": "pydata__xarray-2", "judge": {"keep": True, "gaps": []}},
+            {**_swebench_probe_row(), "instance_id": "pydata__xarray-3", "judge": {"keep": False, "gaps": []}},
+            {**_swebench_probe_row(), "instance_id": "pydata__xarray-4", "judge": {"keep": True, "gaps": []}}]
+    judged = tmp_path / "swebench-annotated.judged.jsonl"
+    judged.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    probed = []
+
+    def fake_probe(row, ws):
+        probed.append(row["instance_id"])
+        if row["instance_id"] == "pydata__xarray-2":
+            return {"fail_to_pass": [], "pass_to_pass": [f + "test_old"], "dropped": {"network_or_env": [f + "test_new"], "gold_regressions": []}, "statuses": {},
+                    "dockerfile": "FROM x", "probe_dir": "/j/2", "test_python": gr.SWEBENCH_PYTHON, "probe": {"kind": "image", "statuses": {"test": {}, "gold": {}}, "probe_dir": "/j/2"}}
+        if row["instance_id"] == "pydata__xarray-4":
+            raise ValueError("unreliable base/gold probe; keep evidence and reject")
+        return {"fail_to_pass": [f + "test_new"], "pass_to_pass": [f + "test_old", f + "test_extra"], "dropped": {"network_or_env": [f + "test_needs_network"], "gold_regressions": []},
+                "statuses": {}, "dockerfile": "FROM x", "probe_dir": "/j/1", "test_python": gr.SWEBENCH_PYTHON, "probe": {"kind": "image", "statuses": {"test": {}, "gold": {}}, "probe_dir": "/j/1"}}
+    monkeypatch.setattr(gr, "probe_tests", fake_probe)
+    out = probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=5)
+    assert out == tmp_path / "swebench-annotated.judged.probed.jsonl" and probed == ["pydata__xarray-1", "pydata__xarray-2", "pydata__xarray-4"]   # keep=False row skipped
+    got = {r["instance_id"]: r for r in (json.loads(l) for l in out.read_text().splitlines())}
+    assert set(got) == {"pydata__xarray-1", "pydata__xarray-2", "pydata__xarray-4"}
+    r1 = got["pydata__xarray-1"]
+    assert r1["fail_to_pass"] == [f + "test_new"] and r1["pass_to_pass"] == [f + "test_old", f + "test_extra"] and r1["judge"]["keep"] is True and "reject_reason" not in r1
+    assert r1["swebench_fail_to_pass"] == [f + "test_new", f + "test_needs_network"] and r1["swebench_pass_to_pass"] == [f + "test_old", f + "test_flaky"]   # originals kept
+    assert r1["probe"]["probe_dir"] == "/j/1" and r1["test_python"] == gr.SWEBENCH_PYTHON
+    r2 = got["pydata__xarray-2"]
+    assert r2["fail_to_pass"] == [] and r2["judge"]["keep"] is False and r2["reject_reason"] == "not-reproducible-offline"
+    r4 = got["pydata__xarray-4"]
+    assert r4["judge"]["keep"] is False and r4["reject_reason"] == "probe-failed" and "unreliable" in r4["probe"]["error"] and r4["fail_to_pass"] == r4["swebench_fail_to_pass"]
+    summary = json.loads(out.with_suffix(".summary.json").read_text())
+    assert summary == {"rows": 4, "probed": 3, "reproducible": 1, "not-reproducible-offline": 1, "probe-failed": 1, "skipped-not-accepted": 1}
+    # build budget and explicit instance selection (which ignores keep)
+    probed.clear()
+    probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=1)
+    assert probed == ["pydata__xarray-1"] and json.loads(out.with_suffix(".summary.json").read_text())["build-budget-exhausted"] == 2
+    probed.clear()
+    out = probe_candidates(Workspace(tmp_path / "ws"), judged, instance_ids=["pydata__xarray-3"], max_builds=1)
+    assert probed == ["pydata__xarray-3"] and [json.loads(l)["instance_id"] for l in out.read_text().splitlines()] == ["pydata__xarray-3"]
 
 
 def test_probe_tests_requires_a_base_image_digest(monkeypatch, tmp_path):

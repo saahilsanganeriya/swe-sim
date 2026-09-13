@@ -29,6 +29,8 @@ FEATURE_LABEL_WORDS = ("enhancement", "feature", "rfc", "proposal")
 KNOWN_RECIPES = {"py-pdf/pypdf": {"install_command": "pip install -e '.[full]' -r requirements/ci.txt", "test_marker": '-m "not samples and not enable_socket"'}}
 TEST_PYTHON = "/usr/local/bin/python"
 BASE_IMAGE = "python:3.12-slim"
+SWEBENCH_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"
+PROBE_TIMEOUT_SEC = 900  # per stage (base, tests applied, gold); SWE-bench test files can run for minutes
 
 
 def normalize_repo(value: str) -> str:
@@ -217,11 +219,13 @@ PROBE_SCRIPT = '''import sys,json,subprocess
 from pathlib import Path
 sys.path.insert(0,'/tests')
 from grader import GradeConfig,_run_tests
-cfg=GradeConfig(Path('/tmp/a'),Path('/app'),Path('/tmp/w'),{},[],[],json.loads(Path('/tests/probe_config.json').read_text()),None,Path('/logs/verifier'),test_timeout_sec=300)
+probe=json.loads(Path('/tests/probe_config.json').read_text())
+repo=probe.get('repo_dir','/app')
+cfg=GradeConfig(Path('/tmp/a'),Path(repo),Path('/tmp/w'),{},[],[],{'kind':'pytest-ra','command':probe['command']},None,Path('/logs/verifier'),test_timeout_sec=int(probe.get('test_timeout_sec',300)))
 results={}
 for stage,patch in [('base',None),('test','/tests/test.patch'),('gold','/tests/oracle.diff')]:
-    if patch: subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','apply',patch],cwd='/app',check=True)
-    st,rc,out,error=_run_tests(cfg,Path('/app'),None)
+    if patch: subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','apply',patch],cwd=repo,check=True)
+    st,rc,out,error=_run_tests(cfg,Path(repo),None)
     results[stage]={'statuses':st,'exit_code':rc,'error':error,'tail':out[-2000:]}
 Path('/logs/verifier').mkdir(parents=True,exist_ok=True)
 Path('/logs/verifier/probe.json').write_text(json.dumps(results))
@@ -242,28 +246,59 @@ build_timeout_sec=3600
 '''
 
 
+def probe_kind(row: dict) -> str:
+    """'image' for prebuilt-image rows (SWE-bench: `image`, `/testbed`, the conda interpreter); 'dockerfile' for repo-URL rows
+    built from a recipe."""
+    return "image" if row.get("image") else "dockerfile"
+
+
+def classify_probe(before: dict, after: dict) -> dict:
+    """Measured contract from per-test statuses with the hidden tests applied (`before`) and after the gold patch (`after`):
+    fail_to_pass = fail/error before and pass after; pass_to_pass = pass on both; dropped.network_or_env = not passing on
+    either side (network-dependent or environment-broken tests SWE-bench's lists still name); dropped.gold_regressions =
+    pass before, not pass after."""
+    f2p = [t for t in before if before[t] in {"failed", "error"} and after.get(t) == "passed"]
+    p2p = [t for t in before if before[t] == "passed" and after.get(t) == "passed"]
+    dropped = {"network_or_env": [t for t in before if before[t] != "passed" and after.get(t) != "passed"],
+               "gold_regressions": [t for t in before if before[t] == "passed" and after.get(t) != "passed"]}
+    return {"fail_to_pass": f2p, "pass_to_pass": p2p, "dropped": dropped}
+
+
 def probe_tests(row: dict, ws) -> dict:
-    """Separate authoring probe on Modal (nop agent): run the PR's test files with the test patch applied, then with the
-    gold patch, and derive FAIL_TO_PASS / PASS_TO_PASS. No ScenarioSpec is constructed until test ids exist."""
+    """Separate authoring probe on Modal (nop agent) that measures the contract offline, for repo-URL rows (Dockerfile recipe,
+    `/app`) and SWE-bench rows (prebuilt `image`, `/testbed`, the testbed interpreter) alike: the verifier runs every test in
+    the test files touched by test_patch with test_patch applied, then again after the gold patch, and the statuses decide
+    fail_to_pass / pass_to_pass / dropped. SWE-bench's own lists were produced with network access and do not reproduce in
+    the offline verifier, so nothing is drafted from them unmeasured. Returns {fail_to_pass, pass_to_pass, dropped, statuses,
+    dockerfile, probe_dir, test_python, probe} where `probe` is the metadata attached to the candidate row."""
     import shlex
     import shutil
     from swesim import harbor_cli
     from swesim.paths import atomic_json
+    from swesim.sources.swebench_annotated import test_files_from_patch
 
     resolve_docker_hub_digest, verifier_src = _compile_imports()
+    kind = probe_kind(row)
     name = row["instance_id"].lower().replace("__", "--")
+    repo_dir = row.get("repo_dir") or ("/testbed" if kind == "image" else "/app")
+    interpreter = row.get("test_python") or (SWEBENCH_PYTHON if kind == "image" else TEST_PYTHON)
     root = ws.root / "probes" / name
     env = root / "environment"
     tests = root / "tests"
     env.mkdir(parents=True, exist_ok=True)
     tests.mkdir(exist_ok=True)
-    digest = resolve_docker_hub_digest(BASE_IMAGE)
-    if not digest:
-        raise RuntimeError("base image digest unavailable")
-    dockerfile = (f"FROM python@{digest}\n"
-                  "RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*\n"
-                  f"RUN git clone {shlex.quote('https://github.com/' + row['repo'])} /app && cd /app && git checkout {row['base_commit']} && {row['install_command']}\n"
-                  "WORKDIR /app\n")
+    if kind == "dockerfile":
+        digest = resolve_docker_hub_digest(BASE_IMAGE)
+        if not digest:
+            raise RuntimeError("base image digest unavailable")
+        dockerfile = (f"FROM python@{digest}\n"
+                      "RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*\n"
+                      f"RUN git clone {shlex.quote('https://github.com/' + row['repo'])} /app && cd /app && git checkout {row['base_commit']} && {row['install_command']}\n"
+                      "WORKDIR /app\n")
+    else:
+        digest = resolve_docker_hub_digest(row["image"])
+        ref = f"{row['image'].rsplit(':', 1)[0]}@{digest}" if digest else row["image"]  # pin when Docker Hub answers, else the tag
+        dockerfile = f"FROM {ref}\nWORKDIR {repo_dir}\n"
     row["dockerfile"] = dockerfile
     (env / "Dockerfile").write_text(dockerfile)
     (tests / "Dockerfile").write_text(dockerfile + "\nCOPY . /tests/\n")
@@ -271,10 +306,12 @@ def probe_tests(row: dict, ws) -> dict:
         shutil.copyfile(p, tests / p.name)
     (tests / "test.patch").write_text(row["test_patch"])
     (tests / "oracle.diff").write_text(row["patch"])
-    files = [p for p in row["test_files"] if p.endswith(".py")]
-    command = TEST_PYTHON + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} " + " ".join(shlex.quote(p) for p in files)
-    atomic_json(tests / "probe_config.json", {"command": command})
-    (tests / "test.sh").write_text("#!/bin/bash\nset -euo pipefail\n" + TEST_PYTHON + " -I /tests/probe.py\n")
+    files = [p for p in (row.get("test_files") or test_files_from_patch(row.get("test_patch") or "")) if p.endswith(".py")]
+    if not files:
+        raise ValueError("no python test files in test_patch to probe")
+    command = shlex.quote(interpreter) + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} " + " ".join(shlex.quote(p) for p in files)
+    atomic_json(tests / "probe_config.json", {"command": command, "repo_dir": repo_dir, "test_timeout_sec": PROBE_TIMEOUT_SEC, "kind": kind})
+    (tests / "test.sh").write_text("#!/bin/bash\nset -euo pipefail\n" + shlex.quote(interpreter) + " -I /tests/probe.py\n")
     (tests / "probe.py").write_text(PROBE_SCRIPT)
     (root / "instruction.md").write_text("Environment authoring probe; no solver work.")
     (root / "task.toml").write_text(PROBE_TASK_TOML)
@@ -284,8 +321,15 @@ def probe_tests(row: dict, ws) -> dict:
     after = data["gold"]["statuses"]
     if data["test"]["error"] or data["gold"]["error"] or not after or set(before) != set(after):
         raise ValueError("unreliable base/gold probe; keep evidence and reject")
-    f = [t for t in before if before[t] in {"failed", "error"} and after[t] == "passed"]
-    p = [t for t in before if before[t] == after[t] == "passed"]
-    if not f or not p:
-        raise ValueError("probe needs target failure and regression coverage")
-    return {"fail_to_pass": f, "pass_to_pass": p, "dockerfile": dockerfile, "probe_dir": str(td), "test_python": TEST_PYTHON}
+    measured = classify_probe(before, after)
+    statuses = {"base": data["base"]["statuses"], "test": before, "gold": after}
+    probe = {"kind": kind, "image": row.get("image"), "image_digest": digest, "repo_dir": repo_dir, "test_python": interpreter, "test_files": files,
+             "command": command, "probe_dir": str(td), "statuses": statuses, "dropped": measured["dropped"],
+             "counts": {"fail_to_pass": len(measured["fail_to_pass"]), "pass_to_pass": len(measured["pass_to_pass"]),
+                        "network_or_env": len(measured["dropped"]["network_or_env"]), "gold_regressions": len(measured["dropped"]["gold_regressions"])}}
+    if kind == "image":  # how far SWE-bench's network-era lists are from what the offline verifier can reproduce
+        orig_f, orig_p = set(row.get("fail_to_pass") or []), set(row.get("pass_to_pass") or [])
+        probe["swebench"] = {"fail_to_pass_not_reproduced": sorted(orig_f - set(measured["fail_to_pass"])),
+                             "pass_to_pass_not_reproduced": sorted(orig_p - set(measured["pass_to_pass"])),
+                             "fail_to_pass_new": sorted(set(measured["fail_to_pass"]) - orig_f)}
+    return {**measured, "statuses": statuses, "dockerfile": dockerfile, "probe_dir": str(td), "test_python": interpreter, "probe": probe}

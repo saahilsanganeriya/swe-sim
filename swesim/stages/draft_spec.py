@@ -516,9 +516,14 @@ def _normalize_groups(groups: list[dict]) -> list[dict]:
     return groups
 
 
-def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_version: str = "0.1.0") -> Path:
+def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_version: str = "0.1.0", require_probe: bool = True) -> Path:
     if judged.get("model_id") and judged["model_id"] == model_id:
         raise ValueError(f"judge and draft models must differ so their errors are not correlated (both {model_id})")
+    probe = row.get("probe") or {}
+    if require_probe and not probe.get("statuses"):
+        raise ValueError("row has no offline probe metadata (measured FAIL_TO_PASS / PASS_TO_PASS from probe_tests); SWE-bench's lists were "
+                         "produced with network access and do not reproduce in the offline verifier. Run `swesim probe` first, or pass "
+                         "require_probe=False to draft unmeasured.")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     assets = out_dir / "assets"
@@ -621,6 +626,8 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                                          "keep": judged.get("keep"), **judged})
     atomic_json(out_dir / "draft.meta.json", {"model_id": model_id, "prompt_version": DRAFT_PROMPT_VERSION, "pipeline_version": pipeline_version,
                                               "created_at": spec["created_at"], "spec_hash": parsed.spec_hash, "auto_linked": auto_linked,
+                                              "probe": ({k: probe.get(k) for k in ("kind", "probe_dir", "image_digest", "counts", "dropped", "swebench")} if probe.get("statuses")
+                                                        else {"unmeasured": True}),
                                               "withholding": {"removed": [{**r, "fact_id": f"withheld-{i + 1:03d}"} for i, r in enumerate(withheld["removed"])],
                                                               "kept": withheld["kept"], "stats": withheld["stats"]}})
     return p

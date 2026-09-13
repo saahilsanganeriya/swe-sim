@@ -53,3 +53,56 @@ def mine_github_repo(ws: Workspace, repo: str, pr: int | None = None, since: str
     if out.stat().st_size == 0:
         out.with_suffix(".status").write_text("no-valid-candidate")
     return out
+
+
+def probe_candidates(ws: Workspace, judged_path: Path | str, instance_ids: list[str] | None = None, max_builds: int = 3) -> Path:
+    """Measure the contract offline before drafting. Probes the accepted rows of a judged file (or exactly `instance_ids`)
+    with `github_repo.probe_tests`, writes `<judged>.probed.jsonl` with the measured fail_to_pass / pass_to_pass replacing the
+    source's lists (the originals kept under swebench_fail_to_pass / swebench_pass_to_pass), `probe` metadata attached, and
+    `judge.keep = False, reject_reason = "not-reproducible-offline"` when nothing fails offline and passes with gold. Bounded
+    by `max_builds`; a summary JSON sits next to the output."""
+    import json
+    from collections import Counter
+    from swesim.sources import github_repo as gr
+
+    judged_path = Path(judged_path)
+    out = judged_path.with_suffix(".probed.jsonl")
+    rows = [json.loads(line) for line in judged_path.read_text().splitlines() if line.strip()]
+    wanted = set(instance_ids) if instance_ids else None
+    summary: Counter = Counter()
+    built = 0
+    with open(out, "w") as f:
+        for row in rows:
+            if wanted is not None:
+                if row.get("instance_id") not in wanted:
+                    continue
+            elif (row.get("judge") or {}).get("keep") is not True:
+                summary["skipped-not-accepted"] += 1
+                continue
+            if built >= max_builds:
+                summary["build-budget-exhausted"] += 1
+                continue
+            built += 1
+            row["swebench_fail_to_pass"] = list(row.get("fail_to_pass") or [])
+            row["swebench_pass_to_pass"] = list(row.get("pass_to_pass") or [])
+            try:
+                res = gr.probe_tests(row, ws)
+            except Exception as e:  # keep the evidence, reject the candidate, continue
+                row["probe"] = {"error": f"{type(e).__name__}: {e}"}
+                row["reject_reason"] = "probe-failed"
+                row.setdefault("judge", {})["keep"] = False
+                summary["probe-failed"] += 1
+                f.write(json.dumps(row) + "\n")
+                continue
+            row["fail_to_pass"], row["pass_to_pass"] = res["fail_to_pass"], res["pass_to_pass"]
+            row["test_python"] = res["test_python"]
+            row["probe"] = res["probe"]
+            if not row["fail_to_pass"]:
+                row["reject_reason"] = "not-reproducible-offline"
+                row.setdefault("judge", {})["keep"] = False
+                summary["not-reproducible-offline"] += 1
+            else:
+                summary["reproducible"] += 1
+            f.write(json.dumps(row) + "\n")
+    out.with_suffix(".summary.json").write_text(json.dumps({"rows": len(rows), "probed": built, **summary}, indent=2, sort_keys=True))
+    return out
