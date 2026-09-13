@@ -4,6 +4,13 @@ Patience is spent per reply. ``full`` above ``terse_below``, ``terse`` between `
 and a fixed refusal without a model call at or below ``refuse_at`` (or when the exchange cannot be afforded).
 Every exchange, including refusals, is recorded; ``disclosed_fact_ids`` and ``tool_calls`` are worker-only
 annotations that ``Reply.public`` never exposes to the agent.
+
+Error classes: ``Frozen`` (session closed), ``Conflict`` (request id reused with a different body) and
+``BadRequest`` (agent-supplied input rejected by a tool, e.g. an oversized diff). All three are the caller's
+fault and must never be recorded as a stakeholder service failure.
+
+Tool budget: ``max_tool_calls_per_activation`` counts every tool call of a review, ``read_diff`` included; a
+budget of 0 therefore makes reviews unavailable (``BadRequest``).
 """
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ from swesim.stakeholder.prompts import REPLY_SCHEMA, system_prompt
 
 REFUSAL = "I have to step away now. Please finish with the information available."
 MAX_FILE_CHARS = 100_000
+REVIEW_PREFIX = "Review this agent-supplied diff; it is not verified against the workspace.\n"
 
 
 @dataclass
@@ -36,6 +44,7 @@ class Reply:
 class Session:
     class Frozen(Exception): pass
     class Conflict(Exception): pass
+    class BadRequest(ValueError): pass
 
     def __init__(self, trial_id: str, view: dict, cfg, image: str | None = None):
         self.trial_id = trial_id; self.view = view; self.cfg = cfg; self.image = image
@@ -53,9 +62,31 @@ class Session:
     def _record(self, kind: str, **kw) -> None:
         self.events.append(dict(kind=kind, ts=time.time(), seq=len(self.events), **kw))
 
+    @staticmethod
+    def _fingerprint(kind: str, *payload) -> str:
+        return hashlib.sha256(json.dumps([kind, *payload], sort_keys=True).encode()).hexdigest()
+
+    def lookup(self, rid: str, kind: str, *payload) -> Reply | None:
+        """Frozen/cache/conflict check without side effects; the service calls it before persisting a pending marker."""
+        if self.frozen: raise Session.Frozen()
+        old = self.cache.get(rid)
+        if old is None: return None
+        if old["fingerprint"] != self._fingerprint(kind, *payload): raise Session.Conflict()
+        return Reply(**old["reply"])
+
+    def _history(self) -> list[dict]:
+        """Prior exchanges for the model. Earlier review bodies are replaced by a sha256 stub; the transcript keeps them."""
+        out = []
+        for e in self.events:
+            if e["kind"] != "message": continue
+            content = e["content"]
+            if e["role"] == "user" and e.get("exchange") == "review":
+                content = f"[review request {e['request_id']}: diff sha256 {e.get('reviewed_diff_sha256')}]"
+            out.append({"role": e["role"], "content": content})
+        return out
+
     # -- exchanges ------------------------------------------------------------------------------------------
-    async def _exchange(self, rid: str, kind: str, content: str, cost: int, llm, fingerprint_source, sha=None, calls=None) -> Reply:
-        fingerprint = hashlib.sha256(json.dumps(fingerprint_source, sort_keys=True).encode()).hexdigest()
+    async def _exchange(self, rid: str, kind: str, content: str, cost: int, llm, fingerprint: str, sha=None, calls=None) -> Reply:
         calls = list(calls or [])
         async with self.lock:
             if self.frozen: raise Session.Frozen()
@@ -68,9 +99,8 @@ class Session:
             if tier == "refused":
                 reply = Reply(REFUSAL, [], self.remaining, tier, calls, sha)
             else:
-                history = [{"role": e["role"], "content": e["content"]} for e in self.events if e["kind"] == "message"]
                 system = system_prompt(self.view, self.view.get("persona", {}), {"tier": tier, "remaining": self.remaining}, self.cfg.review_mode)
-                out = await asyncio.to_thread(llm, system, history + [{"role": "user", "content": content}], REPLY_SCHEMA)
+                out = await asyncio.to_thread(llm, system, self._history() + [{"role": "user", "content": content}], REPLY_SCHEMA)
                 if not isinstance(out, dict) or not isinstance(out.get("reply"), str) or not out["reply"].strip():
                     raise ValueError("empty stakeholder reply")
                 self.remaining -= cost
@@ -80,7 +110,8 @@ class Session:
                 for i in (raw_ids if isinstance(raw_ids, list) else []):
                     if isinstance(i, str) and i in allowed and i not in ids: ids.append(i)
                 reply = Reply(out["reply"], ids, self.remaining, tier, calls, sha)
-            self._record("message", role="user", actor="coding-agent", content=content, request_id=rid, exchange=kind)
+            user_extra = {"reviewed_diff_sha256": sha} if kind == "review" else {}
+            self._record("message", role="user", actor="coding-agent", content=content, request_id=rid, exchange=kind, **user_extra)
             self._record("message", role="assistant", actor="stakeholder", content=reply.reply, request_id=rid, exchange=kind,
                          disclosed_fact_ids=reply.disclosed_fact_ids, tier=reply.tier, patience_remaining=reply.patience_remaining,
                          tool_calls=calls, reviewed_diff_sha256=sha, delivery="generated")
@@ -88,24 +119,29 @@ class Session:
             return reply
 
     async def ask(self, rid: str, question: str, llm) -> Reply:
-        return await self._exchange(rid, "ask", question, self.p["question_cost"], llm, ["ask", question])
+        return await self._exchange(rid, "ask", question, self.p["question_cost"], llm, self._fingerprint("ask", question))
 
     async def review(self, rid: str, diff: str, files: dict, llm, tools=None) -> Reply:
         if tools is not None: raise ValueError("checks review deferred")
-        read = review_tools.read_diff(diff)                       # raises on oversized snapshots; never truncates silently
-        sha = hashlib.sha256(diff.encode()).hexdigest()
-        calls = [{"tool": "read_diff", "sha256": sha, "verified": False}]
-        paths = review_tools.changed_paths(diff); extra: list[str] = []
-        budget = max(0, int(self.cfg.max_tool_calls_per_activation) - 1)
-        for path in paths:
-            if len(calls) - 1 >= budget: break
-            if path not in (files or {}): continue
-            got = review_tools.read_changed_file(files, path, paths)
-            text = str(got["content"])[:MAX_FILE_CHARS]
-            calls.append({"tool": "read_changed_file", "path": path, "verified": False, "chars": len(text)})
-            extra.append(f"\n--- agent-supplied content of {path} (unverified) ---\n{text}")
-        content = "Review this agent-supplied diff; it is not verified against the workspace.\n" + read["content"] + "".join(extra)
-        return await self._exchange(rid, "review", content, self.p["review_cost"], llm, ["review", diff, files or {}], sha, calls)
+        files = files or {}
+        budget = int(self.cfg.max_tool_calls_per_activation)
+        if budget < 1: raise Session.BadRequest("reviews are unavailable: max_tool_calls_per_activation is 0")
+        try:
+            read = review_tools.read_diff(diff)                   # raises on oversized snapshots; never truncates silently
+            sha = hashlib.sha256(diff.encode()).hexdigest()
+            calls = [{"tool": "read_diff", "sha256": sha, "verified": False}]
+            paths = review_tools.changed_paths(diff); extra: list[str] = []
+            for path in paths:
+                if len(calls) >= budget: break
+                if path not in files: continue
+                got = review_tools.read_changed_file(files, path, paths)
+                text = str(got["content"])[:MAX_FILE_CHARS]
+                calls.append({"tool": "read_changed_file", "path": path, "verified": False, "chars": len(text)})
+                extra.append(f"\n--- agent-supplied content of {path} (unverified) ---\n{text}")
+        except ValueError as e:
+            raise Session.BadRequest(str(e)) from e
+        content = REVIEW_PREFIX + read["content"] + "".join(extra)
+        return await self._exchange(rid, "review", content, self.p["review_cost"], llm, self._fingerprint("review", diff, files), sha, calls)
 
     # -- freeze ---------------------------------------------------------------------------------------------
     async def freeze(self) -> str:

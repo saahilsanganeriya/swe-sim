@@ -121,6 +121,10 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
         if not reward: reward = {"reward": 0.0, "success": 0, "outcome_code": 7}
     except harbor_cli.HarborRunError as e:
         status = "launch-failed"; report = {"error": str(e), "outcome": "evaluator-failure"}; reward = {"reward": 0.0, "success": 0, "outcome_code": 7}
+    except Exception as e:
+        # Unknown launch state: leave no record.json (so the trial is reconciled, not silently retried) but make the dir self-describing.
+        (tdir / "status.json").write_text(json.dumps({"status": "error", "trial_id": tid, "started_at": started_at, "finished_at": _now(), "error": type(e).__name__}))
+        raise
 
     if rc.condition == "interactive":
         try: _post(f"{stakeholder_url}/freeze", {}, {"Authorization": f"Bearer {token}"})   # safety net; collect.py froze already
@@ -133,8 +137,10 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
             # Keep correctness scores; a missing transcript does not make a code failure disappear.
         else:
             report["transcript_binding_valid"] = True
-        if transcript.get("service_failure"):
-            report["service_failure_evidence"] = transcript["service_failure"]; report["training_eligible"] = False
+        if transcript.get("service_failure") or transcript.get("pending"):
+            # A recorded model failure or a crash-left pending marker (every later request 503) is simulator evidence.
+            report["service_failure_evidence"] = transcript.get("service_failure"); report["interrupted_request"] = transcript.get("pending")
+            report["training_eligible"] = False
         if bound and transcript.get("transcript_hash") and bound != transcript["transcript_hash"]:
             report["transcript_hash_mismatch"] = True
     report["reviewed_equals_submitted"] = None

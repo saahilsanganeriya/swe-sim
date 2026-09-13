@@ -26,6 +26,7 @@ SYNC = lambda: None      # noqa: E731  (replaced by the Modal app with volume.co
 RELOAD = lambda: None    # noqa: E731  (replaced by the Modal app with volume.reload)
 TRIAL_ID_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789-")
 MAX_FILES_CHARS = 500_000
+MAX_DIFF_BYTES = 200_000
 REQUIRED_VIEW_KEYS = {"brief": str, "facts": list, "requirements": list, "persona": dict}
 
 
@@ -85,6 +86,12 @@ class Review(Strict):
     diff: str = Field(max_length=200000)
     files: dict[str, str] = Field(default_factory=dict)
 
+    @field_validator("diff")
+    @classmethod
+    def _diff_bytes(cls, v: str) -> str:
+        if len(v.encode()) > MAX_DIFF_BYTES: raise ValueError("review diff exceeds 200000 bytes")
+        return v
+
     @field_validator("files")
     @classmethod
     def _bounded(cls, v: dict[str, str]) -> dict[str, str]:
@@ -127,6 +134,11 @@ async def new_session(body: NewSession, x_worker_secret: str | None = Header(def
 async def exchange(kind: str, body, auth: str | None) -> dict:
     async with LOCK:
         await _maybe(RELOAD); p, d = _load(auth); s = Session.restore(d["session"])
+        payload = (body.question,) if kind == "ask" else (body.diff, body.files)
+        try: hit = s.lookup(body.request_id, kind, *payload)          # frozen / cached / conflict: no writes, no commits
+        except Session.Frozen: raise HTTPException(410, "frozen")
+        except Session.Conflict: raise HTTPException(409, "request id changed")
+        if hit is not None: return hit.public()
         if d.get("pending"):
             raise HTTPException(503, "interrupted prior request; simulator failure requires worker adjudication")
         d["pending"] = {"request_id": body.request_id, "kind": kind}; atomic_json(p, d); await _maybe(SYNC)
@@ -137,6 +149,8 @@ async def exchange(kind: str, body, auth: str | None) -> dict:
             d["pending"] = None; atomic_json(p, d); await _maybe(SYNC); raise HTTPException(410, "frozen")
         except Session.Conflict:
             d["pending"] = None; atomic_json(p, d); await _maybe(SYNC); raise HTTPException(409, "request id changed")
+        except Session.BadRequest as e:                              # agent-supplied input rejected: never a service failure
+            d["pending"] = None; atomic_json(p, d); await _maybe(SYNC); raise HTTPException(422, str(e))
         except Exception as e:
             count = int((d.get("failure") or {}).get("count", 0)) + 1
             d["failure"] = {"request_id": body.request_id, "kind": type(e).__name__, "count": count}

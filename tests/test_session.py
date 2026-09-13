@@ -83,11 +83,53 @@ def test_review_records_sha_and_unverified_tool_call():
 
 
 def test_review_tool_calls_bounded_by_config():
-    c = StakeholderConfig.model_validate({"patience_profile": {"start": 6}, "max_tool_calls_per_activation": 2})
-    s = Session("t1", VIEW, c); llm = FakeLLM(ids=[])
+    """read_diff counts toward max_tool_calls_per_activation; a budget of 0 makes reviews unavailable."""
     diff = "".join(f"diff --git a/f{i}.py b/f{i}.py\n--- a/f{i}.py\n+++ b/f{i}.py\n@@ -1 +1 @@\n-a\n+b\n" for i in range(3))
-    r = asyncio.run(s.review("v1", diff, {f"f{i}.py": "b\n" for i in range(3)}, llm))
+    files = {f"f{i}.py": "b\n" for i in range(3)}
+    def mk(n): return Session("t1", VIEW, StakeholderConfig.model_validate({"patience_profile": {"start": 6}, "max_tool_calls_per_activation": n}))
+    r = asyncio.run(mk(2).review("v1", diff, files, FakeLLM(ids=[])))
     assert len(r.tool_calls) == 2 and r.tool_calls[0]["tool"] == "read_diff"
+    r1 = asyncio.run(mk(1).review("v1", diff, files, FakeLLM(ids=[]))); assert [c["tool"] for c in r1.tool_calls] == ["read_diff"]
+    r4 = asyncio.run(mk(4).review("v1", diff, files, FakeLLM(ids=[]))); assert len(r4.tool_calls) == 4
+    s0 = mk(0); llm0 = FakeLLM()
+    with pytest.raises(Session.BadRequest): asyncio.run(s0.review("v1", diff, files, llm0))
+    assert llm0.calls == 0 and s0.events == [] and s0.remaining == 6
+
+
+def test_bad_request_is_distinct_from_service_errors():
+    """Tool rejections of agent input raise BadRequest (a ValueError) and leave the session untouched."""
+    s = Session("t1", VIEW, cfg()); llm = FakeLLM()
+    with pytest.raises(Session.BadRequest): asyncio.run(s.review("v1", "é" * 150_000, {}, llm))   # 150k chars, 300k bytes
+    assert issubclass(Session.BadRequest, ValueError) and llm.calls == 0 and s.events == [] and s.cache == {}
+    with pytest.raises(ValueError) as ei: asyncio.run(s.ask("q1", "x", FakeLLM(reply="")))        # model failure is not a BadRequest
+    assert not isinstance(ei.value, Session.BadRequest)
+
+
+def test_lookup_reports_frozen_cached_and_conflict_without_side_effects():
+    s = Session("t1", VIEW, cfg()); llm = FakeLLM()
+    assert s.lookup("q1", "ask", "Which exception?") is None
+    r = asyncio.run(s.ask("q1", "Which exception?", llm))
+    assert s.lookup("q1", "ask", "Which exception?") == r
+    with pytest.raises(Session.Conflict): s.lookup("q1", "ask", "other")
+    with pytest.raises(Session.Conflict): s.lookup("q1", "review", "Which exception?", {})
+    n = len(s.events); asyncio.run(s.freeze())
+    with pytest.raises(Session.Frozen): s.lookup("q9", "ask", "x")
+    assert len(s.events) == n and llm.calls == 1
+
+
+def test_prior_review_bodies_are_stubbed_in_model_history_but_kept_in_transcript():
+    s = Session("t1", VIEW, cfg(start=9, terse_below=0)); llm = FakeLLM(ids=[])
+    diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x\n+SECRET_DIFF_LINE\n"
+    r = asyncio.run(s.review("v1", diff, {"a.py": "SECRET_FILE_BODY\n"}, llm))
+    asyncio.run(s.ask("q1", "Is that enough?", llm))
+    _, messages, _ = llm.seen[1]
+    assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+    assert messages[0]["content"] == f"[review request v1: diff sha256 {r.reviewed_diff_sha256}]"
+    assert "SECRET_DIFF_LINE" not in json.dumps(messages) and "SECRET_FILE_BODY" not in json.dumps(messages)
+    user_review = next(e for e in s.events if e["kind"] == "message" and e["role"] == "user" and e["exchange"] == "review")
+    assert "SECRET_DIFF_LINE" in user_review["content"] and "SECRET_FILE_BODY" in user_review["content"] and user_review["reviewed_diff_sha256"] == r.reviewed_diff_sha256
+    # The review's own request still carried the full body to the model.
+    assert "SECRET_DIFF_LINE" in llm.seen[0][1][-1]["content"]
 
 
 def test_disclosed_ids_filtered_and_empty_reply_rejected():

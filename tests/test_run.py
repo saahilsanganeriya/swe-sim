@@ -162,6 +162,31 @@ def test_run_trial_transcript_mismatch_marks_binding_invalid(scene):
     assert rec.reward["success"] == 1          # correctness scores are kept; a missing binding does not erase the code outcome
 
 
+def test_run_trial_pending_marker_is_simulator_evidence(scene, monkeypatch):
+    ws, spec, calls, state = scene
+    orig = run._get
+    def with_pending(url, headers): return {**orig(url, headers), "pending": {"request_id": "9", "kind": "ask"}}
+    monkeypatch.setattr(run, "_get", with_pending)
+    rec = run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 2, URL, "secret")
+    assert rec.report["transcript_binding_valid"] is True                                     # hashes still agree
+    assert rec.report["training_eligible"] is False and rec.report["interrupted_request"] == {"request_id": "9", "kind": "ask"}
+    assert rec.report["service_failure_evidence"] is None and rec.reward["success"] == 1
+
+
+def test_run_trial_unexpected_exception_writes_error_status(scene, monkeypatch):
+    ws, spec, calls, state = scene
+    def broken(*a, **k): raise OSError("disk full")
+    monkeypatch.setattr(harbor_cli, "run_task", broken)
+    rc = RunConfig(condition="interactive", model="openai/gpt-5.5")
+    with pytest.raises(OSError): run_trial(ws, spec, rc, 0, URL, "secret")
+    effective = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": "c" * 8, "brief_profile": "natural"})
+    tdir = ws.root / "trials" / trial_id(spec.spec_hash, "interactive", effective.run_config_hash, 0)
+    st = json.loads((tdir / "status.json").read_text())
+    assert st["status"] == "error" and st["error"] == "OSError" and st["finished_at"] and st["started_at"] and st["trial_id"] == tdir.name
+    assert not (tdir / "record.json").exists()                                                # reconcile, never silently retry
+    with pytest.raises(ValueError): run_trial(ws, spec, rc, 0, URL, "secret")               # task dir exists without a record
+
+
 def test_run_trial_hidden_condition_skips_stakeholder(scene):
     ws, spec, calls, state = scene
     rec = run_trial(ws, spec, RunConfig(condition="hidden", model="openai/gpt-5.5"), 0, URL, "secret")

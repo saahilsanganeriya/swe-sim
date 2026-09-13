@@ -1,5 +1,5 @@
 """FastAPI stakeholder service: durable snapshots, worker/session auth, one lock for exchange and freeze."""
-import asyncio, hashlib, json, time
+import asyncio, hashlib, json, pathlib, socket, subprocess, sys, threading, time
 
 import httpx, pytest
 from fastapi.testclient import TestClient
@@ -124,6 +124,115 @@ def test_state_persisted_before_reply_and_failure_recorded(svc, monkeypatch):
     assert c.post("/ask", headers=h, json={"request_id": "3", "question": "a"}).status_code == 503
     t = c.get("/transcript/t1", headers=w).json(); assert t["pending"] == {"request_id": "9", "kind": "ask"}
     assert c.post("/freeze", headers=h).json()["frozen"] is True      # freeze still works
+
+
+def test_oversized_multibyte_diff_is_rejected_not_a_service_failure(svc, monkeypatch):
+    """Important fix: a >200000-byte but <200000-char diff is the agent's input error (422), never service_failure."""
+    c = TestClient(service.app); w = {"X-Worker-Secret": "s3"}
+    tok = c.post("/sessions", headers=w, json=body()).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
+    big = "é" * 150_000; assert len(big) < 200_000 < len(big.encode())
+    calls = []
+    monkeypatch.setattr(service, "call_llm", lambda *a: calls.append(1) or {"reply": "x", "disclosed_fact_ids": []})
+    r = c.post("/review", headers=h, json={"request_id": "v1", "diff": big, "files": {}})
+    assert r.status_code == 422 and calls == []
+    t = c.get("/transcript/t1", headers=w).json()
+    assert t["service_failure"] is None and t["pending"] is None and t["patience_end"] == 2 and len(t["events"]) == 1
+    d = json.loads((svc / "t1.json").read_text()); assert "failure" not in d and d["pending"] is None
+    # Tool-level rejections inside Session.review are 4xx too (no failure record), e.g. reviews disabled by a zero tool budget.
+    cfg0 = {**CFG, "max_tool_calls_per_activation": 0}
+    tok0 = c.post("/sessions", headers=w, json=body(trial_id="t0", stakeholder_config=cfg0)).json()["token"]
+    r0 = c.post("/review", headers={"Authorization": f"Bearer {tok0}"}, json={"request_id": "v1", "diff": "diff --git a/a b/a\n", "files": {}})
+    assert r0.status_code == 422 and "unavailable" in r0.json()["detail"] and c.get("/transcript/t0", headers=w).json()["service_failure"] is None
+    # Service errors keep the 503 + failure path.
+    monkeypatch.setattr(service, "call_llm", lambda *a: {"reply": "", "disclosed_fact_ids": []})
+    assert c.post("/ask", headers=h, json={"request_id": "2", "question": "a"}).status_code == 503
+    assert c.get("/transcript/t1", headers=w).json()["service_failure"]["kind"] == "ValueError"
+
+
+def test_frozen_and_cached_requests_do_not_write_pending(svc):
+    c = TestClient(service.app); w = {"X-Worker-Secret": "s3"}
+    tok = c.post("/sessions", headers=w, json=body()).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
+    assert c.post("/ask", headers=h, json={"request_id": "1", "question": "a"}).status_code == 200
+    before = (svc / "t1.json").read_bytes(); st = (svc / "t1.json").stat()
+    assert c.post("/ask", headers=h, json={"request_id": "1", "question": "a"}).status_code == 200      # cached
+    assert c.post("/ask", headers=h, json={"request_id": "1", "question": "b"}).status_code == 409      # conflict
+    assert (svc / "t1.json").read_bytes() == before and (svc / "t1.json").stat().st_ino == st.st_ino
+    c.post("/freeze", headers=h); frozen = (svc / "t1.json").read_bytes()
+    assert c.post("/ask", headers=h, json={"request_id": "2", "question": "x"}).status_code == 410
+    assert c.post("/review", headers=h, json={"request_id": "3", "diff": "d", "files": {}}).status_code == 410
+    assert (svc / "t1.json").read_bytes() == frozen                                                     # no pending marker written
+
+
+SHIMS = pathlib.Path(service.__file__).parent / "shims"
+
+
+def _shim(name, *args, env=None, cwd=None):
+    base_env = {"PATH": "/usr/bin:/bin"}; base_env.update(env or {})
+    return subprocess.run([sys.executable, "-I", str(SHIMS / name), *args], env=base_env, cwd=cwd, capture_output=True, text=True, timeout=60)
+
+
+def _free_port():
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close(); return port
+
+
+def test_shim_without_session_exits_quietly():
+    p = _shim("ask-user", "hi"); assert p.returncode == 0 and p.stdout.strip() == "No stakeholder is available in this task."
+    p = _shim("request-review", env={"SWESIM_STAKEHOLDER_URL": "http://127.0.0.1:1"}); assert p.returncode == 0 and "No stakeholder" in p.stdout
+
+
+def test_shim_transport_failure_is_one_line_not_a_traceback():
+    env = {"SWESIM_STAKEHOLDER_URL": f"http://127.0.0.1:{_free_port()}", "SWESIM_SESSION_TOKEN": "t1.x", "SWESIM_TRIAL_ID": "t1"}
+    p = _shim("ask-user", "which", "exception?", env=env)
+    assert p.returncode == 1 and p.stderr.strip().startswith("Stakeholder transport failed:") and "Traceback" not in p.stderr and p.stdout == ""
+    p = _shim("ask-user", env=env); assert p.returncode == 1 and p.stderr.strip().startswith("usage:")
+
+
+@pytest.mark.skipif(not pathlib.Path("/usr/bin/git").exists(), reason="shim uses /usr/bin/git")
+def test_review_shim_guards_repo_dir_and_git(tmp_path):
+    env = {"SWESIM_STAKEHOLDER_URL": f"http://127.0.0.1:{_free_port()}", "SWESIM_SESSION_TOKEN": "t1.x", "SWESIM_TRIAL_ID": "t1"}
+    p = _shim("request-review", env=env)
+    assert p.returncode == 1 and "SWESIM_REPO_DIR" in p.stderr and "Traceback" not in p.stderr
+    p = _shim("request-review", env={**env, "SWESIM_REPO_DIR": str(tmp_path / "missing")})
+    assert p.returncode == 1 and "SWESIM_REPO_DIR" in p.stderr and "Traceback" not in p.stderr
+    p = _shim("request-review", env={**env, "SWESIM_REPO_DIR": str(tmp_path)})                # a directory that is not a git repo
+    assert p.returncode == 1 and p.stderr.strip().startswith("request-review: git failed") and "Traceback" not in p.stderr
+
+
+@pytest.mark.skipif(not pathlib.Path("/usr/bin/git").exists(), reason="shim uses /usr/bin/git")
+def test_shims_end_to_end_against_local_service(svc, monkeypatch, tmp_path):
+    """The real shim files against the service on 127.0.0.1 with a fake model: reply, review, 4xx detail, 410 after freeze."""
+    import uvicorn
+    monkeypatch.setattr(service, "call_llm", lambda *a: {"reply": "Raise ValueError naming the field.", "disclosed_fact_ids": ["f01"]})
+    port = _free_port(); server = uvicorn.Server(uvicorn.Config(service.app, host="127.0.0.1", port=port, log_level="warning"))
+    th = threading.Thread(target=server.run, daemon=True); th.start()
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(100):
+        try: httpx.get(base + "/health", timeout=1); break
+        except Exception: time.sleep(0.05)
+    try:
+        cfg = {**CFG, "patience_profile": {"start": 4, "question_cost": 1, "review_cost": 2, "terse_below": 1, "refuse_at": 0}}
+        tok = httpx.post(base + "/sessions", headers={"X-Worker-Secret": "s3"}, json=body(stakeholder_config=cfg)).json()["token"]
+        repo = tmp_path / "repo"; repo.mkdir()
+        def git(*a): subprocess.run(["/usr/bin/git", "-c", "user.email=a@b", "-c", "user.name=a", *a], cwd=repo, check=True, capture_output=True)
+        git("init", "-q"); (repo / "a.py").write_text("raise KeyError\n"); git("add", "."); git("commit", "-q", "-m", "base")
+        env = {"SWESIM_STAKEHOLDER_URL": base, "SWESIM_SESSION_TOKEN": tok, "SWESIM_TRIAL_ID": "t1", "SWESIM_REPO_DIR": str(repo)}
+        p = _shim("ask-user", "Which", "exception?", env=env)
+        assert p.returncode == 0 and p.stdout.splitlines() == ["Raise ValueError naming the field.", "[availability remaining: 3]"]
+        p = _shim("request-review", env=env); assert p.returncode == 1 and "No changes to review" in p.stderr
+        (repo / "a.py").write_text("raise ValueError('f')\n"); (repo / "new.py").write_text("x = 1\n"); (repo / "blob.bin").write_bytes(b"\0\1")
+        p = _shim("request-review", env=env); assert p.returncode == 0 and p.stdout.splitlines()[1] == "[availability remaining: 1]"
+        t = httpx.get(base + "/transcript/t1", headers={"X-Worker-Secret": "s3"}).json()
+        rev = [e for e in t["events"] if e["kind"] == "message" and e["role"] == "assistant" and e["exchange"] == "review"][0]
+        tools = [c["tool"] for c in rev["tool_calls"]]
+        assert tools[0] == "read_diff" and set(tools[1:]) == {"read_changed_file"} and len(tools) <= 4
+        assert {c["path"] for c in rev["tool_calls"][1:]} == {"a.py", "new.py"}                  # binary blob.bin excluded by the shim
+        p = _shim("ask-user", "more?", env=env); assert p.returncode == 0 and "[availability remaining: 0]" in p.stdout
+        httpx.post(base + "/freeze", headers={"Authorization": "Bearer " + tok}, json={})
+        p = _shim("ask-user", "still there?", env=env); assert p.returncode == 0 and p.stdout.strip() == "Stakeholder session closed."
+        p = _shim("ask-user", "x", env={**env, "SWESIM_SESSION_TOKEN": "t1.bad"})
+        assert p.returncode == 1 and p.stderr.strip().startswith("Stakeholder rejected the request (HTTP 401)") and "Traceback" not in p.stderr
+    finally:
+        server.should_exit = True; th.join(timeout=10)
 
 
 @pytest.mark.asyncio
