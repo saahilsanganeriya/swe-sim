@@ -71,7 +71,8 @@ def _fake_openai(monkeypatch, responses, calls, clients=None, stub_secret=True):
             self.message = types.SimpleNamespace(content=content); self.finish_reason = finish
     class Completions:
         def create(self, **kw):
-            calls.append(kw); content, finish = responses.pop(0); return types.SimpleNamespace(choices=[Choice(content, finish)])
+            calls.append(kw); content, finish, *rest = responses.pop(0)
+            return types.SimpleNamespace(choices=[Choice(content, finish)], usage=rest[0] if rest else None)
     class Client:
         def __init__(self, **kw):
             if clients is not None:
@@ -135,6 +136,53 @@ def test_missing_credential_raises_missing_secret_without_the_value(monkeypatch,
         llm.chat_json("openai/gpt-5.5", "sys", [{"role": "user", "content": "q"}], "{}", settings=s)
     assert "OPENAI_API_KEY" in str(e.value) and clients == []                            # no client is built without a key
     assert isinstance(e.value, llm.LLMError)                                             # callers catching LLMError still see it
+
+
+def test_chat_json_with_usage_sums_anthropic_usage_over_both_attempts(monkeypatch):
+    calls = []
+    r1 = _Resp([_Block("thinking")], "max_tokens")
+    r1.usage = types.SimpleNamespace(input_tokens=100, output_tokens=50, cache_read_input_tokens=20, cache_creation_input_tokens=5)
+    r2 = _Resp([_Block("text", '{"ok": true}')])
+    r2.usage = types.SimpleNamespace(input_tokens=100, output_tokens=10, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+    _fake_anthropic(monkeypatch, [r1, r2], calls)
+    res = llm.chat_json_with_usage("anthropic/claude-sonnet-5", "sys", [{"role": "user", "content": "q"}], "{}", max_tokens=100)
+    assert res.data == {"ok": True}
+    # both attempts are billed: prompt tokens include cache reads and writes; cached = cache reads
+    assert (res.usage.input_tokens, res.usage.output_tokens, res.usage.cached_tokens, res.usage.calls) == (225, 60, 20, 2)
+    assert res.usage.reported_cost_usd is None and res.usage.agent_reported_cost_usd is None
+
+
+def test_chat_json_with_usage_reads_openai_usage_and_cached_tokens(monkeypatch):
+    calls = []
+    u1 = types.SimpleNamespace(prompt_tokens=30, completion_tokens=5, prompt_tokens_details=types.SimpleNamespace(cached_tokens=10))
+    u2 = types.SimpleNamespace(prompt_tokens=40, completion_tokens=7, prompt_tokens_details=None)
+    _fake_openai(monkeypatch, [("", "length", u1), ('{"ok": 1}', "stop", u2)], calls)
+    res = llm.chat_json_with_usage("openai/gpt-5.5", "sys", [{"role": "user", "content": "q"}], "{}", max_tokens=100)
+    assert res.data == {"ok": 1} and (res.usage.input_tokens, res.usage.output_tokens, res.usage.cached_tokens, res.usage.calls) == (70, 12, 10, 2)
+
+
+def test_chat_json_with_usage_tolerates_a_response_without_usage(monkeypatch):
+    calls = []
+    _fake_anthropic(monkeypatch, [_Resp([_Block("text", '{"ok": true}')])], calls)          # _Resp carries no usage attribute
+    res = llm.chat_json_with_usage("anthropic/claude-sonnet-5", "sys", [{"role": "user", "content": "q"}], "{}")
+    assert res.data == {"ok": True} and (res.usage.input_tokens, res.usage.output_tokens, res.usage.calls) == (0, 0, 1) and res.usage.cached_tokens is None
+
+
+def test_chat_json_leaves_the_calls_usage_for_the_thread_to_take_once(monkeypatch):
+    import threading
+    calls = []
+    r = _Resp([_Block("text", '{"ok": 1}')])
+    r.usage = types.SimpleNamespace(input_tokens=5, output_tokens=1, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+    _fake_anthropic(monkeypatch, [r], calls)
+    llm.take_last_usage()                                                                     # clear what an earlier call on this thread left
+    assert llm.take_last_usage() is None
+    assert llm.chat_json("anthropic/claude-sonnet-5", "sys", [{"role": "user", "content": "q"}], "{}") == {"ok": 1}
+    seen_elsewhere = []
+    t = threading.Thread(target=lambda: seen_elsewhere.append(llm.take_last_usage()))
+    t.start(); t.join()
+    assert seen_elsewhere == [None]                                                           # per thread: another thread sees nothing
+    u = llm.take_last_usage()
+    assert (u.input_tokens, u.output_tokens, u.calls) == (5, 1, 1) and llm.take_last_usage() is None   # taken once
 
 
 def test_unknown_provider_is_rejected_before_any_network(monkeypatch):

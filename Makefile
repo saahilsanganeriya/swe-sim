@@ -20,17 +20,18 @@ export PATH := $(HOME)/google-cloud-sdk/bin:$(HOME)/.local/bin:$(PATH)
 # Terraform (the google provider and the GCS backend) authenticates with Application Default Credentials. On a machine
 # without them (no `gcloud auth application-default login` yet) fall back to the active gcloud account's short-lived
 # access token, which the provider and backend accept through GOOGLE_OAUTH_ACCESS_TOKEN. Only for cloud goals.
+# ($(shell ...) does not inherit the exported PATH on GNU make 3.81, macOS's default, hence the explicit PATH= prefix.)
 ifneq ($(filter-out check fmt-check,$(MAKECMDGOALS)),)
-ADC_OK := $(shell gcloud auth application-default print-access-token >/dev/null 2>&1 && echo 1)
+ADC_OK := $(shell PATH="$(PATH)" gcloud auth application-default print-access-token >/dev/null 2>&1 && echo 1)
 ifeq ($(ADC_OK),)
-GCLOUD_TOKEN := $(shell gcloud auth print-access-token 2>/dev/null)
+GCLOUD_TOKEN := $(shell PATH="$(PATH)" gcloud auth print-access-token 2>/dev/null)
 ifneq ($(GCLOUD_TOKEN),)
 export GOOGLE_OAUTH_ACCESS_TOKEN ?= $(GCLOUD_TOKEN)
 endif
 endif
 endif
 
-PROJECT ?= $(shell gcloud config get project 2>/dev/null)
+PROJECT ?= $(shell PATH="$(PATH)" gcloud config get project 2>/dev/null)
 REGION ?= us-central1
 SHA ?= HEAD
 SWESIM_ENV_FILE ?= ./.env
@@ -46,8 +47,8 @@ TFVARS := infra/env.auto.tfvars.json
 STATE_BUCKET := $(PROJECT)-swesim-tfstate
 ENV_FILE_FLAGS := --env-file $(SWESIM_ENV_FILE) $(foreach f,$(EXTRA_ENV_FILES),--env-file $(f))
 
-.PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build deploy \
-        verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
+.PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build pin-image \
+        deploy verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
 
 check:
 	uv sync --extra dev --frozen
@@ -95,9 +96,16 @@ seed-registry:
 build: require-project
 	bash scripts/cloud/build.sh $(PROJECT) $(REGION) $(SHA)
 
-deploy: require-project
+# The pinned digest is persisted in the git-ignored infra/image.auto.tfvars.json, so a later plain `make apply`
+# keeps the pools on that digest instead of silently reverting them to :latest.
+pin-image: require-project
 	digest=$$(bash scripts/cloud/build.sh $(PROJECT) $(REGION) $(SHA) | tail -n1); \
-	$(MAKE) apply TF_ARGS="-var image=$$digest"
+	case "$$digest" in *@sha256:*) ;; *) echo "build did not yield a digest; not applying"; exit 1 ;; esac; \
+	printf '{"image": "%s"}\n' "$$digest" > infra/image.auto.tfvars.json; \
+	echo "pinned $$digest"
+
+deploy: require-project pin-image
+	$(MAKE) apply
 	$(MAKE) verify-cloud
 
 verify-cloud:
@@ -128,8 +136,8 @@ cloud-bootstrap: require-project tf-init tfvars
 	$(MAKE) apply TF_ARGS="-var deploy_workloads=false"
 	$(MAKE) push-secrets
 	$(MAKE) seed-registry
-	digest=$$(bash scripts/cloud/build.sh $(PROJECT) $(REGION) $(SHA) | tail -n1); \
-	$(MAKE) apply TF_ARGS="-var image=$$digest"
+	$(MAKE) pin-image
+	$(MAKE) apply
 	$(MAKE) migrate
 	$(MAKE) verify-cloud
 

@@ -24,7 +24,7 @@ Binding documents: `docs/superpowers/specs/2026-09-13-hosted-pipeline-brief.md` 
 | | WIF pool `github` / provider `github-oidc` | Trusts `token.actions.githubusercontent.com` for `assertion.repository == <github_repository>` only; that principal set may impersonate `swesim-deployer`. |
 | Compute | Worker pools `swesim-authoring`, `swesim-build`, `swesim-trials`, `swesim-control` | Same image, `SWESIM_TASK_QUEUE=<pool name>`, 1 vCPU / 2 GiB, manual instance counts (`pool_instances`), bucket + Cloud SQL volumes, secrets as env references. |
 | | Service `swesim-console` | Same image, command `uvicorn swesim.dashboard.app:app --host 0.0.0.0 --port 8080`, Cloud Run **native IAP** (`iap_enabled`, ingress all): the IAP service agent holds `run.invoker`, `iap_members` hold `iap.httpsResourceAccessor`. Only `TEMPORAL_API_KEY`, `SWESIM_WORKER_SECRET`, `SWESIM_DATABASE_URL` are mounted (no provider keys). |
-| Observability | Log metrics `swesim/trial_reconcile`, `swesim/worker_crashes`; alert "swesim worker crash loop" | `notification_channels` is empty by default (the alert exists, nobody is paged). |
+| Observability | Log metrics `swesim/trial_reconcile`, `swesim/worker_crashes`; alert "swesim worker crash loop" | The alert is a log-match condition on worker-pool container exits (rate-limited to one notification per 30 min per pool); `notification_channels` is empty by default (the alert exists, nobody is paged). |
 | Not Terraform | Jobs `swesim-trial-<id>` | Created at runtime by the Cloud Run launcher (`swesim/workflows/launchers/cloudrun.py`), one per trial, deleted after the record is written. |
 
 Environment on the pools/console follows interfaces §9 exactly (`SWESIM_WORKSPACE=/workspace`, `SWESIM_REGISTRY`,
@@ -82,9 +82,12 @@ make cloud-bootstrap PROJECT=<id> REGION=us-central1 SWESIM_ENV_FILE=<path> [EXT
 `cloud-bootstrap` is idempotent and runs, in order: `scripts/cloud/bootstrap.sh` (enable APIs, create the state bucket,
 `terraform init`), `make tfvars`, `terraform apply -var deploy_workloads=false` (everything but the workloads),
 `make push-secrets` (values streamed to Secret Manager on stdin; prints `NAME: updated|unchanged`), `make seed-registry`
-(the tracked `registry.json` into an empty bucket, never overwriting), `scripts/cloud/build.sh` (Cloud Build of `git
-archive HEAD`, prints the digest), `terraform apply -var image=<digest>`, `make migrate` (`swesim index migrate` when
-the command exists and Cloud SQL is reachable, otherwise a notice), and `scripts/cloud/verify_cloud.sh`.
+(the tracked `registry.json` into an empty bucket, never overwriting), `make pin-image` (`scripts/cloud/build.sh`:
+Cloud Build of `git archive HEAD`, reused when that sha already has an image, digest written to the git-ignored
+`infra/image.auto.tfvars.json`), `terraform apply` (now pinned to the digest), `make migrate` (`swesim index migrate`
+when the command exists and Cloud SQL is reachable, otherwise a notice), and `scripts/cloud/verify_cloud.sh`. Because the
+digest lives in `image.auto.tfvars.json`, a later plain `make apply` keeps the pools on it (it never reverts to `:latest`);
+`-var image=...` on the command line still overrides.
 
 Later deploys:
 

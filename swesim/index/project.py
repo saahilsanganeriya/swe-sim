@@ -1,0 +1,693 @@
+"""Projection of the record's files into index rows, shared by `IndexStore.rebuild_from_layout`, `FileIndexReader`
+and the index activities. This is the only place that knows which file feeds which column.
+
+Contract
+- Pure reads: nothing here writes. Every path comes from `Layout`.
+- A missing or malformed file is an empty state, never an exception, *except* when the identity of a row cannot be
+  established (a trial without scenario id / spec hash / run config hash, a scenario without a source, a scores
+  group without a spec hash): that raises `ProjectionError(ValueError)` so the caller can record the skip instead
+  of inventing a row. Nullable columns stay None when the files do not say.
+- Money is `Decimal` (through `dec`), never float. Times are tz-aware UTC (through `aware`): epoch numbers and ISO
+  strings are accepted; a naive ISO string is taken as UTC.
+- `origin` is the file's own label when it carries one, else the caller's (`Settings.origin`).
+- Trial status from files: record.json / status.json `completed|finished` -> completed, `running` -> running,
+  `error` -> runner-error; runner-error.json -> runner-error; launch.json `failed` -> launch-failed; launch.json
+  without status.json or record.json -> unresolved; request.json only -> planned.
+- Scenario validation status from files: scenario.json + validation.json valid -> valid; validation.json not valid
+  -> invalid; a reject decision -> rejected; compile.json -> validating; approval.json -> compiling; else drafting;
+  `archive/v<n>/` -> archived (one row per version).
+"""
+from __future__ import annotations
+
+import json
+import math
+import re
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
+
+from swesim.index import models as M
+from swesim.models import ID_RE
+from swesim.settings import Origin, get_settings
+from swesim.stages.score import count_exchanges, normalize_record, outcome_code, unresolved_attempt
+from swesim.storage.layout import SEGMENT_RE, TRIAL_ID_RE, Layout
+
+ORIGINS: tuple[str, ...] = Origin.__args__
+LAUNCHERS: tuple[str, ...] = ("systemd", "cloudrun", "subprocess")
+PURPOSES: tuple[str, ...] = M.Purpose.__args__
+TIERS: tuple[str, ...] = M.DifficultyTier.__args__
+CONDITIONS: tuple[str, ...] = ("full", "hidden", "interactive")
+SCENARIO_FILES: tuple[str, ...] = ("scenario.json", "scenario.draft.json", "draft.meta.json", "judge.json", "approval.json", "compile.json",
+                                   "validation.json", "difficulty.json", "audit.json", "review.json", "archived.json")
+TRIAL_STATUS: dict[str, str] = {"completed": "completed", "finished": "completed", "running": "running", "error": "runner-error",
+                                "runner-error": "runner-error", "launch-failed": "launch-failed", "unit-failed": "unit-failed",
+                                "cancelled": "cancelled", "unresolved": "unresolved", "requested": "planned", "planned": "planned",
+                                "launched": "launched", "unreadable-record": "unresolved"}
+PROBE_REJECTS: tuple[str, ...] = ("not-reproducible-offline", "probe-failed")
+_PR_RE = re.compile(r"-(\d+)$")
+
+
+class ProjectionError(ValueError):
+    """The files do not identify a row; the caller records the skip rather than guessing."""
+
+
+# ----------------------------------------------------------------------------- primitives
+
+def read_json(path: Path, default: Any = None) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def _dict(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def aware(value: Any) -> datetime | None:
+    """tz-aware UTC datetime from an epoch number or an ISO-8601 string (naive strings are UTC); None otherwise."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        return (value if value.tzinfo else value.replace(tzinfo=UTC)).astimezone(UTC)
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return None
+        try:
+            return datetime.fromtimestamp(value, UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and value.strip():
+        s = value.strip()
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            try:
+                return aware(float(s))
+            except ValueError:
+                return None
+        return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC)
+    return None
+
+
+def dec(value: Any) -> Decimal | None:
+    """Finite Decimal from an int, float, str or Decimal; None for anything else (never a float in a row)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(repr(value)) if math.isfinite(value) else None
+    if isinstance(value, str):
+        try:
+            d = Decimal(value.strip())
+        except (InvalidOperation, ValueError):
+            return None
+        return d if d.is_finite() else None
+    return None
+
+
+def mtime(path: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    except OSError:
+        return None
+
+
+def provider_of(model: str) -> str:
+    """The prefix of a model id before the first `/` (`openrouter/deepseek/deepseek-v3.2` -> `openrouter`)."""
+    return model.split("/", 1)[0] if "/" in model else model
+
+
+def scenario_id_for(instance_id: str) -> str | None:
+    """The drafter's rule: lower-case, `__` -> `--`; None when the result is not a valid scenario id."""
+    sid = str(instance_id).lower().replace("__", "--")
+    return sid if ID_RE.fullmatch(sid) else None
+
+
+def pr_number_of(instance_id: str) -> int | None:
+    m = _PR_RE.search(str(instance_id))
+    return int(m.group(1)) if m else None
+
+
+def _origin(value: Any) -> str | None:
+    return value if value in ORIGINS else None
+
+
+def _default_origin(origin: str | None) -> str:
+    return origin or get_settings().origin
+
+
+def _int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _first(*sources: dict, key: str, allowed: tuple[str, ...] | None = None) -> str | None:
+    for src in sources:
+        v = src.get(key)
+        if isinstance(v, str) and v and (allowed is None or v in allowed):
+            return v
+    return None
+
+
+# ----------------------------------------------------------------------------- registry and scenarios
+
+def project_registry(layout: Layout, registry_path: Path | None = None) -> dict[str, dict]:
+    """`registry.json`'s `scenarios` map (id -> entry); empty when absent or malformed."""
+    data = read_json(registry_path or layout.registry_path(), {})
+    scenarios = data.get("scenarios") if isinstance(data, dict) else None
+    return {k: v for k, v in scenarios.items() if isinstance(k, str) and isinstance(v, dict)} if isinstance(scenarios, dict) else {}
+
+
+def _scenario_files(d: Path) -> tuple[set[str], dict[str, dict]]:
+    """(names present, name -> dict body) for one scenario directory (or archive directory)."""
+    present: set[str] = set()
+    files: dict[str, dict] = {}
+    for name in SCENARIO_FILES:
+        p = d / name
+        if p.is_file():
+            present.add(name)
+        files[name] = _dict(read_json(p)) if name in present else {}
+    return present, files
+
+
+def scenario_version_of(files: dict[str, dict]) -> int | None:
+    for src in (files.get("scenario.json", {}), files.get("scenario.draft.json", {}), files.get("draft.meta.json", {}), files.get("approval.json", {})):
+        v = _int(src.get("version"))
+        if v is not None and v >= 1:
+            return v
+    return None
+
+
+def validation_status_of(present: set[str], files: dict[str, dict]) -> str:
+    validation, approval, review = files["validation.json"], files["approval.json"], files["review.json"]
+    if "scenario.json" in present and validation.get("status") == "valid":
+        return "valid"
+    if "validation.json" in present and validation.get("status") != "valid":
+        return "invalid"
+    if approval.get("approved") is False or review.get("decision") == "reject":
+        return "rejected"
+    if "compile.json" in present:
+        return "validating"
+    if "approval.json" in present:
+        return "compiling"
+    return "drafting"
+
+
+def _registry_status(entry: dict) -> str:
+    status = entry.get("validation_status")
+    return status if status in M.ValidationStatus.__args__ else "drafting"
+
+
+def scenario_ids(layout: Layout, registry: dict[str, dict] | None = None) -> list[str]:
+    """Every scenario directory plus every registered id (a registered scenario may be missing from this copy)."""
+    ids: set[str] = set()
+    sdirs = layout.root / "scenarios"
+    if sdirs.is_dir():
+        ids.update(p.name for p in sdirs.iterdir() if p.is_dir() and ID_RE.fullmatch(p.name))
+    ids.update(sid for sid in (registry or {}) if ID_RE.fullmatch(sid))
+    return sorted(ids)
+
+
+def project_scenario(layout: Layout, scenario_id: str, version: int | None = None, *, registry: dict[str, dict] | None = None,
+                     origin: str | None = None, now: datetime | None = None) -> M.ScenarioRow:
+    """One scenario version. `version=None` is the current one; an archived version reads `archive/v<version>/`."""
+    registry = project_registry(layout) if registry is None else registry
+    origin = _default_origin(origin)
+    now = now or M.utcnow()
+    sdir = layout.scenario_dir(scenario_id)
+    entry = registry.get(scenario_id)
+    present, files = _scenario_files(sdir)
+    current = scenario_version_of(files) or (_int(entry.get("version")) if entry else None)
+    archived_at: datetime | None = None
+    entry_json: dict | None = entry
+    if version is not None and version != current:
+        adir = layout.scenario_archive_dir(scenario_id, version)
+        if not adir.is_dir():
+            raise ProjectionError(f"{scenario_id}: no version {version} (current {current})")
+        present, files = _scenario_files(adir)
+        status = "archived"
+        archived_at = aware(files["archived.json"].get("at")) or mtime(adir / "archived.json") or mtime(adir)
+        row_version = version
+        entry_json = None
+    else:
+        if not present and entry is None:
+            raise ProjectionError(f"{scenario_id}: no scenario files and no registry entry")
+        status = validation_status_of(present, files) if present else _registry_status(entry or {})
+        row_version = current or 1  # ScenarioSpec.version defaults to 1
+    spec = files["scenario.json"] or files["scenario.draft.json"]
+    source = _str(spec.get("source")) or _str((entry or {}).get("source"))
+    source_ref = _str(spec.get("source_ref")) or _str((entry or {}).get("source_ref"))
+    if not source or not source_ref:
+        raise ProjectionError(f"{scenario_id}: source and source_ref are unknown")
+    approval, compiled, validation, meta = files["approval.json"], files["compile.json"], files["validation.json"], files["draft.meta.json"]
+    spec_hash = _first(approval, compiled, validation, meta, key="spec_hash") or (_str((entry or {}).get("spec_hash")) if entry_json is not None else None)
+    difficulty = files["difficulty.json"]
+    tier = difficulty.get("tier") if difficulty.get("tier") in TIERS else None
+    screen = {k: difficulty.get(k) for k in ("model", "hidden", "full", "labelled_at")} if difficulty else None
+    return M.ScenarioRow(
+        scenario_id=scenario_id, version=row_version, spec_hash=spec_hash, source=source, source_ref=source_ref, validation_status=status,
+        compiled_hash=_first(compiled, key="compiled_hash") or (_str((entry_json or {}).get("compiled_hash"))),
+        image_digest=_first(compiled, validation, key="image_digest") or (_str((entry_json or {}).get("image_digest"))),
+        difficulty_tier=tier, difficulty_screen=screen, task_sense=files["audit.json"] or None, registry_json=entry_json, archived_at=archived_at,
+        created_at=now, updated_at=now,
+        workflow_id=_first(validation, compiled, approval, key="workflow_id"), run_id=_first(validation, compiled, approval, key="run_id"),
+        worker_image_digest=_first(validation, compiled, approval, key="worker_image_digest"),
+        origin=_first(validation, compiled, approval, key="origin", allowed=ORIGINS) or origin)
+
+
+def project_scenario_versions(layout: Layout, scenario_id: str, *, registry: dict[str, dict] | None = None, origin: str | None = None,
+                              now: datetime | None = None) -> list[M.ScenarioRow]:
+    """The current version followed by every archived version (ascending)."""
+    registry = project_registry(layout) if registry is None else registry
+    rows = [project_scenario(layout, scenario_id, registry=registry, origin=origin, now=now)]
+    archive = layout.scenario_dir(scenario_id) / "archive"
+    if archive.is_dir():
+        versions = sorted(int(p.name[1:]) for p in archive.iterdir() if p.is_dir() and re.fullmatch(r"v[1-9][0-9]*", p.name))
+        for v in versions:
+            if v != rows[0].version:
+                rows.append(project_scenario(layout, scenario_id, v, registry=registry, origin=origin, now=now))
+    rows.sort(key=lambda r: r.version)
+    return rows
+
+
+# ----------------------------------------------------------------------------- candidates
+
+def source_keys(layout: Layout) -> list[str]:
+    """Source keys with a mined file (`<key>.jsonl`); derived files (`.judged`, `.probed`) are not keys."""
+    cdir = layout.candidates_dir()
+    if not cdir.is_dir():
+        return []
+    keys = set()
+    for p in cdir.glob("*.jsonl"):
+        name = p.name[: -len(".jsonl")]
+        if ".judged" in name or name.endswith(".probed") or not SEGMENT_RE.fullmatch(name):
+            continue
+        keys.add(name)
+    return sorted(keys)
+
+
+def _jsonl_rows(path: Path) -> dict[str, dict]:
+    """instance_id -> row (last occurrence wins); malformed lines and rows without an id are ignored."""
+    rows: dict[str, dict] = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return rows
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and isinstance(row.get("instance_id"), str) and row["instance_id"]:
+            rows[row["instance_id"]] = row
+    return rows
+
+
+def project_candidates(layout: Layout, source_key: str, *, registry: dict[str, dict] | None = None, origin: str | None = None,
+                       now: datetime | None = None) -> list[M.CandidateRow]:
+    """Every instance of one source key with the furthest stage it reached and the outcome at that stage."""
+    registry = project_registry(layout) if registry is None else registry
+    origin = _default_origin(origin)
+    now = now or M.utcnow()
+    mined_path = layout.candidates_file(source_key, "mined")
+    judged_path = layout.candidates_file(source_key, "judged")
+    probed_path = layout.candidates_file(source_key, "probed")
+    mined, judged, probed = _jsonl_rows(mined_path), _jsonl_rows(judged_path), _jsonl_rows(probed_path)
+    judged_dir = layout.candidates_dir() / "judged"
+    rows: list[M.CandidateRow] = []
+    for iid in sorted(set(mined) | set(judged) | set(probed)):
+        sid = scenario_id_for(iid)
+        row = {**mined.get(iid, {}), **judged.get(iid, {}), **probed.get(iid, {})}
+        judged_at = mtime(judged_path) if iid in judged else None
+        if sid is not None and judged_dir.is_dir():
+            for suffix in (".judged.jsonl", ".judged.probed.jsonl"):
+                per = _jsonl_rows(judged_dir / f"{sid}{suffix}").get(iid)
+                if per:
+                    row.update(per)
+                    judged_at = mtime(judged_dir / f"{sid}{suffix}") or judged_at
+        rows.append(_candidate_row(layout, source_key, iid, sid, row, judged_at, registry, origin, now))
+    return rows
+
+
+def _candidate_row(layout: Layout, source_key: str, iid: str, sid: str | None, row: dict, judged_at: datetime | None,
+                   registry: dict[str, dict], origin: str, now: datetime) -> M.CandidateRow:
+    judge = row.get("judge") if isinstance(row.get("judge"), dict) else None
+    probe = row.get("probe") if isinstance(row.get("probe"), dict) else None
+    error_file = _dict(read_json(layout.candidates_dir() / f"{iid}.error.json")) if SEGMENT_RE.fullmatch(iid) else {}
+    stage, status, gate, reasons = "mined", "pending", None, []
+    if judge is not None:
+        keep = judge.get("keep")
+        stage = "judged"
+        status = "kept" if keep is True else "rejected" if keep is False else "pending"
+        if keep is False:
+            gate, reasons = "judge", [str(row.get("reject_reason") or judge.get("reject_reason") or "judge did not keep the candidate")]
+    if error_file:
+        stage, status, gate, reasons = "probed", "error", "probe", [str(error_file.get("error") or "probe error")]
+    elif row.get("reject_reason") in PROBE_REJECTS:
+        stage, status, gate = "probed", "rejected", "probe"
+        reasons = [str(row["reject_reason"])] + ([str(probe["error"])] if probe and probe.get("error") else [])
+    elif probe is not None and probe.get("error"):
+        stage, status, gate, reasons = "probed", "error", "probe", [str(probe["error"])]
+    elif probe is not None and status == "kept" and (probe.get("statuses") or probe.get("stages") or row.get("probe_workflow")):
+        stage = "probed"
+    present: set[str] = set()
+    files: dict[str, dict] = {}
+    entry = registry.get(sid) if sid else None
+    if sid is not None:
+        present, files = _scenario_files(layout.scenario_dir(sid))
+    if present and status not in ("rejected", "error"):
+        if "scenario.draft.json" in present or "draft.meta.json" in present:
+            stage, status = "drafted", "kept"
+        if files["review.json"].get("decision") == "reject":
+            stage, status, gate = "approved", "rejected", "approval"
+            reasons = [str(files["review.json"].get("note") or "rejected in review")]
+        elif "approval.json" in present:
+            stage, status = "approved", "kept"
+        if "compile.json" in present and status == "kept":
+            stage = "compiled"
+        if "validation.json" in present and status == "kept":
+            stage = "validated"
+            if files["validation.json"].get("status") != "valid":
+                status, gate = "rejected", "validation"
+                reasons = [str(f) for f in (files["validation.json"].get("failures") or [])][:10] or ["validation not valid"]
+        if entry is not None and status == "kept":
+            stage = "registered"
+    source = _str(row.get("source")) or ("swebench-annotated" if "swebench" in source_key else source_key.split("--", 1)[0])
+    discovery = _dict(row.get("discovery"))
+    return M.CandidateRow(
+        instance_id=iid, source_key=source_key, source=source, repo=_str(row.get("repo")), pr_number=pr_number_of(iid),
+        pr_kind=_str(discovery.get("kind")), stage=stage, status=status, gate=gate, reasons=reasons, judged_at=judged_at,
+        scenario_id=sid if (present or entry is not None) else None,
+        version=scenario_version_of(files) if files else (_int((entry or {}).get("version")) if entry else None),
+        created_at=now, updated_at=now, origin=origin)
+
+
+# ----------------------------------------------------------------------------- trials
+
+TRIAL_EVIDENCE: tuple[str, ...] = ("record.json", "status.json", "runner-error.json", "request.json", "launch.json")
+
+
+def trial_ids(layout: Layout) -> list[str]:
+    """Trial directories that hold any evidence (`record.json` or one of the files an unresolved attempt leaves);
+    an empty directory is not an attempt."""
+    trials = layout.root / "trials"
+    if not trials.is_dir():
+        return []
+    return sorted(p.name for p in trials.iterdir()
+                  if p.is_dir() and TRIAL_ID_RE.fullmatch(p.name) and any((p / name).exists() for name in TRIAL_EVIDENCE))
+
+
+def _success(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def project_trial(layout: Layout, trial_id: str, *, origin: str | None = None, now: datetime | None = None
+                  ) -> tuple[M.TrialRow, list[M.ExchangeRow], list[M.CostRow]]:
+    """The trial row plus its exchanges (from the frozen transcript) and priced cost records (from costs.json)."""
+    origin = _default_origin(origin)
+    now = now or M.utcnow()
+    d = layout.trial_dir(trial_id)
+    if not d.is_dir():
+        raise ProjectionError(f"{trial_id}: no trial directory")
+    raw = read_json(d / "record.json") if (d / "record.json").exists() else None
+    has_record = isinstance(raw, dict) and bool(raw)
+    request, launch, status_file = _dict(read_json(d / "request.json")), _dict(read_json(d / "launch.json")), _dict(read_json(d / "status.json"))
+    if has_record:
+        rec = normalize_record(raw, d)
+        status_raw = rec.get("status") or status_file.get("status") or "completed"
+    else:
+        u = unresolved_attempt(d)
+        if u is None:
+            raise ProjectionError(f"{trial_id}: no record.json and no launch evidence")
+        rec = u
+        if launch and not status_file and not (d / "runner-error.json").exists():
+            status_raw = "launch-failed" if launch.get("phase") == "failed" else "unresolved"
+        else:
+            status_raw = u["status"]
+    status = TRIAL_STATUS.get(str(status_raw).lower(), "unresolved")
+    rc = _dict(rec.get("run_config")) or _dict(request.get("run_config"))
+    identity = {
+        "scenario_id": rec.get("scenario_id") or request.get("scenario_id"),
+        "spec_hash": rec.get("spec_hash") or request.get("spec_hash"),
+        "condition": rec.get("condition") or rc.get("condition") or request.get("condition"),
+        "model": rec.get("model") or rc.get("model") or request.get("model"),
+        "run_config_hash": rec.get("run_config_hash") or request.get("run_config_hash"),
+        "attempt_index": rec.get("attempt_index", request.get("attempt_index")),
+    }
+    missing = [k for k, v in identity.items() if v in (None, "")]
+    if missing:
+        raise ProjectionError(f"{trial_id}: cannot identify the trial from its files; missing {missing}")
+    if identity["condition"] not in CONDITIONS:
+        raise ProjectionError(f"{trial_id}: unknown condition {identity['condition']!r}")
+    brief_profile = rec.get("brief_profile") or rc.get("brief_profile") or ("natural" if identity["condition"] == "full" else None)
+    if brief_profile not in ("natural", "withheld"):
+        raise ProjectionError(f"{trial_id}: unknown brief profile {brief_profile!r}")
+    purpose = rec.get("purpose") or rc.get("purpose") or ("demonstration" if rc else None)  # RunConfig's default
+    if purpose not in PURPOSES:
+        raise ProjectionError(f"{trial_id}: unknown purpose {purpose!r}")
+    spec_json = _dict(read_json(d / "spec.json"))
+    reward, report = _dict(rec.get("reward")), _dict(rec.get("report"))
+    transcript = _dict(rec.get("transcript")) or _dict(read_json(d / "transcript.json"))
+    audit = _dict(read_json(d / "audit.json"))
+    signals = report.get("integrity_signals")
+    workflow_id = _first(rec, request, launch, key="workflow_id")
+    run_id = _first(rec, request, launch, key="run_id")
+    row_origin = _first(rec, launch, request, key="origin", allowed=ORIGINS) or origin
+    stakeholder = _dict(rc.get("stakeholder"))
+    costs, tokens_in, tokens_out, cost_usd = project_costs(trial_id, d / "costs.json", origin=row_origin, now=now, workflow_id=workflow_id)
+    started = aware(status_file.get("started_at")) or aware(rec.get("started_at")) or aware(launch.get("started_at"))
+    finished = aware(status_file.get("finished_at")) or aware(rec.get("finished_at"))
+    row = M.TrialRow(
+        trial_id=trial_id, scenario_id=str(identity["scenario_id"]), version=_int(spec_json.get("version")), spec_hash=str(identity["spec_hash"]),
+        condition=identity["condition"], brief_profile=brief_profile, model=str(identity["model"]), provider=provider_of(str(identity["model"])),
+        run_config_hash=str(identity["run_config_hash"]), attempt_index=int(identity["attempt_index"]), purpose=purpose, status=status,
+        outcome_code=outcome_code(rec) if has_record and reward else None,
+        reward=dec(reward.get("reward")) if has_record and reward else None,
+        success=_success(reward.get("success")) if has_record and reward else None,
+        integrity_signal_count=len(signals) if isinstance(signals, list) else None,
+        questions_asked=count_exchanges(rec, "ask") if has_record else None,
+        confirmations=count_exchanges(rec, "confirm") if has_record else None,
+        asked_before_implementing=audit.get("asked_before_implementing") if isinstance(audit.get("asked_before_implementing"), bool) else None,
+        started_at=started, finished_at=finished,
+        launcher=launch.get("launcher") if launch.get("launcher") in LAUNCHERS else None,
+        job_name=_str(launch.get("handle")) or _str(launch.get("unit")),
+        cost_usd=cost_usd, input_tokens=tokens_in, output_tokens=tokens_out,
+        stakeholder_model=_str(stakeholder.get("model_id")) or _str(request.get("stakeholder_model")),
+        stakeholder_prompt_version=_str(stakeholder.get("prompt_version")),
+        created_at=now, updated_at=now, workflow_id=workflow_id, run_id=run_id,
+        worker_image_digest=_first(rec, launch, key="worker_image_digest") or _first(launch, key="image_digest"), origin=row_origin)
+    exchanges = project_exchanges(trial_id, transcript, audit, origin=row_origin, now=now, workflow_id=workflow_id, run_id=run_id)
+    return row, exchanges, costs
+
+
+def project_exchanges(trial_id: str, transcript: dict, audit: dict | None = None, *, origin: str, now: datetime | None = None,
+                      workflow_id: str | None = None, run_id: str | None = None) -> list[M.ExchangeRow]:
+    """Message events of a frozen transcript as rows; `seq` is the event's when every event has a distinct one."""
+    now = now or M.utcnow()
+    events = [e for e in (transcript.get("events") or []) if isinstance(e, dict) and e.get("kind") == "message"]
+    seqs = [_int(e.get("seq")) for e in events]
+    use_seq = all(s is not None for s in seqs) and len(set(seqs)) == len(seqs)
+    audit = audit or {}
+    questions = {q["seq"]: q for q in audit.get("questions") or [] if isinstance(q, dict) and _int(q.get("seq")) is not None}
+    replies = {r["seq"]: r for r in audit.get("replies") or [] if isinstance(r, dict) and _int(r.get("seq")) is not None}
+    rows: list[M.ExchangeRow] = []
+    for i, e in enumerate(events):
+        seq = seqs[i] if use_seq else i
+        role_raw = e.get("role")
+        role = "agent" if role_raw == "user" else "stakeholder" if role_raw == "assistant" else "system"
+        kind = e.get("exchange") if e.get("exchange") in ("ask", "confirm", "review") else "system"
+        content = e.get("content")
+        text = content if isinstance(content, str) else json.dumps(content) if content is not None else ""
+        by_role = questions if role == "agent" else replies if role == "stakeholder" else {}
+        rows.append(M.ExchangeRow(
+            trial_id=trial_id, seq=seq, role=role, exchange=kind, ts=aware(e.get("ts")), request_id=_str(e.get("request_id")),
+            patience_after=_int(e.get("patience_remaining")) if role == "stakeholder" else None, text_public=text,
+            disclosed_fact_ids=[str(x) for x in (e.get("disclosed_fact_ids") or []) if x is not None] if isinstance(e.get("disclosed_fact_ids"), list) else [],
+            regenerated=e.get("regenerated") if isinstance(e.get("regenerated"), bool) else None,
+            redacted_terms=[str(x) for x in (e.get("redacted_terms") or []) if x is not None] if isinstance(e.get("redacted_terms"), list) else [],
+            audit=by_role.get(seq), created_at=now, updated_at=now, workflow_id=workflow_id, run_id=run_id, origin=origin))
+    return rows
+
+
+def project_costs(trial_id: str, path: Path, *, origin: str, now: datetime | None = None, workflow_id: str | None = None
+                  ) -> tuple[list[M.CostRow], int | None, int | None, Decimal | None]:
+    """(priced cost rows, input tokens, output tokens, usd) from `costs.json`, a list of CostRecord dicts.
+    Tokens are summed over every record; `usd` over the priced ones. A record whose price is unknown (`usd` null,
+    `price_source` "unknown") is not a `costs` row because the column is not nullable; its tokens still count.
+    A file that is not a list of records raises `ProjectionError`."""
+    now = now or M.utcnow()
+    if not path.exists():
+        return [], None, None, None
+    data = read_json(path)
+    if not isinstance(data, list):
+        raise ProjectionError(f"{path}: costs.json must be a list of cost records")
+    rows: list[M.CostRow] = []
+    tokens_in = tokens_out = 0
+    usd_total: Decimal | None = None
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ProjectionError(f"{path}[{i}]: not a cost record")
+        tokens_in += _int(item.get("input_tokens")) or 0
+        tokens_out += _int(item.get("output_tokens")) or 0
+        if item.get("usd") is None:
+            continue
+        fields = {k: v for k, v in item.items() if k in M.CostRow.model_fields}
+        fields.setdefault("trial_id", trial_id)
+        fields["origin"] = _origin(fields.get("origin")) or origin
+        fields.setdefault("workflow_id", workflow_id)
+        fields.setdefault("created_at", now)
+        fields["updated_at"] = now
+        try:
+            row = M.CostRow(**fields)
+        except ValidationError as e:
+            raise ProjectionError(f"{path}[{i}]: {e.error_count()} invalid field(s): {[err['loc'] for err in e.errors()]}") from e
+        rows.append(row)
+        usd_total = (usd_total or Decimal(0)) + row.usd
+    return rows, tokens_in, tokens_out, usd_total
+
+
+def project_workflow_costs(layout: Layout, *, origin: str | None = None, now: datetime | None = None) -> list[M.CostRow]:
+    """Priced cost records of workflows without a trial (`root/costs/<workflow_id>.json`, written by
+    `swesim.costs.record_cost`). A file that is not a list of records raises `ProjectionError`."""
+    origin = _default_origin(origin)
+    now = now or M.utcnow()
+    cdir = layout.costs_dir()
+    if not cdir.is_dir():
+        return []
+    rows: list[M.CostRow] = []
+    for path in sorted(cdir.glob("*.json")):
+        workflow_id = path.name[: -len(".json")]
+        data = read_json(path)
+        if not isinstance(data, list):
+            raise ProjectionError(f"{path}: costs file must be a list of cost records")
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise ProjectionError(f"{path}[{i}]: not a cost record")
+            if item.get("usd") is None:
+                continue
+            fields = {k: v for k, v in item.items() if k in M.CostRow.model_fields}
+            fields["origin"] = _origin(fields.get("origin")) or origin
+            fields.setdefault("workflow_id", workflow_id)
+            fields.setdefault("created_at", now)
+            fields["updated_at"] = now
+            try:
+                rows.append(M.CostRow(**fields))
+            except ValidationError as e:
+                raise ProjectionError(f"{path}[{i}]: {e.error_count()} invalid field(s): {[err['loc'] for err in e.errors()]}") from e
+    return rows
+
+
+# ----------------------------------------------------------------------------- scores
+
+def _spec_hash_of_trials(layout: Layout, trial_ids_: list) -> str | None:
+    for tid in trial_ids_:
+        if not isinstance(tid, str) or not TRIAL_ID_RE.fullmatch(tid):
+            continue
+        for name in ("record.json", "request.json"):
+            h = _str(_dict(read_json(layout.trial_file(tid, name))).get("spec_hash"))
+            if h:
+                return h
+    return None
+
+
+def _sum_ints(values: Any) -> int:
+    return sum(v for v in values if isinstance(v, int) and not isinstance(v, bool)) if isinstance(values, list) else 0
+
+
+def project_scores(layout: Layout, scenario_id: str, *, origin: str | None = None, now: datetime | None = None) -> list[M.ScoreRow]:
+    """One row per group of `scores.json`; the `unknown-config` group (no lineage) has no row."""
+    origin = _default_origin(origin)
+    now = now or M.utcnow()
+    path = layout.scenario_file(scenario_id, "scores.json")
+    groups = read_json(path) if path.exists() else None
+    if not isinstance(groups, dict):
+        return []
+    computed_at = mtime(path) or now
+    _present, files = _scenario_files(layout.scenario_dir(scenario_id))
+    fallback = _first(files["approval.json"], files["compile.json"], files["validation.json"], key="spec_hash")
+    rows: list[M.ScoreRow] = []
+    for key, g in sorted(groups.items()):
+        if not isinstance(g, dict) or not all(_str(g.get(k)) for k in ("condition", "brief_profile", "run_config_hash", "model")):
+            continue
+        if g["condition"] not in CONDITIONS:
+            raise ProjectionError(f"{scenario_id} scores[{key}]: unknown condition {g['condition']!r}")
+        spec_hash = _spec_hash_of_trials(layout, g.get("trial_ids") or []) or fallback
+        if not spec_hash:
+            raise ProjectionError(f"{scenario_id} scores[{key}]: spec_hash unknown")
+        rows.append(M.ScoreRow(
+            scenario_id=scenario_id, spec_hash=spec_hash, condition=g["condition"], brief_profile=g["brief_profile"], model=g["model"],
+            run_config_hash=g["run_config_hash"], n=_int(g.get("n")) or 0, success_count=_int(g.get("success_count")) or 0,
+            pass_at_k=dec(g.get("pass_at_k")), pass_pow_k=dec(g.get("pass_pow_k")), mean_reward=dec(g.get("mean_reward")),
+            questions_asked=_sum_ints(g.get("questions_asked")), confirmations=_sum_ints(g.get("confirmations")), computed_at=computed_at,
+            created_at=now, updated_at=now, origin=origin))
+    return rows
+
+
+# ----------------------------------------------------------------------------- Harbor job directories
+
+def project_workflows_from_jobs(layout: Layout, *, origin: str | None = None, now: datetime | None = None) -> list[M.WorkflowRow]:
+    """What `jobs/runs/<name>/{config,result,lock}.json` say about each Harbor job: not Temporal state, but the file
+    reader has nothing better. `started_at` is the lock file's UTC `created_at` (Harbor's result timestamps are naive
+    local time; only their difference is used)."""
+    origin = _default_origin(origin)
+    now = now or M.utcnow()
+    runs = layout.jobs_dir("runs")
+    if not runs.is_dir():
+        return []
+    rows: list[M.WorkflowRow] = []
+    for d in sorted(p for p in runs.iterdir() if p.is_dir()):
+        result, config, lock = _dict(read_json(d / "result.json")), _dict(read_json(d / "config.json")), _dict(read_json(d / "lock.json"))
+        if not result and not config:
+            continue
+        stats = _dict(result.get("stats"))
+        total, completed = _int(result.get("n_total_trials")), _int(stats.get("n_completed_trials"))
+        if _int(stats.get("n_errored_trials")):
+            status = "failed"
+        elif _int(stats.get("n_cancelled_trials")):
+            status = "cancelled"
+        elif total is not None and completed == total:
+            status = "completed"
+        else:
+            status = "running"
+        started = aware(lock.get("created_at")) or mtime(d / "config.json") or now
+        rs, rf = aware(result.get("started_at")), aware(result.get("finished_at"))
+        closed = started + (rf - rs) if rs and rf and rf >= rs else None
+        agents = config.get("agents") or []
+        agent = agents[0] if agents and isinstance(agents[0], dict) else {}
+        tasks = config.get("tasks") or []
+        task = tasks[0] if tasks and isinstance(tasks[0], dict) else {}
+        failure = None
+        for ev in _dict(stats.get("evals")).values():
+            exceptions = _dict(_dict(ev).get("exception_stats"))
+            if exceptions:
+                failure = ", ".join(sorted(exceptions))
+                break
+        rows.append(M.WorkflowRow(
+            workflow_id=d.name, run_id=_str(result.get("id")) or "harbor-job", type="harbor-job", parent_workflow_id=None, status=status,
+            params_summary={"agent": agent.get("name"), "model": agent.get("model_name"), "task": task.get("path"),
+                            "trial_id": d.name if TRIAL_ID_RE.fullmatch(d.name) else None},
+            failure=failure, started_at=started, closed_at=closed if status != "running" else None, task_queue=None, cost_usd=None,
+            search_attributes={}, created_at=now, updated_at=now, origin=origin))
+    return rows
+
+
+__all__ = ["ProjectionError", "aware", "dec", "mtime", "provider_of", "scenario_id_for", "pr_number_of", "read_json",
+           "project_registry", "scenario_ids", "scenario_version_of", "validation_status_of", "project_scenario", "project_scenario_versions",
+           "source_keys", "project_candidates", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_workflow_costs",
+           "project_scores", "project_workflows_from_jobs"]

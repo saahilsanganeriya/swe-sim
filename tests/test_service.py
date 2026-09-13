@@ -5,6 +5,7 @@ import httpx, pytest
 from fastapi.testclient import TestClient
 
 from swesim.stakeholder import service
+from swesim.stakeholder.session import REFUSAL
 
 VIEW = {"brief": "b", "facts": [{"id": "f01", "text": "x", "discovery": "on-request", "kind": "interface"}], "requirements": [],
         "persona": {"summary": "m", "tone": "t", "disclosure_style": "d", "role": "maintainer"}, "checks": []}
@@ -52,7 +53,7 @@ def test_public_reply_hides_worker_only_annotations(svc):
     c = TestClient(service.app)
     tok = c.post("/sessions", headers={"X-Worker-Secret": "s3"}, json=body()).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
     a = c.post("/ask", headers=h, json={"request_id": "1", "question": "which exception?"}).json()
-    assert set(a) == {"reply", "patience_remaining", "tier"} and a["tier"] == "full"
+    assert set(a) == {"reply", "patience_remaining"}                                     # no fact ids, no tool audit, no tier (A-P1-3)
     assert c.get("/health").json()["ok"] is True
 
 
@@ -62,7 +63,7 @@ def test_review_returns_sha_and_costs_review(svc, monkeypatch):
     diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
     r = c.post("/review", headers=h, json={"request_id": "v1", "diff": diff, "files": {"a.py": "y\n"}})
     assert r.status_code == 200
-    j = r.json(); assert j["reviewed_diff_sha256"] == hashlib.sha256(diff.encode()).hexdigest() and j["patience_remaining"] == 0 and j["tier"] == "full"
+    j = r.json(); assert j["reviewed_diff_sha256"] == hashlib.sha256(diff.encode()).hexdigest() and j["patience_remaining"] == 0 and "tier" not in j
     t = c.get("/transcript/t1", headers={"X-Worker-Secret": "s3"}).json()
     asst = [e for e in t["events"] if e["kind"] == "message" and e["role"] == "assistant"][0]
     assert asst["disclosed_fact_ids"] == ["f01"] and asst["tool_calls"][0]["tool"] == "read_diff" and t["patience_end"] == 0
@@ -71,7 +72,7 @@ def test_review_returns_sha_and_costs_review(svc, monkeypatch):
     def counting(system, messages, schema, cfg): calls.append(1); return {"reply": "x", "disclosed_fact_ids": []}
     monkeypatch.setattr(service, "call_llm", counting)
     a = c.post("/ask", headers=h, json={"request_id": "2", "question": "more?"}).json()
-    assert a["tier"] == "refused" and calls == [] and a["patience_remaining"] == 0
+    assert a["reply"] == REFUSAL and calls == [] and a["patience_remaining"] == 0 and "tier" not in a
     assert c.post("/review", headers=h, json={"request_id": "v2", "diff": "x" * 200_001, "files": {}}).status_code == 422
     assert c.post("/review", headers=h, json={"request_id": "v3", "diff": "d", "files": {"a": "x" * 600_000}}).status_code == 422
 
@@ -271,7 +272,7 @@ def test_leaked_reply_is_redacted_through_the_service(svc, monkeypatch):
     view = {**VIEW, "forbidden_terms": ["IntervalProperty", "assert", "test_"]}
     tok = c.post("/sessions", headers=w, json=body(visible_view=view)).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
     a = c.post("/ask", headers=h, json={"request_id": "1", "question": "what else?"}).json()
-    assert set(a) == {"reply", "patience_remaining", "tier"} and a["reply"] == "Looks fine. [withheld] Nothing else is missing."
+    assert set(a) == {"reply", "patience_remaining"} and a["reply"] == "Looks fine. [withheld] Nothing else is missing."
     ev = [e for e in c.get("/transcript/t1", headers=w).json()["events"] if e["kind"] == "message" and e["role"] == "assistant"][0]
     assert ev["redacted_terms"] == ["IntervalProperty"] and ev["redaction_count"] == 1 and ev["regenerated"] is True
     assert ev["withheld_sentences"] == ["Add a test that calls IntervalProperty on a boolean series and asserts the mapping."]
@@ -294,15 +295,31 @@ def test_confirm_endpoint_costs_review_cost_and_is_filtered(svc, monkeypatch):
     view = {**VIEW, "forbidden_terms": ["IntervalProperty", "test_"]}
     tok = c.post("/sessions", headers=w, json=body(visible_view=view, stakeholder_config=cfg)).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
     r = c.post("/confirm", headers=h, json={"request_id": "c1", "description": "Boolean values act like 0 and 1 now; before, it raised."})
-    assert r.status_code == 200 and r.json() == {"reply": "Yes, that is what I wanted. [withheld] Nothing seems unmet.", "patience_remaining": 2, "tier": "full"}
+    assert r.status_code == 200 and r.json() == {"reply": "Yes, that is what I wanted. [withheld] Nothing seems unmet.", "patience_remaining": 2}
     ev = [e for e in c.get("/transcript/t1", headers=w).json()["events"] if e["kind"] == "message"]
     assert [e["exchange"] for e in ev] == ["confirm", "confirm"] and ev[1]["redacted_terms"] == ["IntervalProperty", "test_"] and ev[1]["redaction_count"] == 1
     assert c.post("/confirm", headers=h, json={"request_id": "c2", "description": "x" * 4001}).status_code == 422
     assert c.post("/confirm", headers=h, json={"request_id": "c3", "description": ""}).status_code == 422
     assert c.post("/confirm", headers=h, json={"request_id": "c4", "description": "d", "diff": "x"}).status_code == 422   # no diff on this channel
     r2 = c.post("/confirm", headers=h, json={"request_id": "c5", "description": "Also the other case still works."}).json()
-    assert r2["patience_remaining"] == 0 and r2["tier"] == "full"
-    assert c.post("/confirm", headers=h, json={"request_id": "c6", "description": "more"}).json()["tier"] == "refused"
+    assert r2["patience_remaining"] == 0 and "tier" not in r2
+    assert c.post("/confirm", headers=h, json={"request_id": "c6", "description": "more"}).json()["reply"] == REFUSAL
+
+
+def test_confirm_endpoint_rejects_code_with_422_and_a_hint(svc, monkeypatch):
+    """A-P1-4: code, diffs and fenced blocks on the confirm channel are the agent's input error: 422 with a hint, no model
+    call, nothing spent, nothing recorded as a service failure."""
+    calls = []
+    monkeypatch.setattr(service, "call_llm", lambda *a: calls.append(1) or {"reply": "ok", "disclosed_fact_ids": []})
+    c = TestClient(service.app); w = {"X-Worker-Secret": "s3"}
+    tok = c.post("/sessions", headers=w, json=body()).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
+    for text in ("```python\nreturn x\n```", "def _setup(self, data):\n    return data", "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py",
+                 "vmin, vmax = map(float, axis.convert_units((vmin, vmax)))"):
+        r = c.post("/confirm", headers=h, json={"request_id": "c1", "description": text})
+        assert r.status_code == 422 and "plain-language" in r.json()["detail"] and "code" in r.json()["detail"], text
+    t = c.get("/transcript/t1", headers=w).json()
+    assert calls == [] and t["service_failure"] is None and t["pending"] is None and t["patience_end"] == 2 and len(t["events"]) == 1
+    assert c.post("/confirm", headers=h, json={"request_id": "c2", "description": "Boolean values act like 0 and 1 now; before, it raised."}).status_code == 200
 
 
 @pytest.mark.skipif(not _behavior_mode_supported(), reason="models.StakeholderConfig.review_mode does not accept 'behavior' yet (integrator change)")

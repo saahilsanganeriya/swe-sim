@@ -837,11 +837,43 @@ def test_withhold_matches_after_normalization_and_removes_every_occurrence(monke
     monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("error_message", "the ERROR is boom")))
     res = draft_spec.withhold(issue, "fake/model")
     assert res["withheld_brief"] == "Dup title\nUnrelated line here.\nAnother fine line."
-    assert len(res["removed"]) == 1 and len(res["removed"][0]["occurrences"]) == 2 and res["removed"][0]["excerpt"] == "The error is  Boom."
+    # B-P1-2: every expanded occurrence is its own removal, recorded verbatim, so the ledger names everything that disappeared
+    assert [r["excerpt"] for r in res["removed"]] == ["The error is  Boom.", "> the error is boom."]
+    assert all(len(r["occurrences"]) == 1 and issue[r["start"]:r["end"]] == r["excerpt"] and r["selected"] == "the ERROR is boom" for r in res["removed"])
+    assert res["stats"]["sentences_removed"] == 2 and res["stats"]["duplicate_selections"] == 0
+    assert draft_spec.reconstruct_withheld(issue, [r["excerpt"] for r in res["removed"]]) == res["withheld_brief"]
     norm_text, idx = draft_spec._norm_map(issue)
     assert norm_text == draft_spec._norm(issue) and len(idx) == len(norm_text)
     norm_text, idx = draft_spec._norm_map(WITHHOLD_ISSUE)
     assert norm_text == draft_spec._norm(WITHHOLD_ISSUE)
+
+
+def test_repeated_selected_phrase_records_every_removed_sentence(monkeypatch):
+    """Codex B-P1-2 reproduction: one selected phrase occurring in two different sentences removed both but recorded one, so a
+    requirement could vanish from the brief without a ledger entry. Now each expanded sentence is its own recorded removal and
+    the brief is exactly the natural text minus the recorded excerpts."""
+    from swesim.stages import draft_spec
+    issue = ("Numeric export drops values\n"
+             "Expected values are numeric when the option is enabled.\n"
+             "The exporter should keep the column order.\n"
+             "Expected values are numeric and preserve all nulls.\n"
+             "Seen on 1.2.")
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("expected_output", "Expected values are numeric")))
+    res = draft_spec.withhold(issue, "fake/model")
+    assert [r["excerpt"] for r in res["removed"]] == ["Expected values are numeric when the option is enabled.", "Expected values are numeric and preserve all nulls."]
+    assert res["withheld_brief"] == "Numeric export drops values\nThe exporter should keep the column order.\nSeen on 1.2."
+    assert all(r["category"] == "expected_output" and r["fact_text"] == "Reporter's original statement: " + r["excerpt"] for r in res["removed"])
+    assert res["stats"]["sentences_removed"] == 2 and len(res["deleted"]) == 2
+    # the reconstruction is the integrity check approval and the schema can repeat from the recorded excerpts alone
+    assert draft_spec.reconstruct_withheld(issue, [r["excerpt"] for r in res["removed"]]) == res["withheld_brief"]
+    assert draft_spec.reconstruct_withheld(issue, [res["removed"][0]["excerpt"]]) != res["withheld_brief"]           # one recorded excerpt cannot explain both deletions
+    assert draft_spec.reconstruct_withheld(issue, []) == issue
+    # a selection matching one sentence plus a whole-line duplicate elsewhere: both recorded, both facts distinct
+    dup = "T\nThe error is Boom.\nMiddle line.\nThe error is Boom.\nLast line."
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("error_message", "error is Boom")))
+    res = draft_spec.withhold(dup, "fake/model")
+    assert [(r["start"], r["end"]) for r in res["removed"]] == [(2, 20), (34, 52)] and res["withheld_brief"] == "T\nMiddle line.\nLast line."
+    assert draft_spec.reconstruct_withheld(dup, [r["excerpt"] for r in res["removed"]]) == res["withheld_brief"]
 
 
 def _row(**over):
