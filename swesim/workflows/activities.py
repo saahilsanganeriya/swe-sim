@@ -43,6 +43,7 @@ from swesim.models import ID_RE, RunConfig, ScenarioSpec, trial_id
 from swesim.paths import Workspace, atomic_json
 from swesim.settings import Settings, get_settings, has_secret, secret
 from swesim.workflows import archive, batching, retries, validation
+from swesim.sources import observations
 from swesim.workflows.launchers.base import (  # noqa: F401 - re-exported
     Launcher,
     LaunchFailed,
@@ -227,20 +228,23 @@ async def discover_activity(p: dict) -> dict:
         raise ValueError("max_candidates must be positive")
     kwargs = _accepted_kwargs(gr.discover, {k: p[k] for k in ("since", "pr", "max_prs", "kind") if p.get(k) is not None})
     kwargs.setdefault("since", "2026-06-01")
-    cands, rejects = await blocking(lambda: gr.discover(repo, **kwargs))
-    limit = int(p.get("max_candidates") or 0) or len(cands)
+    workflow_id = activity.info().workflow_id if activity.in_activity() else p.get("workflow_id", "direct")
+    run_id = activity.info().workflow_run_id if activity.in_activity() else p.get("run_id")
+    source_key = gr.source_key_for(repo, band)
+    # Every listed PR keeps its decision in an immutable scan record (candidates/<source_key>/scans/<sha256>.json); the
+    # returned histogram already includes the max-candidates cut. gh rate limits/5xx/network raise DiscoveryTransientError.
+    cands, rejects, scan = await blocking(lambda: gr.discover_scan(repo, **kwargs, max_candidates=int(p.get("max_candidates") or 0) or None,
+                                                                   source_key=source_key, workflow_id=workflow_id if run_id else None, run_id=run_id))
     rows = []
-    for c in cands[:limit]:
+    for c in cands:
         row = gr.candidate_to_row(c); row.update(gr.build_recipe(repo, c["base_commit"])); rows.append(row)
-    source_key = f"github-repo--{repo.replace('/', '__')}--{band}"
     out = WS.candidates_dir / f"{source_key}.jsonl"; out.parent.mkdir(parents=True, exist_ok=True)
     candidate_text = "".join(json.dumps(r) + "\n" for r in rows)
     batching.atomic_text(out, candidate_text)
-    rejects = {**dict(rejects), **({"max-candidates-cut": len(cands) - limit} if len(cands) > limit else {})}
     atomic_json(out.with_suffix(".rejects.json"), rejects)
+    scan_path, scan_sha256 = observations.write_scan(WS.layout, scan)
     rejects_bytes = json.dumps(rejects, sort_keys=True, indent=2, allow_nan=False).encode()
     rejects_sha256 = hashlib.sha256(rejects_bytes).hexdigest()
-    workflow_id = activity.info().workflow_id if activity.in_activity() else p.get("workflow_id", "direct")
     snapshot_id = hashlib.sha256(candidate_text.encode() + rejects_bytes).hexdigest()
     snapshot_dir = batching.directory(WS, workflow_id) / "discovery" / source_key
     snapshot = snapshot_dir / f"{snapshot_id}.jsonl"
@@ -253,7 +257,8 @@ async def discover_activity(p: dict) -> dict:
     elif status.exists():
         status.unlink()
     return {"candidates_path": str(snapshot), "canonical_candidates_path": str(out), "source_key": source_key, "band": band, "repo": repo,
-            "discovered": len(cands), "written": len(rows), "rejects": rejects, "rejects_sha256": rejects_sha256, "rejects_path": str(rejects_snapshot)}
+            "discovered": len(cands) + rejects.get("max-candidates-cut", 0), "written": len(rows), "rejects": rejects, "rejects_sha256": rejects_sha256,
+            "rejects_path": str(rejects_snapshot), "scan_path": str(scan_path), "scan_sha256": scan_sha256, "funnel": scan.funnel}
 
 
 @swesim_activity
