@@ -1,0 +1,36 @@
+# Offline checks on every push and pull request (brief §2.6.1). Required to pass before a deploy.
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (frozen)
+        run: uv sync --extra dev --frozen
+      - name: Offline suite
+        run: uv run --frozen --offline python -m pytest -q tests --ignore=tests/integration
+      - name: Contract suite
+        run: uv run --frozen --offline python -m pytest -q tests/test_contracts.py tests/test_settings.py
+      - name: Ruff (syntax errors and undefined names only)
+        run: uv run --frozen ruff check --select E9,F swesim tests scripts
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.2"
+      - run: terraform -chdir=infra fmt -check -recursive
+      - run: terraform -chdir=infra init -input=false -backend=false
+      - run: terraform -chdir=infra validate
