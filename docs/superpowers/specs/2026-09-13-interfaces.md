@@ -29,14 +29,14 @@ class Layout(Strict):
     root: Path                                   # SWESIM_WORKSPACE
     # scenarios
     def scenario_dir(self, scenario_id: str) -> Path                  # root/scenarios/<sid>
-    def scenario_file(self, scenario_id, name: ScenarioFile) -> Path  # scenario.json | scenario.draft.json | draft.meta.json | judge.json | approval.json | compile.json | validation.json
+    def scenario_file(self, scenario_id, name: ScenarioFile) -> Path  # scenario.json | scenario.draft.json | draft.meta.json | judge.json | approval.json | compile.json | validation.json | difficulty.json | audit.json
     def scenario_assets_dir(self, scenario_id) -> Path                # root/scenarios/<sid>/assets
     def scenario_archive_dir(self, scenario_id, version: int) -> Path # root/scenarios/<sid>/archive/v<version>
     # compiled tasks
     def task_dir(self, scenario_id, condition: Condition) -> Path     # root/tasks/<sid>__<condition>
     # trials
     def trial_dir(self, trial_id: str) -> Path                        # root/trials/<tid>
-    def trial_file(self, trial_id, name: TrialFile) -> Path           # request.json launch.json status.json record.json report.json reward.json run_config.json spec.json transcript.json runner-error.json launcher.log
+    def trial_file(self, trial_id, name: TrialFile) -> Path           # request.json launch.json status.json record.json report.json reward.json run_config.json spec.json transcript.json runner-error.json launcher.log costs.json audit.json
     def trial_task_dir(self, trial_id) -> Path                        # root/trials/<tid>/task   (holds the session token: never listed by the console)
     # exports
     def export_path(self, trial_id) -> Path                           # root/exports/<tid>.episode.json
@@ -286,6 +286,21 @@ stored as one secret so the code never assembles credentials). Worker entrypoint
 Console entrypoint: `uvicorn swesim.dashboard.app:app --host 0.0.0.0 --port 8080`. Trial Job command:
 `python -m swesim.workflows.activities run-trial /workspace/trials/<tid>/request.json`. Bucket mounted read-write on
 pools and Jobs, read-only on the console.
+
+## 9.1 Record files added tonight (who writes, who reads)
+
+- `scenarios/<sid>/difficulty.json` — written by `difficulty_label_activity` (launcher+temporal, `swesim/stages/difficulty.py`) after a
+  `purpose="screen"` run: `{tier, model, hidden: {n, successes}, full: {n, successes}, labelled_at, trial_ids}`; projected to `ScenarioRow.difficulty_tier/difficulty_screen`.
+- `scenarios/<sid>/audit.json` and `trials/<tid>/audit.json` — written by the task-sense stream's activities (`swesim/audit/activities.py`,
+  CONTROL queue): scenario labels `{coherent, fair_tests, plausible_withholding, reasons: {...}, model, audited_at, rubric_version}`; trial labels
+  `{questions: [{seq, specific, decision_oriented, before_implementation, redundant, fishing, reason}], replies: [{seq, targeted, volunteered,
+  test_or_identifier_disclosed, behaviour_level, reason}], asked_before_implementing: bool, useful_question_rate, model, audited_at, rubric_version}`;
+  projected to `ScenarioRow.task_sense`, `ExchangeRow.audit`, `TrialRow.asked_before_implementing`.
+- `trials/<tid>/costs.json` — list of `CostRecord` (models stream, `swesim/costs.py`); projected to `costs` and `TrialRow.cost_usd/input_tokens/output_tokens`.
+- Worker registration: `worker.py` registers `swesim.workflows.activities.ALL + swesim.index.activities.ALL + swesim.audit.activities.ALL`,
+  each imported inside a `try/except ImportError` so the worker starts while a stream's module is not merged yet.
+- Leaderboard gate (storage implements in `leaderboard()`, console shows): a scenario appears only when `validation_status == "valid"`,
+  `difficulty_tier in ("informative",)` (saturated shown separately, broken never), and `task_sense.coherent and task_sense.fair_tests`.
 
 ## 10. Ownership (disjoint; ask the integrator for anything else)
 
