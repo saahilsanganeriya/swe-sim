@@ -248,6 +248,56 @@ async def list_candidates_activity(p: dict) -> dict:
     return {"candidates": out}
 
 
+ARCHIVE_FILES = ("scenario.draft.json", "scenario.json", "compile.json", "validation.json", "approval.json", "judge.json", "draft.meta.json")
+
+
+def scenario_version(sid: str) -> dict:
+    """Highest known version of a scenario: max(scenario.json version, registry version). `next` is version + 1, or 1 when
+    neither scenario.json nor a registry entry exists."""
+    sdir = WS.scenario_dir(sid); versions: list[int] = []
+    spec_file = sdir / "scenario.json"
+    if spec_file.exists():
+        versions.append(int((_read_json(spec_file) or {}).get("version") or 1))
+    scenarios = (_read_json(WS.registry_path) or {}).get("scenarios") or {}
+    for key, entry in scenarios.items():
+        entry = entry if isinstance(entry, dict) else {}
+        if key == sid or str(key).startswith(sid + "@") or entry.get("id") == sid:
+            versions.append(int(entry.get("version") or 1))
+    version = max(versions) if versions else None
+    return {"scenario_id": sid, "exists": version is not None, "version": version, "next": (version or 0) + 1}
+
+
+def archive_scenario(sid: str, previous_version: int) -> dict:
+    """Rebuild: move the previous version's files into workspace/scenarios/<sid>/archive/v<previous>/ (the ARCHIVE_FILES plus
+    any scenario.draft.rejected-*.json). Kept in place: assets/ (the drafter rewrites it), scores.json (recomputed from trial
+    records, which carry their own spec_hash) and workspace/tasks/<sid>__<condition> (compile_scenario rmtree's each task dir
+    before rendering). Idempotent: an archived.json marker makes a rerun a no-op, so a half-built newer version is never
+    archived as the old one."""
+    sdir = WS.scenario_dir(sid); target = sdir / "archive" / f"v{int(previous_version)}"; marker = target / "archived.json"
+    if marker.exists():
+        return {**_read_json(marker), "already_archived": True}
+    target.mkdir(parents=True, exist_ok=True); moved: list[str] = []
+    names = list(ARCHIVE_FILES) + sorted(q.name for q in sdir.glob("scenario.draft.rejected-*.json"))
+    for name in names:
+        src = sdir / name
+        if src.is_file():
+            os.replace(src, target / name); moved.append(name)
+    record = {"scenario_id": sid, "previous_version": int(previous_version), "archive_dir": str(target), "archived": moved, "at": time.time(),
+              "kept": ["assets/", "scores.json", "workspace/tasks/<sid>__<condition> (compile rewrites them)"]}
+    atomic_json(marker, record)
+    return record
+
+
+@activity.defn
+async def scenario_version_activity(p: dict) -> dict:
+    return scenario_version(p["scenario_id"])
+
+
+@activity.defn
+async def archive_scenario_activity(p: dict) -> dict:
+    return await blocking(lambda: archive_scenario(p["scenario_id"], int(p["previous_version"])))
+
+
 @activity.defn
 async def judge_one_activity(p: dict) -> dict:
     """Judge one candidate row into its own one-row `<candidates_dir>/judged/<scenario_id>.judged.jsonl`
@@ -412,9 +462,14 @@ async def draft_activity(p: dict) -> dict:
             n += 1
         path.rename(sdir / f"scenario.draft.rejected-{n}.json")  # keep the rejected draft as evidence
     if not path.exists():
-        kwargs = _accepted_kwargs(draft, {"reject_reasons": p["reject_reasons"]}) if p.get("reject_reasons") else {}
+        wanted: dict = {}
+        if p.get("reject_reasons"):
+            wanted["reject_reasons"] = p["reject_reasons"]
+        if p.get("version"):
+            wanted["version"] = int(p["version"])  # rebuilds draft the next version; draft writes spec["version"] and draft.meta.json["version"]
+        kwargs = _accepted_kwargs(draft, wanted)
         await blocking(lambda: draft(row, row.get("judge", {}), p["draft_model"], sdir, **kwargs))
-    return {"scenario_id": sid, "draft_path": str(path)}
+    return {"scenario_id": sid, "draft_path": str(path), "version": int(p.get("version") or 1)}
 
 
 @activity.defn
@@ -758,7 +813,8 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-ALL = [probe_models_activity, mine_activity, judge_activity, list_candidates_activity, judge_one_activity, probe_candidate_activity, draft_activity,
+ALL = [probe_models_activity, mine_activity, judge_activity, list_candidates_activity, judge_one_activity, probe_candidate_activity,
+       scenario_version_activity, archive_scenario_activity, draft_activity,
        auto_approve_activity, precheck_draft_activity, human_approve_activity, verify_approval_activity, compile_activity,
        validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity, score_activity,
        export_activity]

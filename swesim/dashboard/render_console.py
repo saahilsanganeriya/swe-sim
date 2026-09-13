@@ -65,6 +65,11 @@ def create_page(d: dict) -> str:
              "you review in the morning. Hold: each draft waits in the <a href='/review'>review queue</a> until you approve or reject it.</p>"),
             (f"<label for='max_parallel'>max parallel candidates<input id='max_parallel' name='max_parallel' type='number' min='1' max='{console.MAX_PARALLEL}' value='{h(d['max_parallel'])}'></label>"
              "<p class='muted small'>Honored by CreateTasksWorkflow; the legacy one-pipeline-per-repository fallback ignores it.</p>"),
+            "<label class='inline'><input type='checkbox' id='rebuild' name='rebuild' value='1'> Rebuild existing scenarios as a new version</label>",
+            ("<p class='muted small'>Scenarios that already exist (a <code>scenario.json</code> or a registry entry) are re-created as version n+1: the previous "
+             "version's spec, compile, validation, approval, judge and draft-meta files move to <code>archive/v&lt;n&gt;/</code>, then draft, approve, "
+             "compile, validate and register run again. Judged rows and probe results are kept. Candidate ids become "
+             "<code>create:&lt;id&gt;@v&lt;n+1&gt;</code>; scenarios that do not exist yet are created as usual.</p>"),
             "</fieldset><div><button type='submit' class='primary'>Start creation job</button> <span class='muted small' id='form-status'></span></div></form>"]
     return layout("swesim · create", "".join(body), "create", "console")
 

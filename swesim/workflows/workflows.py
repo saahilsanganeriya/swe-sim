@@ -314,6 +314,12 @@ class CandidateWorkflow:
             if not probed.get("fail_to_pass"):
                 return self._done(sid, "not-reproducible-offline", [probed.get("reason") or "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold"], None)
             judged = {**judged, "judged_path": probed["judged_path"]}  # the probed row (measured lists) is what draft reads
+            if p.get("rebuild") and p.get("previous_version"):
+                # Rebuild as version p["version"]: the previous version's spec/compile/validation/approval/judge/draft-meta files
+                # move to archive/v<previous>/ so draft (with version=next), approve, compile, validate and register run afresh.
+                # Judged rows and probe outputs are retained. (The force/reject_reasons re-draft path is unchanged.)
+                await self._stage("archiving", scenario_id=sid)
+                await act("archive_scenario_activity", {"scenario_id": sid, "previous_version": p["previous_version"]}, 5)
             if p.get("approval_mode", "auto") == "hold":
                 sid, approved, terminal = await self._hold_for_reviewer(p, judged, iid)
                 if approved is None:
@@ -352,6 +358,11 @@ def _normalize_repo(repo: str) -> str:
     return r.rstrip("/")
 
 
+def candidate_child_id(sid: str, version=None) -> str:
+    """`create:<sid>` for a first build; `create:<sid>@v<n>` when an existing scenario is rebuilt as version n (n >= 2)."""
+    return f"create:{sid}" if not version or int(version) <= 1 else f"create:{sid}@v{int(version)}"
+
+
 def _source_key(src: dict) -> str:
     kind = src.get("kind", "swebench-annotated")
     if kind == "github-repo":
@@ -385,7 +396,7 @@ class CreateTasksWorkflow:
 
     @workflow.query
     def progress(self) -> dict:
-        return {"stage": self.state["stage"], "counts": self.counts, "sources": self.state.get("sources", {}),
+        return {"stage": self.state["stage"], "counts": self.counts, "sources": self.state.get("sources", {}), "rebuild": self.state.get("rebuild", False),
                 "probe": self.state.get("probe", {}), "candidates": self.candidates,
                 "awaiting_approval": [{"scenario_id": sid, "spec_hash": c.get("spec_hash"), "candidate_workflow_id": c.get("candidate_workflow_id")}
                                       for sid, c in self.candidates.items() if c.get("status") == "awaiting-approval"]}
@@ -405,7 +416,8 @@ class CreateTasksWorkflow:
         if not keys:
             raise ApplicationError("sources is empty", non_retryable=True)
         sem = asyncio.Semaphore(max(1, int(p.get("max_parallel", 8))))
-        self.state = {"stage": "probing-models", "sources": {}, "probe": {}}
+        rebuild = bool(p.get("rebuild"))
+        self.state = {"stage": "probing-models", "sources": {}, "probe": {}, "rebuild": rebuild}
         probe = await act("probe_models_activity", p, 5)
         p = {**p, **(probe.get("substitutions") or {}), **(probe.get("resolved") or {})}
         self.state["probe"] = {"resolved": probe.get("resolved") or {}, "substitutions": probe.get("substitutions") or {},
@@ -418,9 +430,24 @@ class CreateTasksWorkflow:
                 self.candidates[sid].update(status="running", stage="starting")
                 child = {"candidates_path": cand["candidates_path"], "instance_id": cand["instance_id"], "judge_model": p.get("judge_model"),
                          "draft_model": p.get("draft_model"), "stakeholder_model": p.get("stakeholder_model"), "stakeholder_url": p.get("stakeholder_url"),
-                         "approval_mode": mode, "redraft_on_leak": p.get("redraft_on_leak", True)}
+                         "approval_mode": mode, "redraft_on_leak": p.get("redraft_on_leak", True), "version": 1}
+                child_id = candidate_child_id(sid)
+                if rebuild:
+                    # Rebuild: an existing scenario (scenario.json or registry entry) is re-created as version n+1 under a new
+                    # child id; nothing existing behaves like a first build (version 1, plain id).
+                    try:
+                        ver = await act("scenario_version_activity", {"scenario_id": sid}, 5)
+                    except Exception as e:  # noqa: BLE001 - one unreadable scenario never stops its siblings
+                        r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "error", "reasons": [_err(e)], "spec_hash": None}
+                        self.candidates[sid].update(status="error", stage="done", reasons=r["reasons"]); self.counts["error"] = self.counts.get("error", 0) + 1
+                        results[sid] = r
+                        return
+                    if ver.get("exists"):
+                        child.update(rebuild=True, version=ver["next"], previous_version=ver["version"])
+                        child_id = candidate_child_id(sid, ver["next"])
+                        self.candidates[sid].update(version=ver["next"], previous_version=ver["version"], candidate_workflow_id=child_id)
                 try:
-                    r = await workflow.execute_child_workflow(CandidateWorkflow.run, child, id=f"create:{sid}", id_reuse_policy=DUP_FAILED_ONLY)
+                    r = await workflow.execute_child_workflow(CandidateWorkflow.run, child, id=child_id, id_reuse_policy=DUP_FAILED_ONLY)
                 except WorkflowAlreadyStartedError:
                     r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "duplicate-rejected", "spec_hash": None,
                          "reasons": ["a CandidateWorkflow with this id already completed; read its result instead"]}

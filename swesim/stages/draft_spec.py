@@ -1132,7 +1132,7 @@ def _normalize_groups(groups: list[dict]) -> list[dict]:
     return groups
 
 
-def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_version: str = "0.1.0", require_probe: bool = True) -> Path:
+def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_version: str = "0.1.0", require_probe: bool = True, version: int = 1) -> Path:
     if judged.get("model_id") and judged["model_id"] == model_id:
         raise ValueError(f"judge and draft models must differ so their errors are not correlated (both {model_id})")
     probe = row.get("probe") or {}
@@ -1277,7 +1277,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
             briefs.append({"profile": "withheld", "text": withheld_parts["result"]["withheld_brief"], "provenance": "withheld"})
             ledger += withheld_parts["facts"]
             operations += withheld_parts["operations"]
-        spec = {"id": row["instance_id"].lower().replace("__", "--"), "version": 1, "source": row.get("source", "swebench-annotated"),
+        spec = {"id": row["instance_id"].lower().replace("__", "--"), "version": int(version), "source": row.get("source", "swebench-annotated"),
                 "source_ref": row["instance_id"], "created_at": created_at, "pipeline_version": pipeline_version,
                 "environment": environment, "assets": manifest, "briefs": briefs, "ledger": ledger, "operations": operations,
                 "persona": d.get("persona") or {}, "requirements": d.get("requirements") or [],
@@ -1339,7 +1339,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     atomic_json(out_dir / "judge.json", {"gaps": judged.get("gaps", []), "verified_rubric_score": judged.get("verified_rubric_score"),
                                          "keep": judged.get("keep"), **judged})
     atomic_json(out_dir / "draft.meta.json", {"model_id": model_id, "prompt_version": DRAFT_PROMPT_VERSION, "pipeline_version": pipeline_version,
-                                              "created_at": spec["created_at"], "spec_hash": parsed.spec_hash,
+                                              "version": int(version), "created_at": spec["created_at"], "spec_hash": parsed.spec_hash,
                                               "auto_linked": links["auto_linked"], "auto_linked_single_target": links["auto_linked_single_target"],
                                               "fact_filter": fact_filter, "rescue_facts": links.get("rescue_facts", []),
                                               "protected_paths_dropped": protected_dropped,

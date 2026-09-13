@@ -29,6 +29,18 @@ approve; `approval_mode=hold` pre-checks the draft (schema, assets, withholding 
 decision is refused and the candidate keeps waiting. The parent's `progress` query lists every candidate's stage (status
 follows the child's latest stage: `awaiting-approval` only while it waits) and an `awaiting_approval` review queue.
 
+Rebuilding registered scenarios as a new version (`swesim create --source ... --rebuild`, or the "Rebuild existing scenarios
+as a new version" checkbox on `/create`): `CreateTasksWorkflow` asks `scenario_version_activity` per candidate; when a
+`scenario.json` or a registry entry exists (version n), the child starts as `create:<sid>@v<n+1>` (still
+`ALLOW_DUPLICATE_FAILED_ONLY`) with `version: n+1, rebuild: true, previous_version: n`; a scenario that does not exist yet is
+created as usual (version 1, plain id). The candidate keeps the judged row and the probe result, then
+`archive_scenario_activity` moves `scenario.draft.json, scenario.json, compile.json, validation.json, approval.json,
+judge.json, draft.meta.json` and any `scenario.draft.rejected-*.json` into `workspace/scenarios/<sid>/archive/v<n>/`
+(`assets/` is rewritten by the drafter, `scores.json` is recomputed from trial records, and `compile_scenario` rewrites the
+`workspace/tasks/<sid>__<condition>` dirs itself), drafts version n+1, and runs approve, compile, validate and register as
+usual; `register_scenario` replaces the registry entry with the higher version. Old trial records keep their own `spec_hash`
+and stay attributable to the archived version. `/jobs` and `progress` show the `@v<n+1>` candidate ids as-is.
+
 Candidate ids and reruns: a candidate that reached a terminal outcome (`valid`, `invalid`, `rejected`, `rejected-by-human`,
 `not-reproducible-offline`, `approval-timeout`) completes its `create:<scenario_id>` workflow, so a later
 `CreateTasksWorkflow` on the same source records it as `duplicate-rejected` and nothing is redone. An infrastructure failure

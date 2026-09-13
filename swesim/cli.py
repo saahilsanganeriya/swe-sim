@@ -426,6 +426,8 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
            judge_model: str = typer.Option(JUDGE_MODEL_DEFAULT), draft_model: str = typer.Option(DRAFT_MODEL_DEFAULT),
            since: str = typer.Option("2026-06-01"), max_candidates: int = typer.Option(20), max_parallel: int = typer.Option(8),
            approval_mode: str = typer.Option("auto", help="auto | hold (review queue; approve with `swesim workflows approve`)"),
+           rebuild: bool = typer.Option(False, "--rebuild", help="Re-create scenarios that already exist as a new version: archive the previous "
+                                        "version's files under archive/v<n>/, then re-draft, compile, validate and register (judge rows and probes are kept)"),
            stakeholder_url: str = typer.Option("", envvar="SWESIM_STAKEHOLDER_URL")) -> None:
     """Create tasks from many repos/pools: one CreateTasksWorkflow, one CandidateWorkflow per candidate."""
     import asyncio
@@ -437,8 +439,11 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
             sources.append({"kind": "swebench-annotated", "pool": pool or "A", "limit": max_candidates, **({"instance_ids": ids[0].split(",")} if ids else {})})
         else:
             sources.append({"kind": "github-repo", "repo": s, "since": since, "max_candidates": max_candidates})
-    typer.echo(asyncio.run(start_create({"sources": sources, "judge_model": judge_model, "draft_model": draft_model, "max_parallel": max_parallel,
-                                         "approval_mode": approval_mode, "stakeholder_url": _stakeholder_url(stakeholder_url)})))
+    params = {"sources": sources, "judge_model": judge_model, "draft_model": draft_model, "max_parallel": max_parallel,
+              "approval_mode": approval_mode, "stakeholder_url": _stakeholder_url(stakeholder_url)}
+    if rebuild:
+        params["rebuild"] = True
+    typer.echo(asyncio.run(start_create(params)))
 
 @app.command("run-tasks")
 def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenario ids"), models: str = typer.Option(SOLVER_MODEL_DEFAULT),

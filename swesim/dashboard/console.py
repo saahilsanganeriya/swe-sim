@@ -27,7 +27,7 @@ GITHUB_REPO_RE = re.compile(r"^(?:https://github\.com/)?([A-Za-z0-9_.-]+)/([A-Za
 MODEL_RE = re.compile(r"^[a-z0-9-]+/[A-Za-z0-9._:-]+$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+$")
-WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")  # `@` for rebuilt candidates: create:<sid>@v<n>
 CONDITIONS = ("full", "hidden", "interactive")
 PURPOSES = ("calibration", "comparison", "demonstration")
 PROFILES = ("withheld", "natural")
@@ -149,8 +149,18 @@ def validate_create(body: dict) -> tuple[dict, list[str]]:
         "judge_model": judge, "draft_model": draft, "model": d["solver_model"],
         "approval_mode": approval_mode, "max_parallel": _int(body.get("max_parallel"), "max parallel", 1, MAX_PARALLEL, errors, d["max_parallel"]),
         "conditions": ["interactive"], "k": 1,
+        "rebuild": _flag(body.get("rebuild")),
     }
     return params, errors
+
+
+def _flag(value) -> bool:
+    """Checkbox semantics: the console JS posts checked boxes as a list of values and unchecked ones as an empty list."""
+    if isinstance(value, (list, tuple)):
+        return any(_flag(v) for v in value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "on", "yes")
+    return bool(value)
 
 
 def create_sources(p: dict) -> list[dict]:
@@ -220,7 +230,7 @@ def _q(value) -> str:
 
 def cli_for_create(p: dict) -> str:
     base = (f"--judge-model {_q(p['judge_model'])} --draft-model {_q(p['draft_model'])} --approval-mode {_q(p['approval_mode'])} "
-            f"--max-parallel {_q(p['max_parallel'])}")
+            f"--max-parallel {_q(p['max_parallel'])}" + (" --rebuild" if p.get("rebuild") else ""))
     if p["source"] == "github-repo":
         srcs = "".join(f" --source {_q(r)}" for r in p["repos"]) or " --source <repo-url>"
         return f"uv run swesim create{srcs} --since {_q(p['since'])} --max-candidates {_q(p['max_candidates_per_repo'])} {base}"
@@ -269,6 +279,8 @@ async def start_create(params: dict) -> dict:
         if fn is not None:
             wf_params = {"sources": create_sources(params), "judge_model": params["judge_model"], "draft_model": params["draft_model"],
                          "max_parallel": params["max_parallel"], "approval_mode": params["approval_mode"], "stakeholder_url": url}
+            if params.get("rebuild"):
+                wf_params["rebuild"] = True  # existing scenarios are re-created as version n+1 (create:<sid>@v<n+1>)
             return {"workflow_ids": _ids(await call(fn, wf_params)), "via": "start_create (CreateTasksWorkflow)"}
         legacy = client_fn("start_pipeline")
         if legacy is None:

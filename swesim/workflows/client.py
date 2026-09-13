@@ -69,10 +69,20 @@ async def approve_candidate(workflow_id: str, scenario_id: str, spec_hash: str, 
     CreateTasksWorkflow id; the signal always goes to the candidate, whose id is derived from the scenario id."""
     if decision not in ("approve", "reject"):
         raise ValueError("decision must be approve or reject")
-    target = workflow_id if workflow_id.startswith("create:") else candidate_workflow_id(scenario_id)
     c = await connect()
+    target = workflow_id if workflow_id.startswith("create:") else await _candidate_id_from_parent(c, workflow_id, scenario_id)
     await c.get_workflow_handle(target).signal(CandidateWorkflow.approve, {"scenario_id": scenario_id, "spec_hash": spec_hash, "decision": decision, "note": note})
     return target
+
+
+async def _candidate_id_from_parent(c: Client, parent_id: str, scenario_id: str) -> str:
+    """The parent's progress knows the child's actual id (a rebuild runs as create:<sid>@v<n>); fall back to create:<sid>."""
+    try:
+        prog = await c.get_workflow_handle(parent_id).query("progress")
+        cid = ((prog or {}).get("candidates") or {}).get(scenario_id, {}).get("candidate_workflow_id")
+    except Exception:  # noqa: BLE001 - an unreachable or non-create parent falls back to the plain id
+        cid = None
+    return cid or candidate_workflow_id(scenario_id)
 
 
 async def progress(workflow_id: str) -> dict:

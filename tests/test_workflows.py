@@ -858,9 +858,51 @@ def test_client_ids_and_signal_payload(monkeypatch):
     assert fc.wids[-2:] == ["create:a--1", "create:a--1"]
     assert fc.handle.signals[-2:] == [(W.CandidateWorkflow.approve, {"scenario_id": "a--1", "spec_hash": "h", "decision": "approve", "note": "looks right"}),
                                       (W.CandidateWorkflow.approve, {"scenario_id": "a--1", "spec_hash": "h", "decision": "reject", "note": "no"})]
+    # a rebuilt candidate runs as create:<sid>@v<n>: given the parent id, the client reads the child's id from the parent's progress
+    async def query_with_candidates(name): fc.handle.queries.append(name); return {"stage": "creating", "candidates": {"a--1": {"candidate_workflow_id": "create:a--1@v2"}}}
+    fc.handle.query = query_with_candidates
+    assert asyncio.run(C.approve_candidate(cid, "a--1", "h2", "approve", "v2 reviewed")) == "create:a--1@v2" and fc.wids[-1] == "create:a--1@v2"
+    assert asyncio.run(C.approve_candidate("create:a--1@v2", "a--1", "h2", "reject", "no")) == "create:a--1@v2"
     with pytest.raises(ValueError): asyncio.run(C.approve_candidate(cid, "a--1", "h", "maybe"))
-    assert asyncio.run(C.progress(cid)) == {"stage": "x"} and fc.handle.queries == ["progress"]
+    assert asyncio.run(C.progress(cid))["stage"] == "creating" and fc.handle.queries[-1] == "progress"
     asyncio.run(C.cancel(cid)); assert fc.handle.cancelled == 1
+
+
+def test_create_cli_rebuild_flag_sets_the_param(monkeypatch):
+    from typer.testing import CliRunner
+    from swesim import cli as CLI
+    from swesim.workflows import client as C
+    captured = []
+    async def start_create(params): captured.append(params); return "create-fake"
+    monkeypatch.setattr(C, "start_create", start_create)
+    runner = CliRunner()
+    r = runner.invoke(CLI.app, ["create", "--source", "https://github.com/x/y", "--rebuild", "--stakeholder-url", "https://s"])
+    assert r.exit_code == 0, r.output
+    assert "create-fake" in r.output and captured[-1]["rebuild"] is True and captured[-1]["sources"][0]["repo"] == "https://github.com/x/y"
+    r2 = runner.invoke(CLI.app, ["create", "--source", "swebench:A:psf__requests-1944", "--stakeholder-url", "https://s"])
+    assert r2.exit_code == 0, r2.output
+    assert "rebuild" not in captured[-1] and captured[-1]["sources"][0]["instance_ids"] == ["psf__requests-1944"]   # default: today's behavior
+
+
+def test_console_create_form_rebuild_checkbox_maps_to_the_param(monkeypatch):
+    from swesim.dashboard import console, render_console
+    body = {"source": "swebench-annotated", "instance_ids": "psf__requests-1944", "judge_model": "openai/gpt-5.5", "draft_model": "anthropic/claude-sonnet-5",
+            "approval_mode": "auto", "max_parallel": "2", "limit": "5"}
+    params, errors = console.validate_create({**body, "rebuild": ["1"]})          # the console JS posts a checked box as ["1"]
+    assert errors == [] and params["rebuild"] is True and console.cli_for_create(params).endswith("--rebuild")
+    plain, errors = console.validate_create({**body, "rebuild": []})              # unchecked: []
+    assert errors == [] and plain["rebuild"] is False and "--rebuild" not in console.cli_for_create(plain)
+    assert console.validate_create({**body, "rebuild": "true"})[0]["rebuild"] is True and console.validate_create(body)[0]["rebuild"] is False
+    calls = []
+    async def start_create(wf_params): calls.append(wf_params); return "create-fake"
+    monkeypatch.setattr(console, "client_fn", lambda name: start_create if name == "start_create" else None)
+    monkeypatch.setattr(console, "stakeholder_url", lambda: "https://s")
+    out = asyncio.run(console.start_create(params))
+    assert out["workflow_ids"] == ["create-fake"] and calls[-1]["rebuild"] is True and calls[-1]["sources"][0]["kind"] == "swebench-annotated"
+    asyncio.run(console.start_create(plain))
+    assert "rebuild" not in calls[-1]
+    page = render_console.create_page(console.defaults())
+    assert "name='rebuild'" in page and "Rebuild existing scenarios as a new version" in page and "type='checkbox'" in page
 
 
 def test_client_list_runs_filters_by_type_and_summarizes(monkeypatch):
@@ -914,6 +956,67 @@ def test_list_candidates_and_judge_one_per_candidate_files(ws, monkeypatch):
     monkeypatch.setitem(sys.modules, "swesim.stages.draft_spec", fake_module("swesim.stages.draft_spec", draft=draft))
     d = asyncio.run(A.draft_activity({"judged_path": j["judged_path"], "instance_id": "a__1", "draft_model": "dm"}))
     assert d["scenario_id"] == "a--1" and drafted == ["a__1"]
+
+
+def test_scenario_version_helper(ws):
+    sid = "example-scenario"
+    assert A.scenario_version(sid) == {"scenario_id": sid, "exists": False, "version": None, "next": 1}
+    sdir = ws.scenario_dir(sid); sdir.mkdir(parents=True)
+    atomic_json(sdir / "scenario.json", {**minimal_spec_dict(), "version": 1})
+    assert A.scenario_version(sid) == {"scenario_id": sid, "exists": True, "version": 1, "next": 2}
+    atomic_json(ws.registry_path, {"scenarios": {sid: {"id": sid, "version": 3, "spec_hash": "x"}}})     # registry ahead of the file: max wins
+    assert A.scenario_version(sid) == {"scenario_id": sid, "exists": True, "version": 3, "next": 4}
+    (sdir / "scenario.json").unlink()
+    assert A.scenario_version(sid)["exists"] is True and A.scenario_version(sid)["next"] == 4          # registry alone counts as existing
+    atomic_json(ws.registry_path, {"scenarios": {"other": {"id": "other", "version": 9}}})
+    assert A.scenario_version(sid) == {"scenario_id": sid, "exists": False, "version": None, "next": 1}
+    assert asyncio.run(A.scenario_version_activity({"scenario_id": sid}))["next"] == 1
+
+
+def test_archive_scenario_moves_exactly_the_listed_files_and_is_idempotent(ws):
+    sid = "example-scenario"; sdir = ws.scenario_dir(sid); (sdir / "assets").mkdir(parents=True)
+    for name in A.ARCHIVE_FILES + ("scenario.draft.rejected-1.json", "scenario.draft.rejected-2.json", "scores.json", "approval.note.json"):
+        (sdir / name).write_text(json.dumps({"name": name, "version": 1}))
+    (sdir / "assets" / "oracle.diff").write_text("diff"); (sdir / "assets" / "test.patch").write_text("patch")
+    r = asyncio.run(A.archive_scenario_activity({"scenario_id": sid, "previous_version": 1}))
+    archive = sdir / "archive" / "v1"
+    assert r["archive_dir"] == str(archive) and r["previous_version"] == 1 and "already_archived" not in r
+    assert sorted(r["archived"]) == sorted(list(A.ARCHIVE_FILES) + ["scenario.draft.rejected-1.json", "scenario.draft.rejected-2.json"])
+    for name in r["archived"]:
+        assert (archive / name).is_file() and not (sdir / name).exists()
+    assert (sdir / "assets" / "oracle.diff").read_text() == "diff" and (sdir / "scores.json").exists() and (sdir / "approval.note.json").exists()   # kept in place
+    assert json.loads((archive / "archived.json").read_text())["archived"] == r["archived"]
+    # a rerun after a partial rebuild must not archive the half-built newer version as the old one
+    atomic_json(sdir / "scenario.draft.json", {"version": 2})
+    again = A.archive_scenario(sid, 1)
+    assert again["already_archived"] is True and (sdir / "scenario.draft.json").exists() and json.loads((archive / "scenario.draft.json").read_text())["version"] == 1
+    # nothing to archive is fine (a registry-only scenario): empty list, marker written
+    r2 = A.archive_scenario("other-one", 2)
+    assert r2["archived"] == [] and (ws.scenario_dir("other-one") / "archive" / "v2" / "archived.json").exists()
+
+
+def test_draft_activity_passes_version_and_draft_accepts_it(ws, monkeypatch):
+    import inspect
+    from swesim.stages import draft_spec
+    assert inspect.signature(draft_spec.draft).parameters["version"].default == 1                     # the one drafter kwarg this task adds
+    drafted = []
+    def draft(row, judged, model_id, out_dir, pipeline_version="0.1.0", require_probe=True, version=1):
+        drafted.append(version); out_dir.mkdir(parents=True, exist_ok=True); (out_dir / "scenario.draft.json").write_text(json.dumps({"version": version})); return out_dir / "scenario.draft.json"
+    monkeypatch.setitem(sys.modules, "swesim.stages.draft_spec", fake_module("swesim.stages.draft_spec", draft=draft))
+    judged = ws.candidates_dir / "judged" / "a--1.judged.jsonl"; judged.parent.mkdir(parents=True)
+    judged.write_text(json.dumps({"instance_id": "a__1", "judge": {"keep": True}}) + "\n")
+    r = asyncio.run(A.draft_activity({"judged_path": str(judged), "instance_id": "a__1", "draft_model": "d", "version": 2}))
+    assert drafted == [2] and r["version"] == 2 and json.loads(Path(r["draft_path"]).read_text())["version"] == 2
+    (ws.scenario_dir("a--1") / "scenario.draft.json").unlink()
+    r1 = asyncio.run(A.draft_activity({"judged_path": str(judged), "instance_id": "a__1", "draft_model": "d"}))
+    assert drafted == [2, 1] and r1["version"] == 1
+
+
+def test_candidate_child_id_formation():
+    assert W.candidate_child_id("a--1") == "create:a--1" == W.candidate_child_id("a--1", None) == W.candidate_child_id("a--1", 1)
+    assert W.candidate_child_id("a--1", 2) == "create:a--1@v2" and W.candidate_child_id("a--1", 10) == "create:a--1@v10"
+    from swesim.dashboard import console
+    assert console.WORKFLOW_ID_RE.fullmatch("create:a--1@v2") and console.WORKFLOW_ID_RE.fullmatch("create-abc123")   # the console's /jobs route accepts both
 
 
 def test_precheck_and_human_approve_activities(ws, monkeypatch):
@@ -1016,6 +1119,48 @@ def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress()
             r2 = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-test-2", task_queue="swesim")
             assert r2["counts"]["duplicate-rejected"] == 5 and r2["counts"]["error"] == 1 and r2["counts"]["valid"] == 0 and r2["status"] == "complete-with-failures"
             assert r2["candidates"]["a--3"]["status"] == "error" and judge_calls.count("a__3") == 2 and len(judge_calls) == 7
+    _run_in_env(scenario)
+
+
+def test_env_create_tasks_rebuild_uses_versioned_child_ids_and_archives_only_existing_scenarios():
+    from temporalio import activity
+    from temporalio.worker import Worker
+    conc = {"cur": 0, "max": 0}; judge_calls = []; seen_ids = {}; archived = []; draft_versions = {}; existing = {}
+    lists = {"/c/R.jsonl": ["r__1", "r__2"]}
+    @activity.defn(name="scenario_version_activity")
+    async def version(p):
+        v = existing.get(p["scenario_id"]); return {"scenario_id": p["scenario_id"], "exists": v is not None, "version": v, "next": (v or 0) + 1}
+    @activity.defn(name="archive_scenario_activity")
+    async def archive(p): archived.append((p["scenario_id"], p["previous_version"], activity.info().workflow_id)); return {"archived": ["scenario.json"]}
+    base = _create_fakes(conc, judge_calls, validate_invalid=(), judge_error=(), judge_drop=(), lists=lists, not_reproducible=())
+    @activity.defn(name="judge_one_activity")
+    async def judge(p):
+        judge_calls.append(p["instance_id"]); seen_ids.setdefault(p["instance_id"], []).append(activity.info().workflow_id)
+        return {"judged_path": "j", "instance_id": p["instance_id"], "scenario_id": p["instance_id"].replace("__", "--"), "keep": True, "reasons": []}
+    @activity.defn(name="draft_activity")
+    async def draft(p): draft_versions[p["instance_id"]] = p.get("version"); return {"scenario_id": p["instance_id"].replace("__", "--"), "draft_path": "d", "version": p.get("version") or 1}
+    acts = [a for a in base if a.__name__ not in ("judge", "draft")] + [version, archive, judge, draft]
+    params = {"sources": [{"kind": "swebench-annotated", "pool": "R"}], "judge_model": "j", "draft_model": "d", "stakeholder_url": "https://s"}
+    async def scenario(env):
+        async with Worker(env.client, task_queue="swesim", workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow], activities=acts):
+            first = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-first", task_queue="swesim")
+            assert first["counts"]["valid"] == 2 and seen_ids == {"r__1": ["create:r--1"], "r__2": ["create:r--2"]} and archived == [] and draft_versions == {"r__1": 1, "r__2": 1}
+            # r--1 now exists as version 1 (scenario.json / registry); r--2 does not (say its registration was rolled back)
+            existing["r--1"] = 1
+            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, {**params, "rebuild": True}, id="create-rebuild", task_queue="swesim")
+            r = await h.result()
+            assert r["candidates"]["r--1"]["status"] == "valid" and r["candidates"]["r--2"]["status"] == "duplicate-rejected"   # unchanged id for a non-existing scenario
+            assert seen_ids["r__1"] == ["create:r--1", "create:r--1@v2"] and seen_ids["r__2"] == ["create:r--2"]
+            assert archived == [("r--1", 1, "create:r--1@v2")] and draft_versions["r__1"] == 2
+            prog = await h.query(W.CreateTasksWorkflow.progress)
+            assert prog["rebuild"] is True and prog["candidates"]["r--1"]["candidate_workflow_id"] == "create:r--1@v2"
+            assert prog["candidates"]["r--1"]["version"] == 2 and prog["candidates"]["r--1"]["previous_version"] == 1 and "archiving" in prog["candidates"]["r--1"]["stages"]
+            assert prog["candidates"]["r--2"]["candidate_workflow_id"] == "create:r--2" and "version" not in prog["candidates"]["r--2"]
+            child = await env.client.get_workflow_handle("create:r--1@v2").query(W.CandidateWorkflow.progress)
+            assert child["status"] == "valid"
+            # a non-rebuild run keeps today's behavior: ids unchanged, everything duplicate-rejected
+            plain = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-plain-again", task_queue="swesim")
+            assert plain["counts"]["duplicate-rejected"] == 2 and plain["candidates"]["r--1"]["status"] == "duplicate-rejected" and len(archived) == 1
     _run_in_env(scenario)
 
 
