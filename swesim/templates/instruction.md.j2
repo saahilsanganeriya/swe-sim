@@ -1,0 +1,17 @@
+{{ brief }}
+
+{% if condition == "full" %}
+## Requirements (complete)
+{% for f in visible_facts %}- {{ f.text }}
+{% endfor %}
+No stakeholder is available for questions.
+{% elif condition == "hidden" %}
+No stakeholder is available for questions.
+{% else %}
+## Working with the stakeholder
+A stakeholder who filed this request is available. They can answer a limited number of questions before they have to leave; investigate what you can from the repository first.
+- Ask a question: `ask-user "your question"`
+- Request a review of your current changes: `request-review`
+{% endif %}
+
+Repository: `{{ repo_dir }}`. Time budget: {{ solver_minutes }} minutes. Work in place; your changes are collected automatically when you finish.
