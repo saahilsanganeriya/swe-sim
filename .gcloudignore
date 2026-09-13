@@ -1,0 +1,25 @@
+# What `gcloud builds submit` uploads (scripts/cloud/build.sh submits a `git archive` of one commit, so this is a second
+# fence): the package, its lockfile, data/ and cloudbuild.yaml. Never the record, env files or git.
+workspace/
+.venv/
+.git/
+examples/
+docs/
+.superpowers/
+.claude/
+*.env
+.env
+.env.*
+!.env.example
+references/
+tests/
+infra/
+scripts/
+.github/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+registry.json
+registry.json.lock
+.stakeholder_url

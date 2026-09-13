@@ -1,0 +1,23 @@
+# Builds the worker image and pushes ${_REPO}/worker:${SHORT_SHA} and :latest.
+# Submitted by scripts/cloud/build.sh (locally or from .github/workflows/deploy.yml) with explicit substitutions and
+# `--service-account` = the deployer; there is no push trigger. The digest is resolved after the build by build.sh.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - --file=Dockerfile.worker
+      - --tag=${_REPO}/worker:${SHORT_SHA}
+      - --tag=${_REPO}/worker:latest
+      - --label=org.opencontainers.image.revision=${COMMIT_SHA}
+      - .
+images:
+  - ${_REPO}/worker:${SHORT_SHA}
+  - ${_REPO}/worker:latest
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  dynamicSubstitutions: true
+substitutions:
+  _REPO: us-central1-docker.pkg.dev/${PROJECT_ID}/swesim
+timeout: 1800s

@@ -1,0 +1,125 @@
+# Deploy one commit to the hosted stack (brief §2.6.1): WIF auth (no long-lived keys), Cloud Build of the worker image,
+# `terraform apply -var image=<digest>`, verify_cloud.sh, and a job summary with the digest, the plan line and the
+# verify output. A failed verify fails the job; Cloud Run keeps the previous revisions serving.
+#
+# Repository variables (set by `make cloud-bootstrap` docs, see infra/README.md): GCP_PROJECT, GCP_REGION,
+# WIF_PROVIDER (terraform output wif_provider), DEPLOYER_SA (terraform output deployer_service_account).
+name: deploy
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit to build and deploy (empty = the ref this run was started from)"
+        required: false
+        default: ""
+      override_open_executions:
+        description: "Deploy even though workflow types have open executions (recorded in the summary)"
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # build.sh archives an arbitrary commit
+      - name: Resolve commit
+        id: sha
+        run: |
+          sha=$(git rev-parse --verify "${{ inputs.sha != '' && inputs.sha || github.sha }}^{commit}")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "- commit: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.2"
+          terraform_wrapper: false
+      - name: Terraform init (state and non-secret tfvars from the state bucket)
+        run: |
+          gcloud storage cp "gs://$GCP_PROJECT-swesim-tfstate/env.auto.tfvars.json" infra/env.auto.tfvars.json
+          terraform -chdir=infra init -input=false \
+            -backend-config="bucket=$GCP_PROJECT-swesim-tfstate" -backend-config="prefix=terraform/state"
+      - name: Open-executions check
+        env:
+          OVERRIDE: ${{ inputs.override_open_executions }}
+        run: |
+          if ! uv run --frozen swesim workflows open-types --help >/dev/null 2>&1; then
+            echo "::warning::'swesim workflows open-types' is not available in this checkout; the open-executions check was skipped"
+            echo "- open-executions check: **skipped** (command missing)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          TEMPORAL_ADDRESS=$(terraform -chdir=infra output -raw temporal_address)
+          TEMPORAL_NAMESPACE=$(terraform -chdir=infra output -raw temporal_namespace)
+          TEMPORAL_API_KEY=$(gcloud secrets versions access latest --secret TEMPORAL_API_KEY --project "$GCP_PROJECT")
+          echo "::add-mask::$TEMPORAL_API_KEY"
+          export TEMPORAL_ADDRESS TEMPORAL_NAMESPACE TEMPORAL_API_KEY
+          uv run --frozen swesim workflows open-types | tee open-types.txt
+          { echo "### Open executions per workflow type"; echo '```'; cat open-types.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          # Any listed type (a non-empty, non-comment line) means open executions exist.
+          if grep -Eq '^[^#[:space:]]' open-types.txt; then
+            if [ "$OVERRIDE" = "true" ]; then
+              echo "- open executions present; **override recorded** by ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::workflow types have open executions; re-run with override_open_executions=true to deploy anyway"
+              exit 1
+            fi
+          else
+            echo "- open-executions check: none open" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Build image
+        id: build
+        run: |
+          digest=$(bash scripts/cloud/build.sh "$GCP_PROJECT" "$GCP_REGION" "${{ steps.sha.outputs.sha }}" | tail -n1)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "- image: \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Terraform plan
+        run: |
+          terraform -chdir=infra plan -input=false -no-color -var "image=${{ steps.build.outputs.digest }}" -out=plan.out | tee plan.txt
+          { echo "- plan: $(grep -E '^(Plan:|No changes)' plan.txt | head -n1)"; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Terraform apply
+        run: |
+          terraform -chdir=infra apply -input=false -no-color plan.out
+          terraform -chdir=infra output -json > infra/outputs.json
+      - name: Verify
+        run: |
+          set -o pipefail
+          EVIDENCE_DIR=evidence bash scripts/cloud/verify_cloud.sh | tee verify.txt
+          rc=${PIPESTATUS[0]}
+          { echo "### verify_cloud"; echo '```'; cat verify.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deploy-evidence
+          path: |
+            evidence/
+            plan.txt
+            verify.txt
+            open-types.txt
+          if-no-files-found: ignore
