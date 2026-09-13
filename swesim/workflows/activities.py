@@ -540,14 +540,21 @@ async def probe_candidate_activity(p: dict) -> dict:
     """Measure FAIL_TO_PASS / PASS_TO_PASS on base and gold for one judged row (Harbor on Modal; harbor_cli reuses a job dir
     with a terminal result and gives an abandoned one, left by a worker-pool roll, a bounded fresh attempt with recorded
     lineage; the 4th abandonment is a HarborRunError). The probed row replaces the row in the
-    per-candidate judged file, so draft_activity reads the measured lists. Retained: a row with probe.measured is reused."""
+    per-candidate judged file, so draft_activity reads the measured lists. Retained: a row with probe.measured is reused,
+    unless it is stale (`_probe_staleness`, B-P2-1: measured without the grading identity, or bound to another
+    base_commit/test_patch): then its terminal Harbor result is retired beside its evidence (`_retire_stale_probe`) and the
+    row is probed again in a fresh job, so drafting never refuses a row this activity handed it."""
     judged_path = Path(p["judged_path"]); iid = p["instance_id"]; sid = p.get("scenario_id") or scenario_id_for(iid)
     rows = [json.loads(line) for line in judged_path.read_text().splitlines() if line.strip()]
     idx = next((i for i, r in enumerate(rows) if r.get("instance_id") == iid), None)
     if idx is None:
         raise ApplicationError(f"candidate {iid} not in {judged_path}", non_retryable=True)
     row = rows[idx]
-    if not _probe_measured(row):
+    stale = _probe_staleness(row)
+    if stale or not _probe_measured(row):
+        retired = _retire_stale_probe(row, stale) if stale else []
+        if stale:
+            log.info("re-probe candidate=%s reason=%s retired=%s", iid, stale, retired)
         M = importlib.import_module("swesim.stages.mine")
         probe_candidates = getattr(M, "probe_candidates", None)
         dropped: dict = {}
@@ -577,7 +584,9 @@ async def probe_candidate_activity(p: dict) -> dict:
                 res = await blocking(lambda: probe_tests(row, WS))
             except ValueError as e:
                 # Measured but unusable (nothing fails on base and passes with gold; unreliable base/gold statuses): terminal.
-                row.update(fail_to_pass=[], probe={**(row.get("probe") or {}), "error": f"ValueError: {e}"}, reject_reason="not-reproducible-offline")
+                # A stale block is not carried into the error row: it would read as stale again and re-probe on every rerun.
+                previous = {"error": f"ValueError: {e}", "retired": retired} if stale else {**(row.get("probe") or {}), "error": f"ValueError: {e}"}
+                row.update(fail_to_pass=[], probe=previous, reject_reason="not-reproducible-offline")
                 dropped = {"probe-error": str(e)}
             else:
                 row.update(fail_to_pass=list(res.get("fail_to_pass") or []), pass_to_pass=list(res.get("pass_to_pass") or []),
@@ -588,7 +597,7 @@ async def probe_candidate_activity(p: dict) -> dict:
                 dropped = dict(res.get("dropped") or {})
                 if not row["fail_to_pass"]:
                     row["reject_reason"] = "not-reproducible-offline"
-        row["probe_workflow"] = {"measured_at": time.time(), "dropped": dropped}
+        row["probe_workflow"] = {"measured_at": time.time(), "dropped": dropped, **({"reprobed": {"reason": stale, "retired": retired}} if stale else {})}
         rows[idx] = row
         tmp = judged_path.with_name(judged_path.name + ".tmp"); tmp.write_text("".join(json.dumps(r) + "\n" for r in rows)); os.replace(tmp, judged_path)
     probe = row.get("probe") or {}
@@ -606,6 +615,54 @@ def _probe_measured(row: dict) -> bool:
     probe_candidates/probe_tests, or mine's own probe output (`probe_dir`), or this activity's marker."""
     probe = row.get("probe") or {}
     return bool(probe.get("statuses") or probe.get("error") or row.get("probe_dir") or row.get("probe_workflow"))
+
+
+def _probe_staleness(row: dict) -> str | None:
+    """Why a measured probe row cannot be reused (B-P2-1), or None. A `probe` block with statuses must carry the grading identity
+    (`github_repo.GRADING_USER`) and the binding of this row's base_commit/test_patch (`probe_binding`): a row measured before
+    the identity was recorded, or edited since its measurement, is stale — re-probed, never drafted from and never rejected for
+    it. Error rows and legacy probe_dir-only rows carry nothing to re-verify here (draft's own gate still applies to them)."""
+    probe = row.get("probe") or {}
+    if not probe.get("statuses"):
+        return None
+    gr = importlib.import_module("swesim.sources.github_repo")  # lazily: tests substitute the module
+    grading_user, binding_of = getattr(gr, "GRADING_USER", None), getattr(gr, "probe_binding", None)
+    if grading_user is not None and probe.get("test_user") != grading_user:
+        return f"probe did not record the grading identity {grading_user!r} (recorded {probe.get('test_user') or 'none'!r}); re-probing"
+    if binding_of is not None and probe.get("binding") != binding_of(row):
+        return "probe binding differs from this row's base_commit/test_patch (edited since its measurement); re-probing"
+    return None
+
+
+def _retire_stale_probe(row: dict, reason: str) -> list[str]:
+    """Retire the stale measurement's terminal Harbor result(s) on this worker so the re-probe runs a fresh job: `result.json` of
+    every terminal trial dir of the recorded job is renamed `result.stale-<utc>.json` beside its evidence (nothing is deleted;
+    `verifier/probe.json` stays for audit), a `stale.json` names the reason, and harbor_cli's lineage for the job records the
+    retirement. `harbor_cli.run_task` then sees an abandoned job and launches `<job>--attempt-<n>` (bounded by
+    MAX_FRESH_ATTEMPTS) instead of reusing the result whose probe.json lacks the identity. The recorded path may come from
+    another host's mount, so the job is resolved by name under this worker's `jobs/probe`. Returns the retired trial dirs."""
+    from swesim import harbor_cli
+
+    probe = row.get("probe") or {}
+    recorded = probe.get("job_dir") or probe.get("probe_dir") or row.get("probe_dir")
+    if not recorded:
+        return []
+    jobs = WS.jobs_dir / "probe"; job_dir = jobs / Path(str(recorded)).parent.name
+    if not job_dir.is_dir():
+        return []
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"); retired: list[str] = []
+    for result in sorted(job_dir.glob("*/result.json")):
+        os.replace(result, result.with_name(f"result.stale-{stamp}.json"))
+        atomic_json(result.parent / "stale.json", {"reason": reason, "at": stamp, "retired_by": "probe_candidate_activity",
+                                                   "result": result.with_name(f"result.stale-{stamp}.json").name, "worker_image_digest": SETTINGS.worker_image_digest})
+        retired.append(str(result.parent))
+    if retired:
+        lineage = harbor_cli.read_lineage(jobs, job_dir.name)
+        lineage["attempts"] = [*lineage.get("attempts", []),
+                               {"attempt": "retired", "job_dir": str(job_dir), "previous_dir": retired[-1], "reason": f"stale-probe-evidence: {reason}",
+                                "at": datetime.now(timezone.utc).isoformat(), "worker_image_digest": SETTINGS.worker_image_digest}]
+        atomic_json(harbor_cli.lineage_path(jobs, job_dir.name), lineage)
+    return retired
 
 
 def _read_row(path: Path, iid: str) -> dict | None:

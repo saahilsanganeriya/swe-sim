@@ -1909,7 +1909,9 @@ def _fake_probe_candidates(outcome: dict, calls: list):
                     r["probe"] = {"error": outcome["error"]}; r["reject_reason"] = "probe-failed"; r.setdefault("judge", {})["keep"] = False; summary["probe-failed"] = 1
                 else:
                     r["fail_to_pass"], r["pass_to_pass"] = outcome["f2p"], outcome["p2p"]; r["test_python"] = "/opt/py/bin/python"
-                    r["probe"] = {"kind": "swebench", "statuses": {"base": {"t1": "failed"}, "gold": {"t1": "passed"}}, "probe_dir": "/jobs/probe/x", "dropped": {"missing-on-gold": 1}}
+                    from swesim.sources.github_repo import GRADING_USER, probe_binding   # B-P2-1: every measured row carries the identity and the binding
+                    r["probe"] = {"kind": "swebench", "statuses": {"base": {"t1": "failed"}, "gold": {"t1": "passed"}}, "probe_dir": "/jobs/probe/x", "dropped": {"missing-on-gold": 1},
+                                  "test_user": GRADING_USER, "binding": probe_binding(r)}
                     if not r["fail_to_pass"]: r["reject_reason"] = "not-reproducible-offline"; r.setdefault("judge", {})["keep"] = False; summary["not-reproducible-offline"] = 1
                     else: summary["reproducible"] = 1
                 f.write(json.dumps(r) + "\n")
@@ -2364,3 +2366,49 @@ def test_await_reports_running_once_and_records_its_verdict_durably(ws, systemd,
     # a record.json that lands late still wins over the verdict marker
     atomic_json(d / "record.json", {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}})
     assert asyncio.run(A.await_trial_activity(p))["status"] == "completed"
+
+
+# ---------------------------------------------------------------- stale probe rows are re-probed, never drafted from or rejected for (B-P2-1 on a rebuild)
+
+def test_probe_candidate_activity_reprobes_a_row_without_the_grading_identity(ws, monkeypatch):
+    """`swesim create --rebuild` reused last night's probe row, recorded before B-P2-1 made the probe carry the grading identity, and
+    drafting refused it ("probe did not record the grading identity 'tester'; re-probe before drafting"). A measured row without
+    the identity, or bound to another base_commit/test_patch, is stale: the activity retires the stale terminal Harbor result
+    (renamed beside its evidence, lineage recorded) so the re-probe runs a fresh job instead of reusing it, re-probes, and drafting
+    proceeds; a current row is reused without a second Modal run; error rows and legacy probe_dir rows are not re-verified here."""
+    from swesim import harbor_cli
+    from swesim.sources import github_repo as gr
+    judged = ws.candidates_dir / "judged" / "s--1.judged.jsonl"; judged.parent.mkdir(parents=True)
+    base = {"instance_id": "s__1", "base_commit": "abc", "test_patch": "diff --git a/t.py b/t.py", "fail_to_pass": ["t1"], "pass_to_pass": [], "judge": {"keep": True}}
+    stale_trial = ws.jobs_dir / "probe" / "s--1--deadbeefdeadbeef" / "s--1__probe__1"; (stale_trial / "verifier").mkdir(parents=True)
+    (stale_trial / "result.json").write_text(json.dumps({"id": "old"})); (stale_trial / "verifier" / "probe.json").write_text(json.dumps({"binding": gr.probe_binding(base)}))
+    stale = {**base, "probe": {"kind": "swebench", "statuses": {"base": {"t1": "failed"}, "gold": {"t1": "passed"}}, "binding": gr.probe_binding(base),
+                              "probe_dir": str(stale_trial), "job_dir": str(stale_trial)}, "probe_workflow": {"measured_at": 1.0, "dropped": {}}}   # no test_user
+    judged.write_text(json.dumps(stale) + "\n")
+    assert A._probe_staleness(stale).startswith("probe did not record the grading identity 'tester'")
+    calls = []
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"f2p": ["t1"], "p2p": ["t0"]}, calls)))
+    r = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "s__1"}))
+    assert r["reproducible"] is True and calls == [(str(judged), ["s__1"], 1)]                                  # re-probed, not reused
+    # the stale result is retired beside its evidence, never deleted: harbor_cli now sees an abandoned job and launches a fresh attempt
+    assert not (stale_trial / "result.json").exists() and len(list(stale_trial.glob("result.stale-*.json"))) == 1
+    assert (stale_trial / "verifier" / "probe.json").exists() and "grading identity" in json.loads((stale_trial / "stale.json").read_text())["reason"]
+    assert harbor_cli._terminal_trials(stale_trial.parent) == []
+    lineage = harbor_cli.read_lineage(ws.jobs_dir / "probe", stale_trial.parent.name)
+    assert len(lineage["attempts"]) == 1 and lineage["attempts"][0]["reason"].startswith("stale-probe-evidence") and lineage["attempts"][0]["previous_dir"] == str(stale_trial)
+    row = json.loads(judged.read_text().splitlines()[0])
+    assert row["probe"]["test_user"] == gr.GRADING_USER and row["probe"]["binding"] == gr.probe_binding(row) and A._probe_staleness(row) is None
+    assert row["probe_workflow"]["reprobed"]["reason"].startswith("probe did not record the grading identity") and row["probe_workflow"]["reprobed"]["retired"] == [str(stale_trial)]
+    # the current row is reused; a row edited since its measurement (other test_patch) is stale again
+    asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "s__1"}))
+    assert len(calls) == 1
+    judged.write_text(json.dumps({**row, "test_patch": "diff --git a/other.py b/other.py"}) + "\n")
+    asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "s__1"}))
+    assert len(calls) == 2 and "binding differs" in json.loads(judged.read_text())["probe_workflow"]["reprobed"]["reason"]
+    # nothing to re-verify: a recorded probe error, a legacy probe_dir-only row, an unprobed row
+    assert A._probe_staleness({"probe": {"error": "ValueError: x"}}) is None and A._probe_staleness({"probe_dir": "/x"}) is None and A._probe_staleness({}) is None
+    # a stale row whose evidence is not on this worker still re-probes (nothing to retire)
+    judged2 = judged.with_name("u--2.judged.jsonl")
+    judged2.write_text(json.dumps({**base, "instance_id": "u__2", "probe": {"statuses": {"base": {}}, "probe_dir": "/elsewhere/jobs/probe/u--2--0123/t"}}) + "\n")
+    r2 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged2), "instance_id": "u__2"}))
+    assert r2["reproducible"] is True and len(calls) == 3 and json.loads(judged2.read_text())["probe_workflow"]["reprobed"]["retired"] == []
