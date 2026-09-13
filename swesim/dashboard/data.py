@@ -131,6 +131,18 @@ def patience_of(transcript: dict, run_config: dict | None = None) -> dict:
 
 # ----------------------------------------------------------------------------- one trial
 
+def _contained(layout, path: Path) -> bool:
+    """Artifact references in stored records may be stale or hostile; accept only regular workspace paths."""
+    root = layout.root.resolve()
+    if not path.resolve().is_relative_to(root):
+        return False
+    current = path
+    while current != root and current != current.parent:
+        if current.is_symlink():
+            return False
+        current = current.parent
+    return True
+
 def _row(ts, seq, actor, kind, text, meta) -> dict:
     return {"ts": ts, "ts_iso": iso(ts), "no_timestamp": ts is None, "seq": seq, "actor": actor, "kind": kind, "text": text, "meta": meta}
 
@@ -170,7 +182,7 @@ def merge_timeline(traj: dict, transcript: dict, report: dict | None = None, rew
 
 
 def _trajectory(layout, tid: str, record: dict) -> dict:
-    if record.get("trial_dir"):
+    if record.get("trial_dir") and _contained(layout, Path(record["trial_dir"])):
         traj = read_json(Path(record["trial_dir"]) / "agent" / "trajectory.json")
         if traj:
             return traj
@@ -183,7 +195,7 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
     if not TRIAL_RE.fullmatch(tid):
         return None
     d = layout.trial_dir(tid)
-    if not d.is_dir():
+    if not _contained(layout, d) or not d.is_dir():
         return None
     status = read_json(d / "status.json")
     raw = read_json(d / "record.json") if (d / "record.json").exists() else {}
@@ -202,7 +214,7 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
     reward = record.get("reward") or read_json(d / "reward.json")
     traj = _trajectory(layout, tid, record)
     ins = next((p for p in (d / "task" / "instruction.md", Path(record["task_dir"]) / "instruction.md" if record.get("task_dir") else None)
-                if p is not None and p.exists()), None)
+                if p is not None and _contained(layout, p) and p.exists()), None)
     u = unresolved or {}
     meta = {
         "scenario_id": record.get("scenario_id") or request.get("scenario_id") or u.get("scenario_id"),
@@ -221,7 +233,7 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
     patch = None
     if record.get("trial_dir"):
         p = Path(record["trial_dir"]) / "verifier" / "patch.diff"
-        if p.is_file():
+        if _contained(layout, p) and p.is_file():
             try:
                 patch = p.read_text(errors="replace")
             except OSError:
@@ -237,12 +249,14 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
 def resolve_trial_file(layout, t: dict, name: str) -> Path | None:
     base, rel = TRIAL_FILES[name]
     if base == "trial":
-        return t["dir"] / rel
+        path = t["dir"] / rel
+        return path if _contained(layout, path) else None
     trial_dir = t["meta"].get("trial_dir")
     if trial_dir:
-        return Path(trial_dir) / rel
+        path = Path(trial_dir) / rel
+        return path if _contained(layout, path) else None
     found = sorted((layout.jobs_dir("runs") / t["trial_id"]).glob(f"*/{rel}"))
-    return found[0] if len(found) == 1 else None
+    return found[0] if len(found) == 1 and _contained(layout, found[0]) else None
 
 
 # ----------------------------------------------------------------------------- one scenario
@@ -282,6 +296,8 @@ def scenario_detail(layout, sid: str, evaluator: bool = False, version: int | No
     if not ID_RE.fullmatch(sid):
         return None
     sdir = layout.scenario_dir(sid) if version is None else layout.scenario_archive_dir(sid, version)
+    if not _contained(layout, sdir):
+        return None
     if not sdir.is_dir():
         return None
     spec = read_json(sdir / "scenario.json") or read_json(sdir / "scenario.draft.json") or {}

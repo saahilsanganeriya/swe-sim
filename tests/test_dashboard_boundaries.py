@@ -7,9 +7,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from swesim.dashboard import actions, console, rows as R
+from swesim.dashboard import console, rows as R
 from swesim.settings import get_settings
-from test_dashboard import SENTINELS, reader_of, site  # noqa: F401
+from test_dashboard import SENTINELS, reader_of, site as site
 
 routes = importlib.import_module("swesim.dashboard.app")
 
@@ -117,3 +117,42 @@ def test_model_defaults_follow_current_shared_roles():
     assert defaults["draft_model"] == cli.DRAFT_MODEL_DEFAULT
     assert defaults["solver_model"] == cli.SOLVER_MODEL_DEFAULT
     assert defaults["stakeholder_model"] == StakeholderConfig().model_id
+
+
+def test_leaderboard_scores_are_bound_to_admitted_spec_and_configuration(site):
+    from decimal import Decimal
+    sdir = site["ws"].scenario_dir(site["spec"].id)
+    (sdir / "difficulty.json").write_text(json.dumps({"tier": "informative"}))
+    (sdir / "audit.json").write_text(json.dumps({"coherent": True, "fair_tests": True}))
+    reader = reader_of(site)
+    original = reader.scores
+    calls = []
+
+    def scores(f):
+        calls.append(f)
+        selected = original(f)
+        # A different purpose/config has a perfect score; an unbound query would include it.
+        if not f.run_config_hash and selected:
+            selected.append(selected[0].model_copy(update={"run_config_hash": "other", "pass_at_k": Decimal(1), "pass_pow_k": Decimal(1)}))
+        return selected
+
+    reader.scores = scores
+    f = R.LeaderboardFilter(purpose="calibration")
+    cells = routes.board_views(reader, reader.leaderboard(f), {site["spec"].id}, f)
+    assert cells[0]["n"] == 2 and cells[0]["pass_at_k"] is None
+    assert calls and all(f.spec_hash == [site["spec"].spec_hash] and f.run_config_hash for f in calls)
+
+
+def test_iap_verifier_checks_issuer_in_addition_to_signature_and_audience(monkeypatch):
+    from google.oauth2 import id_token
+    from swesim.dashboard.identity import _default_verify, IAP_CERTS_URL
+    seen = {}
+
+    def verify(token, request, **kwargs):
+        seen.update(kwargs)
+        return {"email": "person@example.com", "iss": "https://accounts.google.com"}
+
+    monkeypatch.setattr(id_token, "verify_token", verify)
+    with pytest.raises(ValueError, match="issuer"):
+        _default_verify("token", "audience")
+    assert seen == {"audience": "audience", "certs_url": IAP_CERTS_URL}

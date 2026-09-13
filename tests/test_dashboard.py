@@ -204,7 +204,6 @@ def test_reader_candidates_funnel_and_reject_histogram(site):
     assert by_id["acme__widget-13"].status == "kept" and by_id["acme__widget-13"].stage == "judged" and by_id["acme__widget-13"].pr_number == 13
     steps = {s.stage: s for s in r.funnel()}
     assert steps["mined"].kept == 2 and steps["judged"].rejected == 1 and steps["judged"].kept == 1 and steps["registered"].kept == 0
-    layout = Layout(root=site["ws"].root)
     assert reject_histogram(r, pg.items, None).get("judge") == 1
     assert reject_histogram(r, pg.items, "other-key") == {}
     assert r.candidates(R.CandidateFilter(status=["rejected"])).total == 1

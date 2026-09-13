@@ -162,8 +162,8 @@ def trials_body(page, views: list[dict], facets: dict, current: dict) -> str:
 
 def candidates_body(page, views: list[dict], funnel_steps: list[dict], hist: dict[str, int], source_keys: list[str], current_key: str | None) -> str:
     sel = "".join(f"<option value='{h(k)}'{' selected' if k == current_key else ''}>{h(k)}</option>" for k in source_keys)
-    body = ["<h1>Candidates</h1><p class='lead'>Where the creation funnel loses candidates, and why. Mining-gate rejects (no linked issue, diff size, thread depth) never became rows; "
-            "they are counted at the <em>mined</em> stage from <code>&lt;key&gt;.rejects.json</code>.</p>",
+    body = ["<h1>Candidates</h1><p class='lead'>Where the creation funnel loses candidates, and why. Discovery-time rejects (no linked issue, diff size, thread depth) and candidate gates are "
+            "projected from the index into the histogram below.</p>",
             f"<form class='toolbar' method='get' action='/candidates'><label>source key<select name='source_key'><option value=''>all sources</option>{sel}</select></label>"
             "<button type='submit' class='button'>Filter</button></form>",
             "<div class='side-by-side'><div>", charts.funnel(funnel_steps, "chart-funnel"), "</div><div>",
@@ -270,6 +270,7 @@ def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_
             "pass the task-sense audit (coherent, fair tests) enter the board; saturated scenarios are excluded by default; broken never appear. Nothing is shown without n; "
             "purposes are never pooled.</p>",
             hero(f"{len(eligible)} / {len(gate)}", "scenarios on the board (eligible / current versions)", "/scenarios"), form,
+            leaderboard_comparison(views), "<h2>Scores and interaction details</h2>",
             table("leaderboard", LB_COLUMNS, views, key="key", total=len(views), empty="<strong>No cells with n ≥ 1 on eligible scenarios.</strong> The gate table below says why each scenario is excluded; "
                                                                                        "run the difficulty screen (<a href='/run'>Run</a>, purpose = screen) and the task-sense audit to admit scenarios.", export=True),
             "<h2>Per-scenario matrix</h2>", matrix_html, "<h2>Pass rate by condition</h2>", chart_html]
@@ -278,6 +279,33 @@ def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_
     body.append("<h2>Gate</h2><p class='muted small'>Interfaces §9.1: valid · difficulty informative (saturated only with the toggle; broken never) · task-sense coherent and fair_tests.</p>"
                 f"<div class='table-wrap'><table><thead><tr><th>scenario</th><th>validation</th><th>difficulty</th><th>task sense</th><th>board</th></tr></thead><tbody>{checks}</tbody></table></div>")
     return "".join(body)
+
+
+def leaderboard_comparison(views: list[dict]) -> str:
+    """Models as rows, with separate condition groups and explicit denominators for every estimate."""
+    conditions = ("full", "hidden", "interactive")
+    grouped = {}
+    for row in views:
+        grouped.setdefault((row["model"], row["brief_profile"]), {})[row["condition"]] = row
+    if not grouped:
+        return ""
+    header = "".join(f"<th scope='colgroup' colspan='3'>{condition}</th>" for condition in conditions)
+    subheader = "".join("<th scope='col'>n</th><th scope='col'>pass@k</th><th scope='col'>pass^k</th>" for _ in conditions)
+    body = []
+    for (model, profile), cells in sorted(grouped.items()):
+        row = [f"<tr><th scope='row'>{model_chip(model)}</th><td>{h(profile)}</td>"]
+        for condition in conditions:
+            cell = cells.get(condition)
+            if cell is None:
+                row.append("<td class='num'>0</td><td class='num'>—</td><td class='num'>—</td>")
+                continue
+            query = urlencode({"model": model, "condition": condition, "brief_profile": profile, "purpose": cell["purpose"], "status": "completed"})
+            row.append(f"<td class='num'><a href='/trials?{h(query)}'>{h(cell['n'])}</a></td>")
+            row.extend(f"<td class='num' title='{h(cell['confidence_note'])}'>{dash(cell.get(key))}</td>" for key in ("pass_at_k", "pass_pow_k"))
+        body.append("".join(row) + "</tr>")
+    return ("<div class='table-wrap'><table id='condition-comparison'><caption>Models by condition; a dash means no matching score or insufficient attempts.</caption>"
+            f"<thead><tr><th scope='col' rowspan='2'>model</th><th scope='col' rowspan='2'>brief</th>{header}</tr><tr>{subheader}</tr></thead>"
+            f"<tbody>{''.join(body)}</tbody></table></div>")
 
 
 # ----------------------------------------------------------------------------- database browser
@@ -308,7 +336,8 @@ def db_table_body(name: str, page, columns: list[str], where: dict, q: str | Non
             f"<label>where column<input name='where_col' placeholder='status'></label><label>equals<input name='where_val' placeholder='valid'></label>"
             "<button type='submit' class='button'>Apply</button> <a class='button' href='/db/" + h(name) + "'>Reset</a></form>")
     active = (" · where " + ", ".join(f"<code>{h(k)}={h(v)}</code>" for k, v in where.items())) if where else ""
-    return (f"<h1>Table <span class='mono'>{h(name)}</span></h1><p class='lead'>{page.total} row(s){active}. <a class='button small' href='/api/db/{h(name)}.csv'>CSV (filtered)</a></p>" + form
+    export_query = urlencode({**{f"where.{k}": v for k, v in where.items()}, **({"q": q} if q else {}), **({"order_by": order_by} if order_by else {})})
+    return (f"<h1>Table <span class='mono'>{h(name)}</span></h1><p class='lead'>{page.total} row(s){active}. <a class='button small' href='/api/db/{h(name)}.csv?{h(export_query)}'>CSV (filtered)</a></p>" + form
             + table(f"db-{name}", cols, rows, key=columns[0] if columns else "id", total=page.total, offset=page.offset, limit=page.limit,
                     empty="<strong>No rows.</strong>", dense=True))
 
@@ -409,7 +438,7 @@ def list_dir(root: Path, rel: Path, evaluator: bool, offset: int = 0) -> dict:
 
 
 def artifacts_body(root: Path, listing: dict, preview: dict | None, rel: Path) -> str:
-    crumbs = [f"<a href='/artifacts'>workspace</a>"]
+    crumbs = ["<a href='/artifacts'>workspace</a>"]
     acc = Path()
     for part in rel.parts:
         acc = acc / part
