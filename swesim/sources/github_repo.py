@@ -249,9 +249,10 @@ def runner_prefix(interpreter: str) -> str:
     return shlex.quote(interpreter) + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} "
 
 
-# Stages: base (pristine), test (test_patch applied, whole test files), test_exact (the exact ids the grader will run, in the
-# collected definition order, same launcher), gold and gold_exact after the oracle. Grading lists exact ids, so a test that
-# changes status between the whole-file run and the exact-id run is order-dependent and is dropped from the contract.
+# Stages: base (pristine), test (test_patch applied, whole test files), gold (oracle applied, whole files); then the CONTRACT
+# ids (fail/error->passed and passed->passed, in collected definition order) are re-run exactly as the grader will run them:
+# oracle reverted -> test_exact, oracle re-applied -> gold_exact. A contract test whose status differs between the whole-file
+# run and the exact-id run is order-dependent and is dropped from the contract.
 PROBE_SCRIPT = '''import sys,json,subprocess,shlex
 from pathlib import Path
 sys.path.insert(0,'/tests')
@@ -262,19 +263,24 @@ def cfg_for(command): return GradeConfig(Path('/tmp/a'),Path(repo),Path('/tmp/w'
 def run(command,expected=None):
     st,rc,out,error=_run_tests(cfg_for(command),Path(repo),expected)
     return {'statuses':st,'exit_code':rc,'error':error,'tail':out[-2000:]}
-def apply(patch): subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','apply',patch],cwd=repo,check=True)
+def git_apply(patch,*flags): subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','apply',*flags,patch],cwd=repo,check=True)
 results={'base':run(probe['command'])}
-apply('/tests/test.patch')
+git_apply('/tests/test.patch')
 results['test']=run(probe['command'])
-order=list(results['test']['statuses']); results['order']=order
-exact=(prefix or '')+' '.join(shlex.quote(t) for t in order)
-if prefix and order and len(exact)<=max_chars:
-    results['exact_command']=exact; results['test_exact']=run(exact,order)
-else:
-    results['exact_skipped']='no tests collected' if not order else ('no prefix' if not prefix else 'command exceeds argv budget')
-apply('/tests/oracle.diff')
+git_apply('/tests/oracle.diff')
 results['gold']=run(probe['command'])
-if 'exact_command' in results: results['gold_exact']=run(exact,order)
+before,after=results['test']['statuses'],results['gold']['statuses']
+contract=[t for t in before if (before[t] in ('failed','error') and after.get(t)=='passed') or (before[t]=='passed' and after.get(t)=='passed')]
+results['order']=contract
+exact=(prefix or '')+' '.join(shlex.quote(t) for t in contract)
+if prefix and contract and len(exact)<=max_chars and not results['test']['error'] and not results['gold']['error']:
+    results['exact_command']=exact
+    git_apply('/tests/oracle.diff','-R')
+    results['test_exact']=run(exact,contract)
+    git_apply('/tests/oracle.diff')
+    results['gold_exact']=run(exact,contract)
+else:
+    results['exact_skipped']='no contract tests' if not contract else ('no prefix' if not prefix else ('whole-file stage errored' if (results['test']['error'] or results['gold']['error']) else 'command exceeds argv budget'))
 Path('/logs/verifier').mkdir(parents=True,exist_ok=True)
 Path('/logs/verifier/probe.json').write_text(json.dumps(results))
 Path('/logs/verifier/reward.json').write_text(json.dumps({'reward':int(not results['gold']['error'])}))
@@ -339,26 +345,26 @@ def _probe_record(row: dict, data: dict, *, kind: str, digest: str | None, repo_
                   job_dir: str, probed_at: str) -> dict:
     """Measured lists plus the `probe` metadata block from a probe.json payload; raises on an unreliable probe.
 
-    Grading-faithful: when the exact-id stages (`test_exact`, `gold_exact`: the grader's own command shape, ids in the
-    collected definition order) are present, the contract is derived from them, and every test whose status differs between
-    the whole-file run and the exact-id run in either stage is dropped as `order_dependent` (test pollution the grader would
-    see and the whole-file run hides). Without exact stages (older job dirs, argv budget) the whole-file statuses are used
-    and `probe.exact` says why."""
+    Grading-faithful: the contract (fail_to_pass + pass_to_pass) comes from the whole-file stages; when the exact-id stages
+    (`test_exact`, `gold_exact`: exactly the contract ids in collected definition order, the grader's own command shape) are
+    present, every contract test whose status differs between the whole-file run and the exact-id run in either stage is
+    dropped as `order_dependent` (test pollution the grader would see and the whole-file run hides). Without exact stages
+    (older job dirs, argv budget) the whole-file contract stands and `probe.runner.exact` says why — approval can see it."""
     before, after = data["test"]["statuses"], data["gold"]["statuses"]
     if data["test"].get("error") or data["gold"].get("error") or not after or set(before) != set(after):
         raise ValueError("unreliable base/gold probe; keep evidence and reject")
-    order = list(data.get("order") or before)
+    measured = classify_probe(before, after)
+    contract_set = set(measured["fail_to_pass"]) | set(measured["pass_to_pass"])
+    order = [t for t in (data.get("order") or before) if t in contract_set]  # contract ids in collected definition order
     exact_note = "exact"
     order_dependent: list[str] = []
     if "test_exact" in data and "gold_exact" in data:
         eb, ea = data["test_exact"]["statuses"], data["gold_exact"]["statuses"]
-        if data["test_exact"].get("error") or data["gold_exact"].get("error") or set(eb) != set(before) or set(ea) != set(after):
-            raise ValueError("unreliable exact-id probe (the grader's own command shape); keep evidence and reject")
+        if data["test_exact"].get("error") or data["gold_exact"].get("error") or set(eb) != contract_set or set(ea) != contract_set:
+            raise ValueError("unreliable exact-id probe (the grader's own command shape on the contract ids); keep evidence and reject")
         order_dependent = [t for t in order if before.get(t) != eb.get(t) or after.get(t) != ea.get(t)]
-        measured = classify_probe(eb, ea)
     else:
         exact_note = data.get("exact_skipped") or "missing"
-        measured = classify_probe(before, after)
     dropped = {k: [t for t in v if t not in order_dependent] for k, v in measured["dropped"].items()}
     dropped["order_dependent"] = order_dependent
     measured = {"fail_to_pass": [t for t in measured["fail_to_pass"] if t not in order_dependent],

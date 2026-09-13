@@ -13,6 +13,9 @@ import hashlib
 import json
 import re
 import shlex
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,8 +38,10 @@ Rules: every fact must quote a short excerpt from the thread with its URL, or be
 Facts the agent can learn by reading the repository are discovery=repo-derivable. Facts absent from the repository that the
 maintainer decided are discovery=on-request. Private helper names chosen by the fix author are discovery=author-only and must
 not link tests. Requirements come from review comments. Checks are user-level reproducers (not the hidden tests).
-Groups partition FAIL_TO_PASS test ids into requirement groups with weights summing to 1. Also write one plausible-wrong patch
-as a unified diff against the repository at the base commit: a tempting incomplete or wrong fix (e.g. wrong exception type).
+Groups partition FAIL_TO_PASS test ids into requirement groups with weights summing to 1. Also write one plausible-wrong patch:
+a tempting incomplete or wrong fix (e.g. wrong exception type). Give control patches as `files`: the COMPLETE modified text of
+each file you change (only files the merged fix touches; code builds the diff against the base commit), and use `diff` only when
+that is impossible. Control names are short labels; code turns them into file-safe slugs.
 Constraints the record must satisfy: every on-request fact carries `tests` drawn from the FAIL_TO_PASS ids listed at the top
 of the user message (the decision the agent has to ask about is what those tests pin); fact, requirement, check and group ids match ^[a-z0-9][a-z0-9._-]{2,63}$ and never start with "withheld-" or
 "tests-" (code-generated facts use those); test links use only the FAIL_TO_PASS and PASS_TO_PASS ids given; check ids differ
@@ -59,8 +64,8 @@ SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "ori
 "requirements": [{"id": "r01", "text": "...", "fact_id": "f01", "tests": ["nodeid"], "source_url": "..."}],
 "checks": [{"id": "c01", "description": "...", "command": "python -c '...'", "expected_observation": "..."}],
 "groups": [{"id": "g01", "weight": 0.5, "tests": ["nodeid"]}],
-"plausible_wrong": {"name": "...", "rationale": "...", "diff": "unified diff text"},
-"alternative_correct": {"name": "...", "rationale": "...", "diff": "unified diff text"} | null,
+"plausible_wrong": {"name": "short label", "rationale": "...", "files": {"path/touched/by/the/fix.py": "COMPLETE modified file text"}, "diff": "unified diff, only if files cannot be given"},
+"alternative_correct": {"name": "short label", "rationale": "...", "files": {"path.py": "COMPLETE modified file text"}, "diff": "unified diff, only if files cannot be given"} | null,
 "protected_paths_extra": ["test-tree fixture or data files the hidden tests read (never source files; code drops anything else)"]}"""
 
 WITHHOLD_CATEGORIES = {"reproduction", "error_message", "expected_output", "location", "version", "proposed_fix"}
@@ -70,6 +75,7 @@ MIN_EXCERPT_CHARS = 12   # a one-word "excerpt" grounds nothing; both bounds app
 MIN_EXCERPT_TOKENS = 3
 RESERVED_FACT_PREFIXES = ("withheld-", "tests-")  # code-generated fact ids the drafter may not use
 _TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(")
+_CLASS_DEF = re.compile(r"^\s*class\s+(\w+)\b")
 WITHHOLD_PROMPT_VERSION = "withhold-v2"  # v2: the model selects spans, code deletes them; the brief is computed, never trusted
 WITHHOLD_KINDS = {"reproduction", "context", "behavior", "interface", "constraint"}
 MAX_REMOVED_FRACTION = 0.6  # of sentence/line segments
@@ -298,7 +304,8 @@ def withhold(natural_issue: str, model_id: str) -> dict:
                 continue
             spans = _find_spans(natural_issue, selected)
             if not spans:
-                rejected.append(f"excerpt is not a verbatim span of the issue: {selected!r}")
+                rejected.append(f"excerpt is not a verbatim span of the issue: {selected!r}; closest lines: "
+                                f"{json.dumps(closest_lines(needle, [natural_issue]), ensure_ascii=False)}")
                 continue
             extended = [_extend(s, segs) for s in spans]
             if any(a < title_b and b > title_a for a, b in extended):
@@ -441,35 +448,54 @@ def _test_blocks(test_patch: str) -> list[tuple[str | None, str | None, list[str
     names the function an edit lands in, so lines added inside an existing test belong to it) and at every `def test_*`
     line, and runs to the next boundary."""
     blocks: list[tuple[str | None, str | None, list[str]]] = []
-    current_file = None
+    current_file, current_class = None, None
+
+    def qualified(name: str, indented: bool) -> str:
+        return f"{current_class}::{name}" if indented and current_class else name
+
     for raw in (test_patch or "").splitlines():
         m = re.match(r"diff --git a/(\S+)", raw)
         if m:
-            current_file = m.group(1)
+            current_file, current_class = m.group(1), None
             blocks.append((current_file, None, []))
             continue
         if raw.startswith("@@"):
             trailer = raw.split("@@", 2)[2] if raw.count("@@") >= 2 else ""
+            c = _CLASS_DEF.match(trailer.strip())
+            if c:
+                current_class = c.group(1)
             d = _TEST_DEF.match(trailer.strip())
-            blocks.append((current_file, d.group(1) if d else None, []))
+            blocks.append((current_file, qualified(d.group(1), trailer != trailer.lstrip()) if d else None, []))
             continue
         if raw.startswith(DIFF_HEADER_PREFIXES) or raw[:1] == "-":
             continue
         line = raw[1:] if raw[:1] in ("+", " ") else raw
+        c = _CLASS_DEF.match(line)
+        if c and not line.startswith((" ", "\t")):
+            current_class = c.group(1)
         d = _TEST_DEF.match(line)
         if d:
-            blocks.append((current_file, d.group(1), []))
+            blocks.append((current_file, qualified(d.group(1), line != line.lstrip()), []))
         if blocks:
             blocks[-1][2].append(line)
     return blocks
 
 
+def _qualname(nodeid: str) -> tuple[str, str]:
+    """(file, 'Class::test_x' or 'test_x') of a pytest node id with its parametrization stripped."""
+    path, *rest = nodeid.split("::")
+    return path, re.split(r"[\[(]", "::".join(rest))[0] if rest else ""
+
+
 def _f2p_for_block(file: str | None, fn: str | None, fail_to_pass: list[str]) -> set[str]:
+    """Ids of `fail_to_pass` in `file` whose qualified name matches the block's function: exact when the block knows its class
+    (`TestA::test_x`), by bare function name when it does not."""
     out = set()
     for t in fail_to_pass:
-        path, *rest = t.split("::")
-        func = re.split(r"[\[(]", rest[-1])[0] if rest else ""
-        if path == file and (fn is None or func == fn):
+        path, qual = _qualname(t)
+        if path != file:
+            continue
+        if fn is None or qual == fn or ("::" not in fn and qual.split("::")[-1] == fn):
             out.add(t)
     return out
 
@@ -604,18 +630,21 @@ def definition_order(ids: list[str], test_order: list[str] | None, test_patch: s
     for i, key in enumerate(funcs):
         rank.setdefault(key, i)
 
-    def key_of(t: str):
-        path, *rest = t.split("::")
-        return (path, re.split(r"[\[(]", rest[-1])[0] if rest else "")
+    def rank_of(t: str):
+        path, qual = _qualname(t)
+        if (path, qual) in rank:
+            return rank[(path, qual)]
+        return rank.get((path, qual.split("::")[-1]))  # a block that does not know its class matches by bare name
 
-    known = [t for t in ids if key_of(t) in rank]
-    known.sort(key=lambda t: rank[key_of(t)])  # stable: parametrizations keep their given order
-    return known + [t for t in ids if key_of(t) not in rank], "diff" if known else "given"
+    known = [t for t in ids if rank_of(t) is not None]
+    known.sort(key=rank_of)  # stable: parametrizations keep their given order
+    return known + [t for t in ids if rank_of(t) is None], "diff" if known else "given"
 
 
 def f2p_functions(fail_to_pass: list[str]) -> set[tuple[str, str]]:
-    """(file, function) pairs behind the FAIL_TO_PASS ids; parametrizations of one test collapse to one pair."""
-    return {(t.split("::")[0], re.split(r"[\[(]", t.split("::")[-1])[0]) for t in fail_to_pass}
+    """(file, qualified function) pairs behind the FAIL_TO_PASS ids; parametrizations of one test collapse to one pair, while
+    `TestA::test_x` and `TestB::test_x` stay distinct."""
+    return {_qualname(t) for t in fail_to_pass}
 
 
 def link_single_target(d: dict, fail_to_pass: list[str]) -> list[str]:
@@ -631,12 +660,155 @@ def link_single_target(d: dict, fail_to_pass: list[str]) -> list[str]:
     return linked
 
 
-def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None) -> tuple[dict, dict]:
+CONTROL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
+ASSET_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MAX_BASE_FILES = 8
+MAX_BASE_BYTES = 400_000
+FALLBACK_COMMENT = "# swesim plausible-wrong control: no functional change (the model's control patch did not apply)\n"
+
+
+def slugify_control_name(label, fallback: str, taken: set[str]) -> str:
+    """Code-owned control name: lowercase `[a-z0-9._-]`, 3-64 chars, derived from the model's label by a stable slugify,
+    `-2`, `-3`, ... on collision. The compile stage turns control names into `controls/<name>.diff` paths, so a label such as
+    "strip only width/height ratios ..." must never reach it verbatim."""
+    s = re.sub(r"[^a-z0-9._-]+", "-", str(label or "").casefold())
+    s = re.sub(r"-{2,}", "-", s).strip("-._")[:64].rstrip("-._")
+    if not CONTROL_NAME_RE.match(s):
+        s = fallback
+    base, n, name = s, 2, s
+    while name in taken:
+        suffix = f"-{n}"
+        name = base[:64 - len(suffix)].rstrip("-._") + suffix
+        n += 1
+    taken.add(name)
+    return name
+
+
+def check_asset_paths(names) -> None:
+    for name in names:
+        parts = str(name).split("/")
+        if not parts or any(not ASSET_COMPONENT_RE.match(p) or p == ".." for p in parts):
+            raise ValueError(f"drafter error: asset path component outside [A-Za-z0-9._-]: {name!r}")
+
+
+def fetch_base_files(row: dict, paths, cache: dict[str, str | None] | None = None) -> tuple[dict[str, str | None], list[str]]:
+    """Base-commit content of `paths` via `threads.base_text` (None = absent on base), bounded to MAX_BASE_FILES files and
+    MAX_BASE_BYTES in total; returns (files, skipped paths). `cache` carries fetched content across authoring attempts."""
+    files = dict(cache or {})
+    skipped = []
+    total = sum(len(t.encode()) for t in files.values() if t)
+    for path in sorted(set(paths)):
+        if path in files:
+            continue
+        if len(files) >= MAX_BASE_FILES:
+            skipped.append(path)
+            continue
+        text = threads.base_text(row["repo"], row["base_commit"], path)
+        if text is not None and total + len(text.encode()) > MAX_BASE_BYTES:
+            skipped.append(path)
+            continue
+        files[path] = text
+        total += len(text.encode()) if text else 0
+    if cache is not None:
+        cache.update(files)
+    return files, skipped
+
+
+def verify_diff_applies(base_files: dict[str, str | None], diff: str) -> tuple[bool | None, str]:
+    """`git apply --check` of `diff` against a temporary git repo holding `base_files`. (True, ""), (False, git error) or
+    (None, reason) when it cannot be verified locally (no git, or a touched file outside the fetched base set)."""
+    if shutil.which("git") is None:
+        return None, "git unavailable locally; the Modal sweep verifies application"
+    missing = sorted(p for p in patch_paths(diff) if p not in base_files)
+    if missing:
+        return None, f"base content not fetched for {missing}"
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td) / "repo"
+        repo.mkdir()
+        for path, text in base_files.items():
+            if text is None:
+                continue
+            target = repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+        git = ["git", "-c", "user.name=swesim", "-c", "user.email=swesim@localhost", "-c", "init.defaultBranch=main"]
+        subprocess.run([*git, "init", "-q"], cwd=repo, capture_output=True, text=True)
+        subprocess.run([*git, "add", "-A"], cwd=repo, capture_output=True, text=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "base"], cwd=repo, capture_output=True, text=True)
+        patch = Path(td) / "control.diff"
+        patch.write_text(diff)
+        proc = subprocess.run([*git, "apply", "--check", str(patch)], cwd=repo, capture_output=True, text=True)
+    return (True, "") if proc.returncode == 0 else (False, (proc.stderr or proc.stdout).strip() or "git apply --check failed")
+
+
+def build_control_diff(ctrl: dict, base_files: dict[str, str | None]) -> tuple[str | None, str]:
+    """(diff, method). Primary path: `files` = complete modified text per touched file -> well-formed diff via difflib against
+    the fetched base ('difflib'); fallback: the model's own unified diff ('model-diff'); (None, 'missing') otherwise."""
+    files = ctrl.get("files") if isinstance(ctrl.get("files"), dict) else None
+    if files:
+        parts = []
+        for path, text in files.items():
+            if not isinstance(path, str) or not isinstance(text, str) or not path.strip():
+                continue
+            base = base_files.get(path)
+            if base is not None and text == base:
+                continue  # unchanged file: nothing to diff
+            parts.append(tamper.file_diff(path, base, text if text.endswith("\n") else text + "\n"))
+        if parts:
+            return "".join(parts), "difflib"
+        raise DraftViolation("control patch changes nothing: every file in `files` equals its base-commit content")
+    diff = ctrl.get("diff")
+    if isinstance(diff, str) and diff.strip():
+        return diff, "model-diff"
+    return None, "missing"
+
+
+def fallback_plausible_wrong(gold_patch: str, base_files: dict[str, str | None]) -> tuple[str, str] | None:
+    """Code-generated stand-in when the model's plausible-wrong patch is unusable after the correction round (ScenarioSpec
+    requires one plausible-wrong control): the gold fix cut to its first file or first hunk (an incomplete fix), else a
+    comment-only edit of a gold-touched file (no functional change). Both apply by construction. Returns (diff, method)."""
+    chunks = [c for c in re.split(r"(?=^diff --git )", gold_patch or "", flags=re.M) if c.strip()]
+    candidates = []
+    if len(chunks) >= 2:
+        candidates.append((chunks[0], "fallback-partial-gold"))
+    elif len(chunks) == 1:
+        head, *hunks = re.split(r"(?=^@@ )", chunks[0], flags=re.M)
+        if len(hunks) >= 2:
+            candidates.append((head + hunks[0], "fallback-partial-gold"))
+    for path in sorted(base_files):
+        if base_files[path] is not None:
+            text = base_files[path]
+            candidates.append((tamper.file_diff(path, text, text + ("" if text.endswith("\n") else "\n") + FALLBACK_COMMENT), "fallback-comment-only"))
+            break
+    for diff, method in candidates:
+        ok, _ = verify_diff_applies(base_files, diff)
+        if ok is not False:
+            return diff, method
+    return None
+
+
+class DraftViolation(ValueError):
+    """A model-fixable problem found while assembling the spec (empty control diff, missing alternative-correct patch, or a
+    ScenarioSpec validation error such as a requirement depending on an author-only fact). Fed back to the model in the
+    correction round; fatal only after that round, like every other violation."""
+
+
+def _schema_violations(exc) -> list[str]:
+    out = []
+    for err in exc.errors():
+        loc = " -> ".join(str(x) for x in err.get("loc") or ())
+        out.append("schema: " + (loc + ": " if loc else "") + str(err.get("msg", "")))
+    return out
+
+
+def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None, validate=None) -> tuple[dict, dict]:
     """One LLM authoring call, validated by `ledger_violations`, one correction round (its message names the FAIL_TO_PASS ids
     and the closest corpus lines for any non-verbatim excerpt), then a code-owned fallback that links on-request facts without
     tests to the FAIL_TO_PASS tests sharing content words with them (`auto_link_tests`), then fail. When all FAIL_TO_PASS ids
     belong to a single test function, `link_single_target` links every on-request fact to it before validation and the
-    content-word rule never applies. Returns (draft dict, {"auto_linked": [...], "auto_linked_single_target": bool})."""
+    content-word rule never applies. `validate(d)` (the drafter's spec assembly + ScenarioSpec validation) runs once the
+    ledger is clean and its messages are violations too, so a pydantic `_integrity` error reaches the model instead of
+    killing the draft. Returns (draft dict, {"auto_linked": [...], "auto_linked_single_target": bool})."""
     f2p = list(row.get("fail_to_pass") or [])
     prefix = "FAIL_TO_PASS ids (every on-request fact must carry `tests` drawn from this list): " + json.dumps(f2p) + "\n\n"
     judged_json = json.dumps(judged, ensure_ascii=False)
@@ -650,8 +822,12 @@ def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | No
     single: list[str] = []
     for attempt in range(2):
         d = chat_json(model_id, SYSTEM, messages, SCHEMA, max_tokens=8000)
+        if not isinstance(d, dict):
+            d = {}
         single = link_single_target(d, f2p)
         bad = ledger_violations(d, row, extra_facts)
+        if not bad and validate:
+            bad = validate(d)
         if not bad:
             return d, {"auto_linked": single, "auto_linked_single_target": bool(single)}
         if attempt == 0:
@@ -667,8 +843,14 @@ def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | No
                     auto_linked.append(f.get("id"))
     if auto_linked:
         bad = ledger_violations(d, row, extra_facts)
+        if not bad and validate:
+            bad = validate(d)
         if not bad:
             return d, {"auto_linked": auto_linked, "auto_linked_single_target": bool(single)}
+    if validate and not ledger_violations(d, row, extra_facts):
+        lenient = validate(d, lenient=True)  # control patches that still do not apply are dropped or replaced by code, recorded in the meta
+        if not lenient:
+            return d, {"auto_linked": auto_linked, "auto_linked_single_target": bool(single), "lenient_controls": True}
     raise ValueError("draft failed grounding validation after two attempts: " + "; ".join(bad))
 
 
@@ -701,35 +883,22 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                             allow_reserved=True, require_f2p_link=False)
     if bad:  # code-built from judge evidence; a failure here is a bug or an unusable evidence span, never a model correction
         raise ValueError("synthesized tests-resolved facts failed grounding: " + "; ".join(bad))
-    d, links = _author(row, judged, model_id, extra_facts=synthesized)
+    from pydantic import ValidationError
+    from swesim.models import ScenarioSpec
 
-    pw = d.get("plausible_wrong") or {}
-    if not (pw.get("diff") or "").strip():
-        raise ValueError("plausible-wrong control needs a non-empty diff")
-    files = {"oracle.diff": row["patch"].encode(), "test.patch": row["test_patch"].encode(), "plausible-wrong.diff": pw["diff"].encode()}
-    alt = d.get("alternative_correct") or None
-    if alt and (alt.get("diff") or "").strip():
-        files["alternative-correct.diff"] = alt["diff"].encode()
-    elif judged.get("structural_tests"):
-        raise ValueError("structural tests require an alternative-correct control and the drafter produced none")
-    else:
-        alt = None
-
+    # Everything that does not depend on the model output is computed once, before authoring.
     test_files = test_files_from_patch(row["test_patch"])
-    protected, protected_dropped = protected_paths_for(test_files, d.get("protected_paths_extra") or [], patch_paths(row["patch"]))
+    gold_paths = patch_paths(row["patch"])
     base_files = {p: threads.base_text(row["repo"], row["base_commit"], p) for p in [*test_files, "conftest.py", "sitecustomize.py"]}
     control_diffs = tamper.all_controls(base_files)
+    fixed_files = {"oracle.diff": row["patch"].encode(), "test.patch": row["test_patch"].encode()}
     for name, diff in control_diffs.items():
         if not diff:
             raise ValueError("empty tamper control")
-        files[f"{name}.diff"] = diff.encode()
+        fixed_files[f"{name}.diff"] = diff.encode()
     is_github = row.get("source") == "github-repo"
     if is_github:
-        files["Dockerfile.base"] = row["dockerfile"].encode()
-    manifest = {}
-    for name, data in files.items():
-        (assets / name).write_bytes(data)
-        manifest[name] = {"path": f"assets/{name}", "sha256": _sha(data), "bytes": len(data)}
+        fixed_files["Dockerfile.base"] = row["dockerfile"].encode()
 
     nodeid_map = row.get("nodeid_map") or {}
     ordered, order_source = definition_order(row["fail_to_pass"] + row["pass_to_pass"], row.get("test_order"), row["test_patch"])
@@ -748,53 +917,139 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                    "test_command": runner_cmd, "gold_commit": thread.get("gold_commit")}
     if is_github:
         environment.update(kind="dockerfile", image=None, dockerfile_asset="Dockerfile.base")
-    controls = {"oracle": "oracle.diff",
-                "plausible_wrong": [{"name": pw["name"], "asset": "plausible-wrong.diff", "rationale": pw["rationale"],
-                                     "expected_success": 0, "expected_reward_max": 0.5, "cls": "plausible-wrong"}],
-                "alternative_correct": [{"name": alt["name"], "asset": "alternative-correct.diff", "rationale": alt["rationale"],
-                                         "expected_success": 1, "cls": "alternative-correct"}] if alt else [],
-                "tamper": [{"name": n, "asset": f"{n}.diff", "rationale": "code-generated exploit", "expected_reward": 0.0, "cls": "incorrect-exploit"}
-                           for n in control_diffs]}
-    spec = {"id": row["instance_id"].lower().replace("__", "--"), "version": 1, "source": row.get("source", "swebench-annotated"),
-            "source_ref": row["instance_id"], "created_at": datetime.now(timezone.utc).isoformat(), "pipeline_version": pipeline_version,
-            "environment": environment, "assets": manifest,
-            "briefs": [{"profile": "natural", "text": row["problem_statement"], "provenance": "original-issue"}],
-            "ledger": [*d["ledger"], *synthesized], "operations": d.get("operations") or [], "persona": d["persona"], "requirements": d.get("requirements") or [],
-            "contract": {"fail_to_pass": row["fail_to_pass"], "pass_to_pass": row["pass_to_pass"], "test_assets": ["test.patch"],
-                         "protected_paths": protected,
-                         "runner": {"kind": "pytest-ra", "command": runner_cmd, "single_command": prefix + "{nodeid}", "test_files": test_files,
-                                    "nodeid_map": nodeid_map}},
-            "checks": d.get("checks") or [], "controls": controls, "groups": _normalize_groups(d["groups"]),
-            "difficulty": {"annotated": row["annotation"]["difficulty"], "judged": judged}, "thread": dict(thread)}
+    tamper_controls = [{"name": n, "asset": f"{n}.diff", "rationale": "code-generated exploit", "expected_reward": 0.0, "cls": "incorrect-exploit"}
+                       for n in control_diffs]
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    # Base content of the files the fix touches (bounded), for building/verifying control patches locally before the Modal sweep.
+    base_cache: dict[str, str | None] = {}
+    base_sources, base_skipped = fetch_base_files(row, gold_paths, base_cache)
+    oracle_ok, oracle_msg = verify_diff_applies(base_sources, row["patch"])
+    if oracle_ok is False:  # the merged PR must apply to its own base commit; anything else is a data error, never a correction
+        raise ValueError(f"oracle patch does not apply to the base commit (git apply --check): {oracle_msg}")
+    control_notes: dict = {}
+
+    def control_asset(d: dict, key: str, lenient: bool) -> tuple[dict | None, bytes | None]:
+        """Build and verify one model control (`plausible_wrong` / `alternative_correct`). Returns (record, diff bytes); the
+        record has the code-owned slug, the model's label, the build method and the verification result. Strict mode raises
+        DraftViolation (correction round); lenient mode drops the control (None) and records why."""
+        ctrl = d.get(key) if isinstance(d.get(key), dict) else None
+        if not ctrl:
+            return None, None
+        try:
+            paths = set(ctrl.get("files") or {}) if isinstance(ctrl.get("files"), dict) else patch_paths(ctrl.get("diff") or "")
+            files, _ = fetch_base_files(row, paths, base_cache)
+            diff, method = build_control_diff(ctrl, files)
+        except DraftViolation as e:
+            if lenient:
+                control_notes.setdefault("controls_dropped", []).append({"control": key, "label": ctrl.get("name"), "reason": str(e)})
+                return None, None
+            raise
+        if diff is None:
+            return None, None
+        ok, msg = verify_diff_applies(files, diff)
+        if ok is False:
+            if not lenient:
+                raise DraftViolation(f"{key} patch does not apply to the base commit (git apply --check): {msg}. Prefer `files` with the complete "
+                                     "modified text of each touched file so the diff is built for you.")
+            control_notes.setdefault("controls_dropped", []).append({"control": key, "label": ctrl.get("name"), "reason": f"does not apply: {msg}", "method": method})
+            return None, None
+        record = {"label": ctrl.get("name"), "rationale": ctrl.get("rationale") or "", "method": method, "verified": ok}
+        return record, diff.encode()
+
+    def assemble(d: dict, withheld_parts: dict | None = None, lenient: bool = False) -> tuple[dict, dict, list[dict]]:
+        """Spec dict, asset bytes and dropped protected-path extras from a model output. DraftViolation for model-fixable
+        problems (fed back in the correction round); plain ValueError for drafter errors (never corrected). Lenient mode
+        (after the correction round) drops unusable model controls instead: alternative-correct is optional, plausible-wrong
+        is replaced by `fallback_plausible_wrong` because ScenarioSpec requires one."""
+        control_notes.clear()
+        taken = set(control_diffs)
+        pw_rec, pw_bytes = control_asset(d, "plausible_wrong", lenient)
+        if pw_rec is None:
+            if not lenient:
+                raise DraftViolation("plausible-wrong control needs a patch: give `files` with the complete modified text of each touched file")
+            fb = fallback_plausible_wrong(row["patch"], base_sources)
+            if fb is None:
+                raise ValueError("drafter error: no usable plausible-wrong control and no base content for a code fallback")
+            diff, method = fb
+            pw_rec, pw_bytes = {"label": method, "rationale": "code fallback: the model's plausible-wrong patch was unusable after the correction round",
+                                "method": method, "verified": True}, diff.encode()
+            control_notes["controls_fallback"] = {"plausible_wrong": method}
+        alt_rec, alt_bytes = control_asset(d, "alternative_correct", lenient)
+        if alt_rec is None and judged.get("structural_tests"):
+            raise DraftViolation("structural tests require an alternative-correct control; write one under alternative_correct (`files` with complete text)")
+        pw_name = slugify_control_name(pw_rec["label"], "plausible-wrong", taken)
+        alt_name = slugify_control_name(alt_rec["label"], "alternative-correct", taken) if alt_rec else None
+        protected, protected_dropped = protected_paths_for(test_files, d.get("protected_paths_extra") or [], gold_paths)
+        files = {**fixed_files, "plausible-wrong.diff": pw_bytes}
+        if alt_rec:
+            files["alternative-correct.diff"] = alt_bytes
+        check_asset_paths(files)
+        manifest = {name: {"path": f"assets/{name}", "sha256": _sha(data), "bytes": len(data)} for name, data in files.items()}
+        control_notes["controls"] = {"plausible_wrong": {"name": pw_name, **pw_rec}, **({"alternative_correct": {"name": alt_name, **alt_rec}} if alt_rec else {})}
+        controls = {"oracle": "oracle.diff",
+                    "plausible_wrong": [{"name": pw_name, "asset": "plausible-wrong.diff", "rationale": pw_rec["rationale"],
+                                         "expected_success": 0, "expected_reward_max": 0.5, "cls": "plausible-wrong"}],
+                    "alternative_correct": [{"name": alt_name, "asset": "alternative-correct.diff", "rationale": alt_rec["rationale"],
+                                             "expected_success": 1, "cls": "alternative-correct"}] if alt_rec else [],
+                    "tamper": tamper_controls}
+        briefs = [{"profile": "natural", "text": row["problem_statement"], "provenance": "original-issue"}]
+        ledger = [*(d.get("ledger") or []), *synthesized]
+        operations = list(d.get("operations") or [])
+        if withheld_parts and withheld_parts["result"]["removed"]:  # zero removals is valid: natural brief only
+            briefs.append({"profile": "withheld", "text": withheld_parts["result"]["withheld_brief"], "provenance": "withheld"})
+            ledger += withheld_parts["facts"]
+            operations += withheld_parts["operations"]
+        spec = {"id": row["instance_id"].lower().replace("__", "--"), "version": 1, "source": row.get("source", "swebench-annotated"),
+                "source_ref": row["instance_id"], "created_at": created_at, "pipeline_version": pipeline_version,
+                "environment": environment, "assets": manifest, "briefs": briefs, "ledger": ledger, "operations": operations,
+                "persona": d.get("persona") or {}, "requirements": d.get("requirements") or [],
+                "contract": {"fail_to_pass": row["fail_to_pass"], "pass_to_pass": row["pass_to_pass"], "test_assets": ["test.patch"],
+                             "protected_paths": protected,
+                             "runner": {"kind": "pytest-ra", "command": runner_cmd, "single_command": prefix + "{nodeid}", "test_files": test_files,
+                                        "nodeid_map": nodeid_map}},
+                "checks": d.get("checks") or [], "controls": controls, "groups": _normalize_groups(d.get("groups") or []),
+                "difficulty": {"annotated": row["annotation"]["difficulty"], "judged": judged}, "thread": dict(thread)}
+        return spec, files, protected_dropped
+
+    def validate(d: dict, lenient: bool = False) -> list[str]:
+        """The withheld parts are code-guaranteed to satisfy `_integrity`, so validating without them is enough to catch
+        everything the model can get wrong (requirement on an author-only fact, unknown test id, duplicate ids, a control
+        patch that does not apply, ...)."""
+        try:
+            ScenarioSpec.model_validate(assemble(d, lenient=lenient)[0])
+        except DraftViolation as e:
+            return [str(e)]
+        except ValidationError as e:
+            return _schema_violations(e)
+        return []
+
+    d, links = _author(row, judged, model_id, extra_facts=synthesized, validate=validate)
 
     withheld = withhold(row["problem_statement"], model_id)
-    withheld_facts = []
-    if withheld["removed"]:  # zero removals is valid: the scenario then has only the natural brief and hidden/interactive use it
-        spec["briefs"].append({"profile": "withheld", "text": withheld["withheld_brief"], "provenance": "withheld"})
     issue_url = next((i["issue_url"] for i in thread.get("linked_issues") or []), thread.get("pr_url"))
     if withheld["removed"] and not issue_url:
         raise ValueError("withheld facts need source URL")
+    withheld_facts, withheld_ops = [], []
     for i, item in enumerate(withheld["removed"]):
         fid = f"withheld-{i + 1:03d}"
-        if any(f.get("id") == fid for f in spec["ledger"]):
-            raise ValueError("reserved withholding fact id")
         discovery = "repo-derivable" if item["category"] in REPO_DERIVABLE_CATEGORIES else item["discovery"]
         withheld_facts.append({"id": fid, "text": item["fact_text"], "kind": item["kind"], "provenance": "original-issue",
                                "source_excerpt": item["excerpt"], "source_url": issue_url, "discovery": discovery, "tests": []})
         # Operation is frozen at {type, target, rationale}: the exact span and its offsets in the natural text ride in the rationale
         # (machine-readable copy in draft.meta.json under "withholding").
         offsets = ", ".join(f"natural[{o['start']}:{o['end']}]" for o in item["occurrences"])
-        spec["operations"].append({"type": "withholding", "target": fid,
-                                   "rationale": f"Removed category: {item['category']}; {offsets} = {item['excerpt']!r}"})
+        withheld_ops.append({"type": "withholding", "target": fid, "rationale": f"Removed category: {item['category']}; {offsets} = {item['excerpt']!r}"})
     # The withheld facts go through the same grounding gate as every other fact, with their own removed span as corpus.
     bad = ledger_violations({"ledger": withheld_facts}, row, corpus_by_fact={f["id"]: f["source_excerpt"] for f in withheld_facts},
                             allow_reserved=True, require_f2p_link=False)
     if bad:
         raise ValueError("withheld facts failed grounding: " + "; ".join(bad))
-    spec["ledger"].extend(withheld_facts)
 
-    from swesim.models import ScenarioSpec
-    parsed = ScenarioSpec.model_validate(spec)
+    spec, files, protected_dropped = assemble(d, {"result": withheld, "facts": withheld_facts, "operations": withheld_ops}, lenient=True)
+    parsed = ScenarioSpec.model_validate(spec)  # the model's part already validated; a failure here is a drafter error
+    for name, data in files.items():
+        (assets / name).write_bytes(data)
     p = out_dir / "scenario.draft.json"
     p.write_text(parsed.model_dump_json(indent=2))
     atomic_json(out_dir / "judge.json", {"gaps": judged.get("gaps", []), "verified_rubric_score": judged.get("verified_rubric_score"),
@@ -803,8 +1058,11 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                                               "created_at": spec["created_at"], "spec_hash": parsed.spec_hash,
                                               "auto_linked": links["auto_linked"], "auto_linked_single_target": links["auto_linked_single_target"],
                                               "protected_paths_dropped": protected_dropped,
+                                              "controls": control_notes.get("controls", {}), "controls_dropped": control_notes.get("controls_dropped", []),
+                                              "controls_fallback": control_notes.get("controls_fallback", {}),
+                                              "oracle_apply": {"verified": oracle_ok, "note": oracle_msg, "base_files_fetched": sorted(base_sources), "base_files_skipped": base_skipped},
                                               "runner": {"order": "definition", "order_source": order_source, "ids": selected},
-                                              "probe": ({k: probe.get(k) for k in ("kind", "probe_dir", "image_digest", "counts", "dropped", "swebench")} if probe.get("statuses")
+                                              "probe": ({k: probe.get(k) for k in ("kind", "probe_dir", "image_digest", "counts", "dropped", "swebench", "runner")} if probe.get("statuses")
                                                         else {"unmeasured": True}),
                                               "withholding": {"removed": len(withheld["removed"]), "reason": withheld["stats"].get("reason"),
                                                               "spans": [{**r, "fact_id": f"withheld-{i + 1:03d}"} for i, r in enumerate(withheld["removed"])],
