@@ -57,6 +57,24 @@ def test_store_never_shows_its_url_and_rejects_other_dialects(settings: Settings
         IndexStore("mysql+pymysql://u:p@h/db")
 
 
+def test_ensure_migrated_is_the_workers_startup_step(tmp_path, caplog):
+    import logging
+
+    from swesim.index import ensure_migrated
+
+    disabled = Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env")})
+    assert ensure_migrated(disabled) is False
+    url = f"sqlite:///{tmp_path / 'index.db'}"
+    enabled = Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env"), "SWESIM_DATABASE_URL": url})
+    with caplog.at_level(logging.INFO, logger="swesim.index.store"):
+        assert ensure_migrated(enabled) is True
+        assert ensure_migrated(enabled) is True  # idempotent: nothing to do the second time
+    lines = [r.getMessage() for r in caplog.records if r.name == "swesim.index.store"]
+    assert len(lines) == 2 and all("0001_index_v1" in line for line in lines) and "migrated from empty" in lines[0] and "migrated" not in lines[1]
+    assert not any(url in line or "index.db" in line for line in lines)
+    assert IndexStore(url).trials(M.TrialFilter()).total == 0  # the tables exist
+
+
 def test_upserts_are_idempotent_on_the_primary_key(store: IndexStore):
     first = _trial(reward=Decimal("0.5"), success=False, outcome_code=2)
     store.upsert_trial(first)
