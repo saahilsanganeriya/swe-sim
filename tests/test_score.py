@@ -65,13 +65,20 @@ def review_events(t0: float, remaining: int, rid: str = "r1") -> list[dict]:
     ]
 
 
-def make_spec(sid: str = "example-scenario", version: int = 1, with_author_only: bool = False) -> ScenarioSpec:
+def make_spec(sid: str = "example-scenario", version: int = 1, with_author_only: bool = False, withheld: bool = False) -> ScenarioSpec:
     d = minimal_spec_dict()
     d["id"] = sid
     d["version"] = version
     if with_author_only:
         d["ledger"].append({"id": "f09", "text": "SECRET-AUTHOR-ONLY-NOTE", "kind": "context", "provenance": "authored",
                             "authored_rationale": "internal", "discovery": "author-only"})
+    if withheld:  # a natural brief with a removed reproduction span and the matching withheld brief + operation
+        d["briefs"][0]["text"] = "Import fails\nTraceback: SECRET_ERROR raised in loader\nSteps: run `pkg load`."
+        d["briefs"].append({"profile": "withheld", "text": "Import fails\nSteps: run `pkg load`.", "provenance": "withheld"})
+        d["ledger"].append({"id": "withheld-001", "text": "The traceback shows SECRET_ERROR", "kind": "reproduction",
+                            "provenance": "original-issue", "source_excerpt": "Traceback: SECRET_ERROR raised in loader",
+                            "source_url": "https://example.com/issue", "discovery": "on-request", "tests": []})
+        d["operations"] = [{"type": "withholding", "target": "withheld-001", "rationale": "Removed category: reproduction"}]
     return ScenarioSpec.model_validate(d)
 
 
