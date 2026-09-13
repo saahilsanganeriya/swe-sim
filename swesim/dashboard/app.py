@@ -29,7 +29,7 @@ import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
@@ -43,6 +43,8 @@ from swesim.dashboard.public import PRIVATE_KEYS, project
 from swesim.dashboard.access import all_rows
 from swesim.index import reports
 from swesim.index.cohorts import cohort_of
+from swesim.index.models import TrialStatus
+from swesim.index.project import FAILURE_STATUSES
 from swesim.settings import Settings, get_settings
 from swesim.sources import observations
 
@@ -160,15 +162,24 @@ def _pool(request: Request, lists: dict) -> str | None:
     return key
 
 
-def trial_views(reader, trials: list, source: str | None = None) -> list[dict]:
+# The "graded only" quick chip (``?graded=1``): every status but the ones nothing was graded on.
+GRADED_STATUSES: tuple[str, ...] = tuple(s for s in get_args(TrialStatus) if s not in FAILURE_STATUSES)
+
+
+def trial_views(reader, trials: list, source: str | None = None, layout=None) -> list[dict]:
     """``pages.trial_view`` for a batch, with each trial's scenario source (the task-origin badge) looked up once per batch;
-    ``source`` short-circuits the lookup when every trial is on one known scenario."""
+    ``source`` short-circuits the lookup when every trial is on one known scenario. With ``layout``, a failed attempt whose
+    row was indexed before ``TrialRow.failure`` existed gets its reason from the files (``data.failure_for``, memoised)."""
     trials = list(trials)
+
+    def failure(t) -> str | None:
+        return data.failure_for(layout, t.trial_id) if layout is not None and t.status in FAILURE_STATUSES and not t.failure else None
+
     if source is not None or not trials:
-        return [pages.trial_view(t, source=source) for t in trials]
+        return [pages.trial_view(t, source=source, failure=failure(t)) for t in trials]
     ids = sorted({t.scenario_id for t in trials if t.scenario_id})
     sources = {s.scenario_id: s.source for s in all_rows(reader.scenarios, R.ScenarioFilter(scenario_id=ids, latest_only=True))} if ids else {}
-    return [pages.trial_view(t, source=sources.get(t.scenario_id)) for t in trials]
+    return [pages.trial_view(t, source=sources.get(t.scenario_id), failure=failure(t)) for t in trials]
 
 
 def page(p: render.Page, body: str, reader, identity: Identity, settings: Settings) -> HTMLResponse:
@@ -314,30 +325,34 @@ def _trial_filter(request: Request, default_limit: int = 200) -> R.TrialFilter:
     status = lists.pop("status")
     if status and "unresolved" in status:
         status = sorted(set(status) | {"runner-error", "launch-failed", "unit-failed", "cancelled"})
+    if request.query_params.get("graded") == "1":  # the quick chip: the current selection minus the statuses nothing was graded on
+        status = [s for s in (status or GRADED_STATUSES) if s not in FAILURE_STATUSES] or list(GRADED_STATUSES)
     return R.TrialFilter(**lists, status=status, version=_ints(request.query_params.getlist("version")), outcome_code=_ints(request.query_params.getlist("outcome_code")),
                          started_from=_date(request.query_params.get("since")), started_to=_date(request.query_params.get("until"), end=True),
                          order_by=request.query_params.get("order_by") or None, desc=request.query_params.get("asc") != "1", offset=offset, limit=limit)
 
 
 @app.get("/trials", response_class=HTMLResponse)
-def trials(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+def trials(request: Request, reader=Depends(reader_dep), layout=Depends(layout_dep), identity: Identity = Depends(identity_dep),
+           settings: Settings = Depends(settings_dep)) -> HTMLResponse:
     f = _trial_filter(request)
     pg = reader.trials(f)
-    views = trial_views(reader, pg.items)
+    views = trial_views(reader, pg.items, layout=layout)
     everything = reader.trials(R.TrialFilter(limit=500)).items
     facets = {"scenario_id": sorted({t.scenario_id for t in everything}), "version": sorted({t.version for t in everything if t.version is not None}),
               "model": sorted({t.model for t in everything}), "status": sorted({t.status for t in everything} | {"unresolved"}),
               "outcome_code": sorted({t.outcome_code for t in everything if t.outcome_code is not None}), "origin": sorted({t.origin for t in everything})}
     current = {k: request.query_params.getlist(k) for k in ("scenario_id", "version", "model", "condition", "brief_profile", "status", "outcome_code", "purpose", "origin")}
-    current.update(since=request.query_params.get("since"), until=request.query_params.get("until"), pool=origin.facet_key(request.query_params.get(origin.PARAM)))
+    current.update(since=request.query_params.get("since"), until=request.query_params.get("until"), pool=origin.facet_key(request.query_params.get(origin.PARAM)),
+                   graded=request.query_params.get("graded") == "1")
     p = render.Page("Trials", "trials", "trials", crumbs=(("Trials", None),))
     return page(p, pages.trials_body(pg, views, facets, current, request.query_params.multi_items()), reader, identity, settings)
 
 
 @app.get("/api/trials")
-def api_trials(request: Request, reader=Depends(reader_dep)) -> JSONResponse:
+def api_trials(request: Request, reader=Depends(reader_dep), layout=Depends(layout_dep)) -> JSONResponse:
     pg = reader.trials(_trial_filter(request))
-    return _json(200, {"items": trial_views(reader, pg.items), "total": pg.total, "offset": pg.offset, "limit": pg.limit})
+    return _json(200, {"items": trial_views(reader, pg.items, layout=layout), "total": pg.total, "offset": pg.offset, "limit": pg.limit})
 
 
 @app.get("/candidates", response_class=HTMLResponse)

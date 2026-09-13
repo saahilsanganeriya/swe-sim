@@ -24,6 +24,7 @@ from pathlib import Path
 
 import httpx
 
+from swesim.index.project import trial_failure
 from swesim.settings import MissingSecret, Settings, secret
 from swesim.stages.score import OUTCOME_NAMES, normalize_record, outcome_code, unresolved_attempt
 from swesim.storage.layout import LayoutError
@@ -34,6 +35,7 @@ LIVE_TIMEOUT = 10.0
 LIVE_CACHE_TTL = 6.0
 REFUSAL_PREFIX = "I have to step away now"
 _live_cache: dict[str, tuple[float, dict, str | None]] = {}
+_failures: dict[str, str] = {}  # trial id -> reason nothing was graded; a failed attempt's files never change
 # Files a reader may open from the episode page. Fixed names only; nothing else under the trial dir is served.
 TRIAL_FILES: dict[str, tuple[str, str]] = {
     "record.json": ("trial", "record.json"), "reward.json": ("trial", "reward.json"), "report.json": ("trial", "report.json"),
@@ -235,6 +237,20 @@ def _trajectory(layout, tid: str, record: dict) -> dict:
     return read_json(found[0]) if len(found) == 1 else {}
 
 
+def failure_for(layout, tid: str) -> str | None:
+    """The reason an attempt was never graded, read from its files (``swesim.index.project.trial_failure``) for a trial row
+    indexed before ``TrialRow.failure`` existed. Memoised per trial id once found; None (not cached) while no file says."""
+    if tid in _failures:
+        return _failures[tid]
+    if not TRIAL_RE.fullmatch(tid):
+        return None
+    d = layout.trial_dir(tid)
+    found = trial_failure(d) if _contained(layout, d) and d.is_dir() else None
+    if found:
+        _failures[tid] = found
+    return found
+
+
 def load_trial(layout, tid: str, settings: Settings) -> dict | None:
     """The artifact bundle of one trial (None when the directory does not exist)."""
     if not TRIAL_RE.fullmatch(tid):
@@ -293,6 +309,7 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
                 break
     return {"trial_id": tid, "dir": d, "status": {**{k: v for k, v in meta.items() if k in ("started_at", "finished_at") and v}, **status},
             "record": record, "request": request, "live": live, "unresolved": unresolved, "live_transcript_error": live_error,
+            "failure": trial_failure(d) if unresolved else None,
             "transcript": transcript or {}, "report": report or {}, "reward": reward or {}, "trajectory": traj,
             "instruction": ins.read_text(errors="replace") if ins else None, "instruction_source": ins_source,
             "label": read_json(d / "label.json", default=None) or None, "meta": meta,

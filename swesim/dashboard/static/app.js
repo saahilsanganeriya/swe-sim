@@ -44,7 +44,7 @@
   localizeTimes(document);
   const STATUS = { valid: "good", completed: "good", finished: "good", done: "good", registered: "good", kept: "good", approved: "good", accepted: "good", informative: "good",
     running: "run", launched: "run", pending: "run", requested: "run", drafting: "run", compiling: "run", validating: "run", planned: "run", "awaiting-approval": "run", open: "run",
-    failed: "critical", invalid: "critical", "launch-failed": "critical", "runner-error": "critical", error: "critical", "unit-failed": "critical", rejected: "critical", terminated: "critical", timed_out: "critical", broken: "critical",
+    failed: "critical", invalid: "critical", "launch-failed": "critical", "runner-error": "critical", error: "critical", "unit-failed": "critical", rejected: "critical", terminated: "critical", timed_out: "critical", broken: "critical", "not graded": "critical",
     unresolved: "serious", cancelled: "serious", review_needed: "serious",
     archived: "neutral", saturated: "neutral", continued_as_new: "neutral", unknown: "neutral", mined: "neutral",
     novel: "info", "swe-bench a": "neutral", authored: "neutral" };

@@ -9,7 +9,7 @@ from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
 
-from swesim.dashboard import access, data, render
+from swesim.dashboard import access, data, pages, render
 from swesim.dashboard import rows as R
 from swesim.dashboard.app import app, leaderboard_gate
 from swesim.dashboard.pages import reject_histogram
@@ -35,6 +35,8 @@ SENTINELS = {
     "audit_reason": "AUDIT-SENTINEL-66",
     "hidden_asset": "hidden_test_SENTINEL_44.py",
 }
+# Today's hosted failure (2026-09-13): compiled tasks that predate the manifest binding; the runner writes it before any agent runs.
+RUNNER_ERROR = "ValueError('compiled inputs lack a bound manifest; recompile and revalidate')"
 EVALUATOR_JSON_KEYS = ('"redacted_terms"', '"withheld_sentences"', '"disclosed_fact_ids"', '"tool_calls"', '"tier"', '"regenerated"', '"forbidden_terms"')
 
 
@@ -81,6 +83,7 @@ def site(tmp_path, monkeypatch):
     wrong = write_trial(ws, spec, attempt=1, outcome_code=2, success=0, reward=0.0)
     full = write_trial(ws, spec, condition="full", purpose="comparison")
     runner_error = write_unresolved(ws, spec, kind="runner-error", attempt=5)
+    (ws.root / "trials" / runner_error / "runner-error.json").write_text(json.dumps({"error": RUNNER_ERROR, "type": "ValueError", "at": T0 + 100}))
     launch_failed = write_unresolved(ws, spec, kind="launch-failed", attempt=6)
     running = "ab" * 12
     rdir = ws.root / "trials" / running
@@ -177,7 +180,10 @@ def test_reader_projects_every_attempt_including_unresolved_and_launch_failed(si
     assert by_id[site["wrong"]].outcome_code == 2 and by_id[site["wrong"]].success is False
     assert by_id[site["runner_error"]].status in ("runner-error", "unresolved") and by_id[site["launch_failed"]].status in ("launch-failed", "unresolved")
     assert by_id[site["runner_error"]].outcome_code is None and by_id[site["launch_failed"]].success is None
+    # the reason nothing was graded travels with the row: runner-error.json's error, launch.json's error; never on a graded or live row
+    assert by_id[site["runner_error"]].failure == RUNNER_ERROR and by_id[site["launch_failed"]].failure == "FileNotFoundError('systemd-run')"
     running = by_id[site["running"]]
+    assert done.failure is None and running.failure is None
     assert running.status == "running" and running.attempt_index == 9 and running.workflow_id == "run-live-1" and running.outcome_code is None
     assert r.trials(R.TrialFilter(status=["completed"])).total == 3 and r.trials(R.TrialFilter(condition=["full"])).total == 1
     assert r.trials(R.TrialFilter(started_from=datetime.fromisoformat("2026-09-13T11:00:00+00:00"))).total == 1  # only the running one started at noon
@@ -260,7 +266,7 @@ def test_reader_costs_spend_table_and_operator_actions(site, tmp_path, monkeypat
 
 # ---------------------------------------------------------------- pages and JSON twins
 
-PUBLIC_ROUTES = ("/", "/scenarios", "/trials", "/trials?status=unresolved&condition=interactive", "/candidates", "/workflows", "/review", "/leaderboard",
+PUBLIC_ROUTES = ("/", "/scenarios", "/trials", "/trials?status=unresolved&condition=interactive", "/trials?graded=1", "/api/trials?graded=1", "/candidates", "/workflows", "/review", "/leaderboard",
                  "/leaderboard?include_saturated=1&tier=C", "/leaderboard?difficulty_tier=broken&difficulty_tier=unlabelled", "/trends", "/api/trends", "/db", "/db/trials", "/db/exchanges", "/db/scenarios", "/artifacts", "/artifacts?path=trials", "/create", "/run",
                  "/spend", "/search?q=example", "/api/counts", "/api/home", "/api/scenarios", "/api/trials", "/api/candidates", "/api/workflows", "/api/leaderboard",
                  "/api/spend", "/api/review", "/api/db/trials", "/api/db/exchanges", "/api/db/exchanges.csv", "/api/db/trials.csv", "/api/artifacts?path=scenarios")
@@ -300,7 +306,9 @@ def test_trials_page_filters_and_json_agree(site):
     all_ = c.get("/api/trials").json()
     assert all_["total"] == 6 and {t["status"] for t in all_["items"]} == {"completed", "running", "runner-error", "launch-failed"}
     unresolved = c.get("/api/trials?status=unresolved").json()
-    assert unresolved["total"] == 2 and {t["outcome"] for t in unresolved["items"]} == {"unresolved"}
+    assert unresolved["total"] == 2 and {t["outcome"] for t in unresolved["items"]} == {"not graded", "unresolved"}
+    runner = next(t for t in unresolved["items"] if t["trial_id"] == site["runner_error"])
+    assert runner["status"] == "runner-error" and runner["outcome"] == "not graded" and runner["failure"] == RUNNER_ERROR and runner["failure_short"] == RUNNER_ERROR
     done = next(t for t in all_["items"] if t["trial_id"] == site["done"])
     assert done["outcome"] == "valid-correct" and done["cost_usd"] == "0.0125" and done["questions_asked"] == 1
     html = c.get(f"/trials?model={HAIKU}&condition=full").text
@@ -308,6 +316,41 @@ def test_trials_page_filters_and_json_agree(site):
     windowed = c.get("/api/trials?since=2026-09-13&until=2026-09-13").json()
     assert windowed["total"] == 4 and all(t["started_at"] for t in windowed["items"])  # attempts without a start time fail a bounded window
     assert c.get("/api/trials?since=2026-09-14").json()["total"] == 0
+
+
+def test_runner_error_rows_read_not_graded_with_the_reason_and_graded_only_excludes_them(site):
+    c = site["client"]
+    html = c.get("/trials").text
+    # the outcome cell: the error token (✕ critical), never the ◇ "unresolved" chip; the reason on the row, full text in the tooltip
+    assert "<span class='chip critical'><i aria-hidden='true'>✕</i>not graded</span>" in html
+    assert f"title='{render.h(RUNNER_ERROR)}'" in html and html.count(render.h(RUNNER_ERROR)) >= 2
+    assert "runner-error = the trial could not start; nothing was graded (see the reason on each row)" in html
+    assert "data-quick='graded'>graded only</a>" in html and "aria-current=true data-quick='graded'" not in html
+    # the quick chip: complete history minus runner-error, launch-failed and unresolved; the JSON twin agrees; the note disappears with the rows
+    graded = c.get("/api/trials?graded=1").json()
+    assert graded["total"] == 4 and {t["status"] for t in graded["items"]} == {"completed", "running"}
+    page = c.get("/trials?graded=1").text
+    assert "aria-current=true data-quick='graded'" in page and "<input type='hidden' name='graded' value='1'>" in page
+    assert "not graded" not in page and "runner-error = the trial could not start" not in page and site["runner_error"][:12] not in page
+    assert c.get("/api/trials?graded=1&status=unresolved").json()["total"] == 0  # graded wins over an explicit failure status
+    launch_failed = next(t for t in c.get("/api/trials?status=launch-failed").json()["items"])
+    assert launch_failed["outcome"] == "unresolved" and launch_failed["failure"] == "FileNotFoundError('systemd-run')"
+    # the episode page carries the reason in full
+    ep = c.get(f"/trial/{site['runner_error']}").text
+    assert "nothing was graded" in ep and render.h(RUNNER_ERROR) in ep and "Not counted in n, success or pass@k" in ep
+
+
+def test_trial_view_truncates_the_reason_to_120_chars_and_keeps_the_full_text():
+    long = "x" * 150
+    row = R.TrialRow(trial_id="a" * 24, scenario_id="s", version=None, spec_hash="b" * 64, condition="full", brief_profile="natural", model="anthropic/x",
+                     provider="anthropic", run_config_hash="c" * 64, attempt_index=0, purpose="demonstration", status="runner-error", failure=long, origin="laptop")
+    v = pages.trial_view(row)
+    assert v["outcome"] == "not graded" and v["failure"] == long and v["failure_short"] == "x" * 120 + "…"
+    stale = pages.trial_view(row.model_copy(update={"failure": None}), failure="from the files")  # a row indexed before the column existed
+    assert stale["failure"] == "from the files" and stale["failure_short"] == "from the files" and stale["outcome"] == "not graded"
+    assert pages.trial_view(row.model_copy(update={"status": "launch-failed"}))["outcome"] == "unresolved"
+    done = pages.trial_view(row.model_copy(update={"status": "completed", "failure": None, "outcome_code": 1}))
+    assert done["outcome"] == "valid-correct" and done["failure"] is None and done["failure_short"] is None
 
 
 def test_candidates_page_has_funnel_histogram_and_every_reject_reason(site):

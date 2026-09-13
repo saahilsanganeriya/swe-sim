@@ -115,6 +115,7 @@ STATUS_KIND = {
     # critical
     "failed": "critical", "invalid": "critical", "launch-failed": "critical", "runner-error": "critical", "error": "critical",
     "unit-failed": "critical", "rejected": "critical", "terminated": "critical", "timed_out": "critical", "broken": "critical",
+    "not graded": "critical",  # a runner-error row's outcome: the trial never started (never the ◇ unresolved chip)
     # serious (needs a look, not a failure)
     "unresolved": "serious", "cancelled": "serious", "review_needed": "serious",
     # neutral

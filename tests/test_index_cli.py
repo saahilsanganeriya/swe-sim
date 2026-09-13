@@ -66,7 +66,7 @@ def test_migrate_rebuild_status(env, tmp_path, record: Record):
     before = runner.invoke(index_app, ["status"])
     assert before.exit_code == 0 and "not migrated" in before.output and "missing" in before.output
     migrated = runner.invoke(index_app, ["migrate"])
-    assert migrated.exit_code == 0 and "0005_funnel_versions" in migrated.output
+    assert migrated.exit_code == 0 and "0006_trial_failure" in migrated.output
     bad = runner.invoke(index_app, ["rebuild", "--origin", "moon"])
     assert bad.exit_code == 2
     rebuilt = runner.invoke(index_app, ["rebuild", "--origin", "vm-systemd"])
@@ -76,7 +76,7 @@ def test_migrate_rebuild_status(env, tmp_path, record: Record):
     again = runner.invoke(index_app, ["rebuild", "--json"])
     assert again.exit_code == 0 and '"delta": 0' in again.output and '"origin": "laptop"' in again.output
     status = runner.invoke(index_app, ["status"])
-    assert status.exit_code == 0 and "index enabled: True" in status.output and "revision: 0005_funnel_versions" in status.output
+    assert status.exit_code == 0 and "index enabled: True" in status.output and "revision: 0006_trial_failure" in status.output
     assert f"trials            {len(record.tids) - 1:>7}" in status.output and "last rebuild:" in status.output and "diff none" in status.output
     for out in (before.output, migrated.output, rebuilt.output, status.output):
         assert url not in out and "index.db" not in out  # the database URL is a secret; never printed
