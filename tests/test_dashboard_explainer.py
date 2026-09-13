@@ -86,7 +86,7 @@ def test_diagrams_are_aligned_and_escaped(site):
             assert all(ln == ln.rstrip() for ln in lines), (card.title, "trailing whitespace")
             assert "\t" not in card.diagram, card.title
     body = _main(site["client"].get("/explainer").text)
-    assert body.count("<pre class='code'") >= 12
+    assert body.count("<pre class='code diagram'>") == sum(1 for s in X.SECTIONS for c in s.cards if c.diagram) >= 12
     assert "style=" not in body and re.search(r"#[0-9a-fA-F]{6}\b", body) is None  # no inline styles, no colour literals
 
 

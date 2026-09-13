@@ -1,7 +1,8 @@
 """swesim console: the operator surface for the whole record (FastAPI, server-rendered HTML + vanilla JS, no build step).
 
 Pages answer one question each (design spec §1): Home (what is running and what changed), Scenarios, Trials/Episode,
-Candidates, Workflows, Review, Leaderboard, Database, Artifacts, Create/Run, Spend, Search. Every list, filter, funnel
+Candidates, Workflows, Review, Leaderboard, Database, Artifacts, Create/Run, Spend, Search; Explainer explains the system
+from structured data (``render_explainer``). Every list, filter, funnel
 and score comes from the ``IndexReader`` (``access.reader_for``); the artifact browser is the one page that walks the
 filesystem through ``Layout``. Live updates poll the ``/api/*`` JSON twins of each page.
 

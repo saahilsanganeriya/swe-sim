@@ -397,8 +397,8 @@ SECTION_3 = Section("creation", "Creating a task from a repository URL", (
          "A probe's job name carries the hash of its inputs; cached evidence is reused only when that binding and the tester identity match, so root-run or "
          "unbound legacy evidence is measured again.",
          (S(ARCH, "Creation and evidence: probe binding"), S(GRADING, "Controls and authoring gates: probe binding"), S(GITHUB, "probe_binding, GRADING_USER")),
-         Console("/scenario/<id>", "the 'Lineage' block: base and gold commits, probe evidence and the contract sizes (F2P / P2P) with links to the artifacts",
-                 "/scenarios")),
+         Console("/scenario/<id>", "the header rows 'repository @ base commit' and 'contract' (fail-to-pass · pass-to-pass · protected paths); probe "
+                 "evidence is browsable under /artifacts?path=probes", "/scenarios")),
     Card("Approve: eight code-owned gates",
          "Unattended runs are approved by code, recorded as approved_by: auto-validators with review_needed: true. Hold mode routes the draft to the console's "
          "Review queue for a decision bound to the draft's hash. Either way the gates are the same list and a failing gate triggers at most one re-draft.",
@@ -475,7 +475,8 @@ SECTION_4 = Section("spec", "The lossy spec", (
          "weights that sum to one. Author-only facts can never link tests or support a public requirement.",
          (S(MODELS, "ScenarioSpec, Fact, Discovery, Requirement, Controls, Group and _integrity"), S(DRAFT, "module docstring and SYSTEM prompt"),
           S(ARCH, "Creation and evidence: drafter rules")),
-         Console("/scenario/<id>", "'Briefs' (natural and withheld side by side), 'Ledger' with each fact's kind and discovery, and 'Requirement groups'", "/scenarios"),
+         Console("/scenario/<id>", "'Briefs' (natural and withheld side by side) and 'Ledger' with each fact's kind and discovery; 'Requirement groups' "
+                 "with weights and per-test results are on the episode page", "/scenarios"),
          SPEC_TREE,
          (Decision("A requirement must link to a visible fact or quote human issue/thread text; author-only facts cannot support public requirements.",
                    "A requirement that only the hidden tests justify is a test leaking into the stakeholder's mouth.",
@@ -565,7 +566,8 @@ SECTION_5 = Section("stakeholder", "The stakeholder", (
          "points the agent at the repository; at 0 it refuses with a fixed sentence and no model call. Refusals are recorded like any exchange. Asking changes "
          "what the agent knows; it never changes the tests or the reward.",
          (S(MODELS, "PatienceProfile defaults"), S(SESSION, "module docstring: patience tiers"), S(CLAUDE_MD, "Contracts: stakeholder")),
-         Console("/trial/<id>", "the patience meter on each stakeholder reply, and questions/confirmations counted in 'Scores and interaction details'", "/trials"),
+         Console("/trial/<id>", "the patience meter on each stakeholder reply in the timeline; questions and confirmations per cell are under "
+                 "'Scores and interaction details' on /leaderboard", "/trials"),
          PATIENCE),
     Card("v1 → v2 → v3, and why",
          "v1 spoke as a maintainer and reviewed diffs by default; the historical audit found those reviews exposed test construction, including expected "
@@ -703,8 +705,8 @@ SECTION_7 = Section("judge", "The judge", (
          "The task is kept only if accept() holds: the task is self-contained and at least one gap is explicitly non-derivable from the repository, "
          "consequential, and resolved either by a statement in the thread or by the merged tests. Gaps are phrased as user-visible behavior, never as test construction.",
          (S(JUDGE, "SYSTEM, SCHEMA, issue_contract_delta(), accept()"), S(ARCH, "Creation and evidence"), S(BRIEF, "§3.1 Pipeline roles")),
-         Console("/scenario/<id>", "the 'Judge' block: rubric score and complexity (the rationale and gaps are evaluator-only); /candidates shows every judge rejection",
-                 "/scenarios"),
+         Console("/candidates", "every judge rejection with gate judge and its reasons; the 'Judge' block on /scenario/<id> (score, complexity, gaps, rationale) "
+                 "is evaluator-only"),
          JUDGE_FLOW,
          (Decision("The judge never sees the annotators' notes; the judge and draft models must differ.",
                    "Calibration must measure agreement with an independent label, and correlated errors between judge and drafter would go unnoticed.",
@@ -816,7 +818,8 @@ SECTION_9 = Section("frontier", "Frontier admission gate", (
          "k=1 first for Tier E, a positive cap, complete spend accounting and a forecast under the remaining cap. The decision is written to the evidence "
          "directory and every later planning step verifies the recorded decision against its own request instead of trusting a flag.",
          (S(FRONTIER, "module docstring, evaluate(), verify_admission()"), S(BRIEF, "§3.2 Evaluated agents: gating rule"), S(GRADING, "Deferred experimental evidence")),
-         Console("/run", "the preview of a run naming a frontier model shows the admission decision and each failing reason before anything is confirmed"),
+         Console("/workflows/<id>", "a refused frontier run fails at plan_trials with every reason in the failure text; /run lists Tier D and E as gated; "
+                 "the recorded decision is browsable under /artifacts?path=evidence/sweep", "/workflows"),
          FRONTIER_GATE,
          (Decision("The full > hidden ordering is judged per scenario, pooled over the six core baselines, not per model.",
                    "With two attempts per arm, requiring every model to order strictly would open the gate only by luck even when the effect is large; a gate that can never open is a defect.",
@@ -967,7 +970,7 @@ def _decisions(rows: tuple[Decision, ...]) -> str:
 def _card(card: Card) -> str:
     out = [f"<article class='card'><h3>{h(card.title)}</h3><p>{h(card.text)}</p>"]
     if card.diagram:
-        out.append(f"<pre class='code' data-lang='diagram'>{h(card.diagram.strip(chr(10)))}</pre>")
+        out.append(f"<pre class='code diagram'>{h(card.diagram.strip(chr(10)))}</pre>")  # .diagram: hook for a no-wrap rule in app.css
     out.append(_decisions(card.decisions))
     out.append(_console(card.console))
     out.append(_sources(card.sources))
