@@ -37,6 +37,7 @@ from temporalio.exceptions import ApplicationError
 
 from swesim.models import ID_RE, RunConfig, ScenarioSpec, trial_id
 from swesim.paths import Workspace, atomic_json
+from swesim.roles import ROLE_CHAINS
 from swesim.settings import Settings, get_settings, has_secret, secret
 from swesim.workflows import retries
 from swesim.workflows.launchers.base import (Launcher, LaunchFailed, TrialBindingConflict, TrialEvidence, TrialLayout,  # noqa: F401 - re-exported
@@ -54,13 +55,11 @@ HEARTBEAT_SECONDS = 30.0
 POLL_SECONDS = 10.0
 AWAIT_DEADLINE_SEC = 3 * 3600
 LAUNCH_GRACE_POLLS = 6  # polls without any launch evidence before await reports launch-failed
-# Per-role fallback chains (CLAUDE.md, unattended-run rules): the configured id is probed first, then the chain in order.
-# Judge and draft must resolve to different ids (draft_spec.draft refuses correlated errors); the solver is never substituted.
-FALLBACK_CHAINS = {
-    "judge_model": ["openai/gpt-5.5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5"],
-    "draft_model": ["anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"],
-    "stakeholder_model": ["openai/gpt-5.5", "anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5-20251001"],
-}
+# Per-role fallback chains (swesim.roles.ROLE_CHAINS, interfaces §7): the configured id is probed first, then the chain in
+# order. Only the three pipeline roles are probed here (audit and screen models belong to their own activities). Judge and
+# draft must resolve to different ids (draft_spec.draft refuses correlated errors); the solver is never substituted.
+PROBE_ROLES = ("judge_model", "draft_model", "stakeholder_model")
+FALLBACK_CHAINS = {role: list(ROLE_CHAINS[role]) for role in PROBE_ROLES}
 LAUNCH_SLOTS = asyncio.Semaphore(1)  # pilot trials launch serially per worker
 
 
@@ -674,6 +673,32 @@ async def await_trial_activity(p: dict) -> dict:
         await asyncio.sleep(POLL_SECONDS)
 
 
+CLEANUP_DECISIONS = ("ingest", "runner-error", "launch-failed")  # terminal evidence exists; the runtime resource is no longer the evidence
+
+
+@swesim_activity
+async def cancel_trial_activity(p: dict) -> dict:
+    """Ask the launcher to stop the trial's runtime (workflow cancellation). Without launch evidence there is nothing to stop.
+    The trial id stays consumed: a later run is a new attempt index, never a relaunch."""
+    tid = p["trial_id"]; launch = _read_json(trial_dir(tid) / "launch.json")
+    if not launch:
+        return {"trial_id": tid, "cancelled": False, "reason": "no launch evidence"}
+    await blocking(lambda: launcher().cancel(tid, launch))
+    return {"trial_id": tid, "cancelled": True, "launcher": launcher().name, "handle": launch.get("handle")}
+
+
+@swesim_activity
+async def cleanup_trial_activity(p: dict) -> dict:
+    """Release the trial's runtime resource (Cloud Run: delete the Job; systemd/subprocess: nothing) once terminal evidence
+    exists and nothing is running. Refuses otherwise: until the record is written the runtime is the evidence."""
+    tid = p["trial_id"]; ev = read_evidence(tid); decision = decide_launch(ev)
+    if ev.runtime_state == "running" or decision not in CLEANUP_DECISIONS:
+        return {"trial_id": tid, "cleaned": False, "reason": f"not terminal: decision={decision} runtime={ev.runtime_state}"}
+    launch = _read_json(trial_dir(tid) / "launch.json")
+    await blocking(lambda: launcher().cleanup(tid, launch))
+    return {"trial_id": tid, "cleaned": True, "launcher": launcher().name, "handle": launch.get("handle")}
+
+
 # ------------------------------------------------------------------ the per-trial process (runs inside the unit or Job)
 
 def execute_trial_request(request_path: Path) -> dict:
@@ -718,8 +743,8 @@ def main(argv: list[str] | None = None) -> int:
 ALL = [probe_models_activity, mine_activity, judge_activity, list_candidates_activity, judge_one_activity, probe_candidate_activity,
        scenario_version_activity, archive_scenario_activity, draft_activity,
        auto_approve_activity, precheck_draft_activity, human_approve_activity, verify_approval_activity, compile_activity,
-       validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity, score_activity,
-       export_activity]
+       validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity, cancel_trial_activity,
+       cleanup_trial_activity, score_activity, export_activity]
 
 if __name__ == "__main__":
     raise SystemExit(main())

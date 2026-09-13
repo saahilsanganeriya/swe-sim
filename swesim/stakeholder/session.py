@@ -8,7 +8,14 @@ annotations that ``Reply.public`` never exposes to the agent.
 Channels: ``ask`` (question, ``question_cost``), ``confirm`` (a plain-language behavior description the reporter
 accepts or not at requirement level, ``review_cost``) and ``review`` (diff review, ``review_cost``). The reporter
 cannot read code, so ``review`` is available only when ``StakeholderConfig.review_mode == "diff-only"`` is set
-explicitly; otherwise it raises ``Unavailable`` and the shim tells the agent to use ``confirm-behavior``.
+explicitly; otherwise it raises ``Unavailable`` and the shim tells the agent to use ``confirm-behavior``. ``confirm``
+rejects input that looks like code (``looks_like_code``: fenced blocks, ``def``/``class``/``import`` statements,
+brace-heavy lines, unified-diff headers) with ``BadRequest`` and a hint, before any model call; what the model then
+does with a prose description remains a prompt rule, checked by the disclosure audit, not a code guarantee.
+
+Public reply shape (A-P1-3 ruling): the agent sees the reply text and ``patience_remaining`` (the availability signal
+the design intends, and ``reviewed_diff_sha256`` for reviews). The patience ``tier`` is a worker-only annotation on the
+transcript event, never returned.
 
 Reply filter (code-owned): ``view["forbidden_terms"]`` is a deny-list of tokens computed by the worker from the
 hidden test assets (identifiers absent from the natural issue text, plus fixed test vocabulary; requirements and
@@ -44,6 +51,33 @@ CONFIRM_PREFIX = ("The agent describes the behavior change it made or intends to
                   "and which requirement still seems unmet, in your own words; do not name code.\n")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _OPTION = re.compile(r"(?<![A-Za-z0-9])\(([a-eA-E])\)|\b[Oo]ption\s+\(?([a-eA-E])\)?(?![A-Za-z0-9])")
+# confirm-behavior input that is code rather than a description (A-P1-4). Statement shapes, not words: `def f(`, `class K:`,
+# `import a.b`/`import a, b as c`, `from x import y`; prose such as "import errors are gone" or "a class of inputs" passes.
+_CODE_STATEMENT = re.compile(r"^\s*(?:(?:async\s+)?def\s+\w+\s*\(|class\s+\w+\s*[:(]|import\s+[\w.]+(?:\s*,\s*[\w.]+)*(?:\s+as\s+\w+)?\s*$"
+                             r"|from\s+[\w.]+\s+import\s+[\w.*]+)", re.M)
+_DIFF_HEADER = re.compile(r"^(?:diff --git |--- (?:a/|/dev/null)|\+\+\+ (?:b/|/dev/null)|@@ -\d|index [0-9a-f]{6,}\.\.)", re.M)
+_CODE_SYMBOLS = set("{}[]();=<>")
+BRACE_HEAVY_MIN, BRACE_HEAVY_RATIO = 4, 0.10
+CONFIRM_HINT = ("confirm-behavior takes a plain-language description of how the program behaves now; this looks like code ({reason}). "
+                "Describe the behavior (what happens on which input, before and after), not the code, diff or file contents.")
+
+
+def looks_like_code(text: str) -> str | None:
+    """Why `text` reads as code rather than a behavior description, or None. Checks: a fenced block, a def/class/import
+    statement line, a unified-diff header line, or a brace-heavy line (>= BRACE_HEAVY_MIN of ``{}[]();=<>`` making up >=
+    BRACE_HEAVY_RATIO of the line). Heuristic by design; it bounds the channel, it does not authenticate meaning."""
+    if "```" in text:
+        return "fenced code block"
+    if _DIFF_HEADER.search(text):
+        return "unified-diff header"
+    if _CODE_STATEMENT.search(text):
+        return "def/class/import statement"
+    for line in text.splitlines():
+        s = line.strip()
+        n = sum(ch in _CODE_SYMBOLS for ch in s)
+        if s and n >= BRACE_HEAVY_MIN and n / len(s) >= BRACE_HEAVY_RATIO:
+            return "brace-heavy line"
+    return None
 
 
 # -- reply filter ---------------------------------------------------------------------------------------------------
@@ -117,8 +151,9 @@ class Reply:
     withheld_sentences: list = field(default_factory=list)
 
     def public(self) -> dict:
-        """What the agent sees: the text and availability. Fact annotations, the tool audit and redaction details stay worker-only."""
-        out = {"reply": self.reply, "patience_remaining": self.patience_remaining, "tier": self.tier}
+        """What the agent sees: the text and remaining availability. Fact annotations, the tool audit, redaction details
+        and the patience tier stay worker-only."""
+        out = {"reply": self.reply, "patience_remaining": self.patience_remaining}
         if self.reviewed_diff_sha256 is not None: out["reviewed_diff_sha256"] = self.reviewed_diff_sha256
         return out
 
@@ -235,6 +270,8 @@ class Session:
         """Behavioral acceptance check: the agent describes a behavior change in plain language; costs review_cost."""
         if not description.strip(): raise Session.BadRequest("empty behavior description")
         if len(description) > MAX_CONFIRM_CHARS: raise Session.BadRequest(f"behavior description exceeds {MAX_CONFIRM_CHARS} characters")
+        reason = looks_like_code(description)
+        if reason: raise Session.BadRequest(CONFIRM_HINT.format(reason=reason))
         return await self._exchange(rid, "confirm", CONFIRM_PREFIX + description, self.p["review_cost"], llm, self._fingerprint("confirm", description))
 
     async def review(self, rid: str, diff: str, files: dict, llm, tools=None) -> Reply:

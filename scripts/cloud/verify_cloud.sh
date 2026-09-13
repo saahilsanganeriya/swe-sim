@@ -66,10 +66,10 @@ PY
     failed "iap: curl $CONSOLE_URL failed"
   fi
 
-  # 3 readiness
+  # 3 readiness (gcloud renders pools and services in the same spec/status shape)
   for p in $(pools); do
-    state=$("${GC[@]}" run worker-pools describe "$p" --region "$REGION" --format='value(terminalCondition.state)' 2>&1)
-    if [ "$state" = "CONDITION_SUCCEEDED" ]; then pass "pool $p ready"; else failed "pool $p state=$state"; fi
+    ready=$("${GC[@]}" run worker-pools describe "$p" --region "$REGION" --format=json 2>/dev/null | ready_of_service)
+    if [ "$ready" = "True" ]; then pass "pool $p ready"; else failed "pool $p Ready=$ready"; fi
   done
   ready=$("${GC[@]}" run services describe "$CONSOLE" --region "$REGION" --format=json 2>/dev/null | ready_of_service)
   if [ "$ready" = "True" ]; then pass "console $CONSOLE ready"; else failed "console $CONSOLE Ready=$ready"; fi
@@ -80,7 +80,7 @@ PY
   # 5 image parity
   case $IMAGE in *@sha256:*) ;; *) notice "image is not digest-pinned (bootstrap apply); parity is checked on the tag" ;; esac
   for p in $(pools); do
-    running=$("${GC[@]}" run worker-pools describe "$p" --region "$REGION" --format='value(template.containers[0].image)' 2>/dev/null)
+    running=$("${GC[@]}" run worker-pools describe "$p" --region "$REGION" --format='value(spec.template.spec.containers[0].image)' 2>/dev/null)
     if [ "$running" = "$IMAGE" ]; then pass "pool $p runs the pinned image"; else failed "pool $p runs ${running:-<unknown>} != $IMAGE"; fi
   done
   running=$("${GC[@]}" run services describe "$CONSOLE" --region "$REGION" --format='value(spec.template.spec.containers[0].image)' 2>/dev/null)

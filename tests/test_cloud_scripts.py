@@ -85,6 +85,18 @@ def test_collect_values_first_env_file_wins_and_modal_toml_fills_the_gap(sources
     assert "OPENAI_API_KEY" not in values
 
 
+def test_modal_toml_named_active_profile_is_used_when_there_is_no_default(tmp_path: Path):
+    modal = tmp_path / "modal.toml"
+    modal.write_text('[work-profile]\ntoken_id = "ak-work"\ntoken_secret = "as-work"\nactive = true\n'
+                     '[other]\ntoken_id = "ak-other"\ntoken_secret = "as-other"\n')
+    values = push_secrets.collect_values([], modal, ["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])
+    assert values == {"MODAL_TOKEN_ID": "ak-work", "MODAL_TOKEN_SECRET": "as-work"}
+    # default wins over active; a single profile needs no marker; two unmarked profiles resolve to nothing
+    assert push_secrets.modal_profile({"default": {"token_id": "d"}, "p": {"token_id": "p", "active": True}})["token_id"] == "d"
+    assert push_secrets.modal_profile({"only": {"token_id": "o"}})["token_id"] == "o"
+    assert push_secrets.modal_profile({"a": {"token_id": "a"}, "b": {"token_id": "b"}}) == {}
+
+
 def test_push_is_idempotent_and_adds_a_version_only_when_the_value_changes():
     names = ["ANTHROPIC_API_KEY", "GH_TOKEN"]
     fake = FakeSecretManager(existing=set(names))

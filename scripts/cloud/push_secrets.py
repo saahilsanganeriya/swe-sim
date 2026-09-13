@@ -4,8 +4,8 @@ Contract
 - Names: every secret in `swesim.settings.ENV_VARS` except `SWESIM_DATABASE_URL` (Terraform writes that one from the
   generated password), or an explicit `--names A,B`.
 - Sources: `--env-file` (repeatable; the first file that has a key wins), read with `dotenv_values` — never sourced or
-  exported — and `--modal-toml`, whose `[default] token_id / token_secret` fill `MODAL_TOKEN_ID / MODAL_TOKEN_SECRET`
-  when the env files do not.
+  exported — and `--modal-toml`, whose credentials table (`[default]`, else the profile with `active = true`, else the
+  only profile) supplies `token_id / token_secret` as `MODAL_TOKEN_ID / MODAL_TOKEN_SECRET` when the env files do not.
 - Idempotent: a new version is added only when sha256(latest payload) != sha256(new value); re-runs print "unchanged".
   The secret resource must already exist (`terraform apply` creates it); a missing resource is reported as an error.
 - Output: one line per name, `NAME: updated | unchanged | missing`; never a value, never a hash, never gcloud's stdout.
@@ -53,12 +53,26 @@ def collect_values(env_files: Iterable[Path], modal_toml: Path | None, names: It
                 found[key] = value
     if modal_toml is not None and Path(modal_toml).is_file():
         with open(modal_toml, "rb") as fh:
-            default = tomllib.load(fh).get("default", {})
+            profile = modal_profile(tomllib.load(fh))
         for toml_key, name in MODAL_KEYS.items():
-            value = default.get(toml_key)
+            value = profile.get(toml_key)
             if name in wanted and isinstance(value, str) and value and name not in found:
                 found[name] = value
     return found
+
+
+def modal_profile(doc: Mapping[str, object]) -> Mapping[str, object]:
+    """The credentials table of a ~/.modal.toml: `[default]` when present, else the profile marked `active = true`,
+    else the only profile; an empty mapping when none applies (the Modal pair is then reported missing)."""
+    tables = {k: v for k, v in doc.items() if isinstance(v, Mapping)}
+    if "default" in tables:
+        return tables["default"]
+    active = [t for t in tables.values() if t.get("active") is True]
+    if len(active) == 1:
+        return active[0]
+    if len(tables) == 1:
+        return next(iter(tables.values()))
+    return {}
 
 
 def _sha256(data: bytes) -> str:
