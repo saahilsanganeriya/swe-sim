@@ -562,11 +562,6 @@ async def review_queue(root: Path, reader=None) -> dict:
     return {"items": items, "errors": errors}
 
 
-def local_approve(ws: Workspace, scenario_id: str) -> dict:
-    from swesim.stages.approve import approve_scenario
-    return approve_scenario(ws, scenario_id, auto=False)
-
-
 async def decide(root: Path, registry_path: Path, sid: str, body: dict) -> tuple[int, dict]:
     """Approve or reject a draft. Refuses when the spec hash on disk differs from the one the page rendered."""
     body = body if isinstance(body, dict) else {}
@@ -609,15 +604,7 @@ async def decide(root: Path, registry_path: Path, sid: str, body: dict) -> tuple
     if decision == "reject":
         atomic_json(sdir / "review.json", record)
         return 200, {"ok": True, "decision": "reject", "scenario_id": sid, "spec_hash": current, "via": "local review.json"}
-    try:
-        result = local_approve(Workspace(root, registry_path), sid)
-    except Exception as e:  # noqa: BLE001
-        return 500, {"ok": False, "error": f"approve_scenario failed: {type(e).__name__}: {redact(e)}"}
-    if not result.get("approved"):
-        return 400, {"ok": False, "error": "the code-owned gates rejected this draft", "reasons": result.get("reasons") or []}
-    atomic_json(sdir / "review.json", record)
-    return 200, {"ok": True, "decision": "approve", "scenario_id": sid, "spec_hash": result.get("spec_hash") or current,
-                 "via": "approve_scenario(auto=False)", "approval": read_json(sdir / "approval.json")}
+    return 409, {"ok": False, "error": "approval requires a holding workflow; create or rebuild through Temporal"}
 
 
 def now_ts() -> float:

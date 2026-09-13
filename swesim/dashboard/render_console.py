@@ -59,7 +59,7 @@ def create_body(d: dict, repos: list[str], spend_cap) -> str:
             ("<p class='muted small'>Auto: the code-owned gates decide and record <code>approved_by: auto-validators, review_needed: true</code>. Hold: each draft waits in the "
              "<a href='/review'>review queue</a> until you approve or reject it.</p>"),
             f"<label for='max_parallel'>max parallel candidates<input id='max_parallel' name='max_parallel' type='number' min='1' max='{console.MAX_PARALLEL}' value='{h(d['max_parallel'])}'></label>",
-            "<label class='inline'><input type='checkbox' id='rebuild' name='rebuild' value='1'> Rebuild existing scenarios as a new version</label>",
+            f"<label class='inline'><input type='checkbox' id='rebuild' name='rebuild' value='1'{' checked' if d.get('rebuild') else ''}> Rebuild existing scenarios as a new version</label>",
             ("<p class='muted small'>Existing scenarios are re-created as version n+1; the previous version's files move to <code>archive/v&lt;n&gt;/</code>. Judged rows and probe results are kept.</p>"),
             f"<p class='muted small'>Spend cap: <strong>{h(cap)}</strong>. Pipeline-role costs are recorded per candidate.</p>",
             "</fieldset><div class='actions'><button type='submit' class='button primary'>Preview and confirm…</button> <span data-status class='muted small'></span></div></form>"]
@@ -113,8 +113,8 @@ def review_queue_body(queue: dict) -> str:
     for err in queue.get("errors") or []:
         body.append(f"<div class='banner warn'>{h(err)}</div>")
     views = [{"scenario_id": i["scenario_id"], "source": i.get("source"), "workflow_id": i.get("workflow_id"), "spec_hash": i.get("disk_hash") or i.get("spec_hash"),
-              "hash_state": "differs from job" if i.get("spec_hash") and i.get("disk_hash") and i["spec_hash"] != i["disk_hash"] else "matches",
-              "judge": f"{i.get('judge_keep')} / {i.get('rubric')}", "drafted_at": i.get("drafted_at"), "on_disk": "on disk" if i.get("on_disk") else "not on disk"} for i in items]
+              "hash_state": "not checked" if not i.get("disk_hash") else "differs from job" if i.get("spec_hash") and i["spec_hash"] != i["disk_hash"] else "matches",
+              "judge": f"{i.get('judge_keep')} / {i.get('rubric')}", "drafted_at": i.get("drafted_at"), "on_disk": "indexed"} for i in items]
     cols = (Column("scenario_id", "scenario", "text", href="/review/{scenario_id}"), Column("source", "source", "text"), Column("workflow_id", "held by", "id", href="/workflows/{workflow_id}", n=24),
             Column("spec_hash", "spec hash", "id"), Column("hash_state", "hash", "text"), Column("judge", "judge keep / rubric", "text"), Column("drafted_at", "drafted", "time"), Column("on_disk", "files", "chip"))
     body.append(table("review", cols, views, key="scenario_id", empty="<strong>Nothing to review.</strong> Drafts appear while a creation job with approval mode <em>hold</em> waits, "
@@ -136,13 +136,16 @@ def review_body(d: dict, row, versions: list, spec_hash: str | None, workflow_id
                     + (f" · held by job <a class='mono' href='/workflows/{h(workflow_id)}'>{h(workflow_id)}</a>" if workflow_id else " · local draft") + "</p>")
     if not spec_hash and not approval:
         head.append("<p class='flag'>The draft on disk does not validate against the current schema; approval is disabled.</p>")
+    if not workflow_id and not approval:
+        head.append("<p class='note'>This draft has no holding workflow. <a class='button' href='/create?rebuild=1'>Create a workflow to rebuild this draft…</a> Approval runs through Temporal; a local rejection records a review annotation only.</p>")
     sections = scenario_sections(d, row, versions, "", evaluator)
     disabled = " disabled" if read_only or not spec_hash else ""
+    approve_disabled = disabled or (" disabled" if not workflow_id else "")
     params = {"scenario_id": sid, "spec_hash": spec_hash or "", "workflow_id": workflow_id or ""}
     form = (f"<div class='card' id='review-form'><label for='note'>reason (recorded with the decision)</label><textarea id='note' name='note' rows='3' maxlength='2000'></textarea>"
-            f"<div class='actions'><button type='button' class='button primary' data-action='review' data-params='{h(json.dumps({**params, 'decision': 'approve'}))}' data-reason-from='#note' data-status='#action-status'{disabled}>Approve…</button>"
+            f"<div class='actions'><button type='button' class='button primary' data-action='review' data-params='{h(json.dumps({**params, 'decision': 'approve'}))}' data-reason-from='#note' data-status='#action-status'{approve_disabled}>Approve…</button>"
             f"<button type='button' class='button danger' data-action='review' data-params='{h(json.dumps({**params, 'decision': 'reject'}))}' data-reason-from='#note' data-status='#action-status'{disabled}>Reject…</button>"
             "<span id='action-status' class='muted small'></span></div>"
-            "<p class='muted small'>Approve freezes the draft as scenario.json (local) or signals the holding CandidateWorkflow; the server re-reads the spec hash and refuses if the draft changed since "
+            "<p class='muted small'>Approve signals the holding CandidateWorkflow; the server re-reads the spec hash and refuses if the draft changed since "
             "this page was rendered. Never hand-edit a draft to pass a gate: re-draft or take the next candidate.</p></div>")
     return "".join(head) + sections["briefs"] + sections["ledger"] + sections["controls"] + sections["assets"] + sections["judge"] + form

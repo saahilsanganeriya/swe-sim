@@ -156,3 +156,20 @@ def test_iap_verifier_checks_issuer_in_addition_to_signature_and_audience(monkey
     with pytest.raises(ValueError, match="issuer"):
         _default_verify("token", "audience")
     assert seen == {"audience": "audience", "certs_url": IAP_CERTS_URL}
+
+
+def test_screen_defaults_and_review_approval_cannot_bypass_temporal(site):
+    from swesim.roles import ROLE_CHAINS
+    sid = site["spec"].id
+    params, errors = console.validate_run({"scenario_ids": [sid], "purpose": "screen"}, {sid})
+    assert not errors and params["models"] == [ROLE_CHAINS["screen_model"][0]]
+    assert params["conditions"] == ["hidden", "full"] and params["k"] == 2
+    response = site["client"].post("/api/review/preview", json={"scenario_id": sid, "decision": "approve", "reason": "reviewed"})
+    assert response.status_code == 400 and "holding workflow" in response.text
+
+
+def test_cross_origin_rejections_are_audited_without_executing(site):
+    response = site["client"].post("/api/rebuild/preview", headers={"Origin": "https://other.example"}, json={})
+    assert response.status_code == 403
+    rows = reader_of(site).operator_actions(R.PageFilter()).items
+    assert len(rows) == 1 and rows[0].action == "rebuild" and rows[0].result == "rejected" and not rows[0].confirmed
