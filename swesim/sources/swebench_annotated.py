@@ -17,6 +17,10 @@ TEST_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"
 DATASET = "princeton-nlp/SWE-bench"
 PYTEST_REPOS = {"sphinx-doc/sphinx", "pytest-dev/pytest", "matplotlib/matplotlib", "scikit-learn/scikit-learn", "pydata/xarray",
                 "psf/requests", "mwaskom/seaborn", "astropy/astropy", "pylint-dev/pylint", "pallets/flask"}
+# Repos whose test suites need the network (psf/requests talks to httpbin). The verifier is offline by contract, so
+# their FAIL_TO_PASS/PASS_TO_PASS evidence cannot be reproduced: the psf--requests-1944 control sweep showed 47 of 120
+# PASS_TO_PASS tests failing on the untouched base and the gold patch passing 0 of 5 FAIL_TO_PASS. Excluded up front.
+NETWORK_TEST_REPOS = {"psf/requests"}
 ANNOTATION_KEYS = ("underspecified", "underspecified_notes", "false_negative", "false_negative_notes", "difficulty")
 
 
@@ -40,7 +44,7 @@ def repo_of(instance_id: str) -> str:
 
 
 def filter_pytest_repos(ids: list[str]) -> list[str]:
-    return [i for i in ids if repo_of(i) in PYTEST_REPOS]
+    return [i for i in ids if repo_of(i) in PYTEST_REPOS and repo_of(i) not in NETWORK_TEST_REPOS]
 
 
 def image_for(instance_id: str) -> str:

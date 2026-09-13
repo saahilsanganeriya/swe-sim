@@ -3,7 +3,7 @@
 # the basename selects the endpoint. Standard library only. The shim does not enforce anything: budget,
 # request-id binding and freeze live on the service, which the agent could also reach directly over HTTP.
 # Every failure is one readable line on stderr with exit 1; never a traceback.
-import json, os, pathlib, subprocess, sys, uuid, urllib.error, urllib.request
+import http.client, json, os, pathlib, subprocess, sys, uuid, urllib.error, urllib.request
 
 base = os.environ.get('SWESIM_STAKEHOLDER_URL', '').rstrip('/'); token = os.environ.get('SWESIM_SESSION_TOKEN', '')
 if not token or not base:
@@ -49,11 +49,13 @@ try:
 except urllib.error.HTTPError as e:
     try: detail = json.loads(e.read().decode('utf-8', 'replace')).get('detail', '')
     except Exception: detail = ''
+    if isinstance(detail, list):                        # FastAPI validation errors: join the human-readable msg fields
+        detail = '; '.join(str(item.get('msg', item)) if isinstance(item, dict) else str(item) for item in detail)
     if e.code == 410: print('Stakeholder session closed.')
     elif e.code == 503: raise SystemExit('Stakeholder is temporarily unavailable; try again with a fresh question.')
     elif 400 <= e.code < 500: raise SystemExit('Stakeholder rejected the request (HTTP ' + str(e.code) + '): ' + str(detail))
     else: raise SystemExit('Stakeholder transport failed: HTTP ' + str(e.code))
-except OSError as e:                                    # URLError, TimeoutError, connection reset
-    raise SystemExit('Stakeholder transport failed: ' + str(getattr(e, 'reason', None) or e))
+except (OSError, http.client.HTTPException) as e:       # URLError, TimeoutError, connection reset, malformed HTTP
+    raise SystemExit('Stakeholder transport failed: ' + str(getattr(e, 'reason', None) or e or type(e).__name__))
 except (ValueError, KeyError):
     raise SystemExit('Stakeholder transport failed: malformed reply')

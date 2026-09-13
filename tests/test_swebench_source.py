@@ -61,7 +61,9 @@ def test_candidates_writes_rows_with_annotation_and_thread(monkeypatch, tmp_path
     calls = []
     monkeypatch.setattr(threads, "fetch_pr_thread", lambda repo, pr: calls.append((repo, pr)) or {"pr_url": f"https://github.com/{repo}/pull/{pr}"})
     out = tmp_path / "c" / "swebench-annotated.jsonl"
-    n = sb.candidates(["pydata__xarray-5362", "psf__requests-1963"], out, Path(CSV))
+    # pytest_repos_only=False: psf/requests is excluded by the eligibility filter (network-dependent tests) but this test
+    # exercises row construction, not the filter (see test_eligibility_excludes_network_test_repos).
+    n = sb.candidates(["pydata__xarray-5362", "psf__requests-1963"], out, Path(CSV), pytest_repos_only=False)
     rows = [json.loads(l) for l in out.read_text().splitlines()]
     assert n == 2 and len(rows) == 2 and calls == [("pydata/xarray", 5362), ("psf/requests", 1963)]
     r = rows[0]
@@ -99,7 +101,7 @@ def test_mine_swebench_uses_workspace_and_pool(monkeypatch, tmp_path):
     monkeypatch.setattr(sb, "candidates", fake_candidates)
     ws = Workspace(tmp_path / "ws")
     out = mine_swebench(ws, fetch_threads=False)
-    assert out == ws.candidates_dir / "swebench-annotated.jsonl" and len(seen["ids"]) == 45 and seen["fetch_threads"] is False
+    assert out == ws.candidates_dir / "swebench-annotated.jsonl" and len(seen["ids"]) == 40 and seen["fetch_threads"] is False
     assert all(not i.startswith(("django__", "sympy__")) for i in seen["ids"])
     mine_swebench(ws, instance_ids=["pydata__xarray-5362"], pytest_only=False)
     assert seen["ids"] == ["pydata__xarray-5362"] and seen["pytest_repos_only"] is False
@@ -215,13 +217,29 @@ def test_linked_numbers_from_body_and_timeline_fallback(monkeypatch):
     t = threads.linked_targets("o/r", 5, "Closes #40 and fixes #77")              # 40 is a PR, 77 does not exist -> fallback to timeline
     assert t["prs"] == [40] and t["missing"] == [77] and t["issues"] == [7] and 40 not in t["payloads"]
     t = threads.linked_targets("o/r", 5, "Fixes #12")
-    assert t == {"issues": [12], "prs": [], "missing": [], "payloads": {12: _issue(12)}}
+    assert t == {"issues": [12], "prs": [], "missing": [], "payloads": {12: _issue(12)}, "link_kind": "closing"}
+    assert threads.linked_targets("o/r", 5, "no reference here")["link_kind"] == "timeline"
+
+
+def test_linked_targets_plain_mention_is_the_weakest_tier(monkeypatch):
+    """No closing keyword and no timeline cross-reference: a plain `#N` / `GH-N` / issue-URL mention of a real issue counts,
+    tagged link_kind="mention"; PR-typed and 404 mentions are classified, the PR's own number is skipped, lookups are bounded."""
+    gh = FakeGH({"repos/o/r/issues/5/timeline": [], "repos/o/r/issues/21": _issue(21), "repos/o/r/issues/22": _issue(22, pr=True),
+                 "repos/o/r/issues/23": Exception("gh: HTTP 404 Not Found"), "repos/o/r/issues/24": _issue(24)})
+    monkeypatch.setattr(subprocess, "run", gh)
+    t = threads.linked_targets("o/r", 5, "Follow-up to #5, related to #22 and #23; see GH-21 and https://github.com/o/r/issues/24")
+    assert t["issues"] == [21, 24] and t["prs"] == [22] and t["missing"] == [23] and t["link_kind"] == "mention"
+    assert not any("issues/5\n" in c[2] or c[2].endswith("issues/5") for c in gh.calls)   # own number never looked up
+    monkeypatch.setattr(threads, "MAX_MENTIONS", 1)
+    t = threads.linked_targets("o/r", 5, "see #21 and #24")
+    assert t["issues"] == [21] and t["link_kind"] == "mention"                                 # bounded to one lookup
+    assert threads.linked_targets("o/r", 5, "nothing here")["link_kind"] is None
 
 
 def test_linked_targets_only_404_is_missing(monkeypatch):
     gh = FakeGH({"repos/o/r/issues/5/timeline": [], "repos/o/r/issues/77": Exception("gh: HTTP 500 Internal Server Error")})
     monkeypatch.setattr(subprocess, "run", gh)
-    assert threads.linked_targets("o/r", 5, "Fixes #66") == {"issues": [], "prs": [], "missing": [66], "payloads": {}}   # 404 -> missing
+    assert threads.linked_targets("o/r", 5, "Fixes #66") == {"issues": [], "prs": [], "missing": [66], "payloads": {}, "link_kind": None}   # 404 -> missing
     with pytest.raises(CalledProcessError):
         threads.linked_targets("o/r", 5, "Fixes #77")                                                                     # 500 -> propagates
 
@@ -639,3 +657,9 @@ def test_accept_requires_explicit_non_derivable_gap():
     assert not accept({"gaps": [{**gap, "derivable_from_repo": None}], "self_contained": True})
     assert accept({"gaps": [{**gap, "derivable_from_repo": False}], "self_contained": True})
     assert not accept({"gaps": [{**gap, "derivable_from_repo": False}], "self_contained": "yes"})
+
+
+def test_eligibility_excludes_network_test_repos():
+    """The verifier is offline, so repos whose suites need the network (psf/requests -> httpbin) are not trial-eligible."""
+    assert sb.filter_pytest_repos(["psf__requests-1963", "pydata__xarray-5362", "django__django-1"]) == ["pydata__xarray-5362"]
+    assert "psf/requests" in sb.PYTEST_REPOS and "psf/requests" in sb.NETWORK_TEST_REPOS
