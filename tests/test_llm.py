@@ -1,11 +1,14 @@
-"""Provider adaptation in swesim.llm.chat_json (offline: the SDK clients are faked)."""
+"""Provider adaptation in swesim.llm.chat_json (offline: the SDK clients are faked); credentials come from
+`swesim.settings.secret`, never from a hard-coded env file."""
 from __future__ import annotations
 
+import sys
 import types
 
 import pytest
 
 from swesim import llm
+from swesim.settings import MissingSecret, Settings
 
 
 class _Block:
@@ -20,7 +23,7 @@ class _Resp:
         self.stop_reason = stop_reason
 
 
-def _fake_anthropic(monkeypatch, responses, calls):
+def _fake_anthropic(monkeypatch, responses, calls, clients=None, stub_secret=True):
     class Messages:
         def create(self, **kw):
             calls.append(kw)
@@ -28,10 +31,13 @@ def _fake_anthropic(monkeypatch, responses, calls):
 
     class Client:
         def __init__(self, **kw):
+            if clients is not None:
+                clients.append(kw)
             self.messages = Messages()
 
-    monkeypatch.setitem(__import__("sys").modules, "anthropic", types.SimpleNamespace(Anthropic=Client))
-    monkeypatch.setattr(llm, "_secret", lambda key: "x")
+    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=Client))
+    if stub_secret:
+        monkeypatch.setattr(llm, "_secret", lambda key, settings=None: "x")
 
 
 def test_anthropic_thinking_only_response_falls_back_to_no_thinking(monkeypatch):
@@ -59,7 +65,7 @@ def test_openai_gpt5_gets_no_temperature_and_reasoning_headroom():
     assert kw["temperature"] == 0.0 and kw["max_completion_tokens"] == 5 and "reasoning_effort" not in kw
 
 
-def _fake_openai(monkeypatch, responses, calls):
+def _fake_openai(monkeypatch, responses, calls, clients=None, stub_secret=True):
     class Choice:
         def __init__(self, content, finish):
             self.message = types.SimpleNamespace(content=content); self.finish_reason = finish
@@ -67,9 +73,13 @@ def _fake_openai(monkeypatch, responses, calls):
         def create(self, **kw):
             calls.append(kw); content, finish = responses.pop(0); return types.SimpleNamespace(choices=[Choice(content, finish)])
     class Client:
-        def __init__(self, **kw): self.chat = types.SimpleNamespace(completions=Completions())
-    monkeypatch.setitem(__import__("sys").modules, "openai", types.SimpleNamespace(OpenAI=Client))
-    monkeypatch.setattr(llm, "_secret", lambda key: "x")
+        def __init__(self, **kw):
+            if clients is not None:
+                clients.append(kw)
+            self.chat = types.SimpleNamespace(completions=Completions())
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=Client))
+    if stub_secret:
+        monkeypatch.setattr(llm, "_secret", lambda key, settings=None: "x")
 
 
 def test_openai_empty_reasoning_answer_retries_with_minimal_effort(monkeypatch):
@@ -97,7 +107,38 @@ def test_anthropic_api_rejection_of_thinking_falls_back_to_plain_request(monkeyp
             return _Resp([_Block("text", '{"ok": 2}')])
     class Client:
         def __init__(self, **kw): self.messages = Messages()
-    monkeypatch.setitem(__import__("sys").modules, "anthropic", types.SimpleNamespace(Anthropic=Client, BadRequestError=BadRequestError))
-    monkeypatch.setattr(llm, "_secret", lambda key: "x")
+    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=Client, BadRequestError=BadRequestError))
+    monkeypatch.setattr(llm, "_secret", lambda key, settings=None: "x")
     assert llm.chat_json("anthropic/claude-haiku-4-5-20251001", "sys", [{"role": "user", "content": "q"}], "{}", max_tokens=50) == {"ok": 2}
     assert calls[0]["thinking"] == {"type": "adaptive"} and calls[1]["thinking"] == {"type": "disabled"} and "output_config" not in calls[1]
+
+
+# ------------------------------------------------------------------ credentials come from Settings, never a hard-coded path
+
+def test_credentials_are_read_through_settings_env_file_when_absent_from_the_process(monkeypatch, tmp_path):
+    f = tmp_path / "creds.env"
+    f.write_text("ANTHROPIC_API_KEY=sk-from-file-0001\n")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    s = Settings.from_env({"SWESIM_ENV_FILE": str(f)})
+    calls, clients = [], []
+    _fake_anthropic(monkeypatch, [_Resp([_Block("text", '{"ok": 3}')])], calls, clients, stub_secret=False)
+    assert llm.chat_json("anthropic/claude-sonnet-5", "sys", [{"role": "user", "content": "q"}], "{}", settings=s) == {"ok": 3}
+    assert clients[0]["api_key"] == "sk-from-file-0001"
+
+
+def test_missing_credential_raises_missing_secret_without_the_value(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    s = Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "absent.env")})
+    calls, clients = [], []
+    _fake_openai(monkeypatch, [('{"ok": 1}', "stop")], calls, clients, stub_secret=False)
+    with pytest.raises(MissingSecret) as e:
+        llm.chat_json("openai/gpt-5.5", "sys", [{"role": "user", "content": "q"}], "{}", settings=s)
+    assert "OPENAI_API_KEY" in str(e.value) and clients == []                            # no client is built without a key
+    assert isinstance(e.value, llm.LLMError)                                             # callers catching LLMError still see it
+
+
+def test_unknown_provider_is_rejected_before_any_network(monkeypatch):
+    with pytest.raises(llm.LLMError):
+        llm.chat_json("mistral/x", "sys", [{"role": "user", "content": "q"}], "{}")
+    with pytest.raises(llm.LLMError):
+        llm.chat_json("openrouter/deepseek/deepseek-v3.2", "sys", [{"role": "user", "content": "q"}], "{}")   # roles are Anthropic/OpenAI only
