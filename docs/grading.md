@@ -1,6 +1,6 @@
 # Grading and measurement
 
-This document describes the implemented grading contract and the preserved experimental record shown by the website. **New task discovery and experiments are deferred by the current user priority.** The current work is a verified hosted website over preserved records; no new task yield, treatment effect or hosted model comparison is claimed.
+This document describes the implemented grading contract and the preserved experimental record shown by the website. The hosted smoke started on 2026-09-13 and has produced **no graded hosted outcome yet** ([ops.md](ops.md#hosted-smoke-2026-09-13)); no new task yield, treatment effect or hosted model comparison is claimed.
 
 ## Reward and outcomes
 
@@ -159,12 +159,21 @@ A legacy non-interactive flag reflects the exporter rules that wrote it. It is n
 
 ## Judge calibration
 
-The current metric defines a positive prediction as **`verified_rubric_score >= 2`**, compared with human `underspecified >= 2`. It does not use the narrower creation `keep` decision as the positive label. New calibration artifacts include per-instance scores, booleans, confusion class, errors, seed, model/prompt identity and usage.
+The metric defines a positive prediction as **`verified_rubric_score >= 2`** (threshold 2), compared with the human `underspecified >= 2` label on the 150-row annotated SWE-bench pool. It does not use the narrower creation `keep` decision as the positive label. A calibration artifact records per-instance scores, booleans, confusion class, errors, seed, model/prompt identity, usage and cost.
 
-The preserved `workspace/judge_calibration.json` is an older summary: GPT-5.5, `judge-v3`, 150 requested, 145 judged, five oversized inputs excluded; agreement 0.655, precision 0.644, recall 0.460; tp 29, fp 16, tn 66, fn 34. It has **no per-instance predictions**, so the summary cannot establish a newly recalibrated judge or independently reproduce those labels. A fresh calibration with the new artifact shape is deferred with the experiments.
+Two judges have been calibrated on the same 145 judged rows (150 requested, 5 oversized inputs errored) with prompt `judge-v3`:
+
+| Judge | Agreement | Precision | Recall | tp / fp / tn / fn | Artifact |
+|---|---:|---:|---:|---|---|
+| `anthropic/claude-opus-5` | 0.634 | 0.604 | 0.460 | 29 / 19 / 63 / 34 | `workspace/calibration/anthropic--claude-opus-5/2026-09-13.json` (per-instance rows; started 09:00:15Z, finished 09:08:03Z; usage complete: 1,392,326 input / 154,082 output tokens over 145 calls, $10.81 from the Anthropic pricing page, cost record `01M2D0C41D03P1NTYPQPPXWB81`) |
+| `openai/gpt-5.5` | 0.655 | 0.644 | 0.460 | 29 / 16 / 66 / 34 | `workspace/judge_calibration.json` (summary only, laptop run 2026-09-12/13; carried as `reference` inside the Opus 5 artifact) |
+
+Recall is identical; Opus 5 accepts three more false positives. The gpt-5.5 summary has **no per-instance predictions**, so it cannot be re-scored under a changed threshold; the Opus 5 artifact can.
+
+Ruling (ledger, 2026-09-13): **the judge stays `anthropic/claude-opus-5`** by the user's alignment directive; both numbers are reported here; cost if wrong is about two points of agreement on this calibration set. The runs of 2026-09-13 nevertheless used `openai/gpt-5.5` as judge because the Anthropic workspace API limit made Opus 5 and Sonnet 5 unreachable (fallback chain `swesim/roles.py` `ROLE_CHAINS["judge_model"]`, resolution recorded in `workspace/evidence/model-probe-takeover.json`; see [ops.md](ops.md#model-role-fallbacks-in-force)). Every candidate records the judge that actually scored it in `difficulty.judged.model_id`; do not pool candidates judged by different models when comparing yields.
 
 ## Deferred experimental evidence
 
-The immediate release is the hosted website over preserved records. New repository discovery, hosted task/trial smoke, difficulty screening, Tier A–C comparisons, frontier gating and a new disclosure/integrity sweep are deferred. When resumed, record actual commands, ids, sample sizes, model substitutions, cost/unknown usage and failures. Keep old builds, origins and configuration groups separate, and leave unsupported metrics null.
+The hosted creation smoke has started and no hosted trial has run ([ops.md](ops.md#hosted-smoke-2026-09-13)). Difficulty screening, Tier A–C comparisons, frontier-gated runs and a new disclosure/integrity sweep have not been executed on the hosted stack. As each runs, record actual commands, ids, sample sizes, model substitutions, cost/unknown usage and failures. Keep old builds, origins and configuration groups separate, and leave unsupported metrics null.
 
 [Operations evidence](ops.md) tracks website verification, import parity and the deferred checks.
