@@ -228,8 +228,12 @@ def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extra
     if any(r.get("no_timestamp") for r in rows):
         tl += "<p class='muted small'>Rows marked <span class='flag'>no timestamp</span> are listed last; their position is not chronological evidence.</p>"
     left.append(f"<section data-tab-panel='timeline' id='panel-timeline' role='tabpanel' aria-labelledby='tab-timeline' class='timeline hidden'>{tl}</section>")
-    brief = (f"<details open><summary class='muted small'>instruction.md as the agent saw it</summary><pre class='code'>{h(t['instruction'])}</pre></details>"
-             if t["instruction"] else "<p class='empty'>Instruction not materialised yet; it appears when the trial task is prepared.</p>")
+    from_compiled = t.get("instruction_source") == "compiled-task"
+    ins_label = ("instruction.md from the compiled task <span class='muted'>(the per-trial copy is not mirrored; identical content minus the session token)</span>"
+                 if from_compiled else "instruction.md as the agent saw it")
+    brief = (f"<details open><summary class='muted small'{' data-instruction-source=compiled-task' if from_compiled else ''}>{ins_label}</summary><pre class='code'>{h(t['instruction'])}</pre></details>"
+             if t["instruction"] else "<p class='empty'>Instruction not materialised yet; it appears when the trial task is prepared "
+                                      "(neither the per-trial task copy nor the compiled task's <code>instruction.md</code> is in this workspace).</p>")
     patch_file = t.get("patch_file") or "verifier/patch.diff"
     legacy = " · <span class='flag small' title='pre-2026-09-13 artifact name; the grader now writes verifier/submission.diff'>legacy patch.diff</span>" if patch_file.endswith("patch.diff") else ""
     patch = (f"<details><summary class='muted small'>submitted patch ({len(_files_from_diff(t['patch']))} file(s)) · <code>{h(patch_file)}</code>{legacy}</summary>"
