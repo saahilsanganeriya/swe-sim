@@ -124,19 +124,147 @@ Any declared `expected_reward` is checked exactly. Every control must finish wit
 
 ## Measured results
 
-Only what exists on disk now.
+Everything below is read from artifacts on disk on 2026-09-13 (UTC): `registry.json`, `workspace/scenarios/*/validation.json` and `scores.json`, `workspace/trials/*/{run_config,reward,report,transcript,record}.json`, `workspace/judge_calibration.json`, `workspace/candidates/*.rejects.json` and `.probed.jsonl`, `workspace/evidence/*.log` and `workspace/evidence/vm/`. Every validation ran on Modal (`environment_provider: modal`) under the validation run configuration `0b03142e…`. Nothing here is projected.
 
-**psf--requests-1944, control sweep on Modal, 2026-09-12.** The candidate passed the judge and all six auto-approval gates. Validation launched seven Harbor jobs (nop, oracle, one plausible-wrong, three tamper controls, the probe) and returned `invalid`:
+### Valid scenarios: executed controls
 
-| Check | Observed (expected) |
-|---|---|
-| nop base evidence | 73 of 120 PASS_TO_PASS passed; 47 failed on the untouched base (all pass) |
-| oracle | 0 of 5 FAIL_TO_PASS passed; reward 0, success 0 (reward 1, success 1) |
-| gold exact-id manifest | 52 of 125 ids not passed under the gold patch (all pass) |
-| reachability probe | gold-line hits in `requests/__init__.py` and `build/lib/...` copies present at base (no hits) |
-| plausible-wrong | reward 0, success 0, outcome 2 (success 0, reward at most 0.5) |
-| tamper, three incorrect-exploit controls | reward 0 each, outcome 3, one `protected-path-edit` signal each (reward 0) |
+Three scenarios are `valid` and registered. In every table `nop` earns outcome 3 because Harbor's no-op agent leaves nothing for the path policy to apply (tests still run for base evidence), the oracle earns outcome 1, the plausible-wrong patch applies and fails (outcome 2), and each incorrect-exploit tamper is dropped by the path policy with one `protected-path-edit` signal (outcome 3). The reachability probe found the gold commit object unreachable in all three images.
 
-Cause: the requests test suite talks to an HTTP test server over the network and the verifier is offline by contract. The tamper controls were dropped by the path policy and earned zero as required; the probe failures were the added-line false positive. psf/requests is now excluded from pool eligibility and the scenario was not registered. The sweep is also the first evidence that the hardened collector (root-only directory, two file artifacts, agent processes killed) reaches the separate verifier on Modal: every control produced a receipt and test evidence rather than outcome 5.
+**mwaskom--seaborn-3190** (SWE-bench pool A; contract 1 FAIL_TO_PASS `tests/_core/test_scales.py::TestContinuous::test_interval_with_bools`, 84 PASS_TO_PASS; one group, weight 1.0). This `validation.json` is the re-validation of the build compiled after the interactive-instruction change (`compiled_hash 750e014c…`); the first build (`befc959d…`) was also valid and is the one `registry.json` still records, because `register` was not re-run after the recompile.
 
-**First valid scenario.** None has passed validation yet. Its control table will be inserted here from its `validation.json` when it exists; no trial in any condition has run, so pass@k, pass^k and mean reward are not yet measured.
+| Control | reward | success | F2P | P2P | signals | outcome | Expectation |
+|---|---|---|---|---|---|---|---|
+| `nop` | 0.0 | 0 | 0/1 | 84/84 | 0 | 3 `agent-invalid-submission` | reward 0; base fails every F2P, passes every P2P |
+| `oracle` | 1.0 | 1 | 1/1 | 84/84 | 0 | 1 `valid-correct` | success 1, reward 1 |
+| `plausible-wrong:xor-based-boolean-handling` | 0.0 | 0 | 0/1 | 69/84 | 0 | 2 `valid-incorrect` | success 0, reward at most 0.5 |
+| `tamper:tamper-root-conftest` | 0.0 | 0 | 0/1 | 84/84 | 1 | 3 | reward exactly 0 |
+| `tamper:tamper-skip-marker` | 0.0 | 0 | 0/1 | 84/84 | 1 | 3 | reward exactly 0 |
+| `tamper:tamper-sitecustomize` | 0.0 | 0 | 0/1 | 84/84 | 1 | 3 | reward exactly 0 |
+| reachability probe | gold object unreachable; raw hits 0, filtered hits 0 | | | | | | no gold lines in the image |
+
+**scikit-learn--scikit-learn-13584** (SWE-bench pool A; 6 FAIL_TO_PASS in `sklearn/utils/tests/test_pprint.py`, 3 PASS_TO_PASS; one group). This is the second spec for the instance; the first is in the rejections below.
+
+| Control | reward | success | F2P | P2P | signals | outcome | Expectation |
+|---|---|---|---|---|---|---|---|
+| `nop` | 0.0 | 0 | 0/6 | 3/3 | 0 | 3 | reward 0; base evidence as declared |
+| `oracle` | 1.0 | 1 | 6/6 | 3/3 | 0 | 1 | success 1, reward 1 |
+| `plausible-wrong:wrap-array-equality-with-any` | 0.0 | 0 | 0/6 | 1/3 | 0 | 2 | success 0, reward at most 0.5 |
+| `tamper:tamper-root-conftest` | 0.0 | 0 | 0/6 | 3/3 | 1 | 3 | reward exactly 0 |
+| `tamper:tamper-skip-marker` | 0.0 | 0 | 0/6 | 3/3 | 1 | 3 | reward exactly 0 |
+| `tamper:tamper-sitecustomize` | 0.0 | 0 | 0/6 | 3/3 | 1 | 3 | reward exactly 0 |
+| reachability probe | gold object unreachable; raw hits 0, filtered hits 0 | | | | | | no gold lines |
+
+**py-pdf--pypdf-3826** (repository URL, discovered without a PR override; 2 FAIL_TO_PASS `tests/test_reader.py::test_startxref_corrupt_trailing_pointer` and `::test_find_previous_startxref_pos_recovery_variants`, 95 PASS_TO_PASS; two groups, weights 0.6 and 0.4). The plausible-wrong control is the code-built fallback: the model's own wrong patch did not apply to the base commit (`corrupt patch at line 34`, recorded in `draft.meta.json` under `controls_dropped`), so the drafter substituted `fallback-comment-only`, a comment-only change that is guaranteed to apply and to fail the F2P tests.
+
+| Control | reward | success | F2P | P2P | signals | outcome | Expectation |
+|---|---|---|---|---|---|---|---|
+| `nop` | 0.0 | 0 | 0/2 | 95/95 | 0 | 3 | reward 0; base evidence as declared |
+| `oracle` | 1.0 | 1 | 2/2 | 95/95 | 0 | 1 | success 1, reward 1 |
+| `plausible-wrong:fallback-comment-only` | 0.0 | 0 | 0/2 | 95/95 | 0 | 2 | success 0, reward at most 0.5 |
+| `tamper:tamper-root-conftest` | 0.0 | 0 | 0/2 | 95/95 | 1 | 3 | reward exactly 0 |
+| `tamper:tamper-skip-marker` | 0.0 | 0 | 0/2 | 95/95 | 1 | 3 | reward exactly 0 |
+| `tamper:tamper-sitecustomize` | 0.0 | 0 | 0/2 | 95/95 | 1 | 3 | reward exactly 0 |
+| reachability probe | gold object unreachable; 1 raw hit in `pypdf/_reader.py` filtered as a base copy, filtered hits 0 | | | | | | no gold lines |
+
+The pypdf probe row is the first time the added-line-paired-with-removed-line filter (merged as `3d59493` and `1db2076`) changed a verdict: under the earlier probe this raw hit would have invalidated a legitimate scenario, as it did for requests-1944.
+
+### Trials
+
+25 trial directories exist and all 25 have completed: 15 `valid-correct`, 6 `valid-incorrect`, 4 `evaluator-failure`. Every trial used mini-swe-agent 2.4.6 on Modal with a 2,400 s solver budget and purpose `demonstration`; interactive trials used the stakeholder on `openai/gpt-5.5` with the default patience profile (start 6, question 1, review 2, terse below 3, refuse at 0). Groups are `condition|brief_profile|run_config_hash`, so the two seaborn builds and the three solver models never pool. `pass@k` and `pass^k` (k = 3) are only defined for the two groups with n ≥ 3; both are 1.0. `k` is never reduced.
+
+| Scenario | Condition | Profile | Solver | Build / instruction | n | success | mean reward | questions asked |
+|---|---|---|---|---|---|---|---|---|
+| seaborn-3190 | full | natural | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
+| seaborn-3190 | hidden | natural | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
+| seaborn-3190 | hidden | withheld | Haiku 4.5 | v1 | 1 | 0 | 0.0 | 0 |
+| seaborn-3190 | interactive | withheld | Haiku 4.5 | v1 | 3 | 3 | 1.0 (pass@3 1.0, pass^3 1.0) | 0, 0, 0 |
+| seaborn-3190 | interactive | withheld | Sonnet 5 | v1 | 1 | 1 | 1.0 | 0 |
+| seaborn-3190 | interactive | withheld | Haiku 4.5 | v2; attempts 50 and 51 also carried the scaffold config | 4 | 4 | 1.0 (pass@3 1.0, pass^3 1.0) | 0, 0, 2, 0 |
+| seaborn-3190 | interactive | withheld | Sonnet 5 | v2 | 1 | 1 | 1.0 | 1 |
+| seaborn-3190 | interactive | withheld | Opus 5 | v2 | 1 | 1 | 1.0 | 2 |
+| sklearn-13584 | full | natural | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
+| sklearn-13584 | hidden | natural | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
+| sklearn-13584 | hidden | withheld | Haiku 4.5 | v1 | 1 | 1 | 1.0 | 0 |
+| sklearn-13584 | interactive | withheld | Haiku 4.5 | v1 | 1 | 0 | 0.0 | 0 |
+| pypdf-3826 | full | natural | Haiku 4.5 | attempt 0 | 0 (1 evaluator-failure) | 0 | null | none |
+| pypdf-3826 | hidden | natural | Haiku 4.5 | attempt 0 | 0 (1 evaluator-failure) | 0 | null | none |
+| pypdf-3826 | hidden | withheld | Haiku 4.5 | attempt 0 | 0 (1 evaluator-failure) | 0 | null | none |
+| pypdf-3826 | interactive | withheld | Haiku 4.5 | attempt 0 | 0 (1 evaluator-failure) | 0 | null | none |
+| pypdf-3826 | full | natural | Haiku 4.5 | attempt 1, build-essential image | 1 | 0 | 0.0 | 0 |
+| pypdf-3826 | hidden | natural | Haiku 4.5 | attempt 1 | 1 | 0 | 0.0 | 0 |
+| pypdf-3826 | hidden | withheld | Haiku 4.5 | attempt 1 | 1 | 0 | 0.0 | 0 |
+| pypdf-3826 | interactive | withheld | Haiku 4.5 | attempt 1 | 1 | 0 | 0.0 | 0 |
+
+Sources and caveats for the table: seaborn and sklearn rows come from `scores.json`; the Opus row comes from the trial's `record.json` (trial `e54052254969566b15d6cb1b`, finished 04:04:32Z), because the seaborn `scores.json` on disk was written at 04:03Z and still lists that attempt as unresolved (`running`). The four pypdf evaluator-failures are Harbor launch failures before the agent started: mini-swe-agent's setup needed `gcc`/`make` and tried to `apt-get` inside the allowlisted sandbox; `build-essential` is now pre-installed in the environment image (`5723414`) and attempt 1 ran the agent. Near misses are visible in `report.json`: the seaborn `hidden|withheld` Haiku submission passed the F2P test and failed five `TestTemporal` PASS_TO_PASS tests (reward 0 by the regression rule, outcome 2); the sklearn interactive Haiku submission passed 0 of 6 F2P with 3/3 P2P; each pypdf attempt-1 submission passed 0 of 2 F2P with 95/95 P2P. Solver models: `anthropic/claude-haiku-4-5-20251001`, `anthropic/claude-sonnet-5`, `anthropic/claude-opus-5`.
+
+Three further trials ran on the VM under Temporal and are mirrored under `workspace/evidence/vm/workspace/trials/` (they are not in the laptop's `scores.json`): seaborn-3190 `interactive|withheld` Haiku attempts 10 and 40 (reward 1.0, no questions, transcripts frozen and bound) and `hidden|withheld` Haiku attempt 40 (reward 1.0), all on the v1 build. With the laptop's `hidden|withheld` attempt 0 (0.0) that arm has n = 2 on seaborn.
+
+Every interactive transcript on disk is frozen and hash-bound: `report.transcript_hash` equals the collector receipt's `transcript_hash` and `transcript_binding_valid` is true for every completed interactive trial. Exports mark all episodes `simulator_validity: unadjudicated` and `training_eligible: false`, as designed.
+
+### The interaction finding
+
+15 interactive trial records exist (13 on the laptop, 2 on the VM); 14 reached the agent (the pypdf attempt-0 trial failed at launch). Questions were asked in 3 of those 14:
+
+| Solver | Instruction | Scaffold config | Interactive trials | Trials with at least one question | Questions, reviews, patience |
+|---|---|---|---|---|---|
+| Haiku 4.5 | v1 | no | 7 (seaborn 0, 1, 2 and VM attempts 10, 40; sklearn 0; pypdf 1) | 0 | 6 → 6 in every trial |
+| Haiku 4.5 | v2 | no | 2 (seaborn 20, 21) | 0 | 6 → 6 |
+| Haiku 4.5 | v2 | yes | 2 (seaborn 50, 51) | 1 (attempt 50) | attempt 50: 2 questions, 1 review, 6 → 2; attempt 51: none |
+| Sonnet 5 | v1 | no | 1 (seaborn 0) | 0 | 6 → 6 |
+| Sonnet 5 | v2 | no | 1 (seaborn 30) | 1 | 1 question, 2 reviews, 6 → 1 |
+| Opus 5 | v2 | no | 1 (seaborn 30) | 1 | 2 questions, 1 review, 6 → 2 |
+
+So Haiku 4.5 asked nothing in 9 of 9 trials under either instruction alone, and asked in 1 of 2 trials once the agent scaffold itself listed asking as a step; Sonnet 5 asked under v2 and not under v1 (one trial each); Opus 5 asked under v2 (one trial). Every one of the 12 seaborn interactive trials (10 on the laptop, 2 on the VM) earned reward 1.0 whether or not it asked, while the seaborn `hidden|withheld` arm holds one trial at 0.0 and one at 1.0; nothing about a treatment effect can be concluded from that. All 3 asking trials were on seaborn-3190; the sklearn and pypdf interactive trials (Haiku, v1) asked nothing and failed.
+
+What each change was:
+
+- **v1 instruction** (`instruction.md.j2` as first compiled, build `befc959d…`): "A stakeholder who filed this request is available. They can answer a limited number of questions before they have to leave; investigate what you can from the repository first." plus the two shim commands.
+- **v2 instruction** (`af9fab9`, build `750e014c…`, re-validated valid): "The brief above is intentionally incomplete: the person who filed this request left out decisions that the acceptance tests depend on (expected behavior on edge cases, exact error types or messages, scope, naming). Guessing them is how solutions fail. The stakeholder is available now and will answer a limited number of questions before they have to leave, so ask about any decision the brief does not settle before you implement it, and ask early. Repository facts (where code lives, how it works) you should find yourself."
+- **Scaffold config** (`be55d7f`, `swesim/templates/mini_swe_agent.interactive.yaml`, layered by Harbor as `-c mini -c <file>` for interactive trials only): the packaged mini-swe-agent `instance_template` with one added step in its Recommended Workflow ("List every decision the task description leaves open … Ask the stakeholder about each such decision with `ask-user` BEFORE you implement it") and an optional `request-review` in the edge-case step. It is recorded per trial as `report.agent_config_sha256` (`02791a33…` on attempts 50 and 51, null elsewhere) so the two Haiku v2 groups can be told apart even though they share a `run_config_hash`. It exists because the packaged agent workflow never lists asking as a step, so the instruction alone competes with the harness's own procedure.
+
+**The Sonnet 5 episode** (`workspace/trials/e49349d80b190bf73f14a66f`, seaborn-3190, interactive, withheld brief, attempt 30, v2 instruction, no scaffold). Session created 03:45:24Z; question at 03:46:16Z (patience 6 → 5, tier `full`); review at 03:48:33Z (5 → 3, `full`); review at 03:49:19Z (3 → 1, `terse`, since 1 is below `terse_below 3`); frozen 03:50:15Z; graded `reward 1.0, success 1`, F2P 1/1, P2P 84/84. The agent's edit to `tests/_core/test_scales.py` was dropped with a `protected-path-edit` signal and `seaborn/_core/scales.py` was applied.
+
+The question (excerpt of the transcript event, 03:46:16Z):
+
+> I found the bug: when Color.default_scale infers a scale for boolean data (no explicit scale spec given), it calls variable_type(data, boolean_type='numeric') which returns 'numeric' for booleans, so it picks a Continuous scale, and Continuous._setup crashes because numpy booleans don't support subtraction. […] Should the fix be: (a) narrowly make Color.default_scale treat booleans as categorical/Nominal (matching Color.infer_scale's existing behavior), or (b) more broadly fix the base Property.default_scale to treat booleans as categorical for all properties, or (c) fix it at a lower level in ContinuousBase._setup so that boolean data is cast to float/numeric before computing vmin/vmax normalization […]? Do you have a preference […]
+
+The stakeholder's reply (verbatim):
+
+> Prefer (c). Boolean values that reach the Continuous scale path should be treated numerically, i.e. upcast so False/True map as 0/1 and subtraction does not fail.
+>
+> Do not make booleans default to Nominal here, either just for Color or broadly through Property.default_scale. That would be a larger semantic change; a distinct Boolean scale may make sense later, but this fix should stay narrow and preserve the existing numeric-default path.
+
+That answer is the on-request ledger fact `f03` ("boolean data passed through a continuous scale should be upcast to 0/1 floats", provenance `pr-thread`, linked to the F2P test). The first review round told the agent, without executing anything, that its regression test should exercise `Continuous()._setup(..., IntervalProperty())` directly; the agent's second diff added a test named `test_interval_with_bools`, the same name as the hidden F2P test, which the path policy then dropped so grading used only the hidden test. Transcript hash `417981a4…` appears identically in `report.transcript_hash` and the receipt; `transcript_binding_valid` is true.
+
+**The other two asking trials.** Haiku 4.5 with the scaffold (`c39a73b6cfdffdc66581af1a`, attempt 50): "When boolean data is used with a continuous color property, what should be the expected behavior? Should we: (A) convert boolean to numeric (True->1, False->0) for normalization, (B) treat it as categorical, or (C) raise an informative error?" (answered (A), 6 → 5), then a question about the custom-norm branch (→ 4), then a review the stakeholder called "not acceptable as-is" because scratch files were in the diff (→ 2); the final submission applied only `seaborn/_core/scales.py` and earned 1.0. Opus 5 (`e54052254969566b15d6cb1b`, attempt 30): two multi-part questions on scope and on object-dtype and nullable booleans (6 → 4), one review (→ 2), reward 1.0 with `seaborn/_core/scales.py` and a new test in `tests/_core/test_plot.py` applied (only the contract file is protected). In that review the stakeholder warned that `vmin, vmax = map(float, axis.convert_units((vmin, vmax)))` "is broader than the bug requires"; that line is the gold patch's own change (it is the judge's `g3` evidence). The diff-only reviewer is a model with the requirement texts, not the oracle, and its opinion never reaches the reward.
+
+### Judge calibration
+
+`workspace/judge_calibration.json`: prompt `judge-v3`, model `openai/gpt-5.5`, 150 annotated instances requested, 145 judged, 5 errored (all `pydata__xarray` and `astropy__astropy` rows whose F2P ids, issue head and test-patch head alone exceed the 120,000-character authoring budget). Against the human `underspecified >= 2` label: agreement 0.655, precision 0.644, recall 0.460; confusion tp 29, fp 16, tn 66, fn 34.
+
+What the numbers mean: 63 of the 145 rows carry the human label, so always answering "no" would agree 0.566 of the time; the judge reaches 0.655. When it keeps a row, humans also flagged it 64% of the time; it keeps 46% of the rows humans flagged. The limits: the judge's criterion (at least one gap that is non-derivable from the repository, consequential, and resolved in the thread or by the tests, plus a self-contained task) is not the human criterion ("the issue is underspecified"), so agreement is a sanity check, not a target; one model and one prompt version were measured; the 5 unmeasurable rows are the largest instances, which biases the sample toward smaller issues; and no inter-judge or repeat-run variance was measured. Yield on pool A (45 pytest-eligible rows): judge-v1 kept 1 of an 8-row shortlist (requests-1944), judge-v2 kept 0 of 42 (23 rows produced no extracted gap and 13 had only derivable gaps, because v2 classified literal deltas only), judge-v3 kept 24 of 45 with 1 error. On the pypdf bugfix band it kept 1 of 2 probed candidates.
+
+### What the gates rejected, and why
+
+This is the validity record. Each row is a candidate that a model or a human might have shipped and that a code-owned gate stopped, with the pipeline change it caused.
+
+| Candidate | Where it stopped | What the gate observed | What changed |
+|---|---|---|---|
+| `psf--requests-1944` | validate | oracle 0/5 F2P; base 73/120 P2P (47 fail on the untouched base); gold exact-id manifest failed; probe hits in `build/lib/…` and `requests/__init__.py` | the requests suite needs a network test server and the verifier is offline; psf/requests excluded from pool eligibility (`8dfa939`); probe now pairs added lines with their hunk's removed lines so base copies are not leak evidence |
+| `sphinx-doc--sphinx-9467` | validate | `nop` passed all 4 published F2P ids on base (P2P 22/23); oracle 0/…; plausible-wrong agent failed before a clean submission | SWE-bench's lists were computed with network access; the offline `probe` stage (base vs gold, whole-file then exact-id) now runs before every draft and an empty measured F2P ends the candidate as `not-reproducible-offline` |
+| `scikit-learn--scikit-learn-13584`, first spec | validate | oracle 1.0/1 (first gold pass offline) and all five controls 0, but `nop` showed P2P `test_basic` failing on base when the runner listed F2P ids first | test-order pollution; the runner now emits ids in definition order and the probe runs the grader's exact command (`a98f56e`); re-drafted, valid |
+| `pytest-dev--pytest-7283`, first spec | validate (stopped) | oracle `agent-invalid-submission`: the drafter's `protected_paths_extra` included the gold patch's source file `src/_pytest/unittest.py` | protected paths are code-owned (contract test files only; no gold-touched path may be protected, `78b087c`); later drafts failed on "no on-request fact links the single F2P test" (now auto-linked for single-target contracts) and the final re-probe returned "unreliable exact-id probe … keep evidence and reject" |
+| `matplotlib--matplotlib-24189` | draft, compile, probe | twice "structural tests require an alternative-correct control and the drafter produced none"; an unslugified control name became a path at compile; final re-probe "unreliable exact-id probe" | control names are slugified by code (`f26063e`); the candidate stays rejected |
+| `matplotlib--matplotlib-25547` | draft, then validate | probe binding mismatch (stale measurement, refused); a `pr-review` excerpt that was not verbatim (refused); then all seven controls "control agent failed before a clean submission" | the verifier image build guard exited 1 on the matplotlib base image (ledger: likely symlinks in the base tree, the pilot rule); an infrastructure outcome is never a passing control, so the scenario is invalid rather than accepted by default |
+| `sphinx-doc--sphinx-10097` | draft, then validate | drafts failed for a missing alternative-correct control, a non-verbatim `fact_text`, and a requirement resting on an author-only fact; the final sweep had oracle 1.0/1, nop 0, tampers 0, but `alt-correct:regex-strip-variant` ended `agent-runtime-failure` with success 0 | "alt-correct: success != 1" invalidates; the model's alternative fix was not correct and the pipeline says so |
+| `py-pdf--pypdf-3826`, first spec | validate | base, oracle and tampers correct; the plausible-wrong control agent failed before a clean submission because the model-authored diff was corrupt | draft-time verification of every control patch with `git apply --check` against fetched base files, diffs built by `difflib` from complete file texts, and a code fallback control when the model's patch is unusable (`f26063e`, `2455c7e`); re-drafted, valid |
+| `mwaskom--seaborn-3190`, VM create job | validate (on the VM) | same defect: `plausible-wrong:xor-based-fix` agent failed before a clean submission; nop 0, oracle 1.0, tampers 0 | the fix above; the laptop chain after it produced the valid scenario |
+| earlier draft failures | draft | sphinx-9467 grounding against a corpus that kept diff `+` markers; matplotlib-24189 with no `tests` on on-request facts; sklearn-13584 with an excerpt shorter than the minimum; seaborn-3190 "no removed spans"; pypdf-3826 and sphinx-10097 on the content-word rule for `fact_text` | markers stripped from the corpus; explicit F2P list plus code-owned auto-link; zero-removal drafts are valid (natural-only briefs); withheld `fact_text` is the verbatim span |
+
+Discovery on `py-pdf/pypdf` (`--max-prs 400`, since 2026-06-01): the feature band (200 to 1,500 code lines, feature label) ended `no-valid-candidate` with the histogram no-linked-issue 119, linked-target-is-pr 11, diff-too-small 36, no-test-changes 16, feature-label-missing 2 (from the ledger; the first 188-PR pass before the plain-mention link tier had 160 without a linked issue, 22 too small, 6 other). The bugfix band (20 to 600 lines), whose histogram is the `.rejects.json` on disk, rejected no-linked-issue 119, linked-target-is-pr 11, diff-too-small 21, no-test-changes 16, build-budget-exhausted 13, thin-thread 2, no-source-changes 1, issue-not-before-pr 1, fetch-error 1 (PR 3552: thread pagination exceeded its bound, refused rather than truncated), build-or-probe-failed 1; it built and probed three candidates on Modal: PR 3826 (F2P 2, P2P 95), PR 4032 (F2P 1, P2P 188) and PR 4033 ("unreliable base/gold probe; keep evidence and reject"). The judge kept 3826. Its code diff is below the feature floor, as the ledger ruling anticipated for a repository-URL demonstration.
+
+Offline probe measurements for the SWE-bench candidates that reached a draft: seaborn-3190 measured 86 ids (F2P 1, P2P 84, 1 dropped as neither), sklearn-13584 9 (F2P 6, P2P 3), sphinx-10097 F2P 2 / P2P 18, matplotlib-25547 F2P 2 / P2P 78, matplotlib-24189 F2P 2 / P2P 106 with 7 environment tests dropped, pytest-7283 F2P 1 / P2P 51 with 9 network or environment tests dropped (the last two later failed the exact-id stage).
+
+### Not yet measured
+
+The `hidden` arm has n = 1 or 2 per profile, so the cost of withholding and the effect of interaction are not estimated. No trial has run with a solver other than the three Anthropic models, and no calibration or comparison purpose has been run. Outcome 6 has never been assigned. The stakeholder's `disclosed_fact_ids` self-report has not been audited against the ledger. No human has labeled any episode, so every export stays `unadjudicated`.

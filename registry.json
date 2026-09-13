@@ -3,13 +3,27 @@
     "mwaskom--seaborn-3190": {
       "calibration_runs": [],
       "comparison_runs": [],
-      "compiled_hash": "befc959d526b0f68b8b20530eed51cd40d81283ff475df15037e22349f366d9b",
+      "compiled_hash": "750e014c977e71c35690029a96337399f29bde25a1ac14598699247580c55fd7",
       "conditions": [
         "full",
         "hidden",
         "interactive"
       ],
-      "demonstration_runs": [],
+      "demonstration_runs": [
+        "24ce7fb7bef1fa33f394493f",
+        "2ef141969ebfa9d1de615921",
+        "3ea85d94b07e93301dfe1b8f",
+        "51d1c5ea09dc49e8234cafc4",
+        "6e22b0ad258bbf31737c9cea",
+        "78874ff17a9dcd379ac1c9a8",
+        "78cb5149f1db50ccc79f9448",
+        "8a2f1f59590121137e879dc0",
+        "c39a73b6cfdffdc66581af1a",
+        "e49349d80b190bf73f14a66f",
+        "e54052254969566b15d6cb1b",
+        "ebdad6f745322a682430982d",
+        "f88eb6db86d53d343eb54eb1"
+      ],
       "id": "mwaskom--seaborn-3190",
       "image_digest": "sha256:5ce876a52439385a2638f21617febf25a333c24b0db555cb9e37230b4db2cdcc",
       "source": "swebench-annotated",
