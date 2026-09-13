@@ -259,6 +259,12 @@ def compile_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, s
                    visible_facts=visible_facts(spec), solver_minutes=run_config.solver_timeout_sec // 60)
         (tdir / "task.toml").write_text(env.get_template("task.toml.j2").render(**ctx))
         (tdir / "instruction.md").write_text(env.get_template("instruction.md.j2").render(**ctx))
+        # Every brief profile is rendered at compile time so the run stage never re-renders from live templates.
+        for b in spec.briefs:
+            pctx = dict(ctx, brief=natural.text if condition == "full" else b.text, brief_profile="natural" if condition == "full" else b.profile)
+            (tdir / f"instruction.{b.profile}.md").write_text(env.get_template("instruction.md.j2").render(**pctx))
+        if condition == "interactive":
+            shutil.copyfile(TEMPLATES / "mini_swe_agent.interactive.yaml", tdir / "agent_config.yaml")
         # agent image build context
         (tdir / "environment" / "Dockerfile").write_text(env.get_template("environment.Dockerfile.j2").render(**ctx))
         shutil.copyfile(TEMPLATES / "collect.py", tdir / "environment" / "collect.py")

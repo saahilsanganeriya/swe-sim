@@ -83,9 +83,15 @@ def chat_json(model_id: str, system: str, messages: list[dict], schema_hint: str
         attempts = ({"thinking": {"type": "adaptive"}, "output_config": {"effort": ANTHROPIC_EFFORT}, "headroom": ANTHROPIC_THINKING_BUDGET},
                     {"thinking": {"type": "disabled"}, "headroom": 0})
         last = None
-        for a in attempts:
+        for i, a in enumerate(attempts):
             kwargs = {k: v for k, v in a.items() if k != "headroom"}
-            r = client.messages.create(model=name, system=sys_prompt, messages=messages, max_tokens=max_tokens + a["headroom"], **kwargs)
+            try:
+                r = client.messages.create(model=name, system=sys_prompt, messages=messages, max_tokens=max_tokens + a["headroom"], **kwargs)
+            except Exception as e:  # a model that rejects adaptive thinking / output_config (400) falls back to the plain request
+                if i == 0 and type(e).__name__ in ("BadRequestError", "NotFoundError", "UnprocessableEntityError"):
+                    last = f"{type(e).__name__}: {str(e)[:200]} thinking={a['thinking']['type']}"
+                    continue
+                raise
             text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
             if text.strip():
                 return _extract_json(text)

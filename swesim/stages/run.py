@@ -61,17 +61,19 @@ def _get(url: str, headers: dict) -> dict:
     with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=HTTP_TIMEOUT) as r: return json.load(r)
 
 
-def render_instruction(spec: ScenarioSpec, rc: RunConfig) -> str:
-    """Re-render instruction.md for the effective brief profile with the compile stream's template."""
-    from jinja2 import Environment, FileSystemLoader, StrictUndefined
-    from swesim.stages.compile import TEMPLATES, visible_facts   # owned by the compile stream; imported lazily
+def render_instruction(spec: ScenarioSpec, rc: RunConfig, compiled_task_dir: Path | None = None) -> str:
+    """Instruction for the effective brief profile, read from the COMPILED task (bound by compiled_hash), never re-rendered
+    from live templates. Falls back to the condition's default instruction.md when the profile file is absent."""
+    if compiled_task_dir is None:
+        raise ValueError("compiled task dir required: instructions are rendered at compile time")
     natural = next(b for b in spec.briefs if b.profile == "natural")
     selected = next((b for b in spec.briefs if b.profile == rc.brief_profile), natural)
-    env = Environment(loader=FileSystemLoader(str(TEMPLATES)), keep_trailing_newline=True, undefined=StrictUndefined)
-    return env.get_template("instruction.md.j2").render(
-        spec=spec, run_config=rc, condition=rc.condition, task_name=f"{spec.id}--{rc.condition}",
-        brief=natural.text if rc.condition == "full" else selected.text, visible_facts=visible_facts(spec),
-        repo_dir=spec.environment.repo_dir, solver_minutes=rc.solver_timeout_sec // 60)
+    profile = "natural" if rc.condition == "full" else selected.profile
+    for name in (f"instruction.{profile}.md", "instruction.md"):
+        p = compiled_task_dir / name
+        if p.exists():
+            return p.read_text()
+    raise FileNotFoundError(f"no compiled instruction in {compiled_task_dir}")
 
 
 def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: int, stakeholder_url: str, worker_secret: str) -> TrialRecord:
@@ -81,12 +83,18 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     if val["status"] != "valid" or val["spec_hash"] != spec.spec_hash or val["compiled_hash"] != comp["compiled_hash"]:
         raise ValueError("scenario/build not validated")
     profile = "natural" if rc.condition == "full" or not any(b.profile == rc.brief_profile for b in spec.briefs) else rc.brief_profile
-    rc = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": comp["compiled_hash"], "brief_profile": profile})
+    compiled = ws.task_dir(spec.id, rc.condition)
+    # The agent scaffold is part of the run identity: a compiled interactive task carries agent_config.yaml (bound by
+    # compiled_hash) and its identity enters RunConfig.agent_config, so scaffold and default-agent trials never share a group.
+    agent_config = ""
+    if rc.agent == "mini-swe-agent" and rc.condition == "interactive" and (compiled / "agent_config.yaml").exists():
+        agent_config = "mini-swe-agent.interactive:" + hashlib.sha256((compiled / "agent_config.yaml").read_bytes()).hexdigest()[:16]
+    rc = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": comp["compiled_hash"], "brief_profile": profile, "agent_config": agent_config})
     tid = make_trial_id(spec.spec_hash, rc.condition, rc.run_config_hash, attempt_index)
     tdir = ws.root / "trials" / tid; prior = tdir / "record.json"
     if prior.exists(): return TrialRecord(**json.loads(prior.read_text()))
 
-    compiled = ws.task_dir(spec.id, rc.condition); token = ""
+    token = ""
     tc = tomllib.loads((compiled / "task.toml").read_text())
     expected_host = urlparse(stakeholder_url).hostname if stakeholder_url else None
     if rc.condition == "interactive" and (not expected_host or expected_host not in tc["environment"]["allowed_hosts"]):
@@ -104,7 +112,7 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     task = materialize_trial_task(ws, compiled, tid, token)
     tc = tomllib.loads((task / "task.toml").read_text())
     tc["metadata"].update(run_config_hash=rc.run_config_hash, compiled_hash=rc.compiled_hash, condition=rc.condition, brief_profile=rc.brief_profile)
-    (task / "instruction.md").write_text(render_instruction(spec, rc))
+    (task / "instruction.md").write_text(render_instruction(spec, rc, compiled))
     for phase in ("environment", "agent"):
         tc[phase]["allowed_hosts"] = sorted(set(tc[phase].get("allowed_hosts", [])) | {provider_host})
     (task / "task.toml").write_text(tomli_w.dumps(tc))
@@ -117,11 +125,9 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
         # Interactive condition: layer the swesim scaffold config (the packaged mini-swe-agent workflow never lists asking the
         # stakeholder as a step, and 10 of 10 pilot trials under it asked nothing). Harbor reads the host path and ships it.
         agent_config_sha = None
-        if rc.agent == "mini-swe-agent" and rc.condition == "interactive":
-            src = Path(__file__).resolve().parent.parent / "templates" / "mini_swe_agent.interactive.yaml"
-            dst = task / "agent_config.yaml"; dst.write_bytes(src.read_bytes())
-            agent_config_sha = hashlib.sha256(dst.read_bytes()).hexdigest()
-            agent_kwargs = {**(agent_kwargs or {}), "config_file": str(dst)}
+        if rc.agent == "mini-swe-agent" and rc.condition == "interactive" and (task / "agent_config.yaml").exists():
+            agent_config_sha = hashlib.sha256((task / "agent_config.yaml").read_bytes()).hexdigest()  # copied at compile time
+            agent_kwargs = {**(agent_kwargs or {}), "config_file": str(task / "agent_config.yaml")}
         trial_dir = harbor_cli.run_task(task, rc.agent, ws.jobs_dir / "runs", tid, model=rc.model, agent_kwargs=agent_kwargs,
                                         timeout_sec=rc.solver_timeout_sec + 7200)
         reward = harbor_cli.read_reward(trial_dir); report = harbor_cli.read_report(trial_dir)
@@ -135,6 +141,7 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
         status = "launch-failed"; report = {"error": str(e), "outcome": "evaluator-failure"}; reward = {"reward": 0.0, "success": 0, "outcome_code": 7}
     except Exception as e:
         # Unknown launch state: leave no record.json (so the trial is reconciled, not silently retried) but make the dir self-describing.
+        tdir.mkdir(parents=True, exist_ok=True)
         (tdir / "status.json").write_text(json.dumps({"status": "error", "trial_id": tid, "started_at": started_at, "finished_at": _now(), "error": type(e).__name__}))
         raise
 

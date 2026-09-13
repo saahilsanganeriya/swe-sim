@@ -209,6 +209,7 @@ class RunConfig(Strict):
     solver_timeout_sec: int = Field(2400, ge=60)
     purpose: Literal["calibration", "comparison", "demonstration"] = "demonstration"
     compiled_hash: str = ""  # required for actual run; contract/environment content hash, excluding condition prose
+    agent_config: str = ""   # agent scaffold identity (e.g. "mini-swe-agent.interactive:<sha16>"); empty = the agent's packaged defaults
     stakeholder: StakeholderConfig = Field(default_factory=StakeholderConfig)
     k: int = 3; harbor_version: str = "0.23.0"; environment_provider: Literal["modal"] = "modal"
     @property
@@ -218,6 +219,8 @@ class RunConfig(Strict):
 
 def canonical_hash(model: BaseModel) -> str:
     data = model.model_dump(mode="json", exclude={"spec_hash", "run_config_hash"})
+    if data.get("agent_config") == "":  # added after the first runs; an unset scaffold must not change earlier run_config hashes
+        data.pop("agent_config")
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 def trial_id(spec_hash: str, condition: str, run_config_hash: str, attempt_index: int) -> str:

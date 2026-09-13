@@ -37,13 +37,22 @@
     "py-pdf--pypdf-3826": {
       "calibration_runs": [],
       "comparison_runs": [],
-      "compiled_hash": "9d8afbd03fa9290f329142890d5e84801079be754717e547b8e6d97b99cf76f9",
+      "compiled_hash": "4d03074c8a3b498ff13c95b431113f95ce866199f6377c62f0e8e0aeb64ffd3f",
       "conditions": [
         "full",
         "hidden",
         "interactive"
       ],
-      "demonstration_runs": [],
+      "demonstration_runs": [
+        "099f22b85dc9d816c0b4edb2",
+        "40b876987611e0ef14e27f2c",
+        "4509bfaea9a0e1faa03e86fd",
+        "503aedbf0f67e54bd1b5351d",
+        "539d345673978b14ddd63576",
+        "99686ceb3c9a14b688b46e4e",
+        "d26b51a7886af665086de8d8",
+        "e6e6c1ee281e8c84f7493a8b"
+      ],
       "id": "py-pdf--pypdf-3826",
       "image_digest": "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
       "source": "github-repo",
@@ -63,7 +72,12 @@
         "hidden",
         "interactive"
       ],
-      "demonstration_runs": [],
+      "demonstration_runs": [
+        "2f1ba38b81c2152be53d81a9",
+        "808e811792d13e9bf1e3f1d7",
+        "a9e28ce228cf5b8273491d1f",
+        "b64c78461afbb4be6e0ff283"
+      ],
       "id": "scikit-learn--scikit-learn-13584",
       "image_digest": "sha256:5ca83e8c588bfede26f650da0d725c7093d3e57105586522f9d2829e30117b8c",
       "source": "swebench-annotated",

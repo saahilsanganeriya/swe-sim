@@ -57,11 +57,14 @@ def scene(tmp_path, monkeypatch):
     sdir = ws.scenario_dir(spec.id); sdir.mkdir(parents=True)
     (sdir / "compile.json").write_text(json.dumps({"compiled_hash": "c" * 8, "image_digest": "sha256:" + "d" * 64}))
     (sdir / "validation.json").write_text(json.dumps({"status": "valid", "spec_hash": spec.spec_hash, "compiled_hash": "c" * 8}))
+    from pathlib import Path as _P
+    scaffold = _P(run.__file__).resolve().parent.parent / "templates" / "mini_swe_agent.interactive.yaml"
     for cond in ("interactive", "hidden"):
         tdir = ws.task_dir(spec.id, cond); (tdir / "environment").mkdir(parents=True)
         (tdir / "task.toml").write_text(_compiled_task_toml(["api.openai.com", "swesim-stakeholder-web.modal.run"]))
         (tdir / "instruction.md").write_text("compiled instruction")
-    monkeypatch.setattr(run, "render_instruction", lambda spec, rc: f"INSTRUCTION {rc.condition} {rc.brief_profile}")
+        (tdir / "instruction.natural.md").write_text(f"INSTRUCTION {cond} natural")   # compile-time per-profile render
+        if cond == "interactive": (tdir / "agent_config.yaml").write_bytes(scaffold.read_bytes())  # compile-time scaffold copy
     calls = {"post": [], "get": [], "run": []}
     H = "a" * 64
     state = {"transcript_hash": H, "frozen": True, "report": {"transcript_hash": H, "patch_sha256": "p"}, "exception": None}
@@ -96,7 +99,9 @@ def test_run_trial_interactive_end_to_end(scene):
     rc = RunConfig(condition="interactive", model="openai/gpt-5.5")
     rec = run_trial(ws, spec, rc, 0, URL, "secret")
     assert isinstance(rec, TrialRecord) and rec.status == "completed" and rec.reward == {"reward": 1.0, "success": 1, "outcome_code": 1}
-    effective = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": "c" * 8, "brief_profile": "natural"})
+    import hashlib as _h
+    scaffold_id = "mini-swe-agent.interactive:" + _h.sha256((ws.task_dir(spec.id, "interactive") / "agent_config.yaml").read_bytes()).hexdigest()[:16]
+    effective = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": "c" * 8, "brief_profile": "natural", "agent_config": scaffold_id})
     tid = trial_id(spec.spec_hash, "interactive", effective.run_config_hash, 0)
     assert rec.trial_id == tid and rec.run_config_hash == effective.run_config_hash and rec.compiled_hash == "c" * 8 and rec.brief_profile == "natural"
     assert rec.spec_hash == spec.spec_hash and rec.model == "openai/gpt-5.5" and rec.purpose == "demonstration" and rec.scenario_id == spec.id
@@ -179,7 +184,9 @@ def test_run_trial_unexpected_exception_writes_error_status(scene, monkeypatch):
     monkeypatch.setattr(harbor_cli, "run_task", broken)
     rc = RunConfig(condition="interactive", model="openai/gpt-5.5")
     with pytest.raises(OSError): run_trial(ws, spec, rc, 0, URL, "secret")
-    effective = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": "c" * 8, "brief_profile": "natural"})
+    import hashlib as _h
+    scaffold_id = "mini-swe-agent.interactive:" + _h.sha256((ws.task_dir(spec.id, "interactive") / "agent_config.yaml").read_bytes()).hexdigest()[:16]
+    effective = RunConfig.model_validate({**rc.model_dump(), "compiled_hash": "c" * 8, "brief_profile": "natural", "agent_config": scaffold_id})
     tdir = ws.root / "trials" / trial_id(spec.spec_hash, "interactive", effective.run_config_hash, 0)
     st = json.loads((tdir / "status.json").read_text())
     assert st["status"] == "error" and st["error"] == "OSError" and st["finished_at"] and st["started_at"] and st["trial_id"] == tdir.name
@@ -232,16 +239,19 @@ def test_run_trial_refuses_unvalidated_or_mismatched_builds(scene):
     assert calls["post"] == [] and calls["run"] == []
 
 
-def test_render_instruction_uses_compile_templates(monkeypatch, tmp_path):
-    """render_instruction imports the compile stream's TEMPLATES/visible_facts lazily; here we point it at a stub template."""
-    import sys, types
-    (tmp_path / "instruction.md.j2").write_text("{{ brief }}|{{ condition }}|{{ visible_facts|length }}|{{ repo_dir }}|{{ solver_minutes }}")
-    stub = types.ModuleType("swesim.stages.compile"); stub.TEMPLATES = tmp_path
-    stub.visible_facts = lambda spec: [f for f in spec.ledger if f.discovery.value != "author-only"]
-    monkeypatch.setitem(sys.modules, "swesim.stages.compile", stub)
+def test_render_instruction_reads_the_compiled_profile_file(tmp_path):
+    """Instructions are rendered at compile time per brief profile; the run stage reads the compiled file for the effective
+    profile (full always maps to natural), falls back to the condition's default instruction.md, and never re-renders."""
     spec = ScenarioSpec.model_validate(minimal_spec_dict())
-    assert run.render_instruction(spec, RunConfig(condition="interactive", brief_profile="natural")) == "It breaks.|interactive|1|/app|40"
-    assert run.render_instruction(spec, RunConfig(condition="full")) == "It breaks.|full|1|/app|40"
+    compiled = tmp_path / "task"; compiled.mkdir()
+    (compiled / "instruction.md").write_text("default"); (compiled / "instruction.natural.md").write_text("natural text")
+    assert run.render_instruction(spec, RunConfig(condition="interactive", brief_profile="natural"), compiled) == "natural text"
+    assert run.render_instruction(spec, RunConfig(condition="full", brief_profile="withheld"), compiled) == "natural text"
+    (compiled / "instruction.natural.md").unlink()
+    assert run.render_instruction(spec, RunConfig(condition="hidden", brief_profile="natural"), compiled) == "default"
+    with pytest.raises(ValueError):
+        run.render_instruction(spec, RunConfig(condition="hidden"))
+
 
 
 def test_interactive_runs_layer_the_stakeholder_scaffold_config(scene, monkeypatch):

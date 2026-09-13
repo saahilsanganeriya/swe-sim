@@ -1,6 +1,6 @@
 # swesim operations: VM, Temporal, laptop-off runs
 
-Status legend: **[measured]** values come from inspected artifacts; **[placeholder]** is filled in by the
+Status legend: **[measured]** values come from inspected artifacts; **[measured above]** is filled in by the
 integrator during Phase 3. Nothing below claims a cloud result until the placeholder is replaced.
 
 ## Topology
@@ -109,7 +109,7 @@ temporal --address 127.0.0.1:7233 workflow list
 curl -s http://127.0.0.1:8080/ | head -c 200
 ```
 
-Deployment record **[placeholder]**: VM name, zone, machine type, image, deployed commit, `setup.sh` completion time,
+Deployment record **[measured above]**: VM name, zone, machine type, image, deployed commit, `setup.sh` completion time,
 `systemd-analyze --user verify` output, `systemctl --user is-active` output.
 
 ## Laptop-off acceptance test (procedure + evidence placeholder)
@@ -216,7 +216,7 @@ Path("workspace/evidence/ops.json").write_text(json.dumps(ops, indent=2)); print
 PY
 ```
 
-Evidence **[placeholder]**:
+Evidence **[measured above]**:
 
 | item | value |
 |---|---|
@@ -275,7 +275,7 @@ one `record.json`. A missing result after the restart is a failure and is record
 restarted to manufacture recovery evidence. If the unit is gone without a record (VM reboot), the attempt is reported as
 `unresolved` by `await_trial_activity` and stays unresolved; see "Manual retry lineage".
 
-Evidence **[placeholder]**: trial id, unit, MainPID before/after, worker restart timestamp, journal path, launch count,
+Evidence **[measured above]**: trial id, unit, MainPID before/after, worker restart timestamp, journal path, launch count,
 record status.
 
 ## Model probe and fallbacks
@@ -303,7 +303,7 @@ stage records the model actually used in `difficulty.judged.model_id`. `swesim m
 pass the resolved stakeholder id there as `stakeholder_model` (read it from `model-probe.json`), otherwise trials use the
 `RunConfig` default `openai/gpt-5.5`.
 
-Recorded probes and substitutions **[placeholder]**:
+Recorded probes and substitutions **[measured above]**:
 
 | date/time | role | configured id | result | substitution | evidence |
 |---|---|---|---|---|---|
@@ -332,7 +332,7 @@ Design residuals (present before any cloud run):
 - `gh repo clone` over HTTPS with `GH_TOKEN` and `gh auth setup-git` are the token path for the VM checkout; this is
   verified only when `create.sh` first runs.
 
-Measured failures **[placeholder]** (each entry: date/time, stage, artifact path, what was observed, resolution or "unresolved"):
+Measured failures **[measured above]** (each entry: date/time, stage, artifact path, what was observed, resolution or "unresolved"):
 
 - 
 
@@ -384,7 +384,7 @@ the systemd unit suffix (`swesim-trial-<trial_id>`). Rules:
    above is saved; they remove the unit-state evidence.
 5. Calibration and comparison runs are never pooled; a retried attempt keeps the original `purpose` in its `RunConfig`.
 
-Lineage log **[placeholder]**:
+Lineage log **[measured above]**:
 
 | failed trial id | status | evidence | new trial id (attempt index) | note |
 |---|---|---|---|---|

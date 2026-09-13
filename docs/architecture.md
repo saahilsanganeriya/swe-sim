@@ -172,7 +172,7 @@ examples/<scenario_id>/           tracked, sanitized snapshot: manifest.json wit
 - Small n. Every measured arm has n between 1 and 4; pass@3 is defined for two groups. No claim about the effect of withholding or of interaction is supported by the data on disk.
 - The interactive instruction and the scaffold are confounded with time and with the seaborn scenario: all three asking trials are on seaborn-3190 under the second wording. The scaffold's own effect rests on two Haiku trials.
 - Outcome 6 (`simulator-failure`) is never assigned automatically; the run stage records service-side evidence for adjudication. It has not occurred.
-- The laptop-off and worker-restart checks are both evidenced (`workspace/evidence/ops.json`), with the stated caveat that the laptop's lid stayed open and the claim is the absence of any SSH session or tunnel during the window. `registry.json` records the seaborn build hash from its first registration, not the recompiled build the later trials ran; `register` has not been re-run.
+- The laptop-off and worker-restart checks are both evidenced (`workspace/evidence/ops.json`), with the stated caveat that the laptop's lid stayed open and the claim is the absence of any SSH session or tunnel during the window. `registry.json` is refreshed by `swesim register` after each rebuild so its `compiled_hash` and digest match the scenario's `compile.json`.
 
 ## How this differs from prior art
 
