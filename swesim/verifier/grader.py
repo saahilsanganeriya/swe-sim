@@ -15,6 +15,7 @@ import argparse
 import difflib
 import json
 import os
+import select
 import shlex
 import shutil
 import signal
@@ -39,7 +40,9 @@ PATH_FIELDS = ('artifacts_dir', 'pristine_dir', 'work_dir', 'verifier_out', 'tar
 LAUNCH_FAILURE = 'launch-failure: '   # _run_tests error prefix for failures that cannot be the submission's doing
 MAX_RERUNS = 10
 MAX_DIFF_FILE_BYTES = 5 * 1024 * 1024
-STDOUT_KEEP = 1_000_000
+STDOUT_KEEP = 1_000_000                  # tail of the run output stored in verifier_out/runner_stdout.txt
+MAX_OUTPUT_BYTES = 64 * 1024 * 1024      # combined stdout+stderr read from one test run; beyond it the run is killed
+KILL_GRACE_SEC = 30
 
 
 @dataclass
@@ -255,11 +258,59 @@ def _kill_user_processes(user):
     return killed
 
 
-def _run_tests(cfg, repo, expected):
-    """Run cfg.runner['command'] in repo as the test user. Returns (statuses, rc, stdout, error).
+@dataclass
+class RunResult:
+    statuses: dict
+    rc: int
+    out: str
+    error: str | None
+    output_bytes: int = 0    # combined stdout+stderr the child produced (not what was kept)
+    capped: bool = False     # output exceeded MAX_OUTPUT_BYTES; the run was killed and its evidence is incomplete
+
+
+def _collect_output(p, timeout_sec, cap, kill):
+    """Read p.stdout incrementally until EOF. Returns (data, total_bytes, status).
+
+    status is None, 'timeout' or 'output-cap'. kill() runs once when the deadline passes or the
+    combined output exceeds cap; reading then continues until EOF or KILL_GRACE_SEC so the pipe
+    drains, but nothing beyond the cap is kept in memory.
+    """
+    fd = p.stdout.fileno()
+    chunks, kept, total, status, stop_at = [], 0, 0, None, None
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        now = time.monotonic()
+        if status is None and now >= deadline:
+            status, stop_at = 'timeout', now + KILL_GRACE_SEC
+            kill()
+        if stop_at is not None and now >= stop_at:
+            break   # writers survived the kill; stop waiting for EOF
+        limit = (stop_at if stop_at is not None else deadline) - now
+        ready, _, _ = select.select([fd], [], [], max(0.0, min(limit, 1.0)))
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 1 << 16)
+        except OSError:
+            break
+        if not chunk:
+            break   # EOF
+        total += len(chunk)
+        if kept < cap:
+            chunks.append(chunk)
+            kept += len(chunk)
+        if status is None and total > cap:
+            status, stop_at = 'output-cap', time.monotonic() + KILL_GRACE_SEC
+            kill()
+    return b''.join(chunks), total, status
+
+
+def _run(cfg, repo, expected):
+    """Run cfg.runner['command'] in repo as the test user; returns a RunResult.
 
     expected: exact nodeids the run must collect, or None to accept whatever was collected
     (the authoring probe). Evidence must reconcile completely or no statuses are returned.
+    Output is read incrementally under MAX_OUTPUT_BYTES; a flooding submission is killed.
     """
     work = Path(cfg.work_dir)
     work.mkdir(parents=True, exist_ok=True)
@@ -269,7 +320,7 @@ def _run_tests(cfg, repo, expected):
         try:
             _chown_tree(str(d), cfg.test_user)
         except (KeyError, OSError) as e:
-            return {}, -1, '', LAUNCH_FAILURE + 'test user %r: %s' % (cfg.test_user, e)
+            return RunResult({}, -1, '', LAUNCH_FAILURE + 'test user %r: %s' % (cfg.test_user, e))
     junit, ids = d / 'junit.xml', d / 'nodeids.json'
     cmd = cfg.runner['command'].replace('{junit_path}', shlex.quote(str(junit)))
     # Minimal environment: no inherited PYTHON*/PYTEST_* options reach the test interpreter.
@@ -279,28 +330,40 @@ def _run_tests(cfg, repo, expected):
     if cfg.test_user:
         runuser = shutil.which('runuser', path='/usr/sbin:/usr/bin:/sbin:/bin')
         if not runuser:
-            return {}, -1, '', LAUNCH_FAILURE + 'runuser not found'
+            return RunResult({}, -1, '', LAUNCH_FAILURE + 'runuser not found')
         argv = [runuser, '-u', cfg.test_user, '--', *argv]
     try:
         p = subprocess.Popen(argv, cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
-                             start_new_session=True, encoding='utf-8', errors='replace')
+                             start_new_session=True)
     except OSError as e:
-        return {}, -1, '', LAUNCH_FAILURE + str(e)
-    try:
-        out, _ = p.communicate(timeout=cfg.test_timeout_sec)
-    except subprocess.TimeoutExpired:
+        return RunResult({}, -1, '', LAUNCH_FAILURE + str(e))
+
+    def kill():
         _kill_group(p)
         if cfg.test_user:
             _kill_user_processes(cfg.test_user)
+
+    try:
+        data, total, status = _collect_output(p, cfg.test_timeout_sec, MAX_OUTPUT_BYTES, kill)
         try:
-            out, _ = p.communicate(timeout=30)
+            p.wait(timeout=KILL_GRACE_SEC)
         except subprocess.TimeoutExpired:
+            kill()
             p.kill()
-            out = ''
-        return {}, -9, out or '', 'timeout'
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
     finally:
+        p.stdout.close()
         if cfg.test_user:
             _kill_user_processes(cfg.test_user)   # nothing started by one run may survive into the next
+    out = data.decode('utf-8', 'replace')
+    if status == 'timeout':
+        return RunResult({}, -9, out, 'timeout', total, False)
+    if status == 'output-cap':
+        rc = p.returncode if p.returncode is not None else -9
+        return RunResult({}, rc, out, 'output-cap-exceeded: %d bytes of output (cap %d); evidence incomplete' % (total, MAX_OUTPUT_BYTES), total, True)
     rc = p.returncode
     try:
         collected = json.loads(ids.read_text(encoding='utf-8'))
@@ -312,8 +375,14 @@ def _run_tests(cfg, repo, expected):
             raise parsers.EvidenceError('collection differs from manifest')
         statuses = parsers.reconcile(out, junit, collected, rc)
     except (OSError, ValueError) as e:
-        return {}, rc, out, '%s: %s' % (type(e).__name__, e)
-    return statuses, rc, out, None
+        return RunResult({}, rc, out, '%s: %s' % (type(e).__name__, e), total, False)
+    return RunResult(statuses, rc, out, None, total, False)
+
+
+def _run_tests(cfg, repo, expected):
+    """Compatibility 4-tuple (statuses, rc, stdout, error); the authoring probe imports this name."""
+    r = _run(cfg, repo, expected)
+    return r.statuses, r.rc, r.out, r.error
 
 
 def _diagnostic_reruns(cfg, target, actual, report):
@@ -333,8 +402,9 @@ def _diagnostic_reruns(cfg, target, actual, report):
         nodeid = actual[t]
         sub = replace(cfg, runner=dict(cfg.runner, command=single.replace('{nodeid}', shlex.quote(nodeid))),
                       test_timeout_sec=max(5, int(remaining)))
-        st, sr, so, se = _run_tests(sub, target, [nodeid])
-        report['reruns'].append({'id': t, 'statuses': st, 'exit_code': sr, 'error': se, 'tail': so[-1000:]})
+        r = _run(sub, target, [nodeid])
+        report['reruns'].append({'id': t, 'statuses': r.statuses, 'exit_code': r.rc, 'error': r.error,
+                                 'tail': r.out[-1000:], 'output_bytes': r.output_bytes})
         n += 1
 
 
@@ -492,8 +562,11 @@ def grade(cfg):
     report['tests_ran_as'] = cfg.test_user or _current_user()
     if not cfg.test_user:   # tests share the grader's identity; validation must see this
         report['integrity_signals'].append({'kind': 'tests-ran-as-grader', 'user': report['tests_ran_as']})
-    statuses, rc, out, error = _run_tests(cfg, target, list(actual.values()))
-    report.update(runner_exit_code=rc, runner_tail=out[-4000:], runner_error=error)
+    run = _run(cfg, target, list(actual.values()))
+    statuses, rc, out, error = run.statuses, run.rc, run.out, run.error
+    report.update(runner_exit_code=rc, runner_tail=out[-4000:], runner_error=error, runner_output_bytes=run.output_bytes)
+    if run.capped:   # the submission flooded the output; the run was killed and its evidence is incomplete
+        report['integrity_signals'].append({'kind': 'output-cap-exceeded', 'bytes': run.output_bytes, 'cap': MAX_OUTPUT_BYTES})
     _atomic_write(cfg.verifier_out / 'runner_stdout.txt', out[-STDOUT_KEEP:])
     if error:
         if error.startswith(LAUNCH_FAILURE):
@@ -505,7 +578,10 @@ def grade(cfg):
         report['per_group'] = [dict(id=g['id'], weight=g['weight'], passed=False) for g in cfg.groups]
         report['reruns'] = []
         finish('agent-runtime-failure', patch_applied=patch_applied)
-        _diagnostic_reruns(cfg, target, actual, report)
+        if run.capped:
+            report['reruns_skipped'] = 'output-cap-exceeded'   # the same submission would flood each rerun
+        else:
+            _diagnostic_reruns(cfg, target, actual, report)
         return finish('agent-runtime-failure', patch_applied=patch_applied)
 
     # 7. Credit: success is whole-contract correctness; reward is partial by group; any P2P failure zeroes it.

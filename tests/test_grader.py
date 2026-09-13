@@ -190,6 +190,40 @@ def test_braces_in_nodeids_survive_command_substitution(tmp_path):
     res = grader.grade(cfg)
     assert res.reward["outcome_code"] == 4 and res.report["reruns"][0]["statuses"] == {"tests/test_mod.py::test_p[{a}]": "passed"}
 
+def test_unbounded_output_is_capped_killed_and_coded_runtime_failure(tmp_path, monkeypatch):
+    import time
+    p = _pristine(tmp_path); cfg = _cfg(tmp_path, p, _artifacts(tmp_path, _fixed_tree(tmp_path, p)))
+    monkeypatch.setattr(grader, "MAX_OUTPUT_BYTES", 256 * 1024)
+    (tmp_path / "flood.py").write_text("import os, sys\nopen(sys.argv[1] + '.pid', 'w').write(str(os.getpid()))\n"
+                                       "while True:\n    sys.stdout.write('x' * 65536); sys.stdout.flush()\n")
+    cfg.runner["command"] = sys.executable + " " + str(tmp_path / "flood.py") + " {junit_path}"; cfg.runner["single_command"] = ""
+    cfg.test_timeout_sec = 60
+    t0 = time.monotonic(); res = grader.grade(cfg); elapsed = time.monotonic() - t0
+    assert res.reward["outcome_code"] == 4 and res.reward["reward"] == 0 and res.reward["success"] == 0
+    assert res.report["runner_error"].startswith("output-cap-exceeded")
+    sig = [s for s in res.report["integrity_signals"] if s["kind"] == "output-cap-exceeded"]
+    assert len(sig) == 1 and sig[0]["bytes"] > 256 * 1024 and sig[0]["cap"] == 256 * 1024
+    assert res.report["runner_output_bytes"] == sig[0]["bytes"] and res.reward["integrity_signal_count"] == 2
+    assert len(res.report["runner_tail"]) <= 4000
+    assert (tmp_path / "verifier_out" / "runner_stdout.txt").stat().st_size <= 256 * 1024 + 65536   # nothing past the cap is kept
+    assert elapsed < 30, elapsed                                                                      # killed, not run to the timeout
+    pid = int(next((tmp_path / "work").glob("results-*/junit.xml.pid")).read_text())
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("flooding test process %d still alive" % pid)
+
+def test_normal_run_under_cap_is_unchanged(tmp_path):
+    p = _pristine(tmp_path); res = grader.grade(_cfg(tmp_path, p, _artifacts(tmp_path, _fixed_tree(tmp_path, p))))
+    assert res.reward["outcome_code"] == 1 and res.reward["success"] == 1 and res.report["runner_error"] is None
+    assert 0 < res.report["runner_output_bytes"] < grader.MAX_OUTPUT_BYTES
+    assert not [s for s in res.report["integrity_signals"] if s["kind"] == "output-cap-exceeded"]
+    assert "short test summary info" in (tmp_path / "verifier_out" / "runner_stdout.txt").read_text()
+
 def test_patch_paths_handles_git_quoted_names(tmp_path):
     patch = tmp_path / "t.patch"
     patch.write_text('diff --git "a/tests/da ta.txt" "b/tests/da ta.txt"\n--- "a/tests/da ta.txt"\n+++ "b/tests/da ta.txt"\n@@ -1 +1 @@\n-x\n+y\n'
