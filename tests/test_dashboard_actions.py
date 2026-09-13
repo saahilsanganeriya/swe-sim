@@ -312,3 +312,20 @@ def test_workflow_page_offers_cancel_only_while_open_and_shows_failure_text(site
     failed = c.get("/workflows/create-9").text
     assert "data-action='cancel'" not in failed and "Failure" in failed and "judge rejected" in failed and "secret.example" not in failed and "token=abc" not in failed
     assert c.get("/api/workflows/run-1").json()["progress"]["stage"] == "trial"
+
+
+def test_hosted_actions_require_verified_identity_before_confirmation(site, monkeypatch):
+    from swesim.dashboard.app import app, settings_dep
+    from swesim.settings import get_settings
+    audits=[]
+    monkeypatch.setattr(access,'record_action',lambda reader,settings,row:audits.append(row))
+    hosted=get_settings().model_copy(update={'bucket':'hosted-record'})
+    app.dependency_overrides[settings_dep]=lambda:hosted
+    try:
+        denied=site['client'].post('/api/label/preview',json={'trial_id':site['done'],'label':'no-question'})
+        assert denied.status_code==403 and 'verified IAP' in denied.text
+        permitted=site['client'].post('/api/label/preview',json={'trial_id':site['done'],'label':'no-question'},headers=site['eval'])
+        assert permitted.status_code==200
+        assert len(audits)==1 and audits[0].result=='rejected' and audits[0].actor=='anonymous'
+    finally:
+        app.dependency_overrides.pop(settings_dep,None)

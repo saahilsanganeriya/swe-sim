@@ -83,6 +83,12 @@ def identity_dep(request: Request, settings: Settings = Depends(settings_dep)) -
 
 
 def origin_dep(request: Request, settings: Settings = Depends(settings_dep), reader=Depends(reader_dep), identity: Identity = Depends(identity_dep)) -> None:
+    if settings.bucket and identity.anonymous:
+        action = request.path_params.get("action")
+        if action in actions.ACTIONS:
+            access.record_action(reader, settings, actions.audit_row(identity=identity, action=action, target=None, params={}, confirmed=False,
+                                                                     origin_header=request.headers.get("origin"), result="rejected", workflow_id=None, settings=settings))
+        raise HTTPException(403, detail="A verified IAP operator identity is required")
     try:
         actions.check_origin(request.headers, settings, str(request.url))
     except actions.OriginError as e:

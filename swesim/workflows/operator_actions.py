@@ -79,6 +79,7 @@ async def prepare_operator_action_activity(p: dict) -> dict:
         s = get_settings()
         saved = {'request': request, 'signal_target': target, 'decided_at': datetime.now(UTC).isoformat(),
                  'worker_image_digest': s.worker_image_digest, 'origin': s.origin}
+        check_payload(saved, "prepared operator action")
         atomic_json(path, saved)
         return saved
     except ValueError as error:
@@ -97,7 +98,8 @@ async def commit_operator_action_activity(p: dict) -> dict:
         _validate_record(request, after_signal=True)
         params = request['params']
         layout = Layout(root=get_settings().workspace)
-        provenance = {k: p[k] for k in ('decided_at', 'worker_image_digest', 'origin')}
+        current = get_settings()
+        provenance = {'decided_at': p['decided_at'], 'worker_image_digest': current.worker_image_digest, 'origin': current.origin}
         if activity.in_activity():
             provenance.update(workflow_id=activity.info().workflow_id, run_id=activity.info().workflow_run_id)
         if request['action'] == 'label':
@@ -108,7 +110,9 @@ async def commit_operator_action_activity(p: dict) -> dict:
             atomic_json(layout.scenario_dir(params['scenario_id']) / 'review.json', record)
         result = {'ok': True, 'saved': True, 'action': request['action'], 'request_id': request['request_id'],
                   'decision': params.get('decision'), 'scenario_id': params.get('scenario_id'), 'trial_id': params.get('trial_id'),
-                  'spec_hash': params.get('spec_hash'), 'signalled': p['signal_target'], 'via': 'control workflow'}
+                  'spec_hash': params.get('spec_hash'), 'signalled': p['signal_target'], 'via': 'control workflow',
+                  'worker_image_digest': current.worker_image_digest, 'origin': current.origin}
+        check_payload(result, "committed operator action")
         atomic_json(result_path, result)
         return result
     except ValueError as error:
@@ -161,6 +165,7 @@ async def read_candidate_source_activity(p: dict) -> dict:
     from swesim.storage.layout import SEGMENT_RE
     import hashlib
     try:
+        check_payload(p, 'frozen candidate source input')
         s = get_settings()
         ws = Workspace(s.workspace, s.registry_path)
         path = batching.checked_path(ws, p['candidates_path'])
@@ -177,7 +182,8 @@ async def read_candidate_source_activity(p: dict) -> dict:
         out = batching.directory(ws, wid) / 'retry' / (digest + '.jsonl')
         batching.atomic_text(out, selected_text)
         return {'candidates_path': str(out), 'source_key': p['source_key'], 'written': 1, 'discovered': 1,
-                'source_snapshot_sha256': hashlib.sha256(raw).hexdigest(), 'retried_instance_id': p['instance_id']}
+                'source_snapshot_sha256': hashlib.sha256(raw).hexdigest(), 'retried_instance_id': p['instance_id'],
+                'worker_image_digest': s.worker_image_digest, 'origin': s.origin}
     except (KeyError, ValueError) as error:
         raise ApplicationError(str(error), type='OperatorInputError', non_retryable=True) from error
 
