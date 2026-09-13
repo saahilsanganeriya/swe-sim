@@ -593,9 +593,11 @@ def test_spend_check_sums_cost_files_and_compares_with_the_cap(ws, monkeypatch):
 
 
 def test_record_cost_activity_is_idempotent_and_reports_missing_pieces(ws, monkeypatch):
+    import swesim
     from types import SimpleNamespace
     spec = frozen_scenario(ws); p = trial_request(ws, spec); tid = p["trial_id"]; d = ws.root / "trials" / tid
     monkeypatch.setitem(sys.modules, "swesim.costs", None)                                   # a worker without the models stream's module
+    monkeypatch.setattr(swesim, "costs", None, raising=False)
     r = asyncio.run(A.record_cost_activity({"trial_id": tid}))
     assert r["recorded"] is False and "swesim.costs" in r["reason"]
     written = []
@@ -605,6 +607,7 @@ def test_record_cost_activity_is_idempotent_and_reports_missing_pieces(ws, monke
         written.append((trial_id_, workflow_id, role, model_id)); return SimpleNamespace(usd=0.42, price_source="table")
     fake_costs = fake_module("swesim.costs", solver_usage_from_trajectory=lambda traj: {"input": traj["in"], "output": traj["out"]}, record_cost=record_cost)
     monkeypatch.setitem(sys.modules, "swesim.costs", fake_costs)
+    monkeypatch.setattr(swesim, "costs", fake_costs, raising=False)
     assert asyncio.run(A.record_cost_activity({"trial_id": tid}))["reason"] == "no record.json"
     atomic_json(d / "record.json", {"trial_id": tid, "status": "completed", "model": p["model"], "reward": {"reward": 1.0, "success": 1}})
     assert asyncio.run(A.record_cost_activity({"trial_id": tid}))["reason"] == "no trajectory or agent result to read usage from"
@@ -1240,6 +1243,8 @@ def _create_fakes(conc, judge_calls, validate_invalid=("a--5",), judge_error=("a
     async def probe(p): return {"resolved": {"judge_model": p.get("judge_model"), "draft_model": p.get("draft_model"), "stakeholder_model": "openai/gpt-5.5"}, "substitutions": {}, "needs_human": []}
     @activity.defn(name="mine_activity")
     async def mine(p): return {"candidates_path": f"/c/{p.get('repo') or p.get('pool')}.jsonl"}
+    @activity.defn(name="discover_activity")
+    async def discover(p): return {"candidates_path": f"/c/{p['repo']}.jsonl"}
     @activity.defn(name="list_candidates_activity")
     async def listc(p): return {"candidates": [{"instance_id": i, "scenario_id": sid(i)} for i in lists[p["candidates_path"]]]}
     @activity.defn(name="judge_one_activity")
@@ -1267,7 +1272,7 @@ def _create_fakes(conc, judge_calls, validate_invalid=("a--5",), judge_error=("a
     async def validate(p): return {"status": "invalid" if p["scenario_id"] in validate_invalid else "valid", "failures": ["oracle earned 0"]}
     @activity.defn(name="register_activity")
     async def register(p): return {"registry_entry": {}}
-    return [probe, mine, listc, judge, probe_c, draft, approve, precheck, human, verify, compile_, validate, register]
+    return [probe, mine, discover, listc, judge, probe_c, draft, approve, precheck, human, verify, compile_, validate, register]
 
 
 def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress():

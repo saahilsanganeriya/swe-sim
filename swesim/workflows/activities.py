@@ -41,7 +41,7 @@ from swesim.models import ID_RE, RunConfig, ScenarioSpec, trial_id
 from swesim import roles
 from swesim.paths import Workspace, atomic_json
 from swesim.settings import Settings, get_settings, has_secret, secret
-from swesim.workflows import retries
+from swesim.workflows import retries, validation
 from swesim.workflows.launchers.base import (Launcher, LaunchFailed, TrialBindingConflict, TrialEvidence, TrialLayout,  # noqa: F401 - re-exported
                                              WorkspaceLayout, decide_launch, get_launcher, unit_name)
 from swesim.workflows.launchers.base import launch_once as _launch_once
@@ -99,14 +99,33 @@ def _heartbeat(*details) -> None:
         activity.heartbeat(*details)
 
 
+def _cancelled() -> bool:
+    return activity.in_activity() and activity.is_cancelled()
+
+
 async def blocking(fn, every: float | None = None):
-    """Run a blocking stage function in a thread while heartbeating every `every` seconds."""
+    """Run a blocking stage function in a thread while heartbeating every `every` seconds. Between heartbeats the activity's
+    cancellation is observed: the activity ends as cancelled (the thread cannot be interrupted and runs to completion; a launcher's
+    runtime is stopped by `cancel_trial_activity`, not here)."""
+    if _cancelled():
+        raise asyncio.CancelledError("activity cancelled before the next stage")
     task = asyncio.ensure_future(asyncio.to_thread(fn))
-    while True:
-        done, _ = await asyncio.wait({task}, timeout=every or HEARTBEAT_SECONDS)
-        _heartbeat()
-        if done:
-            return task.result()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=every or HEARTBEAT_SECONDS)
+            if _cancelled():
+                raise asyncio.CancelledError("activity cancelled between stages")
+            if done:
+                return task.result()
+            _heartbeat()
+    except asyncio.CancelledError:
+        # A Python thread cannot be killed. Drain this stage before acknowledging cancellation so that
+        # launch_trial cannot create a Job after the workflow's cancellation cleanup has already run.
+        try:
+            await asyncio.shield(task)
+        except Exception:
+            pass
+        raise
 
 
 def _spec(sid: str) -> ScenarioSpec:
@@ -177,9 +196,36 @@ async def probe_models_activity(p: dict) -> dict:
 
 
 @swesim_activity
-async def mine_activity(p: dict) -> dict:
-    import importlib
+async def discover_activity(p: dict) -> dict:
+    """GitHub discovery without probe builds (AUTHORING): `github_repo.discover` -> candidate rows (candidate_to_row + build_recipe)
+    into candidates/github-repo--<owner>__<repo>.jsonl plus the reject histogram (`.rejects.json`) and a `.status` marker when
+    nothing qualified. Probing happens per candidate in `probe_candidate_activity`. Like mine, a rerun rewrites the file: discovery
+    is the freshest PR list the operator asked for."""
+    gr = importlib.import_module("swesim.sources.github_repo")
+    repo = gr.normalize_repo(p["repo"])
+    kwargs = _accepted_kwargs(gr.discover, {k: p[k] for k in ("since", "pr", "max_prs", "kind") if p.get(k) is not None})
+    kwargs.setdefault("since", "2026-06-01")
+    cands, rejects = await blocking(lambda: gr.discover(repo, **kwargs))
+    limit = int(p.get("max_candidates") or 0) or len(cands)
+    rows = []
+    for c in cands[:limit]:
+        row = gr.candidate_to_row(c); row.update(gr.build_recipe(repo, c["base_commit"])); rows.append(row)
+    out = WS.candidates_dir / f"github-repo--{repo.replace('/', '__')}.jsonl"; out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".tmp"); tmp.write_text("".join(json.dumps(r) + "\n" for r in rows)); os.replace(tmp, out)
+    rejects = {**dict(rejects), **({"max-candidates-cut": len(cands) - limit} if len(cands) > limit else {})}
+    atomic_json(out.with_suffix(".rejects.json"), rejects)
+    status = out.with_suffix(".status")
+    if not rows:
+        status.write_text("no-valid-candidate")
+    elif status.exists():
+        status.unlink()
+    return {"candidates_path": str(out), "repo": repo, "discovered": len(cands), "written": len(rows), "rejects": rejects}
 
+
+@swesim_activity
+async def mine_activity(p: dict) -> dict:
+    """Source mining: SWE-bench pool rows, or the GitHub path with up to `max_builds` probe builds inside the activity (legacy for
+    GitHub; CreateTasksWorkflow uses discover_activity and probes per candidate)."""
     M = importlib.import_module("swesim.stages.mine")
     source = p.get("source", "swebench-annotated")
     if source == "github-repo":
@@ -338,8 +384,6 @@ async def probe_candidate_activity(p: dict) -> dict:
     """Measure FAIL_TO_PASS / PASS_TO_PASS on base and gold for one judged row (Harbor on Modal; one attempt, and
     harbor_cli reconciles an existing job dir instead of relaunching). The probed row replaces the row in the
     per-candidate judged file, so draft_activity reads the measured lists. Retained: a row with probe.measured is reused."""
-    import importlib
-
     judged_path = Path(p["judged_path"]); iid = p["instance_id"]; sid = p.get("scenario_id") or scenario_id_for(iid)
     rows = [json.loads(line) for line in judged_path.read_text().splitlines() if line.strip()]
     idx = next((i for i, r in enumerate(rows) if r.get("instance_id") == iid), None)
@@ -421,8 +465,6 @@ def _read_row(path: Path, iid: str) -> dict | None:
 @swesim_activity
 async def precheck_draft_activity(p: dict) -> dict:
     """Hold mode: schema, asset and withholding-leak checks on scenario.draft.json; writes nothing, approves nothing."""
-    import importlib
-
     AP = importlib.import_module("swesim.stages.approve")
     sid = p["scenario_id"]; sdir = WS.scenario_dir(sid); draft = sdir / "scenario.draft.json"
     if not draft.is_file():
@@ -510,17 +552,48 @@ async def verify_approval_activity(p: dict) -> dict:
 async def compile_activity(p: dict) -> dict:
     from swesim.stages.compile import compile_scenario
 
-    r = await blocking(lambda: compile_scenario(WS, _spec(p["scenario_id"]), RunConfig.default("interactive"), p["stakeholder_url"]))
+    spec = _spec(p["scenario_id"])
+    r = await blocking(lambda: compile_scenario(WS, spec, RunConfig.default("interactive"), p["stakeholder_url"]))
     task_dirs = getattr(r, "task_dirs", None) or {}
-    return {"compile_path": str(r.compile_json), "image_digest": getattr(r, "image_digest", None), "task_dirs": {k: str(v) for k, v in dict(task_dirs).items()}}
+    return {"compile_path": str(r.compile_json), "image_digest": getattr(r, "image_digest", None), "task_dirs": {k: str(v) for k, v in dict(task_dirs).items()},
+            "controls": validation.control_names(spec)}  # the per-control validation plan (validate_control_activity per name)
 
 
 @swesim_activity
 async def validate_activity(p: dict) -> dict:
+    """Legacy whole-scenario validation (all control runs in one activity), used by PipelineWorkflow only; CandidateWorkflow runs
+    validate_control_activity per control and evaluate_controls_activity for the verdict."""
     from swesim.stages.validate import validate_scenario
 
     r = await blocking(lambda: validate_scenario(WS, _spec(p["scenario_id"]), RunConfig.default("full"), p["stakeholder_url"]))
     return {"status": r["status"], "failures": r.get("failures", [])}
+
+
+def _compile_info(sid: str) -> dict:
+    comp = _read_json(WS.scenario_dir(sid) / "compile.json")
+    if not comp.get("compiled_hash"):
+        raise ApplicationError(f"compile.json missing for {sid}; compile before validating", non_retryable=True)
+    return comp
+
+
+@swesim_activity
+async def validate_control_activity(p: dict) -> dict:
+    """One control run of the validation (BUILD): Harbor on Modal through harbor_cli, which reconciles an existing job dir instead
+    of relaunching. `HarborRunError` propagates and the BUILD class retries this one control; the result carries paths and the
+    small reward summary, never report bodies."""
+    spec = _spec(p["scenario_id"]); comp = _compile_info(spec.id)
+    return await blocking(lambda: validation.run_control(WS, spec, p["control"], comp["compiled_hash"]))
+
+
+@swesim_activity
+async def evaluate_controls_activity(p: dict) -> dict:
+    """The verdict over the recorded control runs (`trial_dirs`: control name -> Harbor trial dir): validate.py's rules over each
+    dir's reward and report, then scenarios/<sid>/validation.json in validate_scenario's shape."""
+    spec = _spec(p["scenario_id"]); comp = _compile_info(spec.id)
+    r = await blocking(lambda: validation.assemble_validation(WS, spec, dict(p.get("trial_dirs") or {}), comp.get("compiled_hash"), comp.get("image_digest"),
+                                                              RunConfig.default("full").run_config_hash))
+    return {"status": r["status"], "failures": r.get("failures", []), "validation_path": str(WS.scenario_dir(spec.id) / "validation.json"),
+            "controls": {k: v.get("outcome") for k, v in r["controls"].items()}}
 
 
 @swesim_activity
@@ -821,11 +894,11 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-ALL = [probe_models_activity, mine_activity, judge_activity, list_candidates_activity, judge_one_activity, probe_candidate_activity,
+ALL = [probe_models_activity, discover_activity, mine_activity, judge_activity, list_candidates_activity, judge_one_activity, probe_candidate_activity,
        scenario_version_activity, archive_scenario_activity, draft_activity,
        auto_approve_activity, precheck_draft_activity, human_approve_activity, verify_approval_activity, compile_activity,
-       validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity, cancel_trial_activity,
-       cleanup_trial_activity, score_activity, export_activity, spend_check_activity, record_cost_activity]
+       validate_activity, validate_control_activity, evaluate_controls_activity, register_activity, plan_trials_activity, launch_trial_activity,
+       await_trial_activity, cancel_trial_activity, cleanup_trial_activity, score_activity, export_activity, spend_check_activity, record_cost_activity]
 
 if __name__ == "__main__":
     raise SystemExit(main())
