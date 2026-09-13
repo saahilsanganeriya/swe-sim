@@ -20,7 +20,7 @@ from swesim.llm import chat_json
 from swesim.paths import atomic_json
 from swesim.sources import threads
 from swesim.sources.swebench_annotated import TEST_PYTHON, test_files_from_patch
-from swesim.stages.judge import llm_view
+from swesim.stages.judge import _BLOCKQUOTE, llm_view, norm_text
 
 DRAFT_PROMPT_VERSION = "draft-v1"
 CONTEXT_BUDGET_CHARS = 120000
@@ -34,13 +34,16 @@ not link tests. Requirements come from review comments. Checks are user-level re
 Groups partition FAIL_TO_PASS test ids into requirement groups with weights summing to 1. Also write one plausible-wrong patch
 as a unified diff against the repository at the base commit: a tempting incomplete or wrong fix (e.g. wrong exception type).
 Constraints the record must satisfy: at least one on-request fact links a FAIL_TO_PASS test id (the decision the agent has to
-ask about); fact, requirement, check and group ids match ^[a-z0-9][a-z0-9._-]{2,63}$ and never start with "withheld-"; test
-links use only the FAIL_TO_PASS and PASS_TO_PASS ids given; check ids differ from test ids. Every non-authored fact's
-source_excerpt is copied verbatim (no paraphrase) from the text its provenance names: issue-thread = linked issue
-title/body/comments or hints_text, pr-thread = PR title/body/comments, pr-review = review bodies and review comments,
-annotator-note = the annotation notes; its source_url is a URL under the repository. If the judge marked structural_tests,
-also write one alternative-correct patch (a different implementation the tests should still accept); otherwise set
-alternative_correct to null."""
+ask about); fact, requirement, check and group ids match ^[a-z0-9][a-z0-9._-]{2,63}$ and never start with "withheld-" or
+"tests-" (code-generated facts use those); test links use only the FAIL_TO_PASS and PASS_TO_PASS ids given; check ids differ
+from test ids. Every fact's source_excerpt is copied verbatim (no paraphrase) from the text its provenance names: issue-thread
+= linked issue title/body/comments or hints_text, pr-thread = PR title/body/comments, pr-review = review bodies and review
+comments, annotator-note = the annotation notes, original-issue = the problem statement; its source_url is a URL under the
+repository. provenance=authored is only for decisions that nothing in the discussion states and only the merged tests or
+patch pin: source_excerpt verbatim from test_patch or patch, source_url the PR URL, authored_rationale saying why no thread
+statement exists, discovery on-request, tests = the FAIL_TO_PASS ids whose code the excerpt comes from. Code also adds such
+facts from the judge's tests-resolved gaps. If the judge marked structural_tests, also write one alternative-correct patch (a
+different implementation the tests should still accept); otherwise set alternative_correct to null."""
 SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "original-issue"}],
 "ledger": [{"id": "f01", "text": "...", "kind": "behavior|interface|constraint|reproduction|context",
   "provenance": "original-issue|issue-thread|pr-thread|pr-review|annotator-note|authored", "source_excerpt": "...", "source_url": "...",
@@ -59,7 +62,8 @@ WITHHOLD_DISCOVERY = {"on-request", "repo-derivable"}  # a removed reporter stat
 REPO_DERIVABLE_CATEGORIES = {"location", "proposed_fix"}
 MIN_EXCERPT_CHARS = 12   # a one-word "excerpt" grounds nothing; both bounds apply after _norm
 MIN_EXCERPT_TOKENS = 3
-_BLOCKQUOTE = re.compile(r"(?m)^[ \t]*(?:>[ \t]?)+")
+RESERVED_FACT_PREFIXES = ("withheld-", "tests-")  # code-generated fact ids the drafter may not use
+_TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(")
 WITHHOLD_PROMPT_VERSION = "withhold-v2"  # v2: the model selects spans, code deletes them; the brief is computed, never trusted
 WITHHOLD_KINDS = {"reproduction", "context", "behavior", "interface", "constraint"}
 MAX_REMOVED_FRACTION = 0.6  # of sentence/line segments
@@ -246,13 +250,14 @@ def _sha(b: bytes) -> str:
 
 
 def _norm(text: str | None) -> str:
-    """Grounding normalization, applied identically to corpus and excerpt: drop leading markdown blockquote markers
-    (reviewers quote each other with `>`), collapse whitespace, casefold."""
-    return " ".join(_BLOCKQUOTE.sub("", text or "").split()).casefold()
+    """Grounding normalization shared with the judge (`judge.norm_text`): drop leading markdown blockquote markers,
+    collapse whitespace, casefold. Applied identically to corpus and excerpt."""
+    return norm_text(text)
 
 
 def _corpora(row: dict) -> dict[str, str]:
-    """Whitespace-normalized source text per provenance; a fact's excerpt must be a verbatim span of its corpus."""
+    """Whitespace-normalized source text per provenance; a fact's excerpt must be a verbatim span of its corpus. `authored`
+    facts are decisions pinned only by the merged tests/patch, so their corpus is test_patch + patch."""
     t = row.get("thread") or {}
     ann = row.get("annotation") or {}
 
@@ -266,38 +271,99 @@ def _corpora(row: dict) -> dict[str, str]:
             "issue-thread": _norm("\n".join(issue_parts)),
             "pr-thread": _norm("\n".join([t.get("pr_title") or "", t.get("pr_body") or "", *bodies(t.get("pr_comments"))])),
             "pr-review": _norm("\n".join(bodies(t.get("reviews")) + bodies(t.get("review_comments")))),
-            "annotator-note": _norm("\n".join([ann.get("underspecified_notes") or "", ann.get("false_negative_notes") or ""]))}
+            "annotator-note": _norm("\n".join([ann.get("underspecified_notes") or "", ann.get("false_negative_notes") or ""])),
+            "authored": _norm("\n".join([row.get("test_patch") or "", row.get("patch") or ""]))}
 
 
-def ledger_violations(d: dict, row: dict) -> list[str]:
-    """Code-owned grounding of LLM-authored facts. Every non-authored fact must quote a verbatim span (after whitespace
-    normalization) of the text its provenance names and cite a URL under the repository; and at least one on-request
-    fact must link a FAIL_TO_PASS test, otherwise interaction is not load-bearing and approval would fail anyway."""
+def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None) -> list[str]:
+    """Code-owned grounding of LLM-authored facts. Every fact must quote a verbatim span (after normalization) of the text
+    its provenance names (`authored` = the merged tests/patch) and cite a URL under the repository; and at least one
+    on-request fact (in the model ledger or in `extra_facts`, the code-synthesized ones) must link a FAIL_TO_PASS test,
+    otherwise interaction is not load-bearing and approval would fail anyway."""
     corpora = _corpora(row)
     url_prefix = f"https://github.com/{row['repo']}/".casefold()
     bad = []
     ledger = d.get("ledger") or []
     for f in ledger:
         fid, prov = f.get("id", "?"), f.get("provenance")
-        if prov == "authored":
-            continue
+        if str(fid).startswith(RESERVED_FACT_PREFIXES):
+            bad.append(f"{fid}: fact ids starting with {RESERVED_FACT_PREFIXES} are reserved for code-generated facts")
         if prov not in corpora:
             bad.append(f"{fid}: unknown provenance {prov!r}")
             continue
         excerpt = _norm(f.get("source_excerpt"))
+        where = "merged tests/patch" if prov == "authored" else f"{prov} text"
         if len(excerpt) < MIN_EXCERPT_CHARS or len(excerpt.split()) < MIN_EXCERPT_TOKENS:
             bad.append(f"{fid}: source_excerpt too short to ground a fact (need >= {MIN_EXCERPT_CHARS} chars and >= {MIN_EXCERPT_TOKENS} words): {excerpt!r}")
         elif excerpt not in corpora[prov]:
-            bad.append(f"{fid}: source_excerpt is not a verbatim span of the {prov} text: {excerpt[:80]!r}")
+            bad.append(f"{fid}: source_excerpt is not a verbatim span of the {where}: {excerpt[:80]!r}")
         if not (f.get("source_url") or "").casefold().startswith(url_prefix):
             bad.append(f"{fid}: source_url must be under https://github.com/{row['repo']}/")
     f2p = set(row.get("fail_to_pass") or [])
-    if not any(f.get("discovery") == "on-request" and set(f.get("tests") or []) & f2p for f in ledger):
+    if not any(f.get("discovery") == "on-request" and set(f.get("tests") or []) & f2p for f in [*ledger, *(extra_facts or [])]):
         bad.append("no on-request fact links a FAIL_TO_PASS test id (interaction would not be load-bearing)")
     return bad
 
 
-def _author(row: dict, judged: dict, model_id: str) -> dict:
+def tests_for_excerpt(test_patch: str, excerpt: str, fail_to_pass: list[str]) -> list[str]:
+    """FAIL_TO_PASS ids whose test function (in the unified diff of the hidden tests) contains `excerpt`. Falls back to the
+    F2P tests of the containing file when the excerpt sits at module level, and to every F2P test when the excerpt is not in
+    the test patch at all (evidence from the source patch)."""
+    needle = _norm(excerpt)
+    blocks: list[tuple[str | None, str | None, list[str]]] = []
+    current_file = None
+    for raw in (test_patch or "").splitlines():
+        m = re.match(r"diff --git a/(\S+)", raw)
+        if m:
+            current_file = m.group(1)
+            blocks.append((current_file, None, []))
+            continue
+        line = raw[1:] if raw[:1] in "+- " else raw
+        d = _TEST_DEF.match(line)
+        if d:
+            blocks.append((current_file, d.group(1), []))
+        if blocks:
+            blocks[-1][2].append(line)
+    hits = [(f, fn) for f, fn, lines in blocks if needle and needle in _norm("\n".join(lines))]
+    if not hits:
+        return sorted(fail_to_pass)
+    out = set()
+    for f, fn in hits:
+        for t in fail_to_pass:
+            path, *rest = t.split("::")
+            func = re.split(r"[\[(]", rest[-1])[0] if rest else ""
+            if path == f and (fn is None or func == fn):
+                out.add(t)
+    return sorted(out) or sorted(fail_to_pass)
+
+
+def tests_resolved_facts(row: dict, judged: dict) -> list[dict]:
+    """Code-synthesized ledger facts for judge gaps that only the merged tests/patch resolve: provenance `authored`,
+    source_url = the PR, source_excerpt = the verbatim evidence (re-checked here), discovery on-request, linked to the
+    FAIL_TO_PASS tests whose code the excerpt comes from. Ids `tests-NNN`."""
+    corpus = _corpora(row)["authored"]
+    thread = row.get("thread") or {}
+    pr_url = thread.get("pr_url") or f"https://github.com/{row['repo']}/pull/{str(row.get('instance_id', '')).rsplit('-', 1)[-1]}"
+    kinds = {"behavior", "interface", "constraint", "reproduction", "context"}
+    out, seen = [], set()
+    for g in judged.get("gaps") or []:
+        if not (g.get("resolved_by") == "tests" and g.get("derivable_from_repo") is False and g.get("consequential") is True):
+            continue
+        evidence = (g.get("evidence") or "").strip()
+        key = _norm(evidence)
+        if len(key) < MIN_EXCERPT_CHARS or key not in corpus or key in seen:
+            continue
+        seen.add(key)
+        question = (g.get("question") or "").strip()
+        out.append({"id": f"tests-{len(out) + 1:03d}", "text": (g.get("text") or question or evidence).strip(), "kind": g.get("category") if g.get("category") in kinds else "behavior",
+                    "provenance": "authored", "source_excerpt": evidence, "source_url": pr_url,
+                    "authored_rationale": "Pinned only by the merged tests/patch; no issue or thread statement resolves it (judge gap "
+                                          f"{g.get('id', '?')}, resolved_by=tests)." + (f" Question a developer would ask: {question}" if question else ""),
+                    "discovery": "on-request", "tests": tests_for_excerpt(row.get("test_patch") or "", evidence, list(row.get("fail_to_pass") or []))})
+    return out
+
+
+def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None) -> dict:
     """One LLM authoring call, validated by `ledger_violations`, one correction round, then fail."""
     user = json.dumps({"candidate": llm_view(row), "judge": judged}, ensure_ascii=False)
     if len(user) > CONTEXT_BUDGET_CHARS:
@@ -306,7 +372,7 @@ def _author(row: dict, judged: dict, model_id: str) -> dict:
     bad: list[str] = []
     for _attempt in range(2):
         d = chat_json(model_id, SYSTEM, messages, SCHEMA, max_tokens=8000)
-        bad = ledger_violations(d, row)
+        bad = ledger_violations(d, row, extra_facts)
         if not bad:
             return d
         messages.append({"role": "assistant", "content": json.dumps(d)})
@@ -329,7 +395,8 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     out_dir.mkdir(parents=True, exist_ok=True)
     assets = out_dir / "assets"
     assets.mkdir(exist_ok=True)
-    d = _author(row, judged, model_id)
+    synthesized = tests_resolved_facts(row, judged)
+    d = _author(row, judged, model_id, extra_facts=synthesized)
 
     pw = d.get("plausible_wrong") or {}
     if not (pw.get("diff") or "").strip():
@@ -385,7 +452,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
             "source_ref": row["instance_id"], "created_at": datetime.now(timezone.utc).isoformat(), "pipeline_version": pipeline_version,
             "environment": environment, "assets": manifest,
             "briefs": [{"profile": "natural", "text": row["problem_statement"], "provenance": "original-issue"}],
-            "ledger": d["ledger"], "operations": d.get("operations") or [], "persona": d["persona"], "requirements": d.get("requirements") or [],
+            "ledger": [*d["ledger"], *synthesized], "operations": d.get("operations") or [], "persona": d["persona"], "requirements": d.get("requirements") or [],
             "contract": {"fail_to_pass": row["fail_to_pass"], "pass_to_pass": row["pass_to_pass"], "test_assets": ["test.patch"],
                          "protected_paths": sorted(set(test_files) | set(d.get("protected_paths_extra") or [])),
                          "runner": {"kind": "pytest-ra", "command": runner_cmd, "single_command": prefix + "{nodeid}", "test_files": test_files,
