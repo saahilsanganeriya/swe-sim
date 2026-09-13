@@ -4,6 +4,12 @@ classification of every gap plus the SWE-bench Verified underspecification rubri
 
 The judge model is deliberately different from the draft model so their errors are not correlated. The judge never sees
 the annotators' notes, so `calibrate()` measures agreement with an independent label.
+
+Calibration (B-P2-8): the positive class is `verified_rubric_score >= 2` on both sides (the human ensembled label and the
+judge's score). `calibrate` saves one `per_instance` row per judged instance (scores, both positives, the tp/fp/tn/fn
+outcome, the judge's `keep` and gap count), the run's usage and priced cost, and per-row errors excluded from every
+denominator. `run_calibration` writes it under `Layout.calibration_path(judge_model, day)` and records the judge cost.
+Every judged row carries the call's `usage` (None when the LLM layer recorded none) so callers can record costs.
 """
 from __future__ import annotations
 
@@ -12,9 +18,14 @@ import json
 import keyword
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
 from pathlib import Path
 
+from swesim import costs, llm
 from swesim.llm import chat_json
+from swesim.paths import atomic_json
+from swesim.storage.layout import Layout, model_slug
 
 JUDGE_PROMPT_VERSION = "judge-v3"
 SYSTEM = """You review a GitHub issue, its discussion, the merged fix, and the fix's tests to decide whether it makes a good
@@ -289,7 +300,10 @@ def judge_candidate(row: dict, model_id: str) -> dict:
     user = json.dumps(payload, ensure_ascii=False)
     if len(user) > CONTEXT_BUDGET_CHARS:
         raise ValueError("candidate exceeds authoring context budget")
+    llm.take_last_usage()   # drop anything an earlier call on this thread left behind
     out = chat_json(model_id, SYSTEM, [{"role": "user", "content": user}], SCHEMA)
+    usage = llm.take_last_usage()
+    out["usage"] = None if usage is None else usage.model_dump(mode="json")
     out["payload_chars"] = len(user)
     out["payload_trimmed"] = view.get("trimmed", {})
     gaps, stats = ground_gaps(out.get("gaps") if isinstance(out.get("gaps"), list) else [], row)
@@ -308,35 +322,90 @@ def judge_candidate(row: dict, model_id: str) -> dict:
     return out
 
 
-def calibrate(csv_path: Path, rows_by_id: dict[str, dict], model_id: str, n: int, seed: int = 0) -> dict:
-    """Agreement of the judge's verified_rubric_score with the human ensembled labels at the >=2 threshold.
+CALIBRATION_THRESHOLD = 2
+CALIBRATION_POSITIVE = "verified_rubric_score >= 2"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _calibrate_row(iid: str, ann_row: dict, row: dict, model_id: str) -> tuple[dict | None, dict | None]:
+    """One judged instance: (prediction row + usage, None) or (None, error row). Never raises: one bad row must not
+    lose the whole calibration."""
+    try:
+        human_score = float(ann_row["underspecified"])
+        judged = judge_candidate(row, model_id)
+        score = int(judged.get("verified_rubric_score", 0))
+    except Exception as e:  # noqa: BLE001 - provider, budget and parsing failures are recorded per row and excluded from the denominators
+        return None, {"instance_id": iid, "error": f"{type(e).__name__}: {e}"}
+    human, model = human_score >= CALIBRATION_THRESHOLD, score >= CALIBRATION_THRESHOLD
+    outcome = "tp" if human and model else "fp" if model else "fn" if human else "tn"
+    gaps = judged.get("gaps")
+    per = {"instance_id": iid, "human": human_score, "model": score, "human_positive": human, "model_positive": model, "outcome": outcome,
+           "keep": judged.get("keep"), "gaps": len(gaps) if isinstance(gaps, list) else None}
+    return {"per": per, "usage": judged.get("usage")}, None
+
+
+def calibrate(csv_path: Path, rows_by_id: dict[str, dict], model_id: str, n: int, seed: int = 0, workers: int = 1) -> dict:
+    """Agreement of the judge's verified_rubric_score with the human ensembled labels; positive = `CALIBRATION_POSITIVE`
+    on both sides. The sample is the first `n` of the annotated ids present in `rows_by_id`, shuffled with `seed`
+    (CSV order first), so the same (csv, rows, seed, n) names the same instances for every judge.
 
     Resilient per row: a failure while preparing or judging one instance is recorded under `errors` and excluded from every
     denominator instead of aborting the run. `n` is the number of judged rows; `n_requested` / `n_judged` / `n_errored` make
-    the coverage explicit."""
+    the coverage explicit. `workers` > 1 judges rows concurrently (the aggregation is order-independent: `per_instance` and
+    `errors` are sorted by instance id). `usage` sums the judged rows' usage (`usage_complete` says whether every row had
+    one); `cost_usd`/`price_source` price it with `swesim.costs`."""
+    started_at = _now()
     with open(csv_path, newline="") as f:
         ann = {r["instance_id"]: r for r in csv.DictReader(f)}
     ids = [i for i in ann if i in rows_by_id]
     random.Random(seed).shuffle(ids)
     ids = ids[:n]
-    tp = fp = tn = fn = 0
-    per, errors = [], []
-    for iid in ids:
-        try:
-            human_score = float(ann[iid]["underspecified"])
-            judged = judge_candidate(rows_by_id[iid], model_id)
-            score = int(judged.get("verified_rubric_score", 0))
-        except Exception as e:  # noqa: BLE001 - one bad row must not lose the whole calibration
-            errors.append({"instance_id": iid, "error": f"{type(e).__name__}: {e}"})
-            continue
-        human, model = human_score >= 2, score >= 2
-        per.append({"instance_id": iid, "human": human_score, "model": score})
-        tp += human and model
-        fp += (not human) and model
-        tn += (not human) and (not model)
-        fn += human and (not model)
+
+    def one(iid: str) -> tuple[dict | None, dict | None]:
+        return _calibrate_row(iid, ann[iid], rows_by_id[iid], model_id)
+
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(one, ids))
+    else:
+        results = [one(iid) for iid in ids]
+    per = sorted((r["per"] for r, _ in results if r is not None), key=lambda p: p["instance_id"])
+    errors = sorted((e for _, e in results if e is not None), key=lambda e: e["instance_id"])
+    counts = {k: sum(1 for p in per if p["outcome"] == k) for k in ("tp", "fp", "tn", "fn")}
+    tp, fp, tn, fn = counts["tp"], counts["fp"], counts["tn"], counts["fn"]
     total = max(1, tp + fp + tn + fn)
+    usages = [costs.Usage.model_validate(r["usage"]) for r, _ in results if r is not None and r.get("usage") is not None]
+    usage = None
+    for u in usages:
+        usage = u if usage is None else usage + u
+    cost_usd, price_source = (None, None) if usage is None else costs.usd_for(model_id, usage)
     return {"n": len(per), "n_requested": len(ids), "n_judged": len(per), "n_errored": len(errors),
+            "positive": CALIBRATION_POSITIVE, "threshold": CALIBRATION_THRESHOLD,
             "agreement": (tp + tn) / total, "precision": tp / max(1, tp + fp), "recall": tp / max(1, tp + fn),
             "confusion": {"tp": tp, "fp": fp, "tn": tn, "fn": fn}, "model_id": model_id, "prompt_version": JUDGE_PROMPT_VERSION,
-            "per_instance": per, "errors": errors}
+            "seed": seed, "workers": workers, "per_instance": per, "errors": errors,
+            "usage": None if usage is None else usage.model_dump(mode="json"), "usage_complete": None if usage is None else len(usages) == len(per),
+            "cost_usd": None if cost_usd is None else str(cost_usd), "price_source": price_source,
+            "started_at": started_at, "finished_at": _now()}
+
+
+def run_calibration(layout: Layout, csv_path: Path, rows_by_id: dict[str, dict], model_id: str, n: int, seed: int = 0, *, workers: int = 1,
+                    day: date | None = None, reference: dict | None = None) -> Path:
+    """Run `calibrate` and write it to `layout.calibration_path(model_id, day)` (atomic; a rerun the same day replaces
+    it), recording the judge's cost under `<root>/costs/calibration-<slug>-<day>.json` (deduped on identical usage).
+    `reference` is copied into the file so the previous judge's numbers sit next to the new ones."""
+    day = day or datetime.now(timezone.utc).date()
+    result = calibrate(csv_path, rows_by_id, model_id, n, seed, workers)
+    result["day"] = day.isoformat()
+    result["reference"] = reference
+    result["cost_record_id"] = None
+    if result["usage"] is not None:
+        rec = costs.record_cost(layout, None, f"calibration-{model_slug(model_id)}-{day.isoformat()}", "judge", model_id,
+                                costs.Usage.model_validate(result["usage"]))
+        result["cost_record_id"] = rec.cost_id
+    path = layout.calibration_path(model_id, day)
+    atomic_json(path, result)
+    return path

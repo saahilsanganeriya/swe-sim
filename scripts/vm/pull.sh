@@ -4,12 +4,12 @@
 # under 4 MB; validate: result/reward/report json). Merge only: nothing on the laptop is deleted. Never copied: workspace/trials/*/task/ (task.toml carries the
 # trial's session token), Harbor config.json of run jobs (the materialized task environment), env files, the Temporal database.
 #
-# GCP_PROJECT / GCP_ZONE come from the environment or from SWESIM_ENV_FILE (default ~/Documents/.env) via a line parser.
+# GCP_PROJECT / GCP_ZONE come from the environment or from SWESIM_ENV_FILE (default ./.env) via a line parser.
 # Usage: bash scripts/vm/pull.sh            # prints record counts before/after; the tarball is removed afterwards
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-ENV_FILE=${SWESIM_ENV_FILE:-$HOME/Documents/.env}
+ENV_FILE=${SWESIM_ENV_FILE:-.env}
 VM_NAME=${VM_NAME:-swesim-worker}
 DEST=${SWESIM_WORKSPACE_ROOT:-.}     # repo root: workspace/ and registry.json live here
 

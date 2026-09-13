@@ -4,12 +4,12 @@
 # and the checked-out commit. Refuses to run while the laptop branch has unpushed commits, because origin/main is what
 # the VM pulls and those commits would not be in it.
 #
-# GCP_PROJECT / GCP_ZONE come from the environment or from SWESIM_ENV_FILE (default ~/Documents/.env) via a line parser.
+# GCP_PROJECT / GCP_ZONE come from the environment or from SWESIM_ENV_FILE (default ./.env) via a line parser.
 # The VM-side pull authenticates with the read-only GH_TOKEN already in /etc/swesim/env (gh credential helper).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-ENV_FILE=${SWESIM_ENV_FILE:-$HOME/Documents/.env}
+ENV_FILE=${SWESIM_ENV_FILE:-.env}
 VM_NAME=${VM_NAME:-swesim-worker}
 
 env_get() {

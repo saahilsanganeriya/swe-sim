@@ -22,10 +22,14 @@ from swesim.paths import Workspace
 
 app = typer.Typer(no_args_is_help=True, help=__doc__)
 
-WS = Workspace(os.environ.get("SWESIM_WORKSPACE", "workspace"))
+from swesim.roles import ROLE_CHAINS
+from swesim.settings import get_settings
 
-JUDGE_MODEL_DEFAULT = "openai/gpt-5.5"
-DRAFT_MODEL_DEFAULT = "anthropic/claude-sonnet-5"
+_SETTINGS = get_settings()
+WS = Workspace(_SETTINGS.workspace, _SETTINGS.registry_path)
+
+JUDGE_MODEL_DEFAULT = ROLE_CHAINS["judge_model"][0]
+DRAFT_MODEL_DEFAULT = ROLE_CHAINS["draft_model"][0]
 SOLVER_MODEL_DEFAULT = "anthropic/claude-haiku-4-5-20251001"
 
 
@@ -151,10 +155,12 @@ def judge_calibrate(
     n: int = typer.Option(150),
     model: str = typer.Option(JUDGE_MODEL_DEFAULT),
     seed: int = typer.Option(0),
+    workers: int = typer.Option(4),
 ) -> None:
-    """Agreement of the judge with the human SWE-bench Verified labels (>= 2 threshold) on a random sample."""
+    """Agreement of the judge with the human SWE-bench Verified labels (positive = verified_rubric_score >= 2) on a random
+    sample; writes per-instance predictions under the record's calibration/ prefix and prints the summary."""
     from swesim.sources import swebench_annotated as sb
-    from swesim.stages.judge import calibrate
+    from swesim.stages.judge import run_calibration
 
     rows_by_id = {}
     for r in sb._load_dataset():
@@ -166,8 +172,9 @@ def judge_calibrate(
             "annotation": {},
             "thread": {},
         }
-    result = calibrate(Path("data/annotations/ensembled_annotations_public.csv"), rows_by_id, model, n, seed)
-    typer.echo(json.dumps({k: v for k, v in result.items() if k != "per_instance"}, indent=1))
+    path = run_calibration(WS.layout, Path("data/annotations/ensembled_annotations_public.csv"), rows_by_id, model, n, seed, workers=workers)
+    result = json.loads(path.read_text())
+    typer.echo(json.dumps({"path": str(path), **{k: v for k, v in result.items() if k not in ("per_instance", "errors")}}, indent=1))
 
 
 @app.command(hidden=True)

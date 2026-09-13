@@ -263,11 +263,17 @@ class CostRecord(Strict):
 
 
 def _costs_path(layout: Any, trial_id: str | None, workflow_id: str | None) -> Path:
+    """`Layout.trial_file(tid, "costs.json")` (a `Workspace` delegates to its `.layout`); workflow-level costs, which the
+    layout does not name yet, go under `<root>/costs/<workflow_id>.json`."""
+    lay = getattr(layout, "layout", layout)
     if trial_id:
-        trial_dir = layout.trial_dir(trial_id) if hasattr(layout, "trial_dir") else Path(layout.root) / "trials" / trial_id
-        return Path(trial_dir) / "costs.json"
+        if hasattr(lay, "trial_file"):
+            return Path(lay.trial_file(trial_id, "costs.json"))
+        if hasattr(lay, "trial_dir"):
+            return Path(lay.trial_dir(trial_id)) / "costs.json"
+        return Path(lay.root) / "trials" / trial_id / "costs.json"
     if workflow_id:
-        return Path(layout.root) / "costs" / f"{workflow_id}.json"
+        return Path(lay.root) / "costs" / f"{workflow_id}.json"
     raise ValueError("record_cost needs a trial_id or a workflow_id to file the cost under")
 
 
