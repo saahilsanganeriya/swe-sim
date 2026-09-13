@@ -125,9 +125,11 @@ def linked_targets(repo: str, pr: int, body: str) -> dict:
     for n in sorted({int(x) for x in _LINK.findall(body or "")}):
         try:
             payload = _gh(f"repos/{repo}/issues/{n}")
-        except subprocess.CalledProcessError:
-            out["missing"].append(n)
-            continue
+        except subprocess.CalledProcessError as e:
+            if "404" in (e.stderr or ""):  # a number this repo cannot serve is a data property; anything else is infrastructure
+                out["missing"].append(n)
+                continue
+            raise
         if payload.get("pull_request"):
             out["prs"].append(n)
         else:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,7 +43,7 @@ also write one alternative-correct patch (a different implementation the tests s
 alternative_correct to null."""
 SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "original-issue"}],
 "ledger": [{"id": "f01", "text": "...", "kind": "behavior|interface|constraint|reproduction|context",
-  "provenance": "issue-thread|pr-thread|pr-review|annotator-note|authored", "source_excerpt": "...", "source_url": "...",
+  "provenance": "original-issue|issue-thread|pr-thread|pr-review|annotator-note|authored", "source_excerpt": "...", "source_url": "...",
   "authored_rationale": null, "discovery": "brief|on-request|volunteered-at-review|repo-derivable|author-only", "tests": ["nodeid"]}],
 "operations": [{"type": "clarification|evaluator-repair|synthetic-extension", "target": "...", "rationale": "..."}],
 "persona": {"summary": "...", "tone": "...", "disclosure_style": "...", "derived_from_urls": ["..."], "role": "maintainer|reporter"},
@@ -56,7 +57,9 @@ SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "ori
 WITHHOLD_CATEGORIES = {"reproduction", "error_message", "expected_output", "location", "version", "proposed_fix"}
 WITHHOLD_DISCOVERY = {"on-request", "repo-derivable"}  # a removed reporter statement is never author-only
 REPO_DERIVABLE_CATEGORIES = {"location", "proposed_fix"}
-GROUNDED_PROVENANCE = ("original-issue", "issue-thread", "pr-thread", "pr-review", "annotator-note")
+MIN_EXCERPT_CHARS = 12   # a one-word "excerpt" grounds nothing; both bounds apply after _norm
+MIN_EXCERPT_TOKENS = 3
+_BLOCKQUOTE = re.compile(r"(?m)^[ \t]*(?:>[ \t]?)+")
 WITHHOLD_SCHEMA = ('{"withheld_brief":"text","removed":[{"category":"reproduction|error_message|expected_output|location|version|proposed_fix",'
                    '"excerpt":"verbatim contiguous span","kind":"reproduction|context|behavior|interface|constraint","discovery":"on-request|repo-derivable"}]}')
 WITHHOLD_PROMPT = ("Remove selected spans by category; preserve the first line exactly and a recognizable symptom and desired outcome. "
@@ -100,7 +103,9 @@ def _sha(b: bytes) -> str:
 
 
 def _norm(text: str | None) -> str:
-    return " ".join((text or "").split())
+    """Grounding normalization, applied identically to corpus and excerpt: drop leading markdown blockquote markers
+    (reviewers quote each other with `>`), collapse whitespace, casefold."""
+    return " ".join(_BLOCKQUOTE.sub("", text or "").split()).casefold()
 
 
 def _corpora(row: dict) -> dict[str, str]:
@@ -137,7 +142,9 @@ def ledger_violations(d: dict, row: dict) -> list[str]:
             bad.append(f"{fid}: unknown provenance {prov!r}")
             continue
         excerpt = _norm(f.get("source_excerpt"))
-        if not excerpt or excerpt not in corpora[prov]:
+        if len(excerpt) < MIN_EXCERPT_CHARS or len(excerpt.split()) < MIN_EXCERPT_TOKENS:
+            bad.append(f"{fid}: source_excerpt too short to ground a fact (need >= {MIN_EXCERPT_CHARS} chars and >= {MIN_EXCERPT_TOKENS} words): {excerpt!r}")
+        elif excerpt not in corpora[prov]:
             bad.append(f"{fid}: source_excerpt is not a verbatim span of the {prov} text: {excerpt[:80]!r}")
         if not (f.get("source_url") or "").casefold().startswith(url_prefix):
             bad.append(f"{fid}: source_url must be under https://github.com/{row['repo']}/")

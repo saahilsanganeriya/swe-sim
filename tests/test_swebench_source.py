@@ -218,6 +218,14 @@ def test_linked_numbers_from_body_and_timeline_fallback(monkeypatch):
     assert t == {"issues": [12], "prs": [], "missing": [], "payloads": {12: _issue(12)}}
 
 
+def test_linked_targets_only_404_is_missing(monkeypatch):
+    gh = FakeGH({"repos/o/r/issues/5/timeline": [], "repos/o/r/issues/77": Exception("gh: HTTP 500 Internal Server Error")})
+    monkeypatch.setattr(subprocess, "run", gh)
+    assert threads.linked_targets("o/r", 5, "Fixes #66") == {"issues": [], "prs": [], "missing": [66], "payloads": {}}   # 404 -> missing
+    with pytest.raises(CalledProcessError):
+        threads.linked_targets("o/r", 5, "Fixes #77")                                                                     # 500 -> propagates
+
+
 def _pr_routes():
     return {
         "repos/o/r/pulls/5": {"html_url": "https://github.com/o/r/pull/5", "title": "Fix it", "body": "Fixes #3", "user": {"login": "dev"},
@@ -379,7 +387,7 @@ def _draft_llm(alt=None, repo="pydata/xarray", pr=5362):
             "ledger": [{"id": "f01", "text": "Raise ValueError when the weights dim is missing", "kind": "behavior", "provenance": "pr-review",
                         "source_excerpt": "raise a ValueError when the dim is missing", "source_url": url + "#pullrequestreview-1",  # whitespace differs from the review text
                         "authored_rationale": None, "discovery": "on-request", "tests": [F2P]},
-                       {"id": "f02", "text": "_check_dim helper name", "kind": "interface", "provenance": "pr-thread", "source_excerpt": "_check_dim helper",
+                       {"id": "f02", "text": "_check_dim helper name", "kind": "interface", "provenance": "pr-thread", "source_excerpt": "Adds a _check_dim helper",
                         "source_url": url, "authored_rationale": None, "discovery": "author-only", "tests": []},
                        {"id": "f03", "text": "Reporter expects a ValueError", "kind": "behavior", "provenance": "original-issue", "source_excerpt": "Expected: raise ValueError.",
                         "source_url": f"https://github.com/{repo}/issues/5360", "authored_rationale": None, "discovery": "brief", "tests": []},
@@ -561,12 +569,38 @@ def test_ledger_violations_ground_every_non_authored_fact():
     assert any("f03" in v for v in ledger_violations(d, _row()))
     d = _draft_llm(); d["ledger"][0]["discovery"] = "repo-derivable"                                    # nothing on-request links a F2P test any more
     assert any("on-request" in v for v in ledger_violations(d, _row()))
-    d = _draft_llm(); d["ledger"].append({"id": "f05", "text": "n", "kind": "context", "provenance": "annotator-note", "source_excerpt": "note says n", "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": []})
+    d = _draft_llm(); d["ledger"].append({"id": "f05", "text": "n", "kind": "context", "provenance": "annotator-note", "source_excerpt": "The note says n", "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": []})
     assert ledger_violations(d, _row(annotation={**_row()["annotation"], "underspecified_notes": "The note says n"})) == []  # annotator notes are a valid corpus
     assert any("f05" in v for v in ledger_violations(d, _row()))                                        # blank annotation notes cannot ground a fact
     # hints_text counts as issue-thread text (SWE-bench issue comments)
     d = _draft_llm(); d["ledger"][1].update(provenance="issue-thread", source_excerpt="fixed in the next release")
     assert ledger_violations(d, _row(hints_text="This will be fixed  in the\nnext release")) == []
+
+
+def test_ledger_violations_require_a_minimum_excerpt(monkeypatch):
+    """One common word is a substring of any thread; grounding needs >= 12 chars and >= 3 words after normalization."""
+    from swesim.stages.draft_spec import MIN_EXCERPT_CHARS, MIN_EXCERPT_TOKENS, ledger_violations
+    assert (MIN_EXCERPT_CHARS, MIN_EXCERPT_TOKENS) == (12, 3)
+    for short in ("a", "the", "Adds a", "_check_dim helper", "  the   dim  "):
+        d = _draft_llm(); d["ledger"][1]["source_excerpt"] = short
+        assert any("f02" in v and "too short" in v for v in ledger_violations(d, _row())), short
+    d = _draft_llm(); d["ledger"][1]["source_excerpt"] = "Adds a _check_dim helper"      # 24 chars, 4 words, in the PR body
+    assert ledger_violations(d, _row()) == []
+    d = _draft_llm(); d["ledger"][1]["source_excerpt"] = "a _check_dim helper"           # 19 chars, 3 words: the minimum passes
+    assert ledger_violations(d, _row()) == []
+
+
+def test_ledger_norm_strips_blockquotes_and_casefolds():
+    from swesim.stages.draft_spec import _norm, ledger_violations
+    assert _norm("> raise a ValueError\n> when the dim is missing") == "raise a valueerror when the dim is missing"
+    assert _norm(">> nested\n >quote  here") == "nested quote here" and _norm("x > y") == "x > y"   # only line-leading markers go
+    quoted = {**_thread("pydata/xarray", 5362)}
+    quoted["reviews"] = [{**quoted["reviews"][0], "body": "> raise a ValueError\n> when the dim is missing\n\nAgreed, and use `match=` for the message."}]
+    assert ledger_violations(_draft_llm(), _row(thread=quoted)) == []                    # excerpt without the `>` markers still grounds
+    d = _draft_llm(); d["ledger"][0]["source_excerpt"] = "agreed, and use `match=` for the message"   # case differs from the review text
+    assert ledger_violations(d, _row(thread=quoted)) == []
+    d = _draft_llm(); d["ledger"][0]["source_excerpt"] = "agreed, and use `match=` for the subject"
+    assert any("f01" in v and "verbatim" in v for v in ledger_violations(d, _row(thread=quoted)))
 
 
 def test_draft_rejects_ungrounded_facts_after_one_correction_round(monkeypatch, tmp_path):
