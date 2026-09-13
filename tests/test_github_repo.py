@@ -115,9 +115,22 @@ def _file(path, n_added):
     return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,{n_added + 1} @@\n x\n" + "".join(f"+line{i}\n" for i in range(n_added))
 
 
-def _detail(n, merged_at, body, labels, created_at="2026-07-01T00:00:00Z"):
+def _stats(diff):
+    """The whole-PR totals a real `pulls/{n}` detail carries (tests and docs included), consistent with the fixture diff."""
+    lines = diff.splitlines()
+    return {"additions": sum(l.startswith("+") and not l.startswith("+++") for l in lines),
+            "deletions": sum(l.startswith("-") and not l.startswith("---") for l in lines), "changed_files": diff.count("diff --git ")}
+
+
+def _detail(n, merged_at, body, labels, created_at="2026-07-01T00:00:00Z", diff=None):
     return {"number": n, "html_url": f"https://github.com/o/r/pull/{n}", "title": f"PR {n}", "body": body, "user": {"login": "dev"}, "merged_at": merged_at,
-            "merge_commit_sha": "d" * 40, "created_at": created_at, "base": {"sha": "b" * 40}, "labels": [{"name": l} for l in labels]}
+            "merge_commit_sha": "d" * 40, "created_at": created_at, "base": {"sha": "b" * 40}, "labels": [{"name": l} for l in labels],
+            **(_stats(diff) if diff is not None else {})}
+
+
+DIFFS = {42: _file("pkg/a.py", 120) + _file("pkg/b.py", 80) + _file("pkg/c.py", 50) + _file("tests/test_stream.py", 30),
+         7: _file("pkg/a.py", 3) + _file("tests/test_a.py", 2), 9: _file("pkg/a.py", 30) + _file("tests/test_a.py", 2),
+         11: _file("pkg/a.py", 300) + _file("tests/test_a.py", 2)}
 
 
 def _routes():
@@ -134,22 +147,22 @@ def _routes():
     issue_comments = [_c("u%d" % i, "c%d" % i, "2026-06-0%dT00:00:00Z" % (i + 1)) for i in range(8)]
     return {
         "repos/o/r/pulls": pulls,
-        "repos/o/r/pulls/42": _detail(42, "2026-07-10T00:00:00Z", "Implements streaming.\n\nCloses #40", ["enhancement", "needs-docs"]),
-        ("repos/o/r/pulls/42", "diff"): _file("pkg/a.py", 120) + _file("pkg/b.py", 80) + _file("pkg/c.py", 50) + _file("tests/test_stream.py", 30),
+        "repos/o/r/pulls/42": _detail(42, "2026-07-10T00:00:00Z", "Implements streaming.\n\nCloses #40", ["enhancement", "needs-docs"], diff=DIFFS[42]),
+        ("repos/o/r/pulls/42", "diff"): DIFFS[42],
         "repos/o/r/issues/40": {"html_url": "https://github.com/o/r/issues/40", "title": "Streaming support", "body": "Please add streaming.", "user": {"login": "rep"}, "created_at": "2026-06-01T00:00:00Z"},
         "repos/o/r/issues/40/comments": issue_comments,
         "repos/o/r/issues/42/comments": [], "repos/o/r/pulls/42/reviews": [], "repos/o/r/pulls/42/comments": [],
-        "repos/o/r/pulls/7": _detail(7, "2026-07-03T00:00:00Z", "Fixes #6", ["bug"]),
-        ("repos/o/r/pulls/7", "diff"): _file("pkg/a.py", 3) + _file("tests/test_a.py", 2),
+        "repos/o/r/pulls/7": _detail(7, "2026-07-03T00:00:00Z", "Fixes #6", ["bug"], diff=DIFFS[7]),
+        ("repos/o/r/pulls/7", "diff"): DIFFS[7],
         "repos/o/r/issues/6": {"html_url": "https://github.com/o/r/issues/6", "title": "bug", "body": "", "user": {"login": "rep"}, "created_at": "2026-06-01T00:00:00Z"},
         "repos/o/r/issues/6/comments": [], "repos/o/r/issues/7/comments": [], "repos/o/r/pulls/7/reviews": [], "repos/o/r/pulls/7/comments": [],
-        "repos/o/r/pulls/9": _detail(9, "2026-07-04T00:00:00Z", "no link here", ["bug"]),
+        "repos/o/r/pulls/9": _detail(9, "2026-07-04T00:00:00Z", "no link here", ["bug"], diff=DIFFS[9]),
         "repos/o/r/issues/9/timeline": [],
-        ("repos/o/r/pulls/9", "diff"): _file("pkg/a.py", 30) + _file("tests/test_a.py", 2),
-        "repos/o/r/pulls/11": _detail(11, "2026-07-05T00:00:00Z", "Fixes #8", ["bug"]),
+        ("repos/o/r/pulls/9", "diff"): DIFFS[9],
+        "repos/o/r/pulls/11": _detail(11, "2026-07-05T00:00:00Z", "Fixes #8", ["bug"], diff=DIFFS[11]),
         "repos/o/r/issues/8": {"html_url": "https://github.com/o/r/pull/8", "number": 8, "title": "a PR", "body": "", "user": {"login": "dev"}, "created_at": "2026-06-01T00:00:00Z", "pull_request": {"url": "x"}},
         "repos/o/r/issues/11/timeline": [],
-        ("repos/o/r/pulls/11", "diff"): _file("pkg/a.py", 300) + _file("tests/test_a.py", 2),
+        ("repos/o/r/pulls/11", "diff"): DIFFS[11],
     }
 
 
