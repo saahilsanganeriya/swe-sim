@@ -22,6 +22,7 @@ from swesim.models import RunConfig, ScenarioSpec, trial_id
 from swesim.paths import Workspace, atomic_json
 from swesim.stakeholder.session import CONFIRM_PREFIX
 from test_audit_llm import FakeChat, spec_with_withholding
+from test_audit_rubric import F05_7283, P2P_7283, TEST_PATCH_7283, spec_dict_7283
 
 HAIKU = "anthropic/claude-haiku-4-5-20251001"
 SONNET = "anthropic/claude-sonnet-5"
@@ -289,9 +290,60 @@ def test_audit_scenario_writes_labels_reasons_and_unfair_tests(tmp_path):
     assert set(on_disk) >= {"coherent", "fair_tests", "plausible_withholding", "reasons", "model", "audited_at", "rubric_version"}
     assert a.coherent is True and a.fair_tests is False and a.plausible_withholding is True and a.unfair_tests == ["t1"]
     assert a.reasons["fair_tests"] and a.model == L.AUDIT_MODEL and a.spec_hash == spec.spec_hash
+    # the fact-scope label: the model judged both visible facts inside the contract, nothing mechanical contradicts it
+    assert a.facts_within_contract is True and [(fs.fact_id, fs.within_contract) for fs in a.fact_scope] == [("f01", True), ("withheld-001", True)]
+    assert "f09" not in {fs.fact_id for fs in a.fact_scope} and a.reasons["facts_within_contract"]
+    assert on_disk["facts_within_contract"] is True and on_disk["fact_scope"][0]["fact_id"] == "f01"   # what the index projects to task_sense
     payload = json.loads(chat.calls[0]["messages"][0]["content"])
     assert payload["hidden_tests"]["test.patch"] == TEST_PATCH and "raise ValueError" in payload["oracle_diff"]
     assert RUN.audit_scenario(ws, spec.id, judge=L.Judge(chat=chat)) == a and len(chat.calls) == 1
+
+
+def _record_7283(tmp_path):
+    spec = ScenarioSpec.model_validate(spec_dict_7283())
+    ws, spec = make_record(tmp_path, spec)
+    (ws.scenario_dir(spec.id) / "assets" / "test.patch").write_text(TEST_PATCH_7283)
+    return ws, spec
+
+
+def _scenario_answer(fact_scope: list[dict]) -> dict:
+    return {"coherent": {"label": True, "reason": "one symptom"}, "fair_tests": {"label": True, "reason": "follows from f01"},
+            "plausible_withholding": {"label": None, "reason": "n/a"}, "fact_scope": fact_scope}
+
+
+def test_audit_scenario_mechanical_fact_scope_overrides_a_lenient_model(tmp_path):
+    """pytest-7283: the model calls f05 within the contract; the mechanical rule finds it names the PASS_TO_PASS-only
+    parametrisation and wins. The combined reason keeps both pieces of evidence."""
+    ws, spec = _record_7283(tmp_path)
+    lenient = FakeChat(scenario=_scenario_answer([{"fact_id": "f01", "within_contract": True, "reason": "the failing test checks it"},
+                                                  {"fact_id": "f05", "within_contract": True, "reason": "harmless generalisation"},
+                                                  {"fact_id": "f09", "within_contract": False, "reason": "not visible anyway"}]))
+    a = RUN.audit_scenario(ws, spec.id, judge=L.Judge(chat=lenient))
+    by_id = {fs.fact_id: fs for fs in a.fact_scope}
+    assert set(by_id) == {"f01", "f05"} and a.facts_within_contract is False and a.coherent is True and a.fair_tests is True
+    assert by_id["f01"].within_contract is True and by_id["f01"].reason.endswith("the failing test checks it")
+    assert by_id["f05"].within_contract is False and by_id["f05"].offending_tests == [P2P_7283[0]] and by_id["f05"].markers == ["@pytest.mark.skip"]
+    assert P2P_7283[0] in by_id["f05"].reason and "harmless generalisation" in by_id["f05"].reason
+    assert "f05" in a.reasons["facts_within_contract"] and P2P_7283[0] in a.reasons["facts_within_contract"]
+    payload = json.loads(lenient.calls[0]["messages"][0]["content"])
+    assert payload["pass_to_pass"] == P2P_7283 and F05_7283 in json.dumps(payload["stakeholder_visible_facts"])
+    on_disk = json.loads((ws.scenario_dir(spec.id) / "audit.json").read_text())
+    assert on_disk["facts_within_contract"] is False and on_disk["rubric_version"] == R.RUBRIC_VERSION
+
+
+def test_audit_scenario_takes_the_model_verdict_where_the_mechanical_rule_is_silent(tmp_path):
+    ws, spec = _record_7283(tmp_path)
+    d = spec_dict_7283()
+    d["ledger"] = [f for f in d["ledger"] if f["id"] != "f05"]
+    spec = ScenarioSpec.model_validate(d)
+    (ws.scenario_dir(spec.id) / "scenario.json").write_text(spec.model_dump_json(indent=2))
+    strict = FakeChat(scenario=_scenario_answer([{"fact_id": "f01", "within_contract": False, "reason": "also promises tearDown ordering nobody tests"}]))
+    a = RUN.audit_scenario(ws, spec.id, judge=L.Judge(chat=strict))
+    assert [(fs.fact_id, fs.within_contract) for fs in a.fact_scope] == [("f01", False)] and a.facts_within_contract is False
+    assert a.fact_scope[0].offending_tests == [] and "nobody tests" in a.fact_scope[0].reason
+    silent = FakeChat(scenario=_scenario_answer([]))
+    a = RUN.audit_scenario(ws, spec.id, force=True, judge=L.Judge(chat=silent))
+    assert a.fact_scope[0].within_contract is None and a.facts_within_contract is None and "not judged" in a.fact_scope[0].reason
 
 
 def test_audit_scenario_without_withheld_brief_marks_withholding_not_applicable(tmp_path):
@@ -329,6 +381,7 @@ def test_activities_read_the_settings_workspace_and_are_idempotent(tmp_path, mon
     assert again["written"] is False and len(fake.calls) == 1
     s = asyncio.run(ACT.audit_scenario_activity({"scenario_id": spec.id}))
     assert s["scenario_id"] == spec.id and s["coherent"] is True and s["fair_tests"] is False and s["written"] is True
+    assert s["facts_within_contract"] is True
     with pytest.raises(ApplicationError) as e:
         asyncio.run(ACT.audit_transcript_activity({"trial_id": "0" * 24}))
     assert e.value.non_retryable is True

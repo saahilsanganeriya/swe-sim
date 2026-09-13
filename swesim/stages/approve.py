@@ -11,13 +11,32 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from swesim.audit.rubric import fact_scope_mechanical
 from swesim.models import Discovery, OperationType, ScenarioSpec
 from swesim.paths import Workspace, atomic_json
 from swesim.stages.draft_spec import HUMAN_PROVENANCE, excerpt_grounds, reconstruct_withheld
 from swesim.stages.judge import norm_text
 
-AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "withholding-leak", "withheld-reconstructs", "controls"]
+AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "fact-scope", "withholding-leak",
+              "withheld-reconstructs", "controls"]
 HUMAN_GATES = ["schema", "assets"]
+
+
+def fact_scope_failures(spec: ScenarioSpec, sdir: Path) -> list[str]:
+    """Gate ``fact-scope`` (2026-09-13, pytest-7283): a stakeholder-visible fact whose distinctive parametrisation ids or code
+    identifiers appear only in PASS_TO_PASS tests asserts behaviour the contract does not ask for; agents acting on it changed
+    more than the FAIL_TO_PASS tests require and regressed a passing test. The check is the audit's mechanical rule
+    (``swesim.audit.rubric.fact_scope_mechanical``) over the declared test assets on disk (ids alone when they are absent);
+    no model runs at approval time. Author-only facts are exempt. Reasons name the fact and the offending test id."""
+    texts: dict[str, str] = {}
+    for name in spec.contract.test_assets:
+        asset = spec.assets.get(name)
+        path = Path(sdir) / asset.path if asset else None
+        if path is not None and path.is_file():
+            texts[name] = path.read_text(errors="replace")
+    facts = [{"id": f.id, "text": f.text, "discovery": f.discovery.value} for f in spec.ledger if f.discovery != Discovery.AUTHOR_ONLY]
+    return [f"fact {fs.fact_id} is outside the contract: {fs.reason}"
+            for fs in fact_scope_mechanical(facts, spec.contract.fail_to_pass, spec.contract.pass_to_pass, texts) if fs.within_contract is False]
 
 
 def withheld_reconstruction_failures(spec: ScenarioSpec) -> list[str]:
@@ -93,6 +112,7 @@ def auto_gates(spec: ScenarioSpec, sdir) -> list[str]:
     if not any(f.discovery == Discovery.ON_REQUEST and set(f.tests) & f2p for f in spec.ledger):
         fails.append("no on-request fact is linked to a FAIL_TO_PASS test; interaction would not be load-bearing")
     fails += ungrounded_requirements(spec)
+    fails += fact_scope_failures(spec, Path(sdir))
     withheld = next((b for b in spec.briefs if b.profile == "withheld"), None)
     if withheld is not None:
         targets = {o.target for o in spec.operations if o.type == OperationType.WITHHOLDING}

@@ -7,9 +7,11 @@ Contract
   trajectory, spec or hidden asset changes the hash and re-audits.
 - Labels combine the mechanical rules of ``swesim.audit.rubric`` with the model's reading (``swesim.audit.llm_audit``):
   unambiguous mechanical evidence wins where it exists (a restated brief sentence is ``redundant``; a reply-filter term in a
-  reply is ``test_or_identifier_disclosed``; ``before_implementation`` is trajectory order), the model decides the reading
-  labels (specific, decision_oriented, fishing, targeted, volunteered, behaviour_level) and fills the rest; a label nobody
-  could decide stays ``None``. Every reason names its evidence.
+  reply is ``test_or_identifier_disclosed``; ``before_implementation`` is trajectory order; a fact naming a PASS_TO_PASS-only
+  parametrisation or identifier is outside the contract), the model decides the reading labels (specific, decision_oriented,
+  fishing, targeted, volunteered, behaviour_level, the remaining ``fact_scope`` entries) and fills the rest; a label nobody
+  could decide stays ``None``. ``facts_within_contract`` is False when any visible fact is outside, True when every one was
+  judged inside, else None. Every reason names its evidence.
 - Stakeholder v1 trials are labelled ``legacy`` and get mechanical labels only (no model call); trials without exchanges
   and non-interactive trials get an empty audit with no model call.
 """
@@ -93,11 +95,37 @@ def audit_scenario_result(layout, scenario_id: str, *, force: bool = False, judg
     if b.withheld_brief is None:
         plausible = None
         reasons["plausible_withholding"] = "no withheld brief in this spec (natural profile only); nothing to judge"
+    scope = _fact_scope(b, out.get("fact_scope") or {})
+    within = R.facts_within_contract(scope)
+    reasons["facts_within_contract"] = _fact_scope_summary(scope, within)
     audit = R.ScenarioAudit(scenario_id=scenario_id, spec_hash=b.spec_hash, coherent=out["coherent"], fair_tests=out["fair_tests"],
-                            plausible_withholding=plausible, reasons=reasons, unfair_tests=out["unfair_tests"], model=model,
+                            plausible_withholding=plausible, reasons=reasons, unfair_tests=out["unfair_tests"],
+                            facts_within_contract=within, fact_scope=scope, model=model,
                             audited_at=_now(), rubric_version=R.RUBRIC_VERSION, inputs_hash=h)
     atomic_json(path, audit.model_dump(mode="json"))
     return audit, True
+
+
+def _fact_scope(b: ScenarioBundle, llm: dict[str, dict]) -> list[R.FactScope]:
+    """Per visible fact: the mechanical marker verdict wins (False); otherwise the model's label; reasons keep both."""
+    out = []
+    for m in R.fact_scope_mechanical(b.visible_facts, b.fail_to_pass, b.pass_to_pass, b.test_assets):
+        read = llm.get(m.fact_id) or {}
+        within = False if m.within_contract is False else read.get("within_contract")
+        out.append(m.model_copy(update={"within_contract": within,
+                                        "reason": _join(m.reason, read.get("reason") or None, None if read else "not judged by the model")}))
+    return out
+
+
+def _fact_scope_summary(scope: list[R.FactScope], within: bool | None) -> str:
+    outside = [fs for fs in scope if fs.within_contract is False]
+    if outside:
+        parts = [f"{fs.fact_id}" + (f" (PASS_TO_PASS-only: {', '.join(fs.offending_tests)})" if fs.offending_tests else "") for fs in outside]
+        return f"{len(outside)} of {len(scope)} stakeholder-visible facts outside the contract: {'; '.join(parts)}"
+    if within is True:
+        return f"all {len(scope)} stakeholder-visible facts judged within the FAIL_TO_PASS contract" if scope else "no stakeholder-visible facts"
+    undecided = [fs.fact_id for fs in scope if fs.within_contract is None]
+    return f"no mechanical marker found; the model did not judge {', '.join(undecided)}"
 
 
 def audit_scenario(layout, scenario_id: str, *, force: bool = False, judge: Judge | None = None) -> R.ScenarioAudit:

@@ -7,7 +7,7 @@ from swesim.audit import llm_audit as L
 from swesim.audit import report as REP
 from swesim.audit import run as RUN
 from test_audit_llm import FakeChat
-from test_audit_run import HAIKU, SONNET, make_record, trajectory, v2_events, write_trial
+from test_audit_run import HAIKU, SONNET, _record_7283, _scenario_answer, make_record, trajectory, v2_events, write_trial
 
 
 def build(tmp_path):
@@ -58,6 +58,8 @@ def test_report_pools_only_current_v2_interactive_trials_and_lists_the_rest(tmp_
     s = rep["scenarios"][0]
     assert s["scenario_id"] == spec.id and s["current"] is True and s["coherent"] is True and s["fair_tests"] is False and s["leaderboard_eligible"] is False
     assert s["unfair_tests"] == ["t1"] and rep["unaudited_scenarios"] == []
+    assert s["facts_within_contract"] is True and s["facts_outside_contract"] == []
+    assert rep["scenario_counts"] == {"audited": 1, "facts_outside_contract": 0}
     ps = rep["per_scenario"][spec.id]
     assert ps["trials"] == 3 and ps["models"] == {f"{SONNET} @ v2": 2, f"{HAIKU} @ unknown": 1} and ps["questions"] == 2 and ps["replies"] == 4
     assert rep["llm_usage"]["calls"] == 1 + 3  # scenario + trials a, d, f (b has no exchanges, c is legacy, e is not interactive)
@@ -78,3 +80,19 @@ def test_report_on_an_empty_record_is_empty_not_broken(tmp_path):
     rep = REP.build_report(ws, ws.registry_path)
     assert rep["models"] == {} and rep["scenarios"] == [] and rep["unaudited_scenarios"] == [spec.id] and rep["trials"]["trial_dirs"] == 0
     assert "None." in REP.render_markdown(rep)
+
+
+def test_report_counts_scenarios_with_facts_outside_the_contract(tmp_path):
+    ws, spec = _record_7283(tmp_path)
+    chat = FakeChat(scenario=_scenario_answer([{"fact_id": "f01", "within_contract": True, "reason": "the failing test checks it"},
+                                               {"fact_id": "f05", "within_contract": True, "reason": "lenient"}]))
+    RUN.audit_scenario(ws, spec.id, judge=L.Judge(chat=chat))
+    rep = REP.build_report(ws, ws.registry_path)
+    assert rep["scenario_counts"] == {"audited": 1, "facts_outside_contract": 1}
+    s = rep["scenarios"][0]
+    assert s["facts_within_contract"] is False and s["facts_outside_contract"] == ["f05"]
+    assert s["fact_scope"][1]["fact_id"] == "f05" and s["fact_scope"][1]["offending_tests"] == ["testing/test_unittest.py::test_pdb_teardown_skipped[@pytest.mark.skip]"]
+    assert s["leaderboard_eligible"] is True      # the leaderboard gate stays coherent + fair_tests (storage owns it)
+    md = REP.render_markdown(rep)
+    assert "facts within contract" in md and "f05" in md and "test_pdb_teardown_skipped[@pytest.mark.skip]" in md
+    assert "1 of 1 audited scenarios" in md
