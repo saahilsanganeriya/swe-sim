@@ -32,7 +32,7 @@ OUTCOME_NAMES = {1: "valid-correct", 2: "valid-incorrect", 3: "agent-invalid-sub
 VALID = {1, 2, 3, 4}  # agent-attributable results: in the pass@k denominator; only 1 is a success
 AGENT_FAILURE = {3, 4}  # subset of VALID, reported separately as n_agent_failures
 INFRA = {5, 6, 7}  # excluded from n; counted in outcomes / n_infra_failures
-PURPOSES = ("calibration", "comparison", "demonstration")
+PURPOSES = ("calibration", "comparison", "demonstration", "screen")
 # Files that make a record-less trial directory an "unresolved attempt" instead of nothing at all.
 UNRESOLVED_FILES = ("status.json", "runner-error.json", "request.json", "launch.json")
 UNKNOWN_GROUP = "unknown-config"
