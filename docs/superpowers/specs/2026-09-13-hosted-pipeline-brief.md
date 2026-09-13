@@ -55,6 +55,9 @@ artifacts on disk or on the VM; nothing is asserted without a path.
 | "GPT 5.6 Soul" | Mapped to `gpt-5.6-sol` (the id that exists; `luna` and `terra` also exist). Opus 5 is primary for judge and stakeholder, `gpt-5.6-sol` the fallback, unless the user swaps them. |
 | Primary objective (added ~08:20 UTC) | **Creating tasks from new repositories given as links is the main goal of swesim.** Pool A (the 109) is the starting point and the calibration set, not the product. The sweep runs the repositories first, in both bands, with a per-repository discovery funnel in the console, and targets at least 10 valid repository-sourced scenarios by 08:00 PDT. No reward hacking (§7) and tasks and trajectories that are hard enough (§5) are explicit goals, not side effects. |
 | Reusability (added ~08:35 UTC, refined ~08:45) | **Cloud-only.** A stranger clones the repository, creates a GCP project and a Temporal Cloud namespace, puts their own keys in their env file, and follows `docs/setup.md` to a running hosted pipeline; `docs/runbook.md` covers operating it. No local or offline runtime is required (the offline test suite remains a developer check, not a way to run the pipeline). No path, hostname, account or file that exists only on the author's machine (Codex B10 is the checklist). Verified by a fresh clone into a new directory with a fresh env file. |
+| Leaderboard (added ~08:50 UTC) | By morning: a set of tasks (10–20 novel tasks from new repositories; the 109 too if time allows, or more), 3–4 models judged and scored, and a **leaderboard** page. Setting everything up correctly matters more than the size of the leaderboard, and a leaderboard on a bad task is worthless, so the no-reward-hacking work (§7) and the difficulty screen (§5) gate what appears on it. |
+| UI/UX (added ~08:55 UTC) | In parallel with everything else, the website must become a lot more aesthetically pleasing, with a better colour palette, better UX and UI, easier to use, and showing the right information. See §2.5.1. |
+| Temporal Cloud (done 07:32 UTC) | Namespace `swesim.abcde` in `gcp-us-central1`, API-key auth, 30-day retention, six `swesim_*` Keyword search attributes; service account `swesim-worker` (account role read, namespace write) owns a 90-day API key; values in `~/Documents/.env` (`TEMPORAL_ADDRESS=us-central1.gcp.api.temporal.io:7233`, `TEMPORAL_NAMESPACE=swesim.abcde`, `TEMPORAL_API_KEY`); UI https://cloud.temporal.io/namespaces/swesim.abcde. |
 | Console scope (added ~08:10 UTC) | **The website is the way we interact with the pipeline.** It must show the entire database and every artifact in the bucket, and the complete history of everything that ever happened: every workflow, every trial including failed, unresolved and launch-failed ones, every candidate and gate reject, every scenario version. See §2.5. |
 
 ## 2. Target architecture on GCP
@@ -184,6 +187,43 @@ The website is how the pipeline is operated and how its history is read. Nothing
   + table view, no dual axes).
 - **Quality bar:** consistent layout, keyboard-navigable tables, dark and light, no page over ~1 s on the index, every
   number linked to the artifact it came from.
+
+#### 2.5.1 Design: look, palette, UX
+
+The console is the product surface people will see; it must read as one designed system, not a set of debug
+pages. Requirements, each checked before the cutover:
+
+- **Design system.** One typographic scale (a humanist sans for UI, a monospace for ids, hashes, diffs and logs), an
+  8-px spacing grid, a small set of surfaces (page, card, inset, overlay) in light and dark, consistent radii and borders,
+  a single icon set. Tokens live in one CSS file; no page-specific colour literals.
+- **Palette.** Neutral surfaces with one accent hue for interactive elements; a **categorical palette for model
+  families** (one hue per family, fixed order, never cycled) validated with the dataviz skill's `validate_palette.js` in
+  both modes; a sequential single-hue ramp for magnitudes (pass rate, cost); reserved status colours for
+  valid/invalid/running/failed/unresolved with an icon and a label, never colour alone. Status chips, table cells and
+  charts use the same tokens.
+- **Information hierarchy.** Every page answers one question first: Home = "what is running and what changed", Scenarios
+  = "what tasks exist and how hard are they", Trials = "what happened to each attempt", Leaderboard = "how do models
+  compare on informative tasks", Review = "what needs a decision", Workflows = "what did Temporal do". The first screen of
+  each page carries the numbers and the state; details unfold below or on drill-down. Ids and hashes are shortened with
+  copy-on-click and a full value on hover.
+- **Tables.** Sticky headers, sortable columns, column filters, paging, dense but readable rows, right-aligned numbers,
+  fixed-width monospace for ids, empty states that say what to do next, CSV export.
+- **Navigation and flow.** A persistent left nav with counts (running trials, candidates awaiting review), a global search
+  (scenario id, trial id, workflow id, model), breadcrumbs, and every operator action reachable in two clicks with a
+  confirmation dialog that shows exactly what will run (the CLI equivalent is displayed, as today).
+- **Episode page.** The agent/stakeholder conversation as a readable two-party transcript with timestamps, patience and
+  exchange type, the question and confirmation highlighted, the submitted patch and test results beside it, and the
+  evaluator-only material behind an explicit toggle for evaluator identities.
+- **Leaderboard page.** Models as rows, conditions as column groups, pass@k with n and a confidence note, cost per solved
+  task, questions asked; filters for difficulty label, brief profile, scenario source (repository vs SWE-bench), model tier;
+  a per-scenario matrix view; nothing shown without n, and saturated scenarios excluded by default with a toggle.
+- **Charts.** Follow the dataviz skill: form chosen by the data's job, one axis, legends plus direct labels, table view for
+  every chart, hover tooltips, dark-mode steps validated separately.
+- **Accessibility and performance.** Keyboard navigation, focus states, 4.5:1 text contrast, no information by colour
+  alone, pages under one second on the index, live updates without full reloads.
+- **Process.** A frontend stream works from a short design spec (palette tokens, type scale, page list, component
+  inventory) reviewed against these requirements before the pages are rebuilt; screenshots of every page in both modes
+  are saved under `workspace/evidence/console/` and linked from `docs/ops.md`.
 
 ### 2.6 Build and deploy
 - `Dockerfile.worker` (python 3.12, `uv sync --frozen`, Harbor + Modal clients, `swesim` installed). Cloud Build
@@ -316,6 +356,15 @@ holding on the majority of scenarios (§5), and the per-trial cost model (§6) p
 
 Concurrency: build queue 8–12 validations in parallel (Modal), trial Jobs 30–50 in parallel, LLM concurrency per
 provider respecting rate limits (OpenRouter 20 concurrent per key is a safe start).
+
+### 4.1 Leaderboard target for the morning
+
+- At least 10 (aim 20) valid scenarios created from repository URLs plus whatever pool A yields, all through the new
+  stack, each with its seven-control validation and difficulty label.
+- 3–4 evaluated models across tiers (e.g. `deepseek-v3.2`, `glm-5.3`, `gpt-5-mini`, `claude-haiku-4-5`) at full/hidden/
+  interactive k=2, scored, with the leaderboard page live; frontier models only if the gate in §3.2 holds.
+- Only scenarios that passed the controls and the difficulty screen appear on the leaderboard; saturated ones are shown
+  separately. The leaderboard is worthless on a bad task, so integrity comes first.
 
 ## 5. Difficulty: measured, tiered, reported
 
