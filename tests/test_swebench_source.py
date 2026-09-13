@@ -1184,12 +1184,54 @@ def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
     meta = json.loads((tmp_path / "s5" / "draft.meta.json").read_text())
     assert meta["controls_dropped"][0]["control"] == "plausible_wrong" and "could not be fetched" in meta["controls_dropped"][0]["reason"]
     assert meta["controls_fallback"] == {"plausible_wrong": "fallback-inverted-comparison"} and meta["oracle_apply"]["verified"] is None
+    assert meta["controls"]["plausible_wrong"]["verified"] is None                                   # honest: the fallback could not be checked either
     assert "new file mode" not in (tmp_path / "s5" / "assets" / "plausible-wrong.diff").read_text()
     monkeypatch.setattr(draft_spec, "MAX_BASE_FILES", 8)
     # an oracle that does not apply to its base is a drafter error, not a correction
     outputs = iter([_draft_llm(), _draft_llm()])
     with pytest.raises(ValueError, match="oracle patch does not apply"):
         draft_spec.draft(_row(patch=corrupt.replace("+raise KeyError", "+y")), _judged(), "fake/model", tmp_path / "s3")
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+def test_fallback_inversion_respects_strings_comments_and_prefers_statements():
+    """Review v7: the inversion matched `not in` inside a docstring, yielding a control functionally equal to the gold."""
+    from swesim.stages import draft_spec
+    base = {"pkg/a.py": "a\nc\n"}
+
+    def gold(*added):
+        return ("diff --git a/pkg/a.py b/pkg/a.py\n--- a/pkg/a.py\n+++ b/pkg/a.py\n" + f"@@ -1,2 +1,{2 + len(added)} @@\n a\n"
+                + "".join("+" + line + "\n" for line in added) + " c\n")
+    # occurrences inside a docstring, a string literal or an inline comment are never inverted -> a statement line is dropped instead
+    fb = draft_spec.fallback_plausible_wrong(gold("def f():", '    """Return items not in the set."""', '    msg = "a == b"', "    x = 1  # a == b", "    return x"), base)
+    assert fb is not None and fb[1] == "fallback-dropped-line" and fb[2] is True
+    assert '+    msg = "a == b"' not in fb[0] and "+def f():" in fb[0] and '+    """Return items not in the set."""' in fb[0]   # the def line is never the one dropped
+    # a multi-line docstring continuation is not code; the `if` comparison is inverted and the docstring left intact
+    fb = draft_spec.fallback_plausible_wrong(gold("def f():", '    """First line.', "    values not in the set are dropped.", '    """', "    if a == b:", "        return 1"), base)
+    assert fb[1] == "fallback-inverted-comparison" and "+    if a != b:" in fb[0] and "+    values not in the set are dropped." in fb[0]
+    # a comparison inside if/return/assert is preferred over a plain assignment; the inline comment stays untouched
+    fb = draft_spec.fallback_plausible_wrong(gold("flag = a == b", "if c != d:  # c == d is fine", "    pass"), base)
+    assert fb[1] == "fallback-inverted-comparison" and "+if c == d:  # c == d is fine" in fb[0] and "+flag = a == b" in fb[0]
+    fb = draft_spec.fallback_plausible_wrong(gold("flag = a == b", "other = 2"), base)
+    assert fb[1] == "fallback-inverted-comparison" and "+flag = a != b" in fb[0]                    # no statement comparison: the assignment is fine
+    fb = draft_spec.fallback_plausible_wrong(gold("name = 'TrueType'", "enabled = True"), base)
+    assert fb[1] == "fallback-inverted-comparison" and "+enabled = False" in fb[0] and "+name = 'TrueType'" in fb[0]   # word boundary, string skipped
+    # only header lines and nothing to invert: no real incorrect change exists
+    assert draft_spec.fallback_plausible_wrong(gold("@decorator", "class K:"), base) is None
+    assert draft_spec.fallback_plausible_wrong(gold("def g():", "    if x:"), base) is None
+    # lightening a hunk (not just removing one) shifts the later hunk's new-side start
+    two = ("diff --git a/pkg/a.py b/pkg/a.py\n--- a/pkg/a.py\n+++ b/pkg/a.py\n@@ -1,2 +1,4 @@\n a\n+b = 1\n+c2 = 2\n c\n@@ -7,2 +9,3 @@\n h\n+i = 3\n j\n")
+    base2 = {"pkg/a.py": "a\nc\nd\ne\nf\ng\nh\nj\n"}
+    fb = draft_spec.fallback_plausible_wrong(two, base2)
+    assert fb[1] == "fallback-dropped-line" and "+b = 1" not in fb[0] and "+c2 = 2" in fb[0] and "@@ -1,2 +1,3 @@" in fb[0] and "@@ -7,2 +8,3 @@" in fb[0] and fb[2] is True
+    # the code mask itself
+    state = {"quote": None}
+    mask = draft_spec._code_mask('x = "a == b"  # c == d', state)
+    assert draft_spec._code_of('x = "a == b"  # c == d', mask) == "x =" and state["quote"] is None     # quotes, string body and comment are not code positions
+    state = {"quote": None}
+    draft_spec._code_mask('doc = """open', state); assert state["quote"] == '"""'
+    assert draft_spec._code_of("still inside", draft_spec._code_mask("still inside", state)) == "" and state["quote"] == '"""'
+    assert draft_spec._code_of('end""" + tail', draft_spec._code_mask('end""" + tail', state)) == "+ tail" and state["quote"] is None
 
 
 def test_draft_with_zero_removals_keeps_only_the_natural_brief(monkeypatch, tmp_path):
