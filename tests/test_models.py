@@ -1,4 +1,4 @@
-import json, pytest
+import pytest
 from pydantic import ValidationError
 from swesim.models import (ScenarioSpec, RunConfig, canonical_hash, trial_id, minimal_spec_dict)
 

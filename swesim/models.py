@@ -4,7 +4,7 @@ import hashlib, json, re
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator, computed_field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 

@@ -66,7 +66,7 @@ def test_contract_name(module, name, params):
 def test_trial_dir_convention_and_record_keys():
     """Cross-stream file convention: run.py writes workspace/trials/<trial_id>/{record,reward,report,transcript,status}.json
     and the orchestration/scoring streams read exactly those names."""
-    import ast, pathlib
+    import pathlib
     run_src = pathlib.Path("swesim/stages/run.py").read_text()
     for name in ("record.json", "reward.json", "report.json", "transcript.json", "status.json", "run_config.json", "spec.json"):
         assert name in run_src, name

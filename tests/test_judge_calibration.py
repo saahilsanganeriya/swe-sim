@@ -8,7 +8,6 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-import pytest
 
 from swesim import costs, llm
 from swesim.sources import swebench_annotated as sb

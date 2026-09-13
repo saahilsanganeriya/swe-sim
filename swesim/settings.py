@@ -203,7 +203,7 @@ def render_env_example() -> str:
     lines = ["# swesim environment file. Copy to ./.env (git-ignored) or point SWESIM_ENV_FILE at your copy.",
              "# Read with python-dotenv; never `export $(cat ...)` or `source` it. Secrets are marked; keep them out of git.", ""]
     for v in ENV_VARS:
-        lines.append(f"# {v.purpose}" + (f" [secret]" if v.secret else ""))
+        lines.append(f"# {v.purpose}" + (" [secret]" if v.secret else ""))
         if v.where:
             lines.append(f"#   where: {v.where}")
         lines.append(f"{v.name}={'' if v.secret or v.default is None else v.default}")
