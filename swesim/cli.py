@@ -287,6 +287,19 @@ def dashboard(host: str = typer.Option("127.0.0.1"), port: int = typer.Option(80
     uvicorn.run("swesim.dashboard.app:app", host=host, port=port)
 
 
+@app.command()
+def probe(
+    judged: Path = typer.Option(..., "--judged", help="A .judged.jsonl (or .probed.jsonl) file"),
+    instance: list[str] = typer.Option(None, "--instance", help="Restrict to these instance ids (repeatable)"),
+    max_builds: int = typer.Option(3, help="How many candidates to probe on Modal in this call"),
+) -> None:
+    """Measure the contract offline (base vs gold on Modal) before drafting; writes <judged>.probed.jsonl."""
+    from swesim.stages.mine import probe_candidates
+
+    out = probe_candidates(WS, judged, instance or None, max_builds)
+    typer.echo(str(out))
+
+
 # ----------------------------------------------------------------------------------------------------------
 # Temporal
 # ----------------------------------------------------------------------------------------------------------
@@ -376,6 +389,70 @@ def matrix(
         "stakeholder_url": _stakeholder_url(stakeholder_url),
     })
     typer.echo(asyncio.run(start_matrix(p)))
+
+
+# -- two-workflow operator commands (create tasks / run tasks / inspect workflows) --------------------------
+@app.command()
+def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a GitHub repo URL, or 'swebench:A' (pool A), or 'swebench:A:<id1>,<id2>'"),
+           judge_model: str = typer.Option(JUDGE_MODEL_DEFAULT), draft_model: str = typer.Option(DRAFT_MODEL_DEFAULT),
+           since: str = typer.Option("2026-06-01"), max_candidates: int = typer.Option(20), max_parallel: int = typer.Option(8),
+           approval_mode: str = typer.Option("auto", help="auto | hold (review queue; approve with `swesim workflows approve`)"),
+           stakeholder_url: str = typer.Option("", envvar="SWESIM_STAKEHOLDER_URL")) -> None:
+    """Create tasks from many repos/pools: one CreateTasksWorkflow, one CandidateWorkflow per candidate."""
+    import asyncio
+    from swesim.workflows.client import start_create
+    sources = []
+    for s in source:
+        if s.startswith("swebench:"):
+            _, pool, *ids = s.split(":", 2)
+            sources.append({"kind": "swebench-annotated", "pool": pool or "A", "limit": max_candidates, **({"instance_ids": ids[0].split(",")} if ids else {})})
+        else:
+            sources.append({"kind": "github-repo", "repo": s, "since": since, "max_candidates": max_candidates})
+    typer.echo(asyncio.run(start_create({"sources": sources, "judge_model": judge_model, "draft_model": draft_model, "max_parallel": max_parallel,
+                                         "approval_mode": approval_mode, "stakeholder_url": _stakeholder_url(stakeholder_url)})))
+
+@app.command("run-tasks")
+def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenario ids"), models: str = typer.Option(SOLVER_MODEL_DEFAULT),
+              conditions: str = typer.Option("full,hidden,interactive"), k: int = typer.Option(3), purpose: str = typer.Option("comparison"),
+              brief_profile: str = typer.Option("withheld"), stakeholder_model: str = typer.Option("", help="resolved stakeholder id (workspace/evidence/model-probe.json)"),
+              attempt_offset: int = typer.Option(0), max_parallel_trials: int = typer.Option(1, help="1 on a laptop; raise on the VM"),
+              stakeholder_url: str = typer.Option("", envvar="SWESIM_STAKEHOLDER_URL")) -> None:
+    """Run selected task ids on selected models: one RunTasksWorkflow, TrialWorkflow children with REJECT_DUPLICATE ids."""
+    import asyncio
+    from swesim.workflows.client import start_run
+    params = {"scenario_ids": scenario_ids.split(","), "models": models.split(","), "conditions": conditions.split(","), "k": k, "purpose": purpose,
+              "brief_profile": brief_profile, "attempt_offset": attempt_offset, "max_parallel_trials": max_parallel_trials, "stakeholder_url": _stakeholder_url(stakeholder_url)}
+    if stakeholder_model:
+        params["stakeholder_model"] = stakeholder_model
+    typer.echo(asyncio.run(start_run(params)))
+
+workflows_app = typer.Typer(help="Inspect and steer Temporal workflows.")
+app.add_typer(workflows_app, name="workflows")
+
+@workflows_app.command("list")
+def workflows_list(kind: str = typer.Argument("all", help="create | candidate | run | pipeline | matrix | trial | all"), limit: int = typer.Option(50)) -> None:
+    import asyncio
+    from swesim.workflows.client import list_runs
+    typer.echo(json.dumps(asyncio.run(list_runs(kind, limit)), indent=2))
+
+@workflows_app.command("progress")
+def workflows_progress(workflow_id: str) -> None:
+    import asyncio
+    from swesim.workflows.client import progress
+    typer.echo(json.dumps(asyncio.run(progress(workflow_id)), indent=2))
+
+@workflows_app.command("cancel")
+def workflows_cancel(workflow_id: str) -> None:
+    import asyncio
+    from swesim.workflows.client import cancel
+    asyncio.run(cancel(workflow_id)); typer.echo(json.dumps({"cancelled": workflow_id}))
+
+@workflows_app.command("approve")
+def workflows_approve(workflow_id: str, scenario_id: str, spec_hash: str, decision: str = typer.Option("approve", help="approve | reject"), note: str = typer.Option("")) -> None:
+    """Hold-mode reviewer decision; workflow_id may be the create-<hex> parent or create:<scenario_id>."""
+    import asyncio
+    from swesim.workflows.client import approve_candidate
+    typer.echo(json.dumps({"signalled": asyncio.run(approve_candidate(workflow_id, scenario_id, spec_hash, decision, note)), "decision": decision}))
 
 
 if __name__ == "__main__":
