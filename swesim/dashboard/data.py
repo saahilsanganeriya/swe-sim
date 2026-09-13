@@ -89,7 +89,8 @@ def iso(ts: float | None) -> str | None:
 
 
 def clock(ts: float | None) -> str:
-    return datetime.fromtimestamp(ts, UTC).strftime("%H:%M:%S") if ts is not None else "no timestamp"
+    """HH:MM UTC, no seconds (the console shows minutes; the ISO value stays in the element's title)."""
+    return datetime.fromtimestamp(ts, UTC).strftime("%H:%M") if ts is not None else "no timestamp"
 
 
 # ----------------------------------------------------------------------------- live transcript

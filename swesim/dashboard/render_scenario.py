@@ -11,7 +11,7 @@ from swesim.dashboard import origin
 from swesim.dashboard.public import project
 
 from swesim.dashboard.render import (
-    Column, chip, dash, difficulty_chip, evaluator_switch, h, ident, kv, outcome_chip, short, table,
+    Column, chip, dash, difficulty_chip, evaluator_switch, h, ident, kv, outcome_chip, short, table, when,
 )
 
 SCENARIO_COLUMNS = (
@@ -89,14 +89,14 @@ def scenario_sections(d: dict, row, versions: list, trials_html: str, evaluator:
         ("repository", f"<span class='mono'>{dash(env.get('repo_url'))}</span> @ {ident(env.get('base_commit'), 12)}"),
         ("contract", f"{d['contract']['fail_to_pass']} fail-to-pass · {d['contract']['pass_to_pass']} pass-to-pass · {d['contract']['protected_paths']} protected path(s)"),
         ("requirements / groups / checks", f"{len(d['requirements'])} / {len(d['groups'])} / {len(d['checks'])}"),
-        ("created", f"<span class='mono'>{dash(d.get('created_at'))}</span>"),
+        ("created", when(d.get("created_at"))),
     ])
     # difficulty label (brief §5)
     diff = d.get("difficulty") or {}
     if diff:
         hid, full = diff.get("hidden") or {}, diff.get("full") or {}
         difficulty = (f"<h2>Difficulty</h2><p>{difficulty_chip(diff.get('tier'))} screen model <span class='mono'>{dash(diff.get('model'))}</span> · hidden "
-                      f"{dash(hid.get('successes'))}/{dash(hid.get('n'))} · full {dash(full.get('successes'))}/{dash(full.get('n'))} · labelled {dash(diff.get('labelled_at'))} · "
+                      f"{dash(hid.get('successes'))}/{dash(hid.get('n'))} · full {dash(full.get('successes'))}/{dash(full.get('n'))} · labelled {when(diff.get('labelled_at'))} · "
                       f"<a href='{art}/difficulty.json'>difficulty.json</a></p>")
     else:
         difficulty = ("<h2>Difficulty</h2><p class='empty'>Not screened yet. Run <em>purpose = screen</em> on <a href='/run'>Run</a> (hidden k=2, full k=1 with the screen model); "
@@ -106,7 +106,7 @@ def scenario_sections(d: dict, row, versions: list, trials_html: str, evaluator:
         sense = (f"<h2>Task sense</h2><p>{chip('coherent' if ts.get('coherent') else 'not coherent', 'good' if ts.get('coherent') else 'critical')} "
                  f"{chip('fair tests' if ts.get('fair_tests') else 'unfair tests', 'good' if ts.get('fair_tests') else 'critical')} "
                  f"{chip('plausible withholding' if ts.get('plausible_withholding') else 'implausible withholding', 'good' if ts.get('plausible_withholding') else 'serious')} "
-                 f"<span class='muted small'>audited {dash(ts.get('audited_at'))} by <span class='mono'>{dash(ts.get('model'))}</span></span></p>")
+                 f"<span class='muted small'>audited {when(ts.get('audited_at'))} by <span class='mono'>{dash(ts.get('model'))}</span></span></p>")
         if evaluator and isinstance(ts.get("reasons"), dict):
             sense += "<div data-evaluator-only><dl class='kv'>" + "".join(f"<dt>{h(k)}</dt><dd>{h(v)}</dd>" for k, v in ts["reasons"].items()) + "</dl></div>"
         if ts.get("usage_complete") is not True or ts.get("cost_recorded") is not True:

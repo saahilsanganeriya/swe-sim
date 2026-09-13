@@ -6,6 +6,9 @@ Contract
   attributes) and colour in ``static/tokens.css`` (design spec §2–§3).
 - ``layout()`` renders the persistent left nav with live counts, the global search box, breadcrumbs and the theme toggle;
   pages pass their body and the nav key. Counts come from the reader (``/api/counts`` keeps them live).
+- Every timestamp goes through ``when()``: ``<time datetime='<ISO 8601 UTC>' data-local title='…'>YYYY-MM-DD HH:MM Z</time>``
+  (no seconds); ``static/app.js`` re-formats every ``time[data-local]`` in the viewer's zone on load and after each live
+  refresh, keeping the full ISO value in ``title``. ``when(…, clock_only=True)`` is the episode timeline's HH:MM clock.
 - ``table()`` renders a declarative table from ``Column`` specs and emits the same specs as JSON (``data-cols``) so the
   client re-renders rows from a polled JSON endpoint without a second template. Ids are shortened with copy-on-click and
   the full value on hover (``ident()``); statuses are chips with an icon and a label (``chip()``), never colour alone;
@@ -36,14 +39,31 @@ def short(x, n: int = 12) -> str:
 
 
 def clock(value) -> str:
-    """HH:MM:SS UTC from an ISO string or a datetime; the full value belongs in ``title``."""
+    """HH:MM UTC (no seconds) from an ISO string, epoch or datetime; the full value belongs in ``title``."""
     dt = _dt(value)
-    return dt.strftime("%H:%M:%S") if dt else "no timestamp"
+    return dt.astimezone(UTC).strftime("%H:%M") if dt else "no timestamp"
 
 
 def day_clock(value) -> str:
+    """``YYYY-MM-DD HH:MM`` UTC (no seconds); the plain-text form of ``when()``'s fallback."""
     dt = _dt(value)
-    return dt.strftime("%m-%d %H:%M") if dt else "—"
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M") if dt else "—"
+
+
+def when(value, *, clock_only: bool = False) -> str:
+    """Every timestamp on the console. ``<time datetime='<ISO 8601 UTC>' data-local title='<ISO> (UTC)'>fallback</time>``:
+    the fallback text is UTC ``YYYY-MM-DD HH:MM Z`` (never seconds) and app.js replaces it with the viewer's local
+    ``YYYY-MM-DD HH:MM`` (24 h) on load and after every live refresh, adding the zone name to the title. ``clock_only``
+    (the episode timeline's per-message clock) renders ``HH:MM`` and asks the client for the same shape
+    (``data-local='clock'``). Missing values render an em dash; unparseable ones their escaped text."""
+    dt = _dt(value)
+    if dt is None:
+        return "—" if value in (None, "") else h(value)
+    utc = dt.astimezone(UTC)
+    iso = utc.isoformat(timespec="seconds")
+    text = utc.strftime("%H:%M") if clock_only else utc.strftime("%Y-%m-%d %H:%M") + " Z"
+    local = " data-local='clock'" if clock_only else " data-local"
+    return f"<time datetime='{h(iso)}'{local} title='{h(iso)} (UTC)'>{h(text)}</time>"
 
 
 def _dt(value) -> datetime | None:
@@ -234,7 +254,7 @@ def cell(col: Column, row: dict) -> str:
     elif col.kind == "model":
         inner = model_chip(v)
     elif col.kind == "time":
-        inner = f"<time datetime='{h(v)}' title='{h(v)}'>{h(day_clock(v))}</time>" if v else "—"
+        inner = when(v) if v else "—"
     elif col.kind == "metric":
         inner = fmt_metric(v)
     elif col.kind == "usd":
