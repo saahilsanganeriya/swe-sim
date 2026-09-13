@@ -40,11 +40,11 @@ def test_forbidden_terms_come_from_hidden_tests_minus_what_the_reporter_said(tmp
     for t in ("Continuous", "_setup", "bool_series", "test_bool_series_maps_to_interval", "pkg", "scales", "out", "must", "never", "raised", "here"):
         assert t in terms, t                                                            # in the hidden test, unknown to the reporter
     for t in FIXED_FORBIDDEN: assert t in terms, t
-    assert "ValueError" not in terms and "Raise" not in terms                            # said by the reporter (requirements / facts)
-    assert "IntervalProperty" not in terms                                              # named in a visible fact
+    assert "ValueError" in terms and "Raise" not in terms                                # in the test; requirements / facts never exempt a term (A-P1-2)
+    assert "IntervalProperty" in terms                                                  # named in a visible fact, not by the reporter
     assert "Continuous" in terms                                                        # author-only facts do not count as visible
     for t in ("import", "from", "def", "diff", "git", "index", "mode", "dev", "null", "file"): assert t not in terms, t   # keywords and patch framing
-    assert all(t.casefold() not in {"valueerror", "raise", "intervalproperty", "breaks"} for t in terms)
+    assert all(t.casefold() not in {"raise", "breaks"} for t in terms)
 
 
 def test_visible_view_drops_author_only():
@@ -151,7 +151,7 @@ def test_run_trial_interactive_end_to_end(scene):
     assert body["spec_hash"] == spec.spec_hash and body["run_config_hash"] == effective.run_config_hash and body["image"] == "ubuntu:24.04"
     assert body["visible_view"]["facts"][0]["id"] == "f01" and body["stakeholder_config"]["patience_profile"]["start"] == 6
     ft = body["visible_view"]["forbidden_terms"]                                        # deny-list of tokens from the hidden test
-    assert {"Continuous", "IntervalProperty", "_setup", "_setup(", "assert", "pytest", "tests/", "test_"} <= set(ft) and "ValueError" not in ft
+    assert {"Continuous", "IntervalProperty", "_setup", "_setup(", "assert", "pytest", "tests/", "test_", "ValueError"} <= set(ft) and "breaks" not in ft
     assert HIDDEN_TEST_PATCH.splitlines()[-1].strip("+ ") not in json.dumps(body)        # tokens, never test content
     assert calls["post"][1][0] == URL + "/freeze" and calls["post"][1][2] == {"Authorization": "Bearer t1.tok"}
     assert calls["get"] == [(URL + f"/transcript/{tid}", {"X-Worker-Secret": "secret"})]

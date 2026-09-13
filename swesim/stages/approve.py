@@ -13,9 +13,45 @@ from pydantic import ValidationError
 
 from swesim.models import Discovery, OperationType, ScenarioSpec
 from swesim.paths import Workspace, atomic_json
+from swesim.stages.draft_spec import HUMAN_PROVENANCE, excerpt_grounds
+from swesim.stages.judge import norm_text
 
-AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "withholding-leak", "controls"]
+AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "withholding-leak", "controls"]
 HUMAN_GATES = ["schema", "assets"]
+
+
+def human_corpora(spec: ScenarioSpec) -> dict[str, str]:
+    """Normalized text humans wrote, per provenance, rebuilt from the frozen spec: the natural brief (original-issue), the
+    linked issues (issue-thread), PR title/body/comments (pr-thread) and reviews (pr-review) recorded in `spec.thread`."""
+    t = spec.thread or {}
+
+    def bodies(items):
+        return [x.get("body") or "" for x in items or [] if isinstance(x, dict)]
+
+    issue_parts: list[str] = []
+    for i in t.get("linked_issues") or []:
+        if isinstance(i, dict):
+            issue_parts += [i.get("title") or "", i.get("body") or "", *bodies(i.get("comments"))]
+    raw = {"original-issue": [b.text for b in spec.briefs if b.profile == "natural"], "issue-thread": issue_parts,
+           "pr-thread": [t.get("pr_title") or "", t.get("pr_body") or "", *bodies(t.get("pr_comments"))],
+           "pr-review": bodies(t.get("reviews")) + bodies(t.get("review_comments"))}
+    return {prov: norm_text("\n".join(raw[prov])) for prov in HUMAN_PROVENANCE}
+
+
+def ungrounded_requirements(spec: ScenarioSpec) -> list[str]:
+    """Gate reasons for requirements that neither link a stakeholder-visible fact nor quote the issue/thread verbatim
+    (A-P1-2 / B-P1-2): such text is model prose the stakeholder would present as the reporter's wish."""
+    facts = {f.id: f for f in spec.ledger}
+    corpora = human_corpora(spec)
+    out: list[str] = []
+    for r in spec.requirements:
+        fact = facts.get(r.fact_id) if r.fact_id else None
+        if fact is not None and fact.discovery != Discovery.AUTHOR_ONLY:
+            continue
+        if excerpt_grounds(r.text, corpora):
+            continue
+        out.append(f"requirement {r.id} is ungrounded: no stakeholder-visible fact_id and its text is not a verbatim excerpt of the issue or thread")
+    return out
 
 
 def _judgement(spec: ScenarioSpec, sdir: Path) -> dict:
@@ -35,6 +71,7 @@ def auto_gates(spec: ScenarioSpec, sdir) -> list[str]:
     f2p = set(spec.contract.fail_to_pass)
     if not any(f.discovery == Discovery.ON_REQUEST and set(f.tests) & f2p for f in spec.ledger):
         fails.append("no on-request fact is linked to a FAIL_TO_PASS test; interaction would not be load-bearing")
+    fails += ungrounded_requirements(spec)
     withheld = next((b for b in spec.briefs if b.profile == "withheld"), None)
     if withheld is not None:
         targets = {o.target for o in spec.operations if o.type == OperationType.WITHHOLDING}
