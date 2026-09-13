@@ -126,6 +126,7 @@ GITHUB = "swesim/sources/github_repo.py"
 RUBRIC = "swesim/audit/rubric.py"
 LLM_AUDIT = "swesim/audit/llm_audit.py"
 WORKFLOWS = "swesim/workflows/workflows.py"
+ACTIVITIES = "swesim/workflows/activities.py"
 CLOUDRUN = "swesim/workflows/launchers/cloudrun.py"
 LAYOUT = "swesim/storage/layout.py"
 GRADIENT = "swesim/dashboard/gradient.py"
@@ -182,7 +183,11 @@ SECTION_1 = Section("measures", "What swesim measures", (
          ARMS,
          (Decision("Hidden and interactive share the selected brief profile; full uses natural plus stakeholder-visible facts.",
                    "Only one thing may differ between the arms being compared, or the gap measures the brief rather than the asking.",
-                   "A treatment effect that is really a brief-wording effect."),)),
+                   "A treatment effect that is really a brief-wording effect."),
+          Decision("Brief profiles are never pooled: a leaderboard row is model × brief profile × cohort. Hosted runs use the withheld profile by default; "
+                   "rows labelled natural ran hidden and interactive on the original issue (the laptop/VM demonstration trials and the stage default).",
+                   "Natural measures what the reporter left out; withheld measures what swesim removed. One cell holding both would measure neither.",
+                   "Two thinner rows per model instead of one.", "2026-09-13", S(RUN, "RunConfig.brief_profile; the profile fallback in the task renderer")),)),
     Card("What one trial is",
          "A trial is one attempt of one model on one condition of one frozen spec. Its id binds the spec hash, the condition, the effective run-configuration "
          "hash (purpose, actual model, compiled build, brief profile, scaffold identity) and the attempt index, and the frozen spec and configuration are saved "
@@ -380,7 +385,12 @@ SECTION_3 = Section("creation", "Creating a task from a repository URL", (
                    "Fewer tasks by morning than mining a curated pool would give.", "2026-09-13 08:20 UTC", S(BRIEF, "§1 Primary objective")),
           Decision("Diff size and thread size are discovery filters, never measured difficulty.",
                    "Line counts select for a kind of change; whether a task is hard is measured later, per model, as the capability gradient across real solvers.",
-                   "Some hard small fixes are never listed; the band is tuned from the reject histogram.", "2026-09-13", S(CLAUDE_MD, "Diff size is a filter")))),
+                   "Some hard small fixes are never listed; the band is tuned from the reject histogram.", "2026-09-13", S(CLAUDE_MD, "Diff size is a filter")),
+          Decision("A scan lists the newest 400 closed pull requests unless --max-prs deepens it, decides them ten at a time between GitHub quota checks, "
+                   "and heartbeats once per stage call and after every batch.",
+                   "Batches of quick rejections finish in seconds: without a per-call heartbeat three scans in a row timed out at 180 s on a healthy worker "
+                   "(2026-09-13), and a far --since means nothing against a 400-PR listing.",
+                   "Twenty list calls for a 2,000-PR window and one extra heartbeat per batch.", "2026-09-13", S(ACTIVITIES, "blocking(), run_discovery()")))),
     Card("From candidate to registered scenario",
          "Each retained PR runs one CandidateWorkflow: the judge decides whether a real question is hidden in it (§7), the probe measures the test contract on "
          "Modal, the drafter writes the lossy spec (§4) with one correction round, eight gates approve or reject it, the compiler renders the three conditions, "
@@ -391,7 +401,11 @@ SECTION_3 = Section("creation", "Creating a task from a repository URL", (
          PIPELINE,
          (Decision("Discovery and probing are separate activities; every control validation is its own activity.",
                    "One infrastructure failure then retries one control (minutes) instead of the whole 10–25 minute batch, and the console shows per-control progress.",
-                   "More, smaller Temporal activities to version.", "2026-09-13", S(BRIEF, "§2.8 item 3")),)),
+                   "More, smaller Temporal activities to version.", "2026-09-13", S(BRIEF, "§2.8 item 3")),
+          Decision("Draft checks that the judged row it read carries the probe's measured_at and retries a stale bucket read instead of refusing the row.",
+                   "Pools share the bucket through separate mounts whose metadata caches can serve the previous object generation for up to a minute; "
+                   "sklearn-13584 v3 was refused 16 s after its own re-probe (2026-09-13).",
+                   "Up to a minute of retries on a rebuild.", "2026-09-13", S(ACTIVITIES, "judged_row_stale")),)),
     Card("Probe: the contract is measured, not copied",
          "Before drafting, the candidate's environment is built at the base commit and the PR's tests are run before and after the gold patch, on Modal, as the "
          "grading identity tester, collecting exact test ids in definition order. FAIL_TO_PASS is what the fix makes pass; PASS_TO_PASS is what must keep passing. "
@@ -797,7 +811,13 @@ SECTION_8 = Section("difficulty", "Difficulty screen and task-sense audit", (
          "stored in audit.json per scenario and per trial, projected into the index, and gate the leaderboard through coherent and fair_tests.",
          (S(RUBRIC, "RUBRIC, RUBRIC_VERSION"), S(LLM_AUDIT, "module docstring"), S(INTERFACES, "§9.1 audit.json")),
          Console("/scenario/<id>", "the 'Task sense' block with the three scenario labels; per-reply labels appear on the episode page for evaluators", "/scenarios"),
-         TASK_SENSE),
+         TASK_SENSE,
+         (Decision("A fact is outside the contract when it names a PASS_TO_PASS-only parametrisation or identifier (facts_within_contract, gate fact-scope); "
+                   "a one-word marker must be named exactly, multi-word markers may be prefix-matched.",
+                   "pytest-7283's f05 over-generalised beyond the FAIL_TO_PASS tests and the reading audit had missed it; the mechanical rule catches it, but the "
+                   "prefix rule alone read the plain word 'warning' as the parametrisation warning_msgs0 and rejected pypdf-3826 v3 twice (2026-09-13).",
+                   "A fact naming one PASS_TO_PASS-only word with a suffix reaches the reading pass instead of the gate.", "2026-09-13",
+                   S(RUBRIC, "fact_scope_mechanical, facts_within_contract")),)),
     Card("What the audit found on the preserved record",
          "On the three registered version-2 scenarios: seaborn is coherent with fair tests; sklearn's withholding removed its only error description, so it is "
          "labelled not plausible; pypdf's hidden test calls an oracle-introduced private helper and pins an exact warning string, so its tests are unfair and it "
@@ -860,7 +880,15 @@ SECTION_9 = Section("frontier", "Frontier admission gate", (
                    "A smaller leaderboard by the deadline.", "2026-09-13", S(BRIEF, "§1 Spend; §1 Evaluated agents")),
           Decision("The frontier gate stays, but the operator can proceed past a refusal with a recorded reason.",
                    "Difficulty is model-dependent, so a count of informative screens cannot decide when frontier models run; the operator decides and the record says who and why.",
-                   "A frontier run, at frontier prices, on a task the cheap tiers had not proven.", "2026-09-13 14:50 PDT", LEDGER))),
+                   "A frontier run, at frontier prices, on a task the cheap tiers had not proven.", "2026-09-13 14:50 PDT", LEDGER),
+          Decision("Evaluated set: the Tier A–C comparison (deepseek-v3.2, gpt-5-mini, glm-5.3, deepseek-v4.1-flash) plus a top tier of gpt-5.6-sol, "
+                   "deepseek-v4-pro, claude-opus-5 and claude-sonnet-5 under the recorded override; claude-fable-5-1 and gpt-6-astra are not evaluated.",
+                   "Operator directive: Opus 5 or cheaper. The gradient needs a top that last-generation models cannot reach, not the newest frontier.",
+                   "The top of the gradient is Opus-class.", "2026-09-13 14:45 PDT", LEDGER),
+          Decision("A solver the probe cannot reach is never substituted: while the Anthropic workspace usage limit is reached (2026-09-13 21:42Z) the "
+                   "Anthropic pair waits and the top tier runs on gpt-5.6-sol and deepseek-v4-pro.",
+                   "A substituted solver would be attributed to the wrong model; pipeline roles fall back along their chains, solvers never do.",
+                   "Fewer top-tier cells until the limit is raised.", "2026-09-13", S(OPS, "After the 3d3c432 deploy")))),
 ))
 
 # ----------------------------------------------------------------------------- 10. decisions log
@@ -947,6 +975,14 @@ DECISIONS: tuple[Decision, ...] = (
     Decision("Task creation and graded runs go through Temporal only; stage commands refuse to run without SWESIM_DIRECT=1.",
              "One durable path with retries, receipts and search attributes; direct stage runs leave no workflow history.",
              "Debugging a single stage takes an explicit opt-in.", "2026-09-13", S(CLAUDE_MD, "Execution rule (user directive, 2026-09-13)")),
+    Decision("Evaluated set: Tier A–C comparison plus gpt-5.6-sol, deepseek-v4-pro, claude-opus-5, claude-sonnet-5; no claude-fable-5-1, no gpt-6-astra.",
+             "Operator directive: Opus 5 or cheaper.", "The top of the gradient is Opus-class.", "2026-09-13 14:45 PDT", LEDGER),
+    Decision("Solvers are never substituted; pipeline roles fall back along their chains.",
+             "Attribution: a trial's model must be the model that ran.", "Cells wait when a provider limit is reached (Anthropic, 2026-09-13 21:42Z).", "2026-09-13", LEDGER),
+    Decision("Brief profiles are separate leaderboard rows; hosted runs default to withheld.",
+             "Natural and withheld measure different losses.", "Thinner rows.", "2026-09-13", S(RUN, "RunConfig.brief_profile")),
+    Decision("Fact-scope: a one-word PASS_TO_PASS-only marker must be named exactly.",
+             "The prefix rule rejected pypdf-3826 v3 on the plain word 'warning'.", "A suffixed one-word marker reaches the reading pass.", "2026-09-13", S(RUBRIC, "fact_scope_mechanical")),
 )
 
 SECTION_10 = Section("decisions", "Decisions log", (
