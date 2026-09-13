@@ -189,13 +189,28 @@ record status.
 
 ## Model probe and fallbacks
 
-`PipelineWorkflow` first runs `probe_models_activity`: one tiny `chat_json` request per configured model id (judge, draft,
-solver list, optional stakeholder). Results and substitutions are written to `workspace/evidence/model-probe.json`.
+`PipelineWorkflow` first runs `probe_models_activity`: one tiny `chat_json` request per model id (configured judge, draft
+and stakeholder ids, each fallback that has to be tried, and every solver id). The record
+`workspace/evidence/model-probe.json` holds `models` (per-id result), `configured`, `resolved`, `substitutions`, `notes`
+(the reasoning for every fallback and collision step), `needs_human`, `solver_unavailable` and the `chains`.
 
-Rules (CLAUDE.md, unattended-run rules): if the judge or draft model is unavailable, substitute
-`anthropic/claude-sonnet-5` (the stakeholder model likewise); the solver is **never** substituted silently. A solver that
-fails the probe is listed under `needs_human` in the probe evidence and in the `progress` query, and this section records it.
-The judge stage records the model actually used in `difficulty.judged.model_id`.
+Rules (CLAUDE.md, unattended-run rules), configured id first, then the chain in order:
+
+| role | chain |
+|---|---|
+| judge | `openai/gpt-5.5` -> `anthropic/claude-opus-5` -> `anthropic/claude-sonnet-5` |
+| draft | `anthropic/claude-sonnet-5` -> `anthropic/claude-haiku-4-5-20251001` |
+| stakeholder | `openai/gpt-5.5` -> `anthropic/claude-sonnet-5` -> `anthropic/claude-haiku-4-5-20251001` |
+| solver | never substituted; an unavailable solver is `needs_human` and the scenario ends `complete-no-trials` |
+
+Judge and draft must resolve to different ids (`draft_spec.draft` refuses identical judge/draft models so their errors stay
+uncorrelated): on a collision the draft chain advances, or the judge chain when the draft chain is exhausted, and the step
+is written to `notes`; if no distinct model is available the run records `needs_human`. The resolved ids are passed to every
+later activity: `judge_activity` and `draft_activity` use them, and `plan_trials` sets `RunConfig.stakeholder.model_id` to the
+resolved stakeholder model for every trial, so the stakeholder model is part of each `run_config_hash` and trial id. The judge
+stage records the model actually used in `difficulty.judged.model_id`. `swesim matrix` plans trials outside the pipeline;
+pass the resolved stakeholder id there as `stakeholder_model` (read it from `model-probe.json`), otherwise trials use the
+`RunConfig` default `openai/gpt-5.5`.
 
 Recorded probes and substitutions **[placeholder]**:
 
