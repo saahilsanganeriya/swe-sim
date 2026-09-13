@@ -2,91 +2,95 @@
   "scenarios": {
     "mwaskom--seaborn-3190": {
       "calibration_runs": [],
-      "comparison_runs": [],
-      "compiled_hash": "cfa48d128c0f11c80557e151867823bb7c7cc4453081050adf623aadbbabbfec",
+      "comparison_runs": [
+        "793e78e04f034d4ab7a18bf8",
+        "7bf266dad4d21661d25d647b",
+        "c1846a15feb5afc61bfdc76e",
+        "dc88e7322955749303867fee",
+        "eb1364353c43400a2d8a4f53",
+        "f9435904e9de18475cbd980e"
+      ],
+      "compiled_hash": "e208a80f2029f5bf0e775b1f7be46b1e2792dac7ceb1958bd115a31fe25fe800",
       "conditions": [
         "full",
         "hidden",
         "interactive"
       ],
-      "demonstration_runs": [
-        "24ce7fb7bef1fa33f394493f",
-        "2ef141969ebfa9d1de615921",
-        "3ea85d94b07e93301dfe1b8f",
-        "51d1c5ea09dc49e8234cafc4",
-        "6e22b0ad258bbf31737c9cea",
-        "78874ff17a9dcd379ac1c9a8",
-        "78cb5149f1db50ccc79f9448",
-        "8a2f1f59590121137e879dc0",
-        "c39a73b6cfdffdc66581af1a",
-        "e49349d80b190bf73f14a66f",
-        "e54052254969566b15d6cb1b",
-        "ebdad6f745322a682430982d",
-        "f88eb6db86d53d343eb54eb1"
-      ],
+      "demonstration_runs": [],
       "id": "mwaskom--seaborn-3190",
       "image_digest": "sha256:5ce876a52439385a2638f21617febf25a333c24b0db555cb9e37230b4db2cdcc",
       "source": "swebench-annotated",
       "source_ref": "mwaskom__seaborn-3190",
-      "spec_hash": "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b",
-      "unresolved_runs": [],
-      "validation_path": "/path/to/swesim/workspace/scenarios/mwaskom--seaborn-3190/validation.json",
+      "spec_hash": "812be6e0d3b85220f5ea188160ed5163f9338a3176ee490e53b1d38ff31bf617",
+      "unresolved_runs": [
+        "2a121c8eea598e79fabfc37b",
+        "2c109020fa1fba08e3fe48d8",
+        "6f9ec6d71ecf59985eb8e0a0",
+        "d7ed86126634ff98b74efc9f"
+      ],
+      "validation_path": "/opt/swesim/workspace/scenarios/mwaskom--seaborn-3190/validation.json",
       "validation_status": "valid",
-      "version": 1
+      "version": 2
     },
     "py-pdf--pypdf-3826": {
       "calibration_runs": [],
-      "comparison_runs": [],
-      "compiled_hash": "481ef769602d99988f2416c66e56605768fe2d98417fdfa5e1fc66dced1ce377",
+      "comparison_runs": [
+        "4baf6881dcf13db83e2d24a0",
+        "54faf623a02a6d455e44edae",
+        "c02e868380e50cf85e90994a",
+        "cc070caf14d42bffe8526d9c",
+        "cfb9656a58e8307cdefc92b8",
+        "ef524f4428fe4cfdf19e0c5f"
+      ],
+      "compiled_hash": "2e79624458107f55eae3c0b09412fc4e3367ab8bbbf57c42e001574f935cd91d",
       "conditions": [
         "full",
         "hidden",
         "interactive"
       ],
-      "demonstration_runs": [
-        "099f22b85dc9d816c0b4edb2",
-        "40b876987611e0ef14e27f2c",
-        "4509bfaea9a0e1faa03e86fd",
-        "503aedbf0f67e54bd1b5351d",
-        "539d345673978b14ddd63576",
-        "99686ceb3c9a14b688b46e4e",
-        "d26b51a7886af665086de8d8",
-        "e6e6c1ee281e8c84f7493a8b"
-      ],
+      "demonstration_runs": [],
       "id": "py-pdf--pypdf-3826",
       "image_digest": "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
       "source": "github-repo",
       "source_ref": "py-pdf__pypdf-3826",
-      "spec_hash": "b2cb44ef6e94825009c2668f4fa1c3c136d1deb882eb8615d644474cec64db2e",
+      "spec_hash": "89338bfebc1a3614bfef98df7f161da7b5bbf0bfd330a538de99bfc035cfe00b",
       "unresolved_runs": [],
-      "validation_path": "/path/to/swesim/workspace/scenarios/py-pdf--pypdf-3826/validation.json",
+      "validation_path": "/opt/swesim/workspace/scenarios/py-pdf--pypdf-3826/validation.json",
       "validation_status": "valid",
-      "version": 1
+      "version": 2
     },
     "scikit-learn--scikit-learn-13584": {
       "calibration_runs": [],
-      "comparison_runs": [],
-      "compiled_hash": "f29995a7ecd1d33dfe1edb520acb4ae1de4294ac92129c06aa7618053eb2d48e",
+      "comparison_runs": [
+        "350216f801d3ef1d477cf2be",
+        "3ff99666b423f289e7df190b",
+        "444c038d93231dd4567cd97b",
+        "4b4e9af1677bf7a6c297a7d1",
+        "689a9433aefa9bc77622f0b4",
+        "eb32558259a58fa7688b6211",
+        "f3e43d74ac8f073e17acda49"
+      ],
+      "compiled_hash": "060e1c1bc042ae73d3fabf9b47c099c1e5c616ac678383f3c6c8c2724d975daa",
       "conditions": [
         "full",
         "hidden",
         "interactive"
       ],
-      "demonstration_runs": [
-        "2f1ba38b81c2152be53d81a9",
-        "808e811792d13e9bf1e3f1d7",
-        "a9e28ce228cf5b8273491d1f",
-        "b64c78461afbb4be6e0ff283"
-      ],
+      "demonstration_runs": [],
       "id": "scikit-learn--scikit-learn-13584",
       "image_digest": "sha256:5ca83e8c588bfede26f650da0d725c7093d3e57105586522f9d2829e30117b8c",
       "source": "swebench-annotated",
       "source_ref": "scikit-learn__scikit-learn-13584",
-      "spec_hash": "1484d969c3d57b25eb9fbe91ed987f11114447cbef1f5c727e04d3bdf2f44b2f",
-      "unresolved_runs": [],
-      "validation_path": "/path/to/swesim/workspace/scenarios/scikit-learn--scikit-learn-13584/validation.json",
+      "spec_hash": "4e3ecb62484bd5ad06cdadd82d3e908c493e168f3c35ab937c7befaafdfd9f92",
+      "unresolved_runs": [
+        "3dd42dcf3c715d04c20fa103",
+        "9c7baca657f43e3cf31051b2",
+        "cff0cc9510db5c67b99b8eec",
+        "e846fecaee201e218d2b9752"
+      ],
+      "validation_path": "/opt/swesim/workspace/scenarios/scikit-learn--scikit-learn-13584/validation.json",
       "validation_status": "valid",
-      "version": 1
+      "version": 2
     }
   }
 }
