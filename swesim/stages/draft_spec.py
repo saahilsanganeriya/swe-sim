@@ -792,11 +792,55 @@ def build_control_diff(ctrl: dict, base_files: dict[str, str | None]) -> tuple[s
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 _INVERSIONS = ((" == ", " != "), (" != ", " == "), (" is not ", " is "), (" not in ", " in "), (" >= ", " < "), (" <= ", " > "),
                ("True", "False"), ("False", "True"))
+_WORD_INVERSIONS = {"True", "False"}
+_HEADER_STARTS = ("def ", "async def ", "class ", "@", "if ", "elif ", "else", "try", "except", "finally", "with ", "for ", "while ", "match ", "case ")
+_PREFERRED_INVERSION_STARTS = ("if ", "elif ", "while ", "return ", "assert ", "raise ")
 
 
-def _is_code_line(text: str) -> bool:
-    s = text.strip()
-    return bool(s) and not s.startswith("#") and s not in ('"""', "'''")
+def _code_mask(text: str, state: dict) -> list[bool]:
+    """True at the positions of `text` that are code: outside string literals (single-, double- and triple-quoted; a triple
+    quote left open carries across lines in `state["quote"]`, so docstring continuation lines are not code) and before an
+    inline `#` comment."""
+    mask = [False] * len(text)
+    quote = state.get("quote")
+    i, n = 0, len(text)
+    while i < n:
+        if quote:
+            if text[i] == "\\":
+                i += 2
+                continue
+            if text.startswith(quote, i):
+                i += len(quote)
+                quote = None
+                continue
+            i += 1
+            continue
+        if text[i] == "#":
+            break
+        for q in ('"""', "'''", '"', "'"):
+            if text.startswith(q, i):
+                quote = q
+                i += len(q)
+                break
+        else:
+            mask[i] = True
+            i += 1
+    state["quote"] = quote if quote and len(quote) == 3 else None  # a single-quoted string cannot span lines
+    return mask
+
+
+def _code_of(text: str, mask: list[bool]) -> str:
+    return "".join(ch for ch, m in zip(text, mask) if m).strip()
+
+
+def _invert_once(text: str, mask: list[bool]) -> str | None:
+    """`text` with the first comparison/boolean that sits entirely at code positions inverted; None when there is none."""
+    for old, new in _INVERSIONS:
+        pattern = rf"\b{old}\b" if old in _WORD_INVERSIONS else re.escape(old)
+        for m in re.finditer(pattern, text):
+            if all(mask[m.start():m.end()]):
+                return text[:m.start()] + new + text[m.end():]
+    return None
 
 
 def _split_hunks(chunk: str) -> tuple[str, list[list[str]]]:
@@ -811,50 +855,75 @@ def _split_hunks(chunk: str) -> tuple[str, list[list[str]]]:
     return "".join(head), hunks
 
 
+def _new_side_lines(hunk: list[str]):
+    """(index, line, code) for the new-side lines of a hunk (context and added), with the string/comment state carried across
+    lines so `code` is only what is code on that line."""
+    state = {"quote": None}
+    for li, line in enumerate(hunk[1:], start=1):
+        if line.startswith(("-", "\\")):
+            continue
+        text = line[1:]
+        mask = _code_mask(text, state)
+        yield li, line, _code_of(text, mask), mask
+
+
+def _shift_new_starts(hunks: list[list[str]], delta: int) -> list[list[str]]:
+    out = []
+    for h in hunks:
+        h = list(h)
+        hm = _HUNK.match(h[0].rstrip("\n"))
+        if hm and delta:
+            ha, hb, hc, hd, ht = hm.groups()
+            h[0] = f"@@ -{ha},{hb if hb is not None else 1} +{int(hc) + delta},{hd if hd is not None else 1} @@{ht}\n"
+        out.append(h)
+    return out
+
+
 def _incorrect_variants(head: str, hunks: list[list[str]]):
-    """Real incorrect changes derived from one code chunk of the gold patch: first, one added code line with a comparison or
-    boolean inverted (counts unchanged); then, one added code line dropped (hunk recounted, an emptied hunk removed and later
-    new-side starts shifted). Yields (method, diff)."""
+    """Real incorrect changes derived from one code chunk of the gold patch. First, one added line with a comparison or boolean
+    inverted at a code position (never inside a string, docstring or comment), preferring `if`/`elif`/`while`/`return`/
+    `assert`/`raise` statements; then, one added non-header statement line dropped (hunk recounted, an emptied hunk removed,
+    later new-side starts shifted either way). Yields (method, diff)."""
+    inversions = []
     for hi, hunk in enumerate(hunks):
-        for li, line in enumerate(hunk[1:], start=1):
-            if not (line.startswith("+") and _is_code_line(line[1:])):
+        for li, line, code, mask in _new_side_lines(hunk):
+            if not line.startswith("+") or not code:
                 continue
-            for old, new in _INVERSIONS:
-                if old in line[1:]:
-                    new_hunk = list(hunk)
-                    new_hunk[li] = "+" + line[1:].replace(old, new, 1)
-                    yield "fallback-inverted-comparison", head + "".join("".join(h) for h in [*hunks[:hi], new_hunk, *hunks[hi + 1:]])
-                    break
+            inverted = _invert_once(line[1:], mask)
+            if inverted is not None:
+                inversions.append((0 if code.startswith(_PREFERRED_INVERSION_STARTS) else 1, hi, li, inverted))
+    for _prio, hi, li, inverted in sorted(inversions):
+        new_hunk = list(hunks[hi])
+        new_hunk[li] = "+" + inverted
+        yield "fallback-inverted-comparison", head + "".join("".join(h) for h in [*hunks[:hi], new_hunk, *hunks[hi + 1:]])
     for hi, hunk in enumerate(hunks):
         m = _HUNK.match(hunk[0].rstrip("\n"))
         if not m:
             continue
         a, b, c, d, trailer = m.groups()
         b, d = int(b) if b is not None else 1, int(d) if d is not None else 1
-        for li, line in enumerate(hunk[1:], start=1):
-            if not (line.startswith("+") and _is_code_line(line[1:])) or (li + 1 < len(hunk) and hunk[li + 1].startswith("\\")):
+        for li, line, code, _mask in _new_side_lines(hunk):
+            if not line.startswith("+") or not code or code.startswith(_HEADER_STARTS) or code.endswith(":"):
+                continue
+            if li + 1 < len(hunk) and hunk[li + 1].startswith("\\"):
                 continue
             body = hunk[1:li] + hunk[li + 1:]
             still_changes = any(x[:1] in "+-" for x in body if not x.startswith("\\"))
             new_hunk = [f"@@ -{a},{b} +{c},{d - 1} @@{trailer}\n", *body]
-            rest = [list(h) for h in hunks[hi + 1:]]
-            if not still_changes:  # the hunk became pure context: remove it and shift the new-side starts that followed it
-                for h in rest:
-                    hm = _HUNK.match(h[0].rstrip("\n"))
-                    if hm:
-                        ha, hb, hc, hd, ht = hm.groups()
-                        h[0] = f"@@ -{ha},{hb if hb is not None else 1} +{int(hc) - (d - b)},{hd if hd is not None else 1} @@{ht}\n"
-            new_hunks = [*hunks[:hi], *([new_hunk] if still_changes else []), *rest]
+            delta = -1 if still_changes else -(d - b)  # later hunks lose one line, or the whole removed hunk's net lines
+            new_hunks = [*hunks[:hi], *([new_hunk] if still_changes else []), *_shift_new_starts(hunks[hi + 1:], delta)]
             if new_hunks:
                 yield "fallback-dropped-line", head + "".join("".join(h) for h in new_hunks)
             break
 
 
-def fallback_plausible_wrong(gold_patch: str, base_files: dict[str, str | None]) -> tuple[str, str] | None:
+def fallback_plausible_wrong(gold_patch: str, base_files: dict[str, str | None]) -> tuple[str, str, bool | None] | None:
     """Code-generated stand-in when the model's plausible-wrong patch is unusable after the correction round (ScenarioSpec
     requires one plausible-wrong control). It must be a real incorrect change: from the first CODE chunk of the gold patch
-    (`is_code_path`; changelogs, docs and non-code paths skipped) invert one added comparison/boolean, else drop one added code
-    line. None when no such change exists — the draft then fails rather than carrying a meaningless control."""
+    (`is_code_path`; changelogs, docs and non-code paths skipped) invert one added comparison/boolean at a code position, else
+    drop one added statement line. Returns (diff, method, verified) — `verified` is the actual `git apply --check` result
+    (None when it could not run) — or None when no such change exists, in which case the draft fails rather than carrying a
+    meaningless control."""
     for chunk in (c for c in re.split(r"(?=^diff --git )", gold_patch or "", flags=re.M) if c.strip()):
         m = re.match(r"diff --git a/(\S+)", chunk)
         if not m or not is_code_path(m.group(1)):
@@ -863,7 +932,7 @@ def fallback_plausible_wrong(gold_patch: str, base_files: dict[str, str | None])
         for method, diff in _incorrect_variants(head, hunks):
             ok, _ = verify_diff_applies(base_files, diff)
             if ok is not False:
-                return diff, method
+                return diff, method, ok
     return None
 
 
@@ -1055,9 +1124,9 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
             if fb is None:  # never write a meaningless control; re-draft or take the next candidate
                 raise ValueError("no usable plausible-wrong control: the model's patch was unusable after the correction round and the gold "
                                  "patch has no code change a fallback can make incorrect")
-            diff, method = fb
+            diff, method, verified = fb
             pw_rec, pw_bytes = {"label": method, "rationale": "code fallback: the model's plausible-wrong patch was unusable after the correction round",
-                                "method": method, "verified": True}, diff.encode()
+                                "method": method, "verified": verified}, diff.encode()
             control_notes["controls_fallback"] = {"plausible_wrong": method}
         alt_rec, alt_bytes = control_asset(d, "alternative_correct", lenient)
         if alt_rec is None and judged.get("structural_tests"):
