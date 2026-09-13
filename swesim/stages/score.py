@@ -26,6 +26,9 @@ VALID = {1, 2, 3, 4}  # agent-attributable results: in the pass@k denominator; o
 AGENT_FAILURE = {3, 4}  # subset of VALID, reported separately as n_agent_failures
 INFRA = {5, 6, 7}  # excluded from n; counted in outcomes / n_infra_failures
 PURPOSES = ("calibration", "comparison", "demonstration")
+# Files that make a record-less trial directory an "unresolved attempt" instead of nothing at all.
+UNRESOLVED_FILES = ("status.json", "runner-error.json", "request.json", "launch.json")
+UNKNOWN_GROUP = "unknown-config"
 # RunConfig fields a record may carry flat (TrialRecord dataclass) or nested under ``run_config``.
 _LINEAGE_FIELDS = ("model", "purpose", "brief_profile", "compiled_hash")
 
@@ -118,15 +121,133 @@ def normalize_record(rec: dict, trial_dir: Path | None = None) -> dict:
     return out
 
 
-def load_trial_records(ws: Workspace, scenario_id: str | None = None) -> list[dict]:
-    """All finished trial records under ``workspace/trials`` (normalized), optionally for one scenario."""
-    recs = []
-    for rec_path in sorted((ws.root / "trials").glob("*/record.json")):
-        raw = _read_json(rec_path)
-        if not isinstance(raw, dict):
-            continue
-        rec = normalize_record(raw, rec_path.parent)
-        if scenario_id is not None and rec.get("scenario_id") != scenario_id:
+def _run_config_hash_of(rc: dict) -> str | None:
+    with contextlib.suppress(Exception):
+        from swesim.models import RunConfig
+        return RunConfig.model_validate(rc).run_config_hash
+    return None
+
+
+def _task_metadata(trial_dir: Path) -> dict:
+    """``[metadata]`` of the materialized ``task/task.toml`` (the run stage writes run_config_hash, compiled_hash,
+    condition and brief_profile there before launching; it survives when the run dies before record.json)."""
+    path = trial_dir / "task" / "task.toml"
+    if not path.exists():
+        return {}
+    with contextlib.suppress(Exception):
+        import tomllib
+        meta = tomllib.loads(path.read_text()).get("metadata") or {}
+        return meta if isinstance(meta, dict) else {}
+    return {}
+
+
+def _run_config_for(trial_dir: Path) -> tuple[dict, str | None, str | None]:
+    """(run_config, run_config_hash, source) for an attempt without a record: ``run_config.json`` when present,
+    else ``request.json``'s ``run_config`` (Temporal launches), else the task.toml metadata (hash + condition)."""
+    rc = _read_json(trial_dir / "run_config.json")
+    if isinstance(rc, dict) and rc:
+        return rc, _run_config_hash_of(rc), "run_config.json"
+    req = _read_json(trial_dir / "request.json")
+    if isinstance(req, dict) and isinstance(req.get("run_config"), dict) and req["run_config"]:
+        return req["run_config"], req.get("run_config_hash") or _run_config_hash_of(req["run_config"]), "request.json"
+    meta = _task_metadata(trial_dir)
+    if meta.get("run_config_hash"):
+        return ({k: meta[k] for k in ("condition", "brief_profile", "compiled_hash") if meta.get(k)},
+                str(meta["run_config_hash"]), "task/task.toml")
+    return {}, None, None
+
+
+def unresolved_attempt(trial_dir: Path) -> dict | None:
+    """Describe an attempt directory that has no usable ``record.json`` from whatever files exist, so it cannot
+    vanish from the score tables. None when none of ``UNRESOLVED_FILES`` (or an unreadable record.json) is present.
+
+    ``status`` is taken from runner-error.json (Temporal runner crash), else status.json (``error`` on the run
+    stage's unknown-exception path, ``running`` for a launch whose unit vanished), else launch.json, else
+    ``requested`` (request.json only)."""
+    present = [n for n in UNRESOLVED_FILES if (trial_dir / n).exists()]
+    record_path = trial_dir / "record.json"
+    unreadable_record = record_path.exists() and not isinstance(_read_json(record_path), dict)
+    if not present and not unreadable_record:
+        return None
+    status_file = _read_json(trial_dir / "status.json") or {}
+    runner_error = _read_json(trial_dir / "runner-error.json") or {}
+    request = _read_json(trial_dir / "request.json") or {}
+    launch = _read_json(trial_dir / "launch.json") or {}
+    if unreadable_record:
+        status, error_type, source = "unreadable-record", "unreadable-record", "record.json"
+    elif runner_error:
+        status, error_type, source = "runner-error", runner_error.get("type") or "runner-error", "runner-error.json"
+    elif status_file.get("status"):
+        status, error_type, source = str(status_file["status"]), status_file.get("error"), "status.json"
+    elif launch.get("phase") == "failed":
+        status, error_type, source = "launch-failed", "launch-failed", "launch.json"
+    elif launch:
+        status, error_type, source = f"launch-{launch.get('phase') or 'unknown'}", None, "launch.json"
+    else:
+        status, error_type, source = "requested", None, "request.json"
+    rc, rch, rc_source = _run_config_for(trial_dir)
+    spec_json = _read_json(trial_dir / "spec.json") or {}
+    meta = _task_metadata(trial_dir)
+    return {
+        "trial_id": trial_dir.name, "unresolved": True, "status": status, "error_type": error_type,
+        "source_file": source, "source_files": present + (["record.json"] if unreadable_record else []),
+        "started_at": status_file.get("started_at"), "finished_at": status_file.get("finished_at"),
+        "scenario_id": request.get("scenario_id") or spec_json.get("id"), "spec_hash": request.get("spec_hash"),
+        "condition": rc.get("condition") or request.get("condition") or meta.get("condition"),
+        "brief_profile": rc.get("brief_profile") or meta.get("brief_profile"),
+        "model": rc.get("model") or request.get("model"), "purpose": rc.get("purpose"),
+        "compiled_hash": rc.get("compiled_hash") or meta.get("compiled_hash"),
+        "run_config": rc or None, "run_config_hash": rch, "run_config_source": rc_source,
+        "attempt_index": request.get("attempt_index"),
+        "reward": {}, "report": {}, "transcript": {}, "label": _read_json(trial_dir / "label.json"),
+    }
+
+
+def _belongs(rec: dict, ws: Workspace, scenario_id: str, cache: dict) -> bool:
+    """Scenario attribution: record/request/spec id first; for unresolved attempts without an id, the compiled hash
+    of the scenario's build or its spec hash."""
+    if rec.get("scenario_id") is not None:
+        return rec["scenario_id"] == scenario_id
+    if not rec.get("unresolved"):
+        return False
+    if "compiled_hash" not in cache:
+        sdir = ws.scenario_dir(scenario_id)
+        cache["compiled_hash"] = (_read_json(sdir / "compile.json") or {}).get("compiled_hash")
+        cache["spec_hash"] = None
+        spec_json = _read_json(sdir / "scenario.json")
+        if spec_json:
+            with contextlib.suppress(Exception):
+                from swesim.models import ScenarioSpec
+                cache["spec_hash"] = ScenarioSpec.model_validate(spec_json).spec_hash
+    return bool((rec.get("compiled_hash") and rec["compiled_hash"] == cache["compiled_hash"])
+                or (rec.get("spec_hash") and rec["spec_hash"] == cache["spec_hash"]))
+
+
+def load_trial_records(ws: Workspace, scenario_id: str | None = None, include_unresolved: bool = True) -> list[dict]:
+    """Every attempt under ``workspace/trials`` (normalized), optionally for one scenario.
+
+    Finished attempts come from ``record.json``. Attempts that ended without one (run stage unknown-exception path:
+    ``status.json`` with ``status: error``; Temporal runner: ``runner-error.json``; a launch that left ``status.json``
+    at ``running`` or only ``request.json`` / ``launch.json``) are yielded as unresolved entries (``unresolved: True``)
+    so they never vanish. An unresolved attempt is attributed to a scenario by its request/spec id, else by the
+    scenario's compiled hash or spec hash; unattributable ones appear only in the unfiltered listing.
+    """
+    recs: list[dict] = []
+    trials = ws.root / "trials"
+    if not trials.is_dir():
+        return recs
+    cache: dict = {}
+    for d in sorted(p for p in trials.iterdir() if p.is_dir()):
+        raw = _read_json(d / "record.json") if (d / "record.json").exists() else None
+        if isinstance(raw, dict) and raw:
+            rec = normalize_record(raw, d)
+        else:
+            if not include_unresolved:
+                continue
+            rec = unresolved_attempt(d)
+            if rec is None:
+                continue
+        if scenario_id is not None and not _belongs(rec, ws, scenario_id, cache):
             continue
         recs.append(rec)
     return recs
@@ -142,10 +263,19 @@ def _single(values: set, what: str, key: str):
     return next(iter(values)) if values else None
 
 
+def _attempt_order(r: dict):
+    return (r.get("attempt_index") if isinstance(r.get("attempt_index"), int) else 1 << 30, str(r.get("trial_id") or ""))
+
+
 def summarize(records: list[dict], k: int) -> dict:
-    """Per-group metrics. Groups are ``condition|brief_profile|run_config_hash``; a group with more than one
-    model or purpose is a lineage bug and raises rather than pooling."""
+    """Per-group metrics. Groups are ``condition|brief_profile|run_config_hash``; a group with more than one model or
+    purpose is a lineage bug and raises rather than pooling.
+
+    Unresolved attempts (``unresolved: True``, no record.json) are reported per group as ``attempts_unresolved`` with a
+    per-status breakdown and a detail list; they never enter ``n``, ``success_count``, pass@k or ``mean_reward``.
+    Those without a recoverable run config fall under the ``unknown-config`` group."""
     groups: dict[str, list[dict]] = {}
+    pending: dict[str, list[dict]] = {}
     seen: set[str] = set()
     for r in records:
         tid = r.get("trial_id")
@@ -153,15 +283,19 @@ def summarize(records: list[dict], k: int) -> dict:
             if tid in seen:
                 raise ValueError(f"duplicate attempt {tid}")
             seen.add(tid)
+        if r.get("unresolved"):
+            key = group_key(r) if r.get("run_config_hash") and r.get("condition") else UNKNOWN_GROUP
+            pending.setdefault(key, []).append(r)
+            continue
         try:
             key = group_key(r)
         except KeyError as e:
             raise ValueError(f"record {tid or '<no trial_id>'} lacks {e.args[0]}") from e
         groups.setdefault(key, []).append(r)
     out: dict[str, dict] = {}
-    for key, recs in groups.items():
-        recs = sorted(recs, key=lambda r: (r.get("attempt_index") if isinstance(r.get("attempt_index"), int) else 1 << 30,
-                                           str(r.get("trial_id") or "")))
+    for key in sorted(set(groups) | set(pending)):
+        recs = sorted(groups.get(key, []), key=_attempt_order)
+        unres = sorted(pending.get(key, []), key=_attempt_order)
         codes = [outcome_code(r) for r in recs]
         valid = [r for r, code in zip(recs, codes) if code in VALID]
         n = len(valid)
@@ -170,7 +304,7 @@ def summarize(records: list[dict], k: int) -> dict:
         for code in codes:
             counts[OUTCOME_NAMES[code]] = counts.get(OUTCOME_NAMES[code], 0) + 1
         labels: dict[str, int] = {}
-        for r in recs:
+        for r in recs + unres:
             name = (r.get("label") or {}).get("label") if isinstance(r.get("label"), dict) else None
             if name:
                 labels[name] = labels.get(name, 0) + 1
@@ -179,14 +313,26 @@ def summarize(records: list[dict], k: int) -> dict:
         # pass@k (contract); disagreement is flagged per trial so a skewed success_count is never silent.
         inconsistent = [r.get("trial_id") or f"#{i}" for i, (r, code) in enumerate(zip(recs, codes))
                         if (int((r.get("reward") or {}).get("success", 0) or 0) == 1) != (code == 1)]
-        condition, profile, rch = key.split("|", 2)
+        by_status: dict[str, int] = {}
+        for r in unres:
+            by_status[str(r.get("status") or "unknown")] = by_status.get(str(r.get("status") or "unknown"), 0) + 1
+        if key == UNKNOWN_GROUP:
+            condition = profile = rch = None
+            model = purpose = None  # attempts with no recoverable run config: nothing to bind them to
+        else:
+            condition, profile, rch = key.split("|", 2)
+            model = _single({r.get("model") for r in recs + unres} - {None, ""}, "models", key)
+            purpose = _single({r.get("purpose") for r in recs + unres} - {None, ""}, "purposes", key)
         out[key] = {
-            "condition": condition, "brief_profile": profile, "run_config_hash": rch,
-            "model": _single({r.get("model") for r in recs} - {None, ""}, "models", key),
-            "purpose": _single({r.get("purpose") for r in recs} - {None, ""}, "purposes", key),
+            "condition": condition, "brief_profile": profile, "run_config_hash": rch, "model": model, "purpose": purpose,
             "requested_k": k, "configured_k": _single(cfg_k, "configured k values", key),
             "estimator": "without-replacement",
             "n": n, "n_valid": n, "n_total": len(recs),
+            "attempts_total": len(recs) + len(unres), "attempts_unresolved": len(unres),
+            "unresolved_by_status": by_status,
+            "unresolved": [{"trial_id": r.get("trial_id"), "status": r.get("status"), "error_type": r.get("error_type"),
+                            "source_file": r.get("source_file"), "started_at": r.get("started_at"),
+                            "finished_at": r.get("finished_at")} for r in unres],
             "n_agent_failures": sum(1 for code in codes if code in AGENT_FAILURE),
             "n_infra_failures": sum(1 for code in codes if code in INFRA),
             "success_count": c, "inconsistent_reward": inconsistent,
@@ -210,6 +356,8 @@ def score_scenario(ws: Workspace, scenario_id: str, k: int = 3) -> Path:
     out = ws.scenario_dir(scenario_id) / "scores.json"  # validates the id
     recs = load_trial_records(ws, scenario_id)
     for rec in recs:
+        if rec.get("unresolved"):
+            continue  # no record: reported as an unresolved attempt, never as a scored trial
         if rec.get("trial_id") and not (rec.get("spec_hash") and rec.get("run_config_hash")):
             raise ValueError(f"missing frozen lineage for trial {rec['trial_id']}")
     atomic_json(out, summarize(recs, k))

@@ -45,9 +45,12 @@ def register_scenario(ws: Workspace, spec: ScenarioSpec) -> dict:
                      "source_ref": spec.source_ref, "validation_status": "valid",
                      "validation_path": str(sdir / "validation.json"), "conditions": conditions,
                      "compiled_hash": comp.get("compiled_hash"), "image_digest": comp.get("image_digest"),
-                     "calibration_runs": [], "comparison_runs": [], "demonstration_runs": []}
+                     "calibration_runs": [], "comparison_runs": [], "demonstration_runs": [], "unresolved_runs": []}
             for r in load_trial_records(ws):
                 if r.get("spec_hash") != spec.spec_hash or not r.get("trial_id"):
+                    continue
+                if r.get("unresolved"):  # attempt without a record: listed, never counted as a run of any purpose
+                    entry["unresolved_runs"].append(r["trial_id"])
                     continue
                 purpose = r.get("purpose") if r.get("purpose") in PURPOSES else "other"
                 entry.setdefault(f"{purpose}_runs", []).append(r["trial_id"])
