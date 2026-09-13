@@ -47,6 +47,7 @@ PATCH_SCORE_K = "20260913-requested-score-k"
 PATCH_FROZEN_RETRY = "20260913-frozen-candidate-retry"
 PATCH_LIFECYCLE = "20260913-lifecycle-bookkeeping"  # operator workflows: running row before any probe/gate; failed/cancelled rows on exit
 PATCH_RECEIPTS = "20260913-candidate-receipts"      # index_candidate_event_activity at every terminal candidate decision (P1-7)
+PATCH_RESOLVED = "20260913-resolved-models"         # operator workflows: a second running row after the probe with the resolved roles
 CHILDREN_PER_RUN = 100
 HOOK_MINUTES = 2
 CONTROL_MINUTES = 60                           # one Harbor control run on Modal (validate_scenario's whole set had 180)
@@ -195,6 +196,15 @@ async def _lifecycle(p: dict, body):
         cancelled = isinstance(e, asyncio.CancelledError) or is_cancelled_exception(e)
         await asyncio.shield(index_workflow("cancelled" if cancelled else "failed", params_summary(p), None if cancelled else _err(e)))
         raise
+
+
+async def _record_resolved(p: dict, probe: dict) -> None:
+    """After `probe_models_activity` resolved the roles: a second `running` row whose summary carries `resolved_models` and
+    `substitutions`, so the console's Workflows page shows the models actually used, not the configured ids. `p` is the
+    merged params, so the role keys in the summary already name the resolved ids. Bookkeeping only (`hook`): never fails the run."""
+    if _patched(PATCH_RESOLVED):
+        await index_workflow("running", {**params_summary(p), "resolved_models": dict(probe.get("resolved") or {}),
+                                         "substitutions": dict(probe.get("substitutions") or {})})
 
 
 def _auto(p: dict) -> bool:
@@ -994,6 +1004,7 @@ async def _create_batched(self: CreateTasksWorkflow, p: dict) -> dict:
         p = {**p, **(probe.get('substitutions') or {}), **(probe.get('resolved') or {})}
         self.state['probe'] = {k: probe.get(k) or ({} if k in ('resolved', 'substitutions') else [])
                                for k in ('resolved', 'substitutions', 'notes', 'needs_human')}
+        await _record_resolved(p, probe)
         sources = []
         # Discovery is sequential per repository; children begin from a frozen, deduplicated candidate plan.
         for src in p['sources']:
@@ -1058,6 +1069,7 @@ async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
         self.state = {'stage': 'probing-models'}
         probe = await act('probe_models_activity', p, 5)
         p = {**p, **(probe.get('substitutions') or {}), **(probe.get('resolved') or {})}
+        await _record_resolved(p, probe)
         if probe.get('solver_unavailable'):
             self.state = {'stage': 'complete', 'stopped_reason': 'model-unavailable', 'probe': probe}
             await index_workflow('completed', {**params_summary(p), 'stopped_reason': 'model-unavailable'})

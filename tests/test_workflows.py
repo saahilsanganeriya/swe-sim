@@ -506,6 +506,51 @@ def test_operator_workflows_write_running_first_and_a_terminal_row_on_every_exit
     asyncio.run(scenario())
 
 
+def test_operator_workflows_record_the_resolved_models_after_the_probe(monkeypatch):
+    """The Workflows page shows the models actually used: once probe_models resolves the roles, a second `running` row carries
+    `resolved_models` and `substitutions` and its role keys name the resolved ids (behind PATCH_RESOLVED; pre-patch executions
+    replay without it)."""
+    from types import SimpleNamespace
+    async def scenario():
+        calls = []
+        probe = {"resolved": {"judge_model": "openai/gpt-5.5", "draft_model": "anthropic/claude-sonnet-5", "stakeholder_model": "openai/gpt-5.5"},
+                 "substitutions": {"judge_model": "openai/gpt-5.5"}, "notes": ["judge j unavailable"], "needs_human": [], "solver_unavailable": ["m"]}
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "probe_models_activity": return probe
+            if name == "frontier_gate_activity": return {"allowed": True, "scenario_ids": list(p.get("scenario_ids") or []), "reasons": []}
+            if name == "prepare_candidate_plan_activity": raise RuntimeError("stopped after the probe for the test")
+            return {}
+        monkeypatch.setattr(W, "act", act)
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="run-1", run_id="r1", workflow_type="RunTasksWorkflow"))
+        run_params = {"scenario_ids": ["s1"], "models": ["m"], "judge_model": "j", "stakeholder_url": "https://s"}
+        r = await W.RunTasksWorkflow().run(run_params)
+        assert r["stopped_reason"] == "model-unavailable"
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert [x["status"] for x in rows] == ["running", "running", "completed"]
+        assert "resolved_models" not in rows[0]["params_summary"] and rows[0]["params_summary"]["judge_model"] == "j"
+        assert rows[1]["params_summary"]["resolved_models"] == probe["resolved"] and rows[1]["params_summary"]["substitutions"] == probe["substitutions"]
+        assert rows[1]["params_summary"]["judge_model"] == "openai/gpt-5.5" and rows[1]["params_summary"]["models"] == ["m"]
+        names = [n for n, _ in calls]
+        assert names.index("probe_models_activity") < names.index("index_workflow_activity", names.index("probe_models_activity"))
+        # CreateTasksWorkflow: the same row after its probe, before any mining
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="create-1", run_id="r1", workflow_type="CreateTasksWorkflow"))
+        calls.clear()
+        with pytest.raises(RuntimeError, match="stopped after the probe"):
+            await W.CreateTasksWorkflow().run({"sources": [{"kind": "swebench-annotated", "pool": "A"}], "judge_model": "j", "draft_model": "d"})
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert [x["status"] for x in rows] == ["running", "running", "failed"]
+        assert rows[1]["params_summary"]["resolved_models"] == probe["resolved"] and rows[1]["params_summary"]["draft_model"] == "anthropic/claude-sonnet-5"
+        names = [n for n, _ in calls]
+        assert names.index("probe_models_activity") < names.index("index_workflow_activity", names.index("probe_models_activity")) < names.index("mine_activity")
+        # executions started before the patch replay without the extra row
+        monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_RESOLVED)
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="run-1", run_id="r1", workflow_type="RunTasksWorkflow"))
+        calls.clear(); await W.RunTasksWorkflow().run(run_params)
+        assert [p["status"] for n, p in calls if n == "index_workflow_activity"] == ["running", "completed"]
+    asyncio.run(scenario())
+
+
 def test_candidate_hooks_carry_source_key_and_scenario_and_tolerate_failure(monkeypatch):
     from types import SimpleNamespace
     async def scenario():
