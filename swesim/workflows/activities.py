@@ -229,6 +229,91 @@ async def judge_activity(p: dict) -> dict:
     return {"judged_path": str(out), "instance_ids": [r["instance_id"] for r in rows if r.get("judge", {}).get("keep")]}
 
 
+def is_leak_reason(reason) -> bool:
+    """Same rule as workflows._is_leak_reason (kept separate: the workflow module imports only temporalio)."""
+    r = str(reason).strip().lower()
+    return r.startswith("withholding") or "leak" in r or "withheld" in r
+
+
+@activity.defn
+async def list_candidates_activity(p: dict) -> dict:
+    """Candidate identifiers from a candidates.jsonl (for CreateTasksWorkflow's fan-out); ids only, no row bodies."""
+    lines = [line for line in Path(p["candidates_path"]).read_text().splitlines() if line.strip()]
+    if p.get("max_candidates"):
+        lines = lines[: int(p["max_candidates"])]
+    out = []
+    for line in lines:
+        row = json.loads(line)
+        out.append({"instance_id": row["instance_id"], "scenario_id": scenario_id_for(row["instance_id"])})
+    return {"candidates": out}
+
+
+@activity.defn
+async def judge_one_activity(p: dict) -> dict:
+    """Judge one candidate row into its own one-row `<candidates_dir>/judged/<scenario_id>.judged.jsonl`
+    (parallel-safe; retained on rerun). draft_activity reads that file unchanged."""
+    from swesim.stages.judge import judge_candidate
+
+    src = Path(p["candidates_path"]); sid = scenario_id_for(p["instance_id"])
+    out = src.parent / "judged" / f"{sid}.judged.jsonl"
+    if out.exists():
+        row = json.loads(out.read_text().splitlines()[0])
+    else:
+        row = next((json.loads(line) for line in src.read_text().splitlines() if line.strip() and json.loads(line).get("instance_id") == p["instance_id"]), None)
+        if row is None:
+            raise ApplicationError(f"candidate {p['instance_id']} not in {src}", non_retryable=True)
+        row["judge"] = await blocking(lambda: judge_candidate(row, p["judge_model"]))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(out.name + ".tmp"); tmp.write_text(json.dumps(row) + "\n"); os.replace(tmp, out)
+    judge = row.get("judge", {})
+    return {"judged_path": str(out), "instance_id": p["instance_id"], "scenario_id": sid, "keep": bool(judge.get("keep")),
+            "reasons": [] if judge.get("keep") else ["judge did not keep the candidate"], "judge_model": judge.get("model_id", p.get("judge_model"))}
+
+
+@activity.defn
+async def precheck_draft_activity(p: dict) -> dict:
+    """Hold mode: schema, asset and withholding-leak checks on scenario.draft.json; writes nothing, approves nothing."""
+    import importlib
+
+    AP = importlib.import_module("swesim.stages.approve")
+    sid = p["scenario_id"]; sdir = WS.scenario_dir(sid); draft = sdir / "scenario.draft.json"
+    if not draft.is_file():
+        return {"ok": False, "reasons": [f"missing {draft}"], "scenario_id": sid, "spec_hash": None}
+    try:
+        spec = ScenarioSpec.model_validate_json(draft.read_text())
+    except Exception as e:  # noqa: BLE001 - schema failure is a result, not an infrastructure error
+        return {"ok": False, "reasons": [f"schema: {str(e)[:300]}"], "scenario_id": sid, "spec_hash": None}
+    reasons: list[str] = []
+    check_assets = getattr(AP, "check_assets", None)
+    if check_assets is not None:
+        reasons += [str(r) for r in (await blocking(lambda: check_assets(sdir, spec)) or [])]
+    auto_gates = getattr(AP, "auto_gates", None)
+    if auto_gates is not None:
+        reasons += [str(r) for r in (await blocking(lambda: auto_gates(spec, sdir)) or []) if is_leak_reason(r)]
+    return {"ok": not reasons, "reasons": reasons, "scenario_id": spec.id, "spec_hash": spec.spec_hash}
+
+
+@activity.defn
+async def human_approve_activity(p: dict) -> dict:
+    """Hold mode approve: the signalled spec_hash must equal the draft on disk; then approve_scenario(auto=False)
+    writes scenario.json + approval.json (approved_by human-command, review_needed false). Mismatch -> non-retryable."""
+    from swesim.stages.approve import approve_scenario
+
+    sid = p["scenario_id"]; draft = WS.scenario_dir(sid) / "scenario.draft.json"
+    if not draft.is_file():
+        raise ApplicationError(f"missing {draft}", non_retryable=True)
+    spec = ScenarioSpec.model_validate_json(draft.read_text())
+    if p.get("spec_hash") != spec.spec_hash:
+        raise ApplicationError("signalled spec_hash differs from the draft on disk; refresh the review queue", non_retryable=True)
+    r = await blocking(lambda: approve_scenario(WS, sid, auto=False))
+    if not r.get("approved"):
+        raise ApplicationError("human approval refused by the schema/asset checks: " + "; ".join(map(str, r.get("reasons", []))), non_retryable=True)
+    if r.get("spec_hash") != spec.spec_hash:
+        raise ApplicationError("approval hash differs from the reviewed draft", non_retryable=True)
+    atomic_json(WS.scenario_dir(sid) / "approval.note.json", {"scenario_id": sid, "spec_hash": spec.spec_hash, "note": p.get("note"), "at": time.time()})
+    return {"approved": True, "scenario_id": sid, "spec_hash": spec.spec_hash, "approved_by": "human-command"}
+
+
 @activity.defn
 async def draft_activity(p: dict) -> dict:
     from swesim.stages.draft_spec import draft
@@ -585,9 +670,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-ALL = [probe_models_activity, mine_activity, judge_activity, draft_activity, auto_approve_activity, verify_approval_activity,
-       compile_activity, validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity,
-       score_activity, export_activity]
+ALL = [probe_models_activity, mine_activity, judge_activity, list_candidates_activity, judge_one_activity, draft_activity,
+       auto_approve_activity, precheck_draft_activity, human_approve_activity, verify_approval_activity, compile_activity,
+       validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity, score_activity,
+       export_activity]
 
 if __name__ == "__main__":
     raise SystemExit(main())

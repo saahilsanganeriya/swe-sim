@@ -17,6 +17,19 @@ integrator during Phase 3. Nothing below claims a cloud result until the placeho
 
 Files on the VM: `/opt/swesim` (git checkout at the deployed commit), `/opt/swesim/workspace/{candidates,scenarios,tasks,trials,jobs,exports,evidence}`, `/opt/swesim/registry.json`, `/var/lib/swesim/temporal.db`, `/etc/swesim/env` (0600; rendered by `render_worker_env` from the laptop's dotenv file and holding only `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SWESIM_WORKER_SECRET`, `SWESIM_STAKEHOLDER_URL`, `GH_TOKEN` as `KEY='value'` lines; read by systemd `EnvironmentFile=` for the worker and dashboard and by python-dotenv in trial units via `SWESIM_ENV_FILE`; never from the repo), `~/.modal.toml` (0600). All service ports bind to 127.0.0.1; nothing is exposed on the VM's public address.
 
+Workflows (task queue `swesim`): `CreateTasksWorkflow` mines each source (GitHub repo URL or SWE-bench pool) and fans out
+one `CandidateWorkflow` per candidate (id `create:<scenario_id>`, `REJECT_DUPLICATE`, at most `max_parallel` at a time,
+default 8): judge -> draft -> approval -> compile -> validate -> register. `approval_mode=auto` (default) lets the code-owned
+gates approve; `approval_mode=hold` pre-checks the draft (schema, assets, withholding leak) and parks the candidate in
+`awaiting-approval` for up to 7 days until a reviewer sends `approve` (`swesim workflows approve <create-id> <scenario_id>
+<spec_hash> --decision approve|reject --note ...`); a signalled hash that differs from the draft on disk is refused and the
+candidate keeps waiting. The parent's `progress` query lists every candidate's stage and an `awaiting_approval` review queue.
+`RunTasksWorkflow` runs selected scenario ids on selected models: `plan_trials` per scenario, `TrialWorkflow` children (id = trial
+id, `REJECT_DUPLICATE`) at most `max_parallel_trials` at a time (default 1; raise it on the VM), then score + export per
+scenario; `progress` lists every trial id with its status. `PipelineWorkflow` (single candidate end to end) and
+`RunMatrixWorkflow` remain as thin compositions of the same pieces. Cancelling a parent cancels its children; running trial
+units keep running and a later await reconciles them, never relaunches.
+
 Why per-trial units: `systemd-run` places the Harbor process in its own unit under the user manager (lingering enabled), so `systemctl --user restart swesim-worker` cannot kill it. The worker records `launch.json` (intent, then acknowledgement) before and after the single `systemd-run`; every later poll reads that file and the unit state and never launches again (`swesim/workflows/activities.py: decide_launch`).
 
 ## Deploy (VM)

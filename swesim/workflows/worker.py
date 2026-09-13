@@ -20,11 +20,14 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from swesim.workflows import activities as A
-from swesim.workflows.workflows import PipelineWorkflow, RunMatrixWorkflow, TrialWorkflow
+from swesim.workflows.workflows import (CandidateWorkflow, CreateTasksWorkflow, PipelineWorkflow, RunMatrixWorkflow, RunTasksWorkflow,
+                                        TrialWorkflow)
 
 TASK_QUEUE = "swesim"
-MAX_CONCURRENT_ACTIVITIES = 4  # light activities; trials are serialized by the workflows and LAUNCH_SLOTS
-WORKFLOWS = [TrialWorkflow, RunMatrixWorkflow, PipelineWorkflow]
+# Light LLM activities plus up to 8 parallel compile/validate activities (Harbor/Modal do the heavy lifting).
+# Trial launches are still serialized per worker by activities.LAUNCH_SLOTS and bounded by the workflows.
+MAX_CONCURRENT_ACTIVITIES = 16
+WORKFLOWS = [TrialWorkflow, RunMatrixWorkflow, PipelineWorkflow, CandidateWorkflow, CreateTasksWorkflow, RunTasksWorkflow]
 
 
 def address() -> str:

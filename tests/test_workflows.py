@@ -791,23 +791,26 @@ def test_env_matrix_runs_children_serially_with_trial_ids_then_scores():
 
 def test_worker_registers_all_workflows_and_activities_serial_trials():
     from swesim.workflows import worker as WK
-    assert WK.TASK_QUEUE == "swesim" and WK.MAX_CONCURRENT_ACTIVITIES == 4
+    assert WK.TASK_QUEUE == "swesim" and WK.MAX_CONCURRENT_ACTIVITIES >= 8   # 8 parallel validations; launches stay behind LAUNCH_SLOTS
     names = {a.__name__ for a in A.ALL}
     assert {"mine_activity", "judge_activity", "draft_activity", "auto_approve_activity", "verify_approval_activity", "compile_activity", "validate_activity",
-            "register_activity", "plan_trials_activity", "launch_trial_activity", "await_trial_activity", "score_activity", "export_activity", "probe_models_activity"} <= names
-    assert set(WK.WORKFLOWS) == {W.TrialWorkflow, W.RunMatrixWorkflow, W.PipelineWorkflow}
+            "register_activity", "plan_trials_activity", "launch_trial_activity", "await_trial_activity", "score_activity", "export_activity", "probe_models_activity",
+            "list_candidates_activity", "judge_one_activity", "precheck_draft_activity", "human_approve_activity"} <= names
+    assert set(WK.WORKFLOWS) == {W.TrialWorkflow, W.RunMatrixWorkflow, W.PipelineWorkflow, W.CandidateWorkflow, W.CreateTasksWorkflow, W.RunTasksWorkflow}
     assert A.LAUNCH_SLOTS._value == 1                        # one launch at a time per worker
 
 
 def test_client_ids_and_signal_payload(monkeypatch):
     from swesim.workflows import client as C
     class Handle:
-        def __init__(s): s.signals = []
+        def __init__(s): s.signals = []; s.cancelled = 0; s.queries = []
         async def signal(s, fn, arg): s.signals.append((fn, arg))
+        async def cancel(s): s.cancelled += 1
+        async def query(s, name): s.queries.append(name); return {"stage": "x"}
     class FakeClient:
-        def __init__(s): s.started = []; s.handle = Handle()
+        def __init__(s): s.started = []; s.handle = Handle(); s.wids = []
         async def start_workflow(s, fn, arg, **kw): s.started.append((fn, arg, kw))
-        def get_workflow_handle(s, wid): s.wid = wid; return s.handle
+        def get_workflow_handle(s, wid): s.wids.append(wid); return s.handle
     fc = FakeClient()
     async def connect(): return fc
     monkeypatch.setattr(C, "connect", connect)
@@ -815,9 +818,255 @@ def test_client_ids_and_signal_payload(monkeypatch):
     assert wid.startswith("pipeline-") and fc.started[0][2]["id"] == wid and fc.started[0][2]["task_queue"] == "swesim"
     assert fc.started[0][2]["id_reuse_policy"] == WorkflowIDReusePolicy.REJECT_DUPLICATE
     asyncio.run(C.approve(wid, "a--1", "h"))
-    assert fc.wid == wid and fc.handle.signals == [(W.PipelineWorkflow.approve_spec, {"scenario_id": "a--1", "spec_hash": "h"})]
+    assert fc.wids[-1] == wid and fc.handle.signals == [(W.PipelineWorkflow.approve_spec, {"scenario_id": "a--1", "spec_hash": "h"})]
     mid = asyncio.run(C.start_matrix({"scenario_id": "a--1", "trials": []}))
     assert mid.startswith("matrix-") and fc.started[1][0] == W.RunMatrixWorkflow.run
+    # create / run starters carry a secret-free summary memo
+    cid = asyncio.run(C.start_create({"sources": [{"kind": "github-repo", "repo": "https://github.com/x/y"}, {"kind": "swebench-annotated", "pool": "A"}],
+                                      "judge_model": "j", "draft_model": "d", "stakeholder_url": "https://s", "approval_mode": "hold"}))
+    assert cid.startswith("create-") and fc.started[2][0] == W.CreateTasksWorkflow.run
+    assert fc.started[2][2]["memo"] == {"summary": {"sources": ["https://github.com/x/y", "swebench-annotated:A"], "judge_model": "j", "draft_model": "d", "approval_mode": "hold"}}
+    rid = asyncio.run(C.start_run({"scenario_ids": ["a--1"], "models": ["m"], "conditions": ["hidden"], "k": 2, "stakeholder_url": "https://s"}))
+    assert rid.startswith("run-") and fc.started[3][0] == W.RunTasksWorkflow.run and fc.started[3][2]["memo"]["summary"]["scenario_ids"] == ["a--1"]
+    assert "stakeholder_url" not in json.dumps(fc.started[3][2]["memo"])
+    # hold-mode decisions always reach the candidate workflow, whether given the parent id or the candidate id
+    assert asyncio.run(C.approve_candidate(cid, "a--1", "h", "approve", "looks right")) == "create:a--1"
+    assert asyncio.run(C.approve_candidate("create:a--1", "a--1", "h", "reject", "no")) == "create:a--1"
+    assert fc.wids[-2:] == ["create:a--1", "create:a--1"]
+    assert fc.handle.signals[-2:] == [(W.CandidateWorkflow.approve, {"scenario_id": "a--1", "spec_hash": "h", "decision": "approve", "note": "looks right"}),
+                                      (W.CandidateWorkflow.approve, {"scenario_id": "a--1", "spec_hash": "h", "decision": "reject", "note": "no"})]
+    with pytest.raises(ValueError): asyncio.run(C.approve_candidate(cid, "a--1", "h", "maybe"))
+    assert asyncio.run(C.progress(cid)) == {"stage": "x"} and fc.handle.queries == ["progress"]
+    asyncio.run(C.cancel(cid)); assert fc.handle.cancelled == 1
+
+
+def test_client_list_runs_filters_by_type_and_summarizes(monkeypatch):
+    from datetime import datetime, timezone
+    from temporalio.client import WorkflowExecutionStatus
+    from swesim.workflows import client as C
+    class Exec:
+        def __init__(s, wid, wtype, status, summary):
+            s.id = wid; s.run_id = "r"; s.workflow_type = wtype; s.status = status; s._summary = summary
+            s.start_time = datetime(2026, 9, 13, tzinfo=timezone.utc); s.close_time = None
+        async def memo(s): return {"summary": s._summary}
+    class FakeClient:
+        def __init__(s): s.queries = []
+        async def list_workflows(s, query, limit=None):
+            s.queries.append((query, limit))
+            for e in (Exec("create-1", "CreateTasksWorkflow", WorkflowExecutionStatus.RUNNING, {"sources": ["r"]}), Exec("run-1", "RunTasksWorkflow", WorkflowExecutionStatus.COMPLETED, {"models": ["m"]})):
+                if e.workflow_type in query: yield e
+    fc = FakeClient()
+    async def connect(): return fc
+    monkeypatch.setattr(C, "connect", connect)
+    runs = asyncio.run(C.list_runs("create", 10))
+    assert fc.queries[-1] == ("WorkflowType = 'CreateTasksWorkflow'", 10)
+    assert runs == [{"workflow_id": "create-1", "run_id": "r", "type": "CreateTasksWorkflow", "status": "RUNNING", "start_time": "2026-09-13T00:00:00+00:00", "close_time": None, "summary": {"sources": ["r"]}}]
+    allruns = asyncio.run(C.list_runs("all", 5))
+    assert [r["type"] for r in allruns] == ["CreateTasksWorkflow", "RunTasksWorkflow"] and " OR " in fc.queries[-1][0]
+    with pytest.raises(ValueError): asyncio.run(C.list_runs("bogus"))
+
+
+# ---------------------------------------------------------------- task-creation activities
+
+def test_list_candidates_and_judge_one_per_candidate_files(ws, monkeypatch):
+    calls = []
+    def judge_candidate(row, model_id):
+        calls.append(row["instance_id"]); return {"gaps": [], "verified_rubric_score": 2, "keep": row["instance_id"] == "a__1", "model_id": model_id}
+    monkeypatch.setitem(sys.modules, "swesim.stages.judge", fake_module("swesim.stages.judge", judge_candidate=judge_candidate))
+    cand = ws.candidates_dir / "github-repo--x__y.jsonl"; cand.parent.mkdir(parents=True)
+    cand.write_text("".join(json.dumps({"instance_id": i, "repo": "x/y"}) + "\n" for i in ("a__1", "b__2", "c__3")))
+    listed = asyncio.run(A.list_candidates_activity({"candidates_path": str(cand), "max_candidates": 2}))
+    assert listed == {"candidates": [{"instance_id": "a__1", "scenario_id": "a--1"}, {"instance_id": "b__2", "scenario_id": "b--2"}]}
+    j = asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "a__1", "judge_model": "jm"}))
+    assert j["keep"] is True and j["scenario_id"] == "a--1" and j["judge_model"] == "jm" and Path(j["judged_path"]) == cand.parent / "judged" / "a--1.judged.jsonl"
+    assert json.loads(Path(j["judged_path"]).read_text())["judge"]["keep"] is True
+    assert asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "a__1", "judge_model": "jm"})) == j and calls == ["a__1"]   # retained
+    j2 = asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "b__2", "judge_model": "jm"}))
+    assert j2["keep"] is False and j2["reasons"] == ["judge did not keep the candidate"]
+    with pytest.raises(Exception, match="not in"): asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "zz__9", "judge_model": "jm"}))
+    # the one-row judged file feeds draft_activity unchanged
+    drafted = []
+    def draft(row, judged, model_id, out_dir, **kw):
+        drafted.append(row["instance_id"]); out_dir.mkdir(parents=True, exist_ok=True); (out_dir / "scenario.draft.json").write_text("{}"); return out_dir / "scenario.draft.json"
+    monkeypatch.setitem(sys.modules, "swesim.stages.draft_spec", fake_module("swesim.stages.draft_spec", draft=draft))
+    d = asyncio.run(A.draft_activity({"judged_path": j["judged_path"], "instance_id": "a__1", "draft_model": "dm"}))
+    assert d["scenario_id"] == "a--1" and drafted == ["a__1"]
+
+
+def test_precheck_and_human_approve_activities(ws, monkeypatch):
+    spec = ScenarioSpec.model_validate(minimal_spec_dict()); sdir = ws.scenario_dir(spec.id); sdir.mkdir(parents=True)
+    atomic_json(sdir / "scenario.draft.json", spec.model_dump(mode="json"))
+    gates = {"reasons": ["judge did not accept", "withheld brief still contains excerpt of f01"]}; approvals = []
+    def check_assets(sdir_, spec_): return []
+    def auto_gates(spec_, sdir_): return list(gates["reasons"])
+    def approve_scenario(ws_, sid, auto):
+        approvals.append(auto); atomic_json(ws_.scenario_dir(sid) / "approval.json", {"spec_hash": spec.spec_hash, "approved_by": "human-command", "review_needed": False})
+        return {"approved": True, "spec_hash": spec.spec_hash, "mode": "human"}
+    monkeypatch.setitem(sys.modules, "swesim.stages.approve", fake_module("swesim.stages.approve", check_assets=check_assets, auto_gates=auto_gates, approve_scenario=approve_scenario))
+    pre = asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id}))
+    assert pre["ok"] is False and pre["reasons"] == ["withheld brief still contains excerpt of f01"] and pre["spec_hash"] == spec.spec_hash   # only leak gates pre-check
+    gates["reasons"] = []
+    assert asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id})) == {"ok": True, "reasons": [], "scenario_id": spec.id, "spec_hash": spec.spec_hash}
+    assert not (sdir / "approval.json").exists()                                     # pre-check writes nothing
+    with pytest.raises(Exception, match="differs from the draft"): asyncio.run(A.human_approve_activity({"scenario_id": spec.id, "spec_hash": "0" * 64}))
+    assert approvals == [] and not (sdir / "approval.json").exists()                 # a mismatched hash never approves
+    r = asyncio.run(A.human_approve_activity({"scenario_id": spec.id, "spec_hash": spec.spec_hash, "note": "reviewed"}))
+    assert r == {"approved": True, "scenario_id": spec.id, "spec_hash": spec.spec_hash, "approved_by": "human-command"} and approvals == [False]
+    assert json.loads((sdir / "approval.note.json").read_text())["note"] == "reviewed"
+    (sdir / "scenario.draft.json").write_text("{not json")
+    bad = asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id}))
+    assert bad["ok"] is False and bad["reasons"][0].startswith("schema:")
+
+
+# ---------------------------------------------------------------- CreateTasksWorkflow / RunTasksWorkflow (real Temporal test environment)
+
+def _create_fakes(conc, judge_calls, validate_invalid=("a--5",), judge_error=("a__3",), judge_drop=("a__4",), lists=None, hold=None):
+    from temporalio import activity
+    from temporalio.exceptions import ApplicationError
+    lists = lists or {"/c/https://github.com/x/a.jsonl": ["a__1", "a__2", "a__3", "a__4", "a__5"], "/c/A.jsonl": ["a__1", "b__1"]}
+    sid = lambda i: i.replace("__", "--")
+    @activity.defn(name="probe_models_activity")
+    async def probe(p): return {"resolved": {"judge_model": p.get("judge_model"), "draft_model": p.get("draft_model"), "stakeholder_model": "openai/gpt-5.5"}, "substitutions": {}, "needs_human": []}
+    @activity.defn(name="mine_activity")
+    async def mine(p): return {"candidates_path": f"/c/{p.get('repo') or p.get('pool')}.jsonl"}
+    @activity.defn(name="list_candidates_activity")
+    async def listc(p): return {"candidates": [{"instance_id": i, "scenario_id": sid(i)} for i in lists[p["candidates_path"]]]}
+    @activity.defn(name="judge_one_activity")
+    async def judge(p):
+        judge_calls.append(p["instance_id"]); conc["cur"] += 1; conc["max"] = max(conc["max"], conc["cur"])
+        await asyncio.sleep(0.05); conc["cur"] -= 1
+        if p["instance_id"] in judge_error: raise ApplicationError("judge exploded", non_retryable=True)
+        return {"judged_path": "j", "instance_id": p["instance_id"], "scenario_id": sid(p["instance_id"]), "keep": p["instance_id"] not in judge_drop, "reasons": []}
+    @activity.defn(name="draft_activity")
+    async def draft(p): return {"scenario_id": sid(p["instance_id"]), "draft_path": "d"}
+    @activity.defn(name="auto_approve_activity")
+    async def approve(p): return {"approved": True, "spec_hash": "h-" + p["scenario_id"], "reasons": []}
+    @activity.defn(name="precheck_draft_activity")
+    async def precheck(p): return {"ok": True, "reasons": [], "scenario_id": p["scenario_id"], "spec_hash": "draft-" + p["scenario_id"]}
+    @activity.defn(name="human_approve_activity")
+    async def human(p):
+        if hold is not None: hold.setdefault("calls", []).append(p)
+        if p["spec_hash"] != "draft-" + p["scenario_id"]: raise ApplicationError("signalled spec_hash differs from the draft on disk", non_retryable=True)
+        return {"approved": True, "scenario_id": p["scenario_id"], "spec_hash": p["spec_hash"], "approved_by": "human-command"}
+    @activity.defn(name="verify_approval_activity")
+    async def verify(p): return {"scenario_id": p["scenario_id"], "spec_hash": p["spec_hash"]}
+    @activity.defn(name="compile_activity")
+    async def compile_(p): return {"compile_path": "c"}
+    @activity.defn(name="validate_activity")
+    async def validate(p): return {"status": "invalid" if p["scenario_id"] in validate_invalid else "valid", "failures": ["oracle earned 0"]}
+    @activity.defn(name="register_activity")
+    async def register(p): return {"registry_entry": {}}
+    return [probe, mine, listc, judge, draft, approve, precheck, human, verify, compile_, validate, register]
+
+
+def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress():
+    from temporalio.worker import Worker
+    conc = {"cur": 0, "max": 0}; judge_calls = []
+    params = {"sources": [{"kind": "github-repo", "repo": "https://github.com/x/a", "since": "2026-06-01"}, {"kind": "swebench-annotated", "pool": "A"}],
+              "judge_model": "j", "draft_model": "d", "stakeholder_url": "https://s", "max_parallel": 2}
+    async def scenario(env):
+        async with Worker(env.client, task_queue="swesim", workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow], activities=_create_fakes(conc, judge_calls)):
+            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, params, id="create-test-1", task_queue="swesim")
+            r = await h.result()
+            assert r["counts"] == {"candidates": 6, "valid": 3, "invalid": 1, "rejected": 1, "error": 1, "duplicate-rejected": 0, "duplicate-in-batch": 1}
+            assert r["status"] == "complete" and {s for s, c in r["candidates"].items() if c["status"] == "valid"} == {"a--1", "a--2", "b--1"}
+            assert r["candidates"]["a--5"]["status"] == "invalid" and r["candidates"]["a--5"]["reasons"] == ["oracle earned 0"]
+            assert r["candidates"]["a--3"]["status"] == "error" and "judge exploded" in r["candidates"]["a--3"]["reasons"][0]
+            assert r["candidates"]["a--4"]["status"] == "rejected" and r["candidates"]["a--1"]["spec_hash"] == "h-a--1"
+            assert conc["max"] <= 2 and sorted(judge_calls) == ["a__1", "a__2", "a__3", "a__4", "a__5", "b__1"]   # bound respected; duplicate judged once
+            prog = await h.query(W.CreateTasksWorkflow.progress)
+            assert prog["stage"] == "complete" and set(prog["candidates"]) == {"a--1", "a--2", "a--3", "a--4", "a--5", "b--1"} and prog["awaiting_approval"] == []
+            c1 = prog["candidates"]["a--1"]
+            assert c1["status"] == "valid" and c1["stage"] == "done" and c1["candidate_workflow_id"] == "create:a--1" and c1["source"] in ("github-repo:https://github.com/x/a", "swebench-annotated:A")
+            assert ["judging", "auto-approving", "compiling", "validating", "registering"] == [s for s in c1["stages"] if s in ("judging", "auto-approving", "compiling", "validating", "registering")]
+            assert "registering" not in prog["candidates"]["a--5"]["stages"] and prog["candidates"]["a--3"]["stages"] == ["judging"]
+            assert {s["status"] for s in prog["sources"].values()} == {"mined"} and prog["probe"]["resolved"]["judge_model"] == "j"
+            # the same candidates again: every child id already exists, nothing is re-judged
+            r2 = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-test-2", task_queue="swesim")
+            assert r2["counts"]["duplicate-rejected"] == 6 and r2["counts"]["valid"] == 0 and r2["status"] == "complete-with-failures" and len(judge_calls) == 6
+    _run_in_env(scenario)
+
+
+def test_env_create_tasks_hold_mode_review_queue_approve_reject_and_refused_hash(monkeypatch):
+    from temporalio.worker import Worker
+    from swesim.workflows import client as C
+    conc = {"cur": 0, "max": 0}; judge_calls = []; hold = {}
+    lists = {"/c/H.jsonl": ["h__1", "h__2", "h__3"]}
+    params = {"sources": [{"kind": "swebench-annotated", "pool": "H"}], "judge_model": "j", "draft_model": "d", "stakeholder_url": "https://s", "approval_mode": "hold"}
+    async def scenario(env):
+        async def connect(): return env.client
+        monkeypatch.setattr(C, "connect", connect)
+        async with Worker(env.client, task_queue="swesim", workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow],
+                          activities=_create_fakes(conc, judge_calls, validate_invalid=(), judge_error=(), judge_drop=(), lists=lists, hold=hold)):
+            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, params, id="create-hold", task_queue="swesim")
+            for _ in range(400):
+                prog = await h.query(W.CreateTasksWorkflow.progress)
+                if len(prog["awaiting_approval"]) == 3: break
+                await asyncio.sleep(0.05)
+            queue = sorted(prog["awaiting_approval"], key=lambda x: x["scenario_id"])
+            assert queue == [{"scenario_id": s, "spec_hash": "draft-" + s, "candidate_workflow_id": "create:" + s} for s in ("h--1", "h--2", "h--3")]
+            assert all(prog["candidates"][s]["status"] == "awaiting-approval" for s in ("h--1", "h--2", "h--3"))
+            # a mismatched hash is refused and the candidate keeps waiting
+            await C.approve_candidate("create-hold", "h--1", "stale-hash", "approve", "old queue")
+            for _ in range(400):
+                prog = await h.query(W.CreateTasksWorkflow.progress)
+                if prog["candidates"]["h--1"].get("refusals"): break
+                await asyncio.sleep(0.05)
+            assert "differs from the draft" in prog["candidates"]["h--1"]["refusals"][0] and prog["candidates"]["h--1"]["status"] == "awaiting-approval"
+            child = await env.client.get_workflow_handle("create:h--1").query(W.CandidateWorkflow.progress)
+            assert child["stage"] == "awaiting-approval" and child["spec_hash"] == "draft-h--1" and child["refusals"]
+            await C.approve_candidate("create-hold", "h--1", "draft-h--1", "approve", "reviewed")
+            await C.approve_candidate("create:h--2", "h--2", "draft-h--2", "reject", "not ready")
+            await C.approve_candidate("create-hold", "h--3", "draft-h--3")
+            r = await h.result()
+            assert r["counts"]["valid"] == 2 and r["counts"]["rejected-by-human"] == 1 and r["status"] == "complete"
+            assert r["candidates"]["h--2"] == {"scenario_id": "h--2", "instance_id": "h__2", "status": "rejected-by-human", "reasons": ["not ready"], "spec_hash": "draft-h--2"}
+            assert r["candidates"]["h--1"]["status"] == "valid" and r["candidates"]["h--3"]["status"] == "valid"
+            assert [c["spec_hash"] for c in hold["calls"]] == ["stale-hash", "draft-h--1", "draft-h--3"] and hold["calls"][1]["note"] == "reviewed"
+            prog = await h.query(W.CreateTasksWorkflow.progress)
+            assert prog["awaiting_approval"] == [] and "awaiting-approval" in prog["candidates"]["h--1"]["stages"] and "compiling" in prog["candidates"]["h--1"]["stages"]
+    _run_in_env(scenario)
+
+
+def test_env_run_tasks_two_scenarios_bounded_and_progress():
+    from temporalio import activity
+    from temporalio.exceptions import ApplicationError
+    from temporalio.worker import Worker
+    conc = {"cur": 0, "max": 0}; scored = []; exported = []; planned = []
+    @activity.defn(name="plan_trials_activity")
+    async def plan(p):
+        planned.append(p)
+        if p["scenario_id"] == "bad": raise ApplicationError("scenario/build not validated", non_retryable=True)
+        return {"scenario_id": p["scenario_id"], "trials": [{"trial_id": f"{p['scenario_id']}-t{i}", "scenario_id": p["scenario_id"], "model": p["models"][0], "condition": "hidden", "attempt_index": i} for i in range(2)]}
+    @activity.defn(name="launch_trial_activity")
+    async def launch(p):
+        conc["cur"] += 1; conc["max"] = max(conc["max"], conc["cur"]); await asyncio.sleep(0.05); conc["cur"] -= 1
+        return {"trial_id": p["trial_id"], "launched": True}
+    @activity.defn(name="await_trial_activity")
+    async def collect(p): return {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}}
+    @activity.defn(name="score_activity")
+    async def score(p): scored.append(p["scenario_id"]); return {"scores_path": "s"}
+    @activity.defn(name="export_activity")
+    async def export(p): exported.append(p["scenario_id"]); return {"manifest_paths": []}
+    params = {"scenario_ids": ["s1", "s2", "bad"], "models": ["m"], "conditions": ["hidden"], "k": 2, "purpose": "comparison", "stakeholder_model": "anthropic/claude-sonnet-5",
+              "attempt_offset": 0, "stakeholder_url": "https://s", "max_parallel_trials": 1}
+    async def scenario(env):
+        async with Worker(env.client, task_queue="swesim", workflows=[W.RunTasksWorkflow, W.TrialWorkflow], activities=[plan, launch, collect, score, export]):
+            h = await env.client.start_workflow(W.RunTasksWorkflow.run, params, id="run-test-1", task_queue="swesim")
+            r = await h.result()
+            assert r["status"] == "complete-with-failures" and r["scenarios"]["bad"]["status"] == "error" and "not validated" in r["scenarios"]["bad"]["error"]
+            for sid in ("s1", "s2"):
+                assert r["scenarios"][sid]["status"] == "complete" and [t["status"] for t in r["scenarios"][sid]["trials"]] == ["completed", "completed"]
+            assert conc["max"] == 1 and sorted(scored) == ["s1", "s2"] == sorted(exported)              # trials one at a time; score+export per scenario
+            assert all(p["stakeholder_model"] == "anthropic/claude-sonnet-5" and p["purpose"] == "comparison" for p in planned)
+            prog = await h.query(W.RunTasksWorkflow.progress)
+            assert prog["stage"] == "complete" and set(prog["trials"]) == {"s1-t0", "s1-t1", "s2-t0", "s2-t1"}
+            assert prog["trials"]["s1-t0"] == {"scenario_id": "s1", "model": "m", "condition": "hidden", "attempt_index": 0, "status": "completed"}
+            assert prog["scenarios"] == {"s1": {"status": "complete", "trials": 2}, "s2": {"status": "complete", "trials": 2}, "bad": {"status": "error", "error": prog["scenarios"]["bad"]["error"], "trials": 0}}
+            # running the same selection again cannot relaunch: every trial id is already used
+            r2 = await env.client.execute_workflow(W.RunTasksWorkflow.run, {**params, "scenario_ids": ["s1"]}, id="run-test-2", task_queue="swesim")
+            assert [t["status"] for t in r2["scenarios"]["s1"]["trials"]] == ["duplicate-rejected", "duplicate-rejected"] and r2["status"] == "complete"
+    _run_in_env(scenario)
 
 
 # ---------------------------------------------------------------- Task 13 deployment files (syntax and contracts)
