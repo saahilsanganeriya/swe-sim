@@ -54,6 +54,7 @@ artifacts on disk or on the VM; nothing is asserted without a path.
 | Runtime (confirmed ~07:50 UTC) | **Cloud Run**, not GKE. The user first asked about the ECS equivalent, then leaned GKE, then confirmed Cloud Run for tonight; the launcher contract and queue split are runtime-neutral so GKE remains a later Terraform module. |
 | "GPT 5.6 Soul" | Mapped to `gpt-5.6-sol` (the id that exists; `luna` and `terra` also exist). Opus 5 is primary for judge and stakeholder, `gpt-5.6-sol` the fallback, unless the user swaps them. |
 | Primary objective (added ~08:20 UTC) | **Creating tasks from new repositories given as links is the main goal of swesim.** Pool A (the 109) is the starting point and the calibration set, not the product. The sweep runs the repositories first, in both bands, with a per-repository discovery funnel in the console, and targets at least 10 valid repository-sourced scenarios by 08:00 PDT. No reward hacking (§7) and tasks and trajectories that are hard enough (§5) are explicit goals, not side effects. |
+| Reusability (added ~08:35 UTC) | **A stranger must be able to clone the repository, put in their own API keys, set up the environment and run it.** `.env.example` lists every variable with a comment; `make check` runs the offline suite; `make dev` runs a local stack (Temporal dev server, worker with the local launcher, console) against Modal with the user's keys; `make cloud-bootstrap` applies Terraform and deploys with the user's GCP project; no path, hostname or file that exists only on the author's machine (Codex B10 is the checklist). Verified by a fresh clone into a new directory on the laptop. |
 | Console scope (added ~08:10 UTC) | **The website is the way we interact with the pipeline.** It must show the entire database and every artifact in the bucket, and the complete history of everything that ever happened: every workflow, every trial including failed, unresolved and launch-failed ones, every candidate and gate reject, every scenario version. See §2.5. |
 
 ## 2. Target architecture on GCP
@@ -438,6 +439,18 @@ priority.
   `docs/grading.md` (difficulty method, tiered results, integrity report, disclosure audit),
   `docs/superpowers/specs/2026-09-13-gcp-hosting-design.md` updated to "as built".
 
+## 9.1 Reusable by a stranger (acceptance)
+
+- `git clone` into a fresh directory; `cp .env.example ~/Documents/.env` (or any path via `SWESIM_ENV_FILE`) and fill:
+  provider keys (Anthropic, OpenAI, OpenRouter), `SWESIM_WORKER_SECRET`, `GH_TOKEN` (read-only), Modal token, GCP project and
+  region, Temporal Cloud values (optional for local mode). Every variable documented in the file.
+- `make check`: `uv sync --extra dev --frozen` + the offline suite + `verify.sh` levels that need no cloud.
+- `make dev`: `temporal server start-dev`, the worker with `SWESIM_TRIAL_LAUNCHER=local`, the console on 127.0.0.1; a
+  documented smoke `swesim create --source swebench:A:<id>` and `swesim run-tasks` that reach Modal with the user's keys.
+- `make cloud-bootstrap PROJECT=<id>`: Terraform init/apply, Cloud Build image, deploy, `verify_cloud.sh`; `make cloud-destroy`
+  tears it down. Secrets are read from the env file into Secret Manager by a script that never echoes values.
+- `README.md` Quickstart is exactly these steps; the fresh-clone run is recorded (commands and outcomes) in `docs/ops.md`.
+
 ## 10. Rules that do not bend
 
 - Task creation and graded runs only through Temporal (workflows or the console). Stage commands stay debug-only.
@@ -473,13 +486,15 @@ Ship swesim as a hosted production pipeline on GCP (Cloud Run, Temporal Cloud) a
 
 Infrastructure (brief 2.1-2.7, Terraform in infra/, second apply clean): Temporal Cloud for every client and worker; one worker image built by Cloud Build, digest pinned in Terraform and recorded in every activity result and trial record; four Cloud Run worker pools, one per task queue; one Cloud Run Job per trial named by trial id, deleted after its record is written, launch-once proven by a worker-pool restart during a running trial with saved evidence; workspace on a versioned GCS bucket mounted everywhere, the VM record imported and labelled; Cloud SQL Postgres index written by the workflows and rebuildable from the files; secrets only from Secret Manager; the console as a Cloud Run service behind an HTTPS load balancer with IAP and an IAP-bound evaluator gate; one CreateTasksWorkflow and one RunTasksWorkflow completing end to end on the new stack before any sweep; the VM worker then stopped and documented as fallback.
 
-Temporal design (brief 2.8, all eight items): per-queue activity routing; retry classification (transient retries with backoff, gate rejections non-retryable, no blind relaunch); mine split into discover plus per-candidate probe, validate split per control; workflow.patched with an open-executions check before every deploy; search attributes; continue-as-new every 100 children; cancellation observed; payload sizes asserted.
+Temporal design (brief 2.8, all eight items): per-queue routing; retry classification (transient retries, gate rejections non-retryable, no blind relaunch); mine split into discover plus per-candidate probe, validate split per control; workflow.patched with an open-executions check before deploys; search attributes; continue-as-new; cancellation observed; payload sizes asserted.
 
 Independent review (brief 7.1): Codex reports in docs/reviews/2026-09-13-codex/; before-sweep rows fixed with tests (A-P1-2, A-P1-3, A-P1-4, B-P1-2, B-P2-1, B-P2-5, B-P2-6, B-P2-7); the rest as the table says. No reward hacking: brief 7 in full.
 
 Models (brief 3): judge and stakeholder anthropic/claude-opus-5 with openai/gpt-5.6-sol fallback, drafter anthropic/claude-sonnet-5; judge calibration re-run with per-instance predictions; OpenRouter in the solver path with a smoke trial first; per-trial cost captured.
 
 Sweep (brief 4-6, Temporal only): repositories first, the ten in the brief in both bands with a per-repository discovery funnel in the console and at least 10 valid repository-sourced scenarios targeted, then swebench:A; seven-control validation and the difficulty screen on every valid scenario; Tier A-C matrix on the six matrix models, remaining Tier A-C on a 10-scenario subset; Tier D and E (claude-sonnet-5, gpt-5.6-sol; gpt-6-astra, claude-fable-5-1, claude-opus-5, gpt-5.5) only when the brief 3.2 gate holds, k=1 first; spend tracked per run and capped by SWESIM_SPEND_CAP_USD at about $1,500.
+
+Reusable (brief 9.1): .env.example, make check, make dev (local stack with the local launcher), make cloud-bootstrap; a fresh clone on the laptop runs them with only the env file; no author-machine paths (Codex B10).
 
 Console (brief 2.5, all of it): complete history of every workflow, trial (including failed, unresolved, launch-failed), candidate, gate reject and scenario version; database browser with CSV export; artifact browser over the bucket with evaluator gating; every operator action from the UI with confirmation, Origin check and audit; live views; accuracy tables with null on insufficient n; trend charts; difficulty and tier labels.
 
