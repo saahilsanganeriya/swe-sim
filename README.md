@@ -7,11 +7,11 @@ swesim turns naturally underspecified GitHub issues into interactive, gradable s
 ```
 swebench-annotated (pool A)  \                                                +-> full         natural brief + every stakeholder-visible fact
 github-repo URL (merged PRs)  +-> mine -> judge -> probe -> draft -> approve -> compile -+-> hidden       natural or withheld brief, no stakeholder
-                              /          (LLM)   (Modal:    (LLM)   (6 code-   (3 Harbor    +-> interactive  same brief + ask-user / request-review
+                              /          (LLM)   (Modal:    (LLM)   (6 code-   (3 Harbor    +-> interactive  same brief + ask-user / confirm-behavior
                                                  base/gold)          owned)     tasks)             |
 validate (nop, oracle, plausible-wrong, tamper, reachability; all on Modal) -> register -> run ----+  harbor run -e modal
    |                                                                                               v
-   |   agent sandbox (Modal, user `agent`) <-- ask-user / request-review over HTTPS --> stakeholder service (Modal, patience budget)
+   |   agent sandbox (Modal, user `agent`) <-- ask-user / confirm-behavior over HTTPS --> stakeholder service (Modal, patience budget)
    |   root collect hook: kill agent processes, tar the tree, POST /freeze, write receipt                    |  GET /transcript
    +-> separate verifier (Modal, no network): reward.json + report.json ----------------> worker: bind transcript hash, record.json
                                        -> score (pass@k, pass^k, mean reward) -> export (policy-visible vs evaluator-only) -> dashboard
