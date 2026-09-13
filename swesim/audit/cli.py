@@ -29,7 +29,7 @@ def _echo(obj) -> None:
 
 @app.command()
 def scenario(scenario_id: str, force: bool = typer.Option(False, help="re-audit even when audit.json is current")) -> None:
-    """Audit one scenario: coherent, fair-tests, plausible-withholding."""
+    """Audit one scenario: coherent, fair-tests, plausible-withholding, facts-within-contract."""
     judge = Judge()
     audit, written = RUN.audit_scenario_result(layout_from_settings(), scenario_id, force=force, judge=judge)
     _echo({"written": written, "audit": audit.model_dump(mode="json"), "llm_usage": judge.usage()})
@@ -53,7 +53,8 @@ def audit_everything(layout, registry_path: Path | None, *, force: bool = False,
         try:
             audit, written = RUN.audit_scenario_result(layout, sid, force=force, judge=judge)
             summary["scenarios"][sid] = {"written": written, "coherent": audit.coherent, "fair_tests": audit.fair_tests,
-                                         "plausible_withholding": audit.plausible_withholding, "model": audit.model}
+                                         "plausible_withholding": audit.plausible_withholding,
+                                         "facts_within_contract": audit.facts_within_contract, "model": audit.model}
         except (AuditInputError, AuditLLMError) as e:
             summary["errors"].append({"scenario_id": sid, "error": f"{type(e).__name__}: {e}"})
     troot = paths.trials_root()

@@ -3,7 +3,8 @@
 Contract
 - ``build_report(layout, registry_path)`` reads every ``scenarios/*/audit.json`` and ``trials/*/audit.json`` plus the trial's
   ``record.json``/``run_config.json``/``report.json``/``transcript.json`` and the registry, and returns one JSON-able dict:
-  per-scenario labels with the leaderboard gate (``coherent and fair_tests``), per-model interaction metrics (trials,
+  per-scenario labels with the leaderboard gate (``coherent and fair_tests``) and the fact-scope label (``scenario_counts``
+  says how many audited scenarios carry a stakeholder-visible fact outside the contract), per-model interaction metrics (trials,
   asked-before-implementing rate, questions, useful-question rate, replies and their disclosure labels, reply-filter
   regenerations/redactions, integrity signals per trial), per-scenario question/reply counts, the list of disclosure
   violations (trial id + seq + evidence) and the list of excluded trials with the reason.
@@ -69,6 +70,9 @@ def _scenario_rows(paths: RecordPaths, registry: dict[str, dict]) -> tuple[list[
             "coherent": a.coherent, "fair_tests": a.fair_tests, "plausible_withholding": a.plausible_withholding, "reasons": a.reasons,
             "unfair_tests": a.unfair_tests, "model": a.model, "audited_at": a.audited_at, "rubric_version": a.rubric_version,
             "leaderboard_eligible": bool(a.coherent and a.fair_tests),
+            "facts_within_contract": a.facts_within_contract,
+            "facts_outside_contract": [fs.fact_id for fs in a.fact_scope if fs.within_contract is False],
+            "fact_scope": [fs.model_dump(mode="json") for fs in a.fact_scope],
         })
     return rows, unaudited
 
@@ -230,8 +234,9 @@ def build_report(layout, registry_path: Path | None = None, *, llm_usage: dict |
                                         "dropped_paths": report.get("dropped_paths") or []})
     for m in models.values():
         _finish_model_row(m)
+    scenario_counts = {"audited": len(scenarios), "facts_outside_contract": sum(1 for s in scenarios if s["facts_within_contract"] is False)}
     return {"generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "rubric_version": R.RUBRIC_VERSION,
-            "root": str(paths.root), "scenarios": scenarios, "unaudited_scenarios": unaudited, "models": models,
+            "root": str(paths.root), "scenarios": scenarios, "scenario_counts": scenario_counts, "unaudited_scenarios": unaudited, "models": models,
             "per_scenario": per_scenario, "disclosure_violations": violations, "excluded": excluded, "trials": counts,
             "llm_usage": llm_usage}
 
@@ -250,17 +255,26 @@ def render_markdown(report: dict) -> str:
     """Markdown tables over ``build_report``'s dict."""
     out = [f"# Task-sense audit report ({report['generated_at']}, rubric {report['rubric_version']})", "",
            f"Record root: `{report['root']}`.", "", "## Scenarios", "",
-           "| scenario | version | current | validation | coherent | fair tests | plausible withholding | leaderboard | model |",
-           "|---|---|---|---|---|---|---|---|---|"]
+           "| scenario | version | current | validation | coherent | fair tests | plausible withholding | facts within contract | leaderboard | model |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
     for s in report["scenarios"]:
         out.append(f"| {s['scenario_id']} | {s['version']} | {_yn(s['current'])} | {s['validation_status']} | {_yn(s['coherent'])} | "
-                   f"{_yn(s['fair_tests'])} | {_yn(s['plausible_withholding'])} | {'eligible' if s['leaderboard_eligible'] else 'gated out'} | {s['model']} |")
+                   f"{_yn(s['fair_tests'])} | {_yn(s['plausible_withholding'])} | {_yn(s.get('facts_within_contract'))} | "
+                   f"{'eligible' if s['leaderboard_eligible'] else 'gated out'} | {s['model']} |")
+    counts = report.get("scenario_counts") or {}
+    if counts:
+        out += ["", f"{counts['facts_outside_contract']} of {counts['audited']} audited scenarios carry a stakeholder-visible fact outside the "
+                    "contract (facts_within_contract = no; the leaderboard gate is coherent + fair tests)."]
     for s in report["scenarios"]:
         out += ["", f"### {s['scenario_id']}", ""]
-        for k in ("coherent", "fair_tests", "plausible_withholding"):
-            out.append(f"- **{k}** = {_yn(s[k])}: {s['reasons'].get(k, '')}")
+        for k in ("coherent", "fair_tests", "plausible_withholding", "facts_within_contract"):
+            out.append(f"- **{k}** = {_yn(s.get(k))}: {s['reasons'].get(k, '')}")
         if s["unfair_tests"]:
             out.append(f"- unfair tests: {', '.join(f'`{t}`' for t in s['unfair_tests'])}")
+        for fs in s.get("fact_scope") or []:
+            if fs["within_contract"] is False:
+                tests = ", ".join(f"`{t}`" for t in fs["offending_tests"]) or "per the reading pass"
+                out.append(f"- fact `{fs['fact_id']}` outside the contract ({tests}): {fs['reason']}")
     if report["unaudited_scenarios"]:
         out += ["", f"Scenarios without an audit: {', '.join(report['unaudited_scenarios'])}."]
     c = report["trials"]

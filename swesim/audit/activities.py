@@ -119,7 +119,8 @@ async def audit_scenario_activity(p: dict) -> dict:
     except AuditInputError as e:
         raise ApplicationError(str(e), type="AuditInputError", non_retryable=True) from e
     return {"scenario_id": sid, "path": str(RUN.scenario_audit_path(layout, sid)), "written": written, "coherent": audit.coherent,
-            "fair_tests": audit.fair_tests, "plausible_withholding": audit.plausible_withholding, "model": audit.model,
+            "fair_tests": audit.fair_tests, "plausible_withholding": audit.plausible_withholding,
+            "facts_within_contract": audit.facts_within_contract, "model": audit.model,
             "rubric_version": audit.rubric_version, "llm_calls": judge.usage()["calls"],
             "unknown_usage_count": audit.unknown_usage_count, "usage_complete": audit.usage_complete, "cost_recorded": audit.cost_recorded}
 
