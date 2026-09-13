@@ -950,11 +950,16 @@ async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
     if not resume:
         if _patched(PATCH_FRONTIER):
             admission = await act('frontier_gate_activity', p, 5, retry=retries.READ)
-            if not admission['allowed']:
+            if not admission.get('allowed'):
                 self.state = {'stage': 'complete', 'stopped_reason': 'frontier-gate', 'admission': admission}
                 await index_workflow('completed', {**params_summary(p), 'stopped_reason': 'frontier-gate'})
-                return {'status': 'blocked', 'scenarios': {}, 'trials': {}, 'admission': admission}
+                return {'status': 'blocked', 'scenarios': {}, 'trials': {}, 'admission': admission, 'stopped_reason': 'frontier-gate'}
             p = {**p, 'scenario_ids': admission.get('scenario_ids', p.get('scenario_ids', []))}
+            if admission.get('evidence_path'):
+                # A Tier D/E request: every later planning step (fresh plan, cached plan page, continue-as-new resume) verifies
+                # this recorded decision against its own request (`plan_trials`); a Tier A–C request carries nothing.
+                p['admission'] = {'evidence_path': admission['evidence_path'], 'identity': admission.get('identity')}
+                self.state = {'stage': 'probing-models', 'admission': p['admission']}
         self.state = {'stage': 'probing-models'}
         probe = await act('probe_models_activity', p, 5)
         p = {**p, **(probe.get('substitutions') or {}), **(probe.get('resolved') or {})}
@@ -963,7 +968,8 @@ async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
             await index_workflow('completed', {**params_summary(p), 'stopped_reason': 'model-unavailable'})
             return {'status': 'complete-with-failures', 'scenarios': {}, 'trials': {}, 'stopped_reason': 'model-unavailable', 'probe': probe}
     sem = asyncio.Semaphore(max(1, int(p.get('max_parallel_trials', 1))))
-    keys = ('models', 'conditions', 'k', 'purpose', 'brief_profile', 'stakeholder_model', 'audit_model', 'attempt_offset', 'stakeholder_url')
+    keys = ('models', 'conditions', 'k', 'purpose', 'brief_profile', 'stakeholder_model', 'audit_model', 'attempt_offset', 'stakeholder_url',
+            'include_saturated', 'admission')
     plan_p = {k: p[k] for k in keys if p.get(k) is not None}
     results = {}; children = 0; summary = dict(resume.get('summary') or {'children': 0, 'scenarios': 0, 'failed_scenarios': 0})
     self.state = {'stage': 'running', 'summary': summary, 'checkpoint_path': resume.get('previous_checkpoint')}

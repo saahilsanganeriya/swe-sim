@@ -1,6 +1,8 @@
 """Frontier solver admission uses measured compatible baselines and a complete budget forecast."""
 from decimal import Decimal
 
+import pytest
+
 from swesim.models import RunConfig
 from swesim.stages.frontier import BASELINE_MODELS, evaluate
 
@@ -88,3 +90,42 @@ def test_tier_e_starts_with_one_attempt_and_unknown_price_never_becomes_zero():
     scenarios, records = evidence()
     assert not evaluate(plan(models=["openai/gpt-6-astra"]), scenarios, records, budget(), Decimal("1500"))["allowed"]
     assert evaluate(plan(models=["openai/gpt-6-astra"], k=1), scenarios, records, budget(), Decimal("1500"))["allowed"]
+
+
+def test_ordering_is_pooled_across_the_core_baselines_per_scenario():
+    """§3.2 asks for the ordering to hold on a majority of *scenarios*; one noisy baseline at n=2 does not veto a scenario."""
+    scenarios, records = evidence()
+    for r in records:
+        if r["model"] == BASELINE_MODELS[0]:  # this model alone reads hidden 2/2 and full 1/2 everywhere
+            r["reward"] = {"success": 1, "outcome_code": 1} if r["condition"] == "hidden" else {"success": int(r["trial_id"].endswith("-0")), "outcome_code": 1 if r["trial_id"].endswith("-0") else 2}
+    result = evaluate(plan(), scenarios, records, budget(), Decimal("1500"))
+    assert result["allowed"] and result["ordered_scenarios"] == 15
+    # pooled equality (every arm saturated) is not an ordering
+    for r in records:
+        r["reward"] = {"success": 1, "outcome_code": 1}
+    assert evaluate(plan(), scenarios, records, budget(), Decimal("1500"))["ordered_scenarios"] == 0
+
+
+def test_cap_in_force_is_the_lower_of_run_and_global_caps():
+    from swesim.settings import Settings
+    from swesim.stages.frontier import cap_in_force
+    s = Settings.from_env({"SWESIM_SPEND_CAP_USD": "1500"})
+    assert cap_in_force(s, {}) == Decimal("1500") and cap_in_force(s, {"spend_cap_usd": 200}) == Decimal("200")
+    assert cap_in_force(s, {"spend_cap_usd": 5000}) == Decimal("1500") and cap_in_force(Settings.from_env({}), {}) is None
+    assert cap_in_force(Settings.from_env({}), {"spend_cap_usd": "nan"}) is None
+
+
+def test_preflight_without_evidence_refuses_and_records_a_verifiable_decision(tmp_path):
+    from swesim.paths import Workspace
+    from swesim.settings import Settings
+    from swesim.stages import frontier as F
+    ws = Workspace(tmp_path / "ws", tmp_path / "registry.json")
+    request = {"scenario_ids": ["s1"], "models": ["openai/gpt-5.6-sol"], "conditions": ["hidden"], "k": 1}
+    out = F.preflight(ws, Settings.from_env({"SWESIM_SPEND_CAP_USD": "100"}), request)
+    assert out["allowed"] is False and out["identity"] == F.identity_of(F.request_of(request))
+    assert out["evidence_path"] == str(F.decision_path(ws, out["identity"])) and "accounting" in out
+    with pytest.raises(ValueError, match="frontier admission rejected"):
+        F.verify_admission(ws, {**request, "scenario_id": "s1"}, {"evidence_path": out["evidence_path"]})
+    # Tier A–C: no evidence, no file
+    assert F.preflight(ws, Settings.from_env({}), {**request, "models": [BASELINE_MODELS[1]]})["allowed"] is True
+    assert len(list(ws.layout.evidence_dir("sweep").glob("frontier-*.json"))) == 1

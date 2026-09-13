@@ -1,16 +1,26 @@
 """Measured admission policy for Tier D/E solvers (hosted brief §3.2, §5, §6).
 
 Admission requires fifteen current, audited scenarios with two outcomes per arm
-for each core cheap baseline, a strict full-over-hidden ordering on a majority,
-and a complete spend forecast below the configured cap. Saturated targets are
-excluded unless requested. Pipeline judge/draft/stakeholder roles are unaffected.
+(full, hidden, interactive) for each of the six core cheap baselines of §6, the
+full-over-hidden ordering (pooled over those baselines, strict) on a majority of
+the qualified scenarios, and a complete spend forecast below the cap in force
+(the run's `spend_cap_usd` and the global cap, whichever is lower). Saturated
+targets are excluded unless requested; Tier E starts at k=1. Pipeline
+judge/draft/stakeholder roles are unaffected.
+
+The decision is durable: `preflight` writes `evidence/sweep/frontier-<identity>.json`
+and later planning steps (`plan_trials` through `admission_for_plan`) verify that
+recorded decision against their own request instead of trusting a flag. A caller
+without a recorded decision is evaluated afresh; a decision that names other models,
+another k or another scenario set does not admit.
 """
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from collections import defaultdict
 from decimal import Decimal
+from pathlib import Path
 
 from swesim.costs import cost_of
 from swesim.roles import TIERS
@@ -68,7 +78,7 @@ def _coverage(scenario: dict, records: list[dict]) -> tuple[bool, bool]:
         protocol["origin"] = record["origin"]
         key = (record["model"], json.dumps(protocol, sort_keys=True, separators=(",", ":")))
         groups[key][arm][rc.get("agent_config", "")].append(record)
-    selected: dict[str, tuple[str, bool]] = {}
+    selected: dict[str, tuple[str, list[dict], list[dict]]] = {}
     for (model, protocol), arms in groups.items():
         # The interactive scaffold is a condition treatment, but repetitions within each arm must share it.
         interactive = [rows for rows in arms["interactive"].values() if len(rows) >= MIN_PER_ARM]
@@ -79,11 +89,17 @@ def _coverage(scenario: dict, records: list[dict]) -> tuple[bool, bool]:
             if min(len(full), len(hidden)) < MIN_PER_ARM:
                 continue
             latest = max(str(r.get("finished_at") or "") for r in full + hidden)
-            candidate = (latest + protocol, _success(full) > _success(hidden))
-            if model not in selected or candidate[0] > selected[model][0]:
-                selected[model] = candidate
+            if model not in selected or latest + protocol > selected[model][0]:
+                selected[model] = (latest + protocol, full, hidden)
     covered = set(BASELINE_MODELS) <= selected.keys()
-    return covered, covered and all(selected[m][1] for m in BASELINE_MODELS)
+    if not covered:
+        return False, False
+    # §3.2 "the full > hidden ordering holding on the majority of scenarios": the ordering is a property of the scenario, so
+    # the comparison pools the six core baselines' attempts (12 vs 12 at n=2) rather than demanding every model separately
+    # order at n=2, which noise alone would defeat (see the decision record in the stream report).
+    full_rows = [r for m in BASELINE_MODELS for r in selected[m][1]]
+    hidden_rows = [r for m in BASELINE_MODELS for r in selected[m][2]]
+    return True, _success(full_rows) > _success(hidden_rows)
 
 
 def evaluate(params: dict, scenarios: dict[str, dict], records: list[dict], accounting: dict,
@@ -154,15 +170,90 @@ def evaluate(params: dict, scenarios: dict[str, dict], records: list[dict], acco
     return result
 
 
+POLICY_KEYS = ("models", "conditions", "k", "purpose", "brief_profile", "include_saturated")  # what a recorded decision binds
+
+
+def _decimal(value) -> Decimal | None:
+    try:
+        d = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return d if d.is_finite() else None
+
+
+def cap_in_force(settings: Settings, params: dict) -> Decimal | None:
+    """The lower of the run's `spend_cap_usd` and the global cap; None when neither is set (the gate then refuses)."""
+    caps = [c for c in (_decimal(params.get("spend_cap_usd")), settings.spend_cap_usd) if c is not None]
+    return min(caps) if caps else None
+
+
+def request_of(params: dict) -> dict:
+    """The request a decision is bound to: policy keys plus the ordered target scenario ids (bodies and urls stay out)."""
+    targets = list(dict.fromkeys(params.get("scenario_ids") or ([params["scenario_id"]] if params.get("scenario_id") else [])))
+    return {**{k: params[k] for k in POLICY_KEYS if params.get(k) is not None}, "scenario_ids": targets}
+
+
+def identity_of(request: dict) -> str:
+    return hashlib.sha256(json.dumps(request, sort_keys=True, default=str).encode()).hexdigest()[:24]
+
+
+def decision_path(ws: Workspace, identity: str):
+    return ws.layout.evidence_dir("sweep") / f"frontier-{identity}.json"
+
+
+def verify_admission(ws: Workspace, params: dict, admission: dict) -> dict:
+    """Re-read the recorded decision a caller names and check it admits *this* request: allowed, same policy keys, and the
+    planned scenario among the admitted ids. ValueError (non-retryable upstream) otherwise. Never re-evaluates spend, so a run
+    admitted at its start is not blocked mid-way by its own recorded spend."""
+    ref = admission.get("evidence_path") if isinstance(admission, dict) else None
+    if not ref:
+        raise ValueError("frontier admission reference lacks evidence_path")
+    path = Path(str(ref)).resolve(); root = ws.layout.evidence_dir("sweep").resolve()
+    if not path.is_relative_to(root) or not path.name.startswith("frontier-"):
+        raise ValueError("frontier admission evidence must be a recorded decision under evidence/sweep")
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise ValueError(f"frontier admission evidence unreadable: {type(e).__name__}") from e
+    decision, recorded = record.get("decision") or {}, record.get("request") or {}
+    if path.name != f"frontier-{identity_of(recorded)}.json":
+        raise ValueError("frontier admission evidence does not match its recorded request")
+    if decision.get("allowed") is not True:
+        raise ValueError("frontier admission rejected: " + "; ".join(decision.get("reasons") or ["recorded decision is not an admission"]))
+    mine = request_of(params)
+    diff = [k for k in POLICY_KEYS if recorded.get(k) != mine.get(k)]
+    if diff:
+        raise ValueError(f"frontier admission was recorded for a different request ({', '.join(diff)} differ)")
+    admitted = list(decision.get("scenario_ids") or [])
+    for sid in mine["scenario_ids"]:
+        if sid not in admitted:
+            raise ValueError(f"scenario {sid} is not admitted by the recorded frontier decision: "
+                             + str((decision.get("excluded_scenarios") or {}).get(sid) or "not among its targets"))
+    return {**decision, "evidence_path": str(path), "identity": identity_of(recorded), "verified": True}
+
+
+def admission_for_plan(ws: Workspace, settings: Settings, params: dict) -> dict:
+    """What `plan_trials` enforces: nothing for Tier A–C requests; the recorded decision a workflow carries (`params["admission"]`)
+    verified against this request; else a fresh evaluation from frozen evidence."""
+    if not frontier_requested(params):
+        return {"allowed": True, "scenario_ids": request_of(params)["scenario_ids"], "reasons": []}
+    if params.get("admission") is not None:
+        return verify_admission(ws, params, params["admission"])
+    return preflight(ws, settings, params)
+
+
 def preflight(ws: Workspace, settings: Settings, params: dict) -> dict:
     """Load authoritative evidence, persist the admission decision, and return only bounded summary data."""
     if not frontier_requested(params):
-        return {"allowed": True, "scenario_ids": params.get("scenario_ids") or [params.get("scenario_id")], "reasons": []}
+        return {"allowed": True, "scenario_ids": request_of(params)["scenario_ids"], "reasons": []}
     from swesim import costs
     from swesim.models import ScenarioSpec
     from swesim.stages.score import load_trial_records
-    request = {**params, "scenario_ids": params.get("scenario_ids") or [params.get("scenario_id")]}
-    registry = json.loads(ws.registry_path.read_text())
+    request = request_of(params)
+    try:
+        registry = json.loads(ws.registry_path.read_text())
+    except (OSError, ValueError):
+        registry = {}  # no registry: no scenario can qualify; the decision below records why
     scenarios = {}
     for sid, entry in registry.get("scenarios", {}).items():
         directory = ws.scenario_dir(sid)
@@ -182,8 +273,10 @@ def preflight(ws: Workspace, settings: Settings, params: dict) -> dict:
                           "profile": "withheld" if any(b.profile == "withheld" for b in spec.briefs) else "natural",
                           "difficulty": difficulty.get("tier") if difficulty.get("spec_hash") == spec.spec_hash
                           and difficulty.get("compiled_hash") == compiled.get("compiled_hash") else None}
-    result = evaluate(request, scenarios, load_trial_records(ws), costs.accounting_summary(ws.layout), settings.spend_cap_usd)
-    identity = hashlib.sha256(json.dumps(request, sort_keys=True, default=str).encode()).hexdigest()[:24]
-    path = ws.layout.evidence_dir("sweep") / f"frontier-{identity}.json"
+    accounting = dict(costs.accounting_summary(ws.layout))
+    result = evaluate(request, scenarios, load_trial_records(ws), accounting, cap_in_force(settings, params))
+    result["accounting"] = {k: (str(v) if isinstance(v, Decimal) else v) for k, v in accounting.items()}
+    identity = identity_of(request)
+    path = decision_path(ws, identity)
     atomic_json(path, {"request": request, "decision": result, "baseline_models": list(BASELINE_MODELS)})
-    return {**result, "evidence_path": str(path)}
+    return {**result, "evidence_path": str(path), "identity": identity}
