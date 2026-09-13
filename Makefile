@@ -20,17 +20,18 @@ export PATH := $(HOME)/google-cloud-sdk/bin:$(HOME)/.local/bin:$(PATH)
 # Terraform (the google provider and the GCS backend) authenticates with Application Default Credentials. On a machine
 # without them (no `gcloud auth application-default login` yet) fall back to the active gcloud account's short-lived
 # access token, which the provider and backend accept through GOOGLE_OAUTH_ACCESS_TOKEN. Only for cloud goals.
+# ($(shell ...) does not inherit the exported PATH on GNU make 3.81, macOS's default, hence the explicit PATH= prefix.)
 ifneq ($(filter-out check fmt-check,$(MAKECMDGOALS)),)
-ADC_OK := $(shell gcloud auth application-default print-access-token >/dev/null 2>&1 && echo 1)
+ADC_OK := $(shell PATH="$(PATH)" gcloud auth application-default print-access-token >/dev/null 2>&1 && echo 1)
 ifeq ($(ADC_OK),)
-GCLOUD_TOKEN := $(shell gcloud auth print-access-token 2>/dev/null)
+GCLOUD_TOKEN := $(shell PATH="$(PATH)" gcloud auth print-access-token 2>/dev/null)
 ifneq ($(GCLOUD_TOKEN),)
 export GOOGLE_OAUTH_ACCESS_TOKEN ?= $(GCLOUD_TOKEN)
 endif
 endif
 endif
 
-PROJECT ?= $(shell gcloud config get project 2>/dev/null)
+PROJECT ?= $(shell PATH="$(PATH)" gcloud config get project 2>/dev/null)
 REGION ?= us-central1
 SHA ?= HEAD
 SWESIM_ENV_FILE ?= ./.env
