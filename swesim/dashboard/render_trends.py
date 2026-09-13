@@ -45,7 +45,7 @@ def cohort_fragments(c: dict) -> dict[str, str]:
     frags[f"gradient-{key}-head"] = (f"<h2>{h(c['cohort_label'])}</h2><p class='muted small'>{c['trial_count']} admitted trials · {len(c['models'])} model(s): "
                                      + ", ".join(f"{h(charts.short_model(m))} ({h(gradient.tier_label(m))})" for m in c["models"]) + "</p>")
     # (a) accuracy by model, tier A→E, one chart per arm
-    arms = sorted({(x["condition"], x["brief_profile"]) for x in c["accuracy"]}, key=gradient._arm_order)
+    arms = sorted({(x["condition"], x["brief_profile"]) for x in c["accuracy"]}, key=gradient.arm_order)
     for condition, profile in arms:
         cid = f"gradient-{key}-{condition}-{profile}-accuracy"
         cells = [x for x in c["accuracy"] if x["condition"] == condition and x["brief_profile"] == profile]
@@ -112,11 +112,14 @@ def cohort_fragments(c: dict) -> dict[str, str]:
                                                f"<th class='num'>USD per solved task</th><th>why unknown</th></tr></thead><tbody>{rows}</tbody></table></div>")
     # (e) integrity flags per model
     cid = f"gradient-{key}-integrity"
-    rows = "".join(f"<tr><td>{model_chip(r['model'])}</td><td class='num'>{r['n']}</td><td class='num'>{r['known_n']}</td>"
-                   f"<td class='num'>{(chip(str(r['flagged_n']), 'serious') if r['flagged_n'] else '0')}</td><td class='num'>{r['signals']}</td>"
-                   f"<td class='num'>{f'{r[chr(114) + chr(97) + chr(116) + chr(101)]:.2f}' if r['rate'] is not None else '—'}</td>"
-                   f"<td>{('<a href=' + chr(39) + h(r['evidence_url']) + chr(39) + '>flagged trials</a>') if r['flagged_n'] else '<span class=' + chr(39) + 'muted' + chr(39) + '>none</span>'}</td></tr>"
-                   for r in c["integrity"])
+    def integrity_row(r: dict) -> str:
+        flagged = chip(str(r["flagged_n"]), "serious") if r["flagged_n"] else "0"
+        rate = f"{r['rate']:.2f}" if r["rate"] is not None else "—"
+        evidence = f"<a href='{h(r['evidence_url'])}'>flagged trials</a>" if r["flagged_n"] else "<span class='muted'>none</span>"
+        return (f"<tr><td>{model_chip(r['model'])}</td><td class='num'>{r['n']}</td><td class='num'>{r['known_n']}</td><td class='num'>{flagged}</td>"
+                f"<td class='num'>{r['signals']}</td><td class='num'>{rate}</td><td>{evidence}</td></tr>")
+
+    rows = "".join(integrity_row(r) for r in c["integrity"])
     frags[cid] = ("<h3>Integrity flags per model</h3><p class='muted small'>Trials whose grader report carries at least one integrity signal (forged reports, protected-path "
                   "touches, config edits). Count and rate over trials with a known signal count; unknown stays unknown.</p>"
                   "<div class='table-wrap'><table><thead><tr><th>model</th><th class='num'>trials</th><th class='num'>with known count</th><th class='num'>flagged</th>"

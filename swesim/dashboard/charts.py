@@ -432,12 +432,14 @@ def tier_bars(cells: list[dict], *, chart_id: str, title: str, ymax: float = 1.0
     parts.append("</svg>")
     rows = sorted(cells, key=lambda c: ((*TIER_ORDER, "other").index(c.get("tier", "other")) if c.get("tier") in (*TIER_ORDER, "other") else 99,
                                         family_of(c["model"])[2] or 99, c["model"]))
-    body_rows = "".join(
-        f"<tr><td>{_h(c.get('tier'))}</td><td class='mono'>{_h(c['model'])}</td><td>{_h(family_of(c['model'])[1])}</td>"
-        f"<td class='num'>{_h(f'{_num(c.get("accuracy")):.3f}') if _num(c.get('accuracy')) is not None else 'n/a'}</td>"
-        f"<td class='num'>{_h(c.get('success_count', 0))}</td>"
-        f"<td class='num'>{('<a href=' + chr(39) + _h(c['evidence_url']) + chr(39) + '>' + str(c['n']) + '</a>') if c.get('evidence_url') else c['n']}</td>"
-        f"<td class='num'>{_h(c.get('scenarios'))}</td></tr>" for c in rows)
+    def table_row(c: dict) -> str:
+        acc = _num(c.get("accuracy"))
+        n_cell = f"<a href='{_h(c['evidence_url'])}'>{c['n']}</a>" if c.get("evidence_url") else str(c["n"])
+        return (f"<tr><td>{_h(c.get('tier'))}</td><td class='mono'>{_h(c['model'])}</td><td>{_h(family_of(c['model'])[1])}</td>"
+                f"<td class='num'>{f'{acc:.3f}' if acc is not None else 'n/a'}</td><td class='num'>{_h(c.get('success_count', 0))}</td>"
+                f"<td class='num'>{n_cell}</td><td class='num'>{_h(c.get('scenarios'))}</td></tr>")
+
+    body_rows = "".join(table_row(c) for c in rows)
     table = ("<div class='table-wrap'><table><thead><tr><th>tier</th><th>model</th><th>family</th><th class='num'>accuracy</th><th class='num'>solved</th>"
              f"<th class='num'>n</th><th class='num'>scenarios</th></tr></thead><tbody>{body_rows}</tbody></table></div>")
     caption = (f"{len(cells)} model cell(s) across {len(tiers)} tier group(s); one bar per model, colour = family (fixed slot), the label under each bar "
@@ -553,10 +555,15 @@ def model_hbars(rows: list[dict], *, metric: str, chart_id: str, title: str, fmt
             return f"<td class='num'>{text}</td>"
         if kind == "link":
             return f"<td class='num'><a href='{_h(r.get('evidence_url'))}'>{_h(v)}</a></td>" if r.get("evidence_url") else f"<td class='num'>{_h(v)}</td>"
-        return f"<td{' class=' + chr(39) + 'mono' + chr(39) if key == 'model' else ''}>{_h(v) if v is not None else '—'}</td>"
+        cls = " class='mono'" if key == "model" else ""
+        return f"<td{cls}>{_h(v) if v is not None else '—'}</td>"
+
+    def th(label: str, kind: str) -> str:
+        cls = " class='num'" if kind != "text" else ""
+        return f"<th{cls}>{_h(label)}</th>"
 
     body_rows = "".join("<tr>" + "".join(td(r, key, kind) for key, _label, kind in columns) + "</tr>" for r in rows)
-    table = ("<div class='table-wrap'><table><thead><tr>" + "".join(f"<th{' class=' + chr(39) + 'num' + chr(39) if kind != 'text' else ''}>{_h(label)}</th>" for _k, label, kind in columns)
+    table = ("<div class='table-wrap'><table><thead><tr>" + "".join(th(label, kind) for _k, label, kind in columns)
              + f"</tr></thead><tbody>{body_rows}</tbody></table></div>")
     return figure(title, "".join(parts) + family_legend([r["model"] for r in rows]), table,
                   caption or "One bar per model in tier order (A→E); colour = family; the value sits at the bar tip and n in the tooltip and table.", chart_id)

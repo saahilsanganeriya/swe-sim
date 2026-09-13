@@ -63,7 +63,8 @@ def tier_label(model: str) -> str:
     return tier_of(model) or "other"
 
 
-def _arm_order(arm: tuple[str, str]) -> tuple[int, str]:
+def arm_order(arm: tuple[str, str]) -> tuple[int, str]:
+    """Arms in condition order (full, hidden, interactive), then brief profile."""
     condition, profile = arm
     return (CONDITIONS.index(condition) if condition in CONDITIONS else len(CONDITIONS)), profile
 
@@ -97,7 +98,7 @@ def accuracy_cells(trials: list, query: dict) -> list[dict]:
     for t in trials:
         groups[(t.condition, t.brief_profile, t.model)].append(t)
     out = []
-    for (condition, profile, model), rows in sorted(groups.items(), key=lambda kv: (_arm_order(kv[0][:2]), model_order(kv[0][2]))):
+    for (condition, profile, model), rows in sorted(groups.items(), key=lambda kv: (arm_order(kv[0][:2]), model_order(kv[0][2]))):
         out.append({"condition": condition, "brief_profile": profile, "model": model, "tier": tier_label(model), "family": family_of(model)[1],
                     **_cell(rows), "evidence_url": evidence_url(query, model=model, condition=condition, brief_profile=profile)})
     return out
@@ -144,7 +145,7 @@ def matrices(trials: list, scenarios: dict) -> list[dict]:
     for t in trials:
         arms[(t.condition, t.brief_profile)].append(t)
     out = []
-    for (condition, profile), rows in sorted(arms.items(), key=lambda kv: _arm_order(kv[0])):
+    for (condition, profile), rows in sorted(arms.items(), key=lambda kv: arm_order(kv[0])):
         models = sort_models(t.model for t in rows)
         by_cell: dict[tuple[str, str], list] = defaultdict(list)
         for t in rows:
