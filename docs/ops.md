@@ -78,6 +78,10 @@ Prerequisites on the laptop:
 1. `gcloud` authenticated for the project. The dotenv file (`SWESIM_ENV_FILE`, default `~/Documents/.env`) contains
    `GCP_PROJECT`, `GCP_ZONE`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SWESIM_WORKER_SECRET`, `SWESIM_STAKEHOLDER_URL`
    and a **read-only** `GH_TOKEN` (from `gh auth token`; written into the ignored env file, never into tracked files).
+   For Temporal Cloud (planned; see `docs/superpowers/specs/2026-09-13-gcp-hosting-design.md`) add `TEMPORAL_ADDRESS`
+   (`<region>.gcp.api.temporal.io:7233`), `TEMPORAL_NAMESPACE` (`<name>.<account>`) and `TEMPORAL_API_KEY`; the client and
+   worker turn TLS on when the key is present (`swesim.workflows.client.connect_kwargs`) and log only the auth mode, never the key.
+   Without them the worker uses the VM's local dev server.
    `~/.modal.toml` holds the Modal token. Both files are mode 0600.
 2. The commit to deploy is pushed to `origin` (the VM clones it over HTTPS with `GH_TOKEN`).
 

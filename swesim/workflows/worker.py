@@ -42,8 +42,9 @@ async def main(launcher: str | None = None) -> None:
     A.LAUNCHER = launcher or os.environ.get("SWESIM_TRIAL_LAUNCHER", A.LAUNCHER)
     if A.LAUNCHER != "systemd":
         print(f"WARNING: trial launcher {A.LAUNCHER!r} is for local smoke only; NOT production", file=sys.stderr, flush=True)
-    client = await Client.connect(address(), namespace=namespace())
-    print(f"swesim worker: temporal={address()} namespace={namespace()} queue={TASK_QUEUE} launcher={A.LAUNCHER} workspace={A.WS.root}", flush=True)
+    from swesim.workflows.client import connect, describe_connection
+    client = await connect()
+    print(f"swesim worker: {describe_connection()} queue={TASK_QUEUE} launcher={A.LAUNCHER} workspace={A.WS.root}", flush=True)
     async with Worker(client, task_queue=TASK_QUEUE, workflows=WORKFLOWS, activities=A.ALL, max_concurrent_activities=MAX_CONCURRENT_ACTIVITIES):
         await asyncio.Event().wait()
 

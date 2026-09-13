@@ -82,6 +82,10 @@ _CLASS_DEF = re.compile(r"^\s*class\s+(\w+)\b")
 WITHHOLD_PROMPT_VERSION = "withhold-v2"  # v2: the model selects spans, code deletes them; the brief is computed, never trusted
 WITHHOLD_KINDS = {"reproduction", "context", "behavior", "interface", "constraint"}
 MAX_REMOVED_FRACTION = 0.6  # of sentence/line segments
+_WITHHOLDABLE = re.compile(r"```|^Traceback \(most recent call last\)", re.M)  # material the model usually can withhold
+WITHHOLD_NUDGE = ("You selected no spans, but the issue contains a fenced code block or a traceback. If it is a reproduction, an "
+                  "error message, or a literal expected output that a developer could ask the reporter for, select that span "
+                  "verbatim under its category. If nothing qualifies, return {\"removed\": []} again.")
 WITHHOLD_SCHEMA = ('{"removed":[{"category":"reproduction|error_message|expected_output|location|version|proposed_fix",'
                    '"excerpt":"verbatim contiguous span copied from the issue","paraphrase":"optional one-sentence paraphrase (metadata only)",'
                    '"kind":"reproduction|context|behavior|interface|constraint","discovery":"on-request|repo-derivable"}]}')
@@ -280,7 +284,13 @@ def withhold(natural_issue: str, model_id: str) -> dict:
             rejected.append("removed must be a list of selections")
             items = []
         if not items and not rejected:
-            return none_removed("model selected no spans")
+            if _attempt == 0 and _WITHHOLDABLE.search(natural_issue):
+                # Span selection is a model choice and varies run to run (seaborn-3190 lost its withheld brief on a rebuild);
+                # one nudge when the issue visibly carries withholdable material, then zero removals stands.
+                messages.append({"role": "assistant", "content": json.dumps(out)})
+                messages.append({"role": "user", "content": WITHHOLD_NUDGE})
+                continue
+            return none_removed("model selected no spans" if attempts == 1 else "model selected no spans after one nudge")
         for item in items:
             if not isinstance(item, dict):
                 rejected.append(f"selection must be an object with category/excerpt/kind/discovery: {str(item)[:60]!r}")

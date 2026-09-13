@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import uuid
 
 from temporalio.client import Client
@@ -15,8 +16,28 @@ TYPES = {"create": "CreateTasksWorkflow", "candidate": "CandidateWorkflow", "run
 REJECT_DUP = WorkflowIDReusePolicy.REJECT_DUPLICATE
 
 
+def connect_kwargs(env: dict | None = None) -> dict:
+    """Connection settings from the environment. Local dev server by default; Temporal Cloud with `TEMPORAL_API_KEY` (TLS on,
+    address like `us-central1.gcp.api.temporal.io:7233`, namespace like `swesim.abcde`) or mTLS with `TEMPORAL_TLS_CERT` /
+    `TEMPORAL_TLS_KEY` (PEM file paths). The key value never appears in logs: `describe_connection` reports only the mode."""
+    e = os.environ if env is None else env
+    kw: dict = {"target_host": e.get("TEMPORAL_ADDRESS", "localhost:7233"), "namespace": e.get("TEMPORAL_NAMESPACE", "default")}
+    if e.get("TEMPORAL_API_KEY"):
+        kw["api_key"] = e["TEMPORAL_API_KEY"]; kw["tls"] = True
+    elif e.get("TEMPORAL_TLS_CERT") and e.get("TEMPORAL_TLS_KEY"):
+        from temporalio.service import TLSConfig
+        kw["tls"] = TLSConfig(client_cert=Path(e["TEMPORAL_TLS_CERT"]).read_bytes(), client_private_key=Path(e["TEMPORAL_TLS_KEY"]).read_bytes())
+    return kw
+
+
+def describe_connection(env: dict | None = None) -> str:
+    kw = connect_kwargs(env)
+    mode = "api-key" if "api_key" in kw else "mtls" if kw.get("tls") else "plain"
+    return f"temporal={kw['target_host']} namespace={kw['namespace']} auth={mode}"
+
+
 async def connect() -> Client:
-    return await Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"), namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"))
+    return await Client.connect(**connect_kwargs())
 
 
 def _summary(params: dict) -> dict:

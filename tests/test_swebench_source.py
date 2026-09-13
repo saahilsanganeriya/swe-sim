@@ -1660,3 +1660,30 @@ def test_eligibility_excludes_network_test_repos():
     """The verifier is offline, so repos whose suites need the network (psf/requests -> httpbin) are not trial-eligible."""
     assert sb.filter_pytest_repos(["psf__requests-1963", "pydata__xarray-5362", "django__django-1"]) == ["pydata__xarray-5362"]
     assert "psf/requests" in sb.PYTEST_REPOS and "psf/requests" in sb.NETWORK_TEST_REPOS
+
+
+def test_withhold_nudges_once_when_nothing_selected_but_issue_has_a_code_block(monkeypatch):
+    """Zero selections on an issue with a fenced code block or a traceback gets one nudge; a second empty answer stands as zero
+    removals. An issue without such material is accepted as zero removals on the first answer (no extra model call)."""
+    from swesim.stages import draft_spec
+    issue = "Import fails\nThe importer stops on the first row.\n```\nimport lib; lib.load('x.csv')\n```\nExpected the rows to load."
+    calls = []
+
+    def empty_then_select(model_id, system, messages, schema, **kw):
+        calls.append(list(messages))
+        if len(calls) == 1:
+            return {"removed": []}
+        return {"removed": [{"category": "reproduction", "excerpt": "import lib; lib.load('x.csv')", "kind": "reproduction", "discovery": "on-request"}]}
+    monkeypatch.setattr(draft_spec, "chat_json", empty_then_select)
+    res = draft_spec.withhold(issue, "fake/model")
+    assert len(calls) == 2 and calls[1][-1]["role"] == "user" and "selected no spans" in calls[1][-1]["content"]
+    assert res["stats"]["attempts"] == 2 and len(res["removed"]) == 1 and "lib.load" not in res["withheld_brief"]
+
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: {"removed": []})
+    res = draft_spec.withhold(issue, "fake/model")
+    assert res["removed"] == [] and res["stats"]["attempts"] == 2 and res["stats"]["reason"] == "model selected no spans after one nudge"
+
+    plain = "Import fails\nThe importer stops on the first row.\nExpected the rows to load."
+    calls.clear(); monkeypatch.setattr(draft_spec, "chat_json", lambda m, s, msgs, sch, **k: (calls.append(1), {"removed": []})[1])
+    res = draft_spec.withhold(plain, "fake/model")
+    assert len(calls) == 1 and res["stats"]["attempts"] == 1 and res["stats"]["reason"] == "model selected no spans"

@@ -18,7 +18,9 @@ What is wrong with it for a hosted product: the dev server is single-process SQL
 
 ## Design
 
-### 1. Temporal: Temporal Cloud (**recommend**) over self-hosting
+### 1. Temporal: Temporal Cloud (**decided**: the user will create the account, 2026-09-13)
+
+Code side is done ahead of the account: `connect_kwargs` reads `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY` (or mTLS PEM paths); the VM env renderer ships those keys. What is needed from the account: a namespace (region on GCP `us-central1` if offered), and an API key with write access to that namespace, placed in the dotenv file the VM scripts read.
 
 - **Temporal Cloud**: managed service, namespace `swesim.<account>`, mTLS certificate or API key. Code change is one function: `swesim/workflows/client.py:connect` gains `TEMPORAL_TLS_CERT/KEY` or `TEMPORAL_API_KEY` handling (`Client.connect(address, namespace=..., tls=TLSConfig(...))` or `api_key=...`). The worker is unchanged. The Temporal UI comes with it, behind Temporal's own login. Cost is a base fee plus per-action pricing; at our volume (thousands of actions per day, not millions) the base fee dominates.
 - **Self-hosted**: Temporal server on GKE Autopilot with Cloud SQL for PostgreSQL, plus the UI. More moving parts, more to patch, and no one on call for it. Only worth it if the Temporal Cloud account is a blocker.
@@ -79,7 +81,7 @@ Ops Agent ships journald to Cloud Logging; an uptime check on the console; alert
 
 ## Open questions for the user
 
-1. Temporal Cloud account and budget, or self-host?
+1. ~~Temporal Cloud account and budget, or self-host?~~ Decided: Temporal Cloud; the user creates the account.
 2. Who gets console access (email allowlist), and is there a domain to use?
 3. One VM with autohealing now, with per-host queues deferred, or build the multi-worker path immediately?
 4. Should the OpenRouter weak-model sweep run from the same worker (rate limits per provider) or a second one?

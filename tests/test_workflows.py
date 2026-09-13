@@ -1511,7 +1511,8 @@ def test_worker_env_is_rendered_with_only_the_five_keys(tmp_path):
     src = tmp_path / "laptop.env"
     src.write_text("# laptop env\nexport ANTHROPIC_API_KEY=\"fake-anthropic-123\"\nOPENAI_API_KEY=fake-openai-456 \n"
                    "SWESIM_WORKER_SECRET='fake-worker-secret'\nSWESIM_STAKEHOLDER_URL=https://stake.example\nGH_TOKEN=fake-gh-token\n"
-                   "GCP_PROJECT=my-proj\nGCP_ZONE=us-central1-a\nAWS_SECRET_ACCESS_KEY=must-not-ship\nHF_TOKEN=must-not-ship-either\n")
+                   "GCP_PROJECT=my-proj\nGCP_ZONE=us-central1-a\nAWS_SECRET_ACCESS_KEY=must-not-ship\nHF_TOKEN=must-not-ship-either\n"
+                   "TEMPORAL_API_KEY=fake-temporal-key\n")   # Temporal Cloud keys ship when present; absent ones only warn
     create = (ROOT / "scripts/vm/create.sh").read_text(); setup = (ROOT / "scripts/vm/setup.sh").read_text()
     funcs = _bash_functions(create, ["env_get", "render_worker_env"])
     assert funcs == _bash_functions(setup, ["env_get", "render_worker_env"])          # identical copies in both scripts
@@ -1522,7 +1523,7 @@ def test_worker_env_is_rendered_with_only_the_five_keys(tmp_path):
     assert "GCP_" not in text and "AWS_" not in text and "HF_TOKEN" not in text and "export" not in text and "#" not in text
     assert all(re.fullmatch(r"[A-Z_]+='[^'\n]*'", line) for line in text.splitlines())   # systemd EnvironmentFile= safe
     assert dotenv_values(dst) == {"ANTHROPIC_API_KEY": "fake-anthropic-123", "OPENAI_API_KEY": "fake-openai-456 ", "SWESIM_WORKER_SECRET": "fake-worker-secret",
-                                  "SWESIM_STAKEHOLDER_URL": "https://stake.example", "GH_TOKEN": "fake-gh-token"}
+                                  "SWESIM_STAKEHOLDER_URL": "https://stake.example", "GH_TOKEN": "fake-gh-token", "TEMPORAL_API_KEY": "fake-temporal-key"}
     # create.sh ships the rendered temp file, and setup.sh renders again into /etc/swesim/env
     assert '"${SCP[@]}" "$WORKER_ENV" "$VM_NAME":~/swesim-bootstrap/env' in create and 'render_worker_env "$ENV_FILE" "$WORKER_ENV"' in create
     assert 'render_worker_env "$BOOT/env" /etc/swesim/env' in setup and 'install -m 600 "$BOOT/env"' not in setup
@@ -1530,3 +1531,18 @@ def test_worker_env_is_rendered_with_only_the_five_keys(tmp_path):
     bad = tmp_path / "bad.env"; bad.write_text("ANTHROPIC_API_KEY=it's-bad\nSWESIM_WORKER_SECRET=x\nGH_TOKEN=y\n")
     cp = subprocess.run(["bash", "-c", funcs + '\nrender_worker_env "$1" "$2"', "bash", str(bad), str(tmp_path / "bad.out")], capture_output=True, text=True)
     assert cp.returncode != 0 and "single quote" in cp.stderr
+
+
+def test_connect_kwargs_local_api_key_and_mtls(tmp_path):
+    """Local dev server by default; Temporal Cloud API key turns TLS on; mTLS reads the PEM files; the key never enters the log line."""
+    from swesim.workflows import client as C
+    assert C.connect_kwargs({}) == {"target_host": "localhost:7233", "namespace": "default"}
+    kw = C.connect_kwargs({"TEMPORAL_ADDRESS": "us-central1.gcp.api.temporal.io:7233", "TEMPORAL_NAMESPACE": "swesim.abcde", "TEMPORAL_API_KEY": "tmprl_secret"})
+    assert kw == {"target_host": "us-central1.gcp.api.temporal.io:7233", "namespace": "swesim.abcde", "api_key": "tmprl_secret", "tls": True}
+    line = C.describe_connection({"TEMPORAL_ADDRESS": "x:7233", "TEMPORAL_NAMESPACE": "n", "TEMPORAL_API_KEY": "tmprl_secret"})
+    assert line == "temporal=x:7233 namespace=n auth=api-key" and "tmprl_secret" not in line
+    cert = tmp_path / "c.pem"; key = tmp_path / "k.pem"; cert.write_bytes(b"CERT"); key.write_bytes(b"KEY")
+    kw = C.connect_kwargs({"TEMPORAL_ADDRESS": "y:7233", "TEMPORAL_TLS_CERT": str(cert), "TEMPORAL_TLS_KEY": str(key)})
+    assert kw["tls"].client_cert == b"CERT" and kw["tls"].client_private_key == b"KEY" and "api_key" not in kw
+    assert C.describe_connection({"TEMPORAL_TLS_CERT": str(cert), "TEMPORAL_TLS_KEY": str(key)}).endswith("auth=mtls")
+    assert C.describe_connection({}).endswith("auth=plain")

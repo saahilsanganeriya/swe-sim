@@ -38,7 +38,7 @@ env_get() {
 # systemd EnvironmentFile= and python-dotenv both read the value literally. Values are never printed.
 render_worker_env() {
   local src=$1 dst=$2 key value
-  local keys=(ANTHROPIC_API_KEY OPENAI_API_KEY SWESIM_WORKER_SECRET SWESIM_STAKEHOLDER_URL GH_TOKEN)
+  local keys=(ANTHROPIC_API_KEY OPENAI_API_KEY SWESIM_WORKER_SECRET SWESIM_STAKEHOLDER_URL GH_TOKEN TEMPORAL_ADDRESS TEMPORAL_NAMESPACE TEMPORAL_API_KEY)
   local missing=()
   : > "$dst"
   chmod 600 "$dst"
