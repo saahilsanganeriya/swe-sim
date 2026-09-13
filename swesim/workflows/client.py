@@ -81,8 +81,9 @@ async def progress(workflow_id: str) -> dict:
 
 
 async def cancel(workflow_id: str) -> None:
-    """Request cancellation; children are cancelled with the parent. Running trial units keep running and are reconciled
-    by a later await, never relaunched."""
+    """Request cancellation; children are cancelled with the parent. A cancelled trial's systemd unit keeps running on the
+    VM and finishes on its own, but no workflow collects it afterwards (its trial id is consumed); a later run uses a new
+    attempt index and is a fresh launch, never a relaunch of the cancelled one."""
     c = await connect()
     await c.get_workflow_handle(workflow_id).cancel()
 

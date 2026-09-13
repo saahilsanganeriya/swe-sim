@@ -18,7 +18,7 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
-from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
+from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlreadyStartedError
 
 ONE = RetryPolicy(maximum_attempts=1)
 READ = RetryPolicy(maximum_attempts=3)
@@ -31,6 +31,16 @@ CREATE_APPROVAL_MODES = {"auto", "hold"}
 # contains excerpt of <fact>"). Anything else (judge, load-bearing, controls, assets) moves to the next candidate.
 LEAK_GATE = "withholding-leak"
 REJECT_DUP = WorkflowIDReusePolicy.REJECT_DUPLICATE
+# Candidate children: a terminal outcome (valid/invalid/rejected/not-reproducible/...) completes the child, so the id
+# `create:<scenario_id>` is consumed and a later CreateTasksWorkflow records `duplicate-rejected`. An infrastructure
+# failure (LLM/Harbor/cancel) FAILS the child, so a later run may start the same id again and recover the candidate.
+DUP_FAILED_ONLY = WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY
+
+
+def _refusable(e: BaseException) -> bool:
+    """True for an activity that ended with an ApplicationError (a refused decision); cancellations and infrastructure
+    failures are not refusals and must propagate."""
+    return isinstance(e, ActivityError) and isinstance(e.cause, ApplicationError)
 
 
 def _is_leak_reason(reason) -> bool:
@@ -112,19 +122,30 @@ async def run_trials(set_trial_status, trials: list[dict], sem: asyncio.Semaphor
 
 @workflow.defn
 class TrialWorkflow:
+    def __init__(self) -> None:
+        self.state: dict = {"stage": "starting"}
+
+    @workflow.query
+    def progress(self) -> dict:
+        return self.state
+
     @workflow.run
     async def run(self, p: dict) -> dict:
         launch = None
+        self.state = {"stage": "launching", "trial_id": p.get("trial_id")}
         try:
             launch = await act("launch_trial_activity", p, 5)
         except Exception as e:  # noqa: BLE001 - a lost launch acknowledgement is ambiguous by design
             # Poll the same unit/id; never relaunch it. The await activity reads the recorded evidence.
             launch = {"trial_id": p.get("trial_id"), "launched": False, "error": str(e)[:500]}
+        self.state = {"stage": "awaiting", "trial_id": p.get("trial_id"), "launch": launch}
         try:
             result = await workflow.execute_activity("await_trial_activity", p, start_to_close_timeout=timedelta(hours=3),
                                                      heartbeat_timeout=timedelta(minutes=2), retry_policy=READ)
         except Exception as e:  # noqa: BLE001 - deadline or repeated read failures: unresolved, not relaunched
+            self.state = {"stage": "done", "trial_id": p.get("trial_id"), "status": "unresolved", "launch": launch}
             return {"trial_id": p.get("trial_id"), "status": "unresolved", "error": str(e)[:500], "launch": launch}
+        self.state = {"stage": "done", "trial_id": p.get("trial_id"), "status": result.get("status"), "launch": launch}
         return {**result, "launch": launch}
 
 
@@ -255,30 +276,44 @@ class CandidateWorkflow:
             d = self.decisions.pop(0)
             if d.get("scenario_id") not in (None, sid):
                 refusal = f"decision for {d.get('scenario_id')} ignored by {sid}"
-                self.state["refusals"] = [*self.state.get("refusals", []), refusal]
-                continue
-            if d.get("decision") == "reject":
+            elif d.get("decision") not in ("approve", "reject"):
+                refusal = f"unknown decision {d.get('decision')!r} ignored"
+            elif d.get("spec_hash") != draft_hash:
+                # Both decisions are bound to the reviewed draft; a stale hash means the reviewer saw something else.
+                refusal = f"{d.get('decision')} refused: signalled spec_hash differs from the draft on disk"
+            elif d.get("decision") == "reject":
                 return sid, None, self._done(sid, "rejected-by-human", [d.get("note") or "rejected by reviewer"], draft_hash)
-            try:
-                # The activity re-reads the draft on disk, compares its hash to the signalled one and writes approval.json
-                # (approved_by human-command, review_needed false). A mismatch is refused and the candidate keeps waiting.
-                approved = await act("human_approve_activity", {"scenario_id": sid, "spec_hash": d.get("spec_hash"), "note": d.get("note")}, 5)
-                return sid, approved, {}
-            except Exception as e:  # noqa: BLE001 - refused decision; keep waiting for a correct one
-                refusal = f"approve refused: {_err(e)}"
-                self.state["refusals"] = [*self.state.get("refusals", []), refusal]
+            else:
+                try:
+                    # The activity re-reads the draft on disk, compares its hash to the signalled one and writes approval.json
+                    # (approved_by human-command, review_needed false). A mismatch is refused and the candidate keeps waiting.
+                    approved = await act("human_approve_activity", {"scenario_id": sid, "spec_hash": d.get("spec_hash"), "note": d.get("note")}, 5)
+                    return sid, approved, {}
+                except Exception as e:
+                    if not _refusable(e):  # cancellation or infrastructure failure: propagate, never re-enter the wait
+                        raise
+                    refusal = f"approve refused: {_err(e)}"
+            self.state["refusals"] = [*self.state.get("refusals", []), refusal]
 
     @workflow.run
     async def run(self, p: dict) -> dict:
         p = dict(p or {}); iid = p["instance_id"]; sid = None
         self.state = {**self.state, "instance_id": iid}
         if p.get("approval_mode", "auto") not in CREATE_APPROVAL_MODES:
-            return self._done(None, "error", [f"approval_mode must be one of {sorted(CREATE_APPROVAL_MODES)}"], None)
+            raise ApplicationError(f"approval_mode must be one of {sorted(CREATE_APPROVAL_MODES)}", non_retryable=True)
         try:
             await self._stage("judging", instance_id=iid)
             judged = await act("judge_one_activity", p, 30); sid = judged.get("scenario_id")
             if not judged.get("keep"):
                 return self._done(sid, "rejected", list(judged.get("reasons") or ["judge did not keep the candidate"]), None)
+            # Measure FAIL_TO_PASS / PASS_TO_PASS on base and gold (Harbor on Modal) for every source kind: SWE-bench's
+            # published lists do not always reproduce offline. One attempt; harbor_cli reconciles an existing job.
+            await self._stage("probing", scenario_id=sid)
+            probed = await act("probe_candidate_activity", {"judged_path": judged["judged_path"], "instance_id": iid, "scenario_id": sid,
+                                                            "max_builds": p.get("max_builds", 1)}, 150)
+            if not probed.get("fail_to_pass"):
+                return self._done(sid, "not-reproducible-offline", [probed.get("reason") or "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold"], None)
+            judged = {**judged, "judged_path": probed["judged_path"]}  # the probed row (measured lists) is what draft reads
             if p.get("approval_mode", "auto") == "hold":
                 sid, approved, terminal = await self._hold_for_reviewer(p, judged, iid)
                 if approved is None:
@@ -289,8 +324,11 @@ class CandidateWorkflow:
                     return self._done(sid, "rejected", list(approved.get("reasons", [])), None)
             built = await build_scenario(self._stage, p, sid, approved["spec_hash"])
             return self._done(sid, built["status"], built["reasons"], built["spec_hash"])
-        except Exception as e:  # noqa: BLE001 - the candidate reports the failure; siblings are unaffected
-            return self._done(sid, "error", [f"{self.state.get('stage')}: {_err(e)}"], None)
+        except Exception as e:
+            # Infrastructure failure (LLM, Harbor, a lost parent): FAIL the child so `create:<sid>` can be started again
+            # (ALLOW_DUPLICATE_FAILED_ONLY); the parent records `error` from the cause and siblings are unaffected.
+            self._done(sid, "error", [f"{self.state.get('stage')}: {_err(e)}"], None)
+            raise ApplicationError(f"candidate {iid} failed at stage {self.state.get('stage')}: {_err(e)}", non_retryable=True) from e
 
 
 def _mine_params(src: dict) -> dict:
@@ -324,8 +362,8 @@ class CreateTasksWorkflow:
         c["stage"] = p.get("stage"); c["stages"] = [*c.get("stages", []), p.get("stage")]
         if p.get("spec_hash"):
             c["spec_hash"] = p["spec_hash"]
-        if p.get("stage") == "awaiting-approval":
-            c["status"] = "awaiting-approval"
+        # Status follows the child's latest stage: in the review queue only while it waits; "running" otherwise.
+        c["status"] = "awaiting-approval" if p.get("stage") == "awaiting-approval" else "running"
         if p.get("refusal"):
             c["refusals"] = [*c.get("refusals", []), p["refusal"]]
 
@@ -342,6 +380,14 @@ class CreateTasksWorkflow:
         mode = p.get("approval_mode", "auto")
         if mode not in CREATE_APPROVAL_MODES:
             raise ApplicationError(f"approval_mode must be one of {sorted(CREATE_APPROVAL_MODES)}", non_retryable=True)
+        # Mine outputs are one file per pool/repo, so two sources with the same key in one batch would race on that
+        # file while mining concurrently. Guard: duplicate keys are rejected before any activity runs.
+        keys = [_source_key(src) for src in p.get("sources", [])]
+        dups = sorted({k for k in keys if keys.count(k) > 1})
+        if dups:
+            raise ApplicationError(f"duplicate sources in one batch: {dups}; merge them into one source or run separate batches", non_retryable=True)
+        if not keys:
+            raise ApplicationError("sources is empty", non_retryable=True)
         sem = asyncio.Semaphore(max(1, int(p.get("max_parallel", 8))))
         self.state = {"stage": "probing-models", "sources": {}, "probe": {}}
         probe = await act("probe_models_activity", p, 5)
@@ -358,11 +404,11 @@ class CreateTasksWorkflow:
                          "draft_model": p.get("draft_model"), "stakeholder_model": p.get("stakeholder_model"), "stakeholder_url": p.get("stakeholder_url"),
                          "approval_mode": mode, "redraft_on_leak": p.get("redraft_on_leak", True)}
                 try:
-                    r = await workflow.execute_child_workflow(CandidateWorkflow.run, child, id=f"create:{sid}", id_reuse_policy=REJECT_DUP)
+                    r = await workflow.execute_child_workflow(CandidateWorkflow.run, child, id=f"create:{sid}", id_reuse_policy=DUP_FAILED_ONLY)
                 except WorkflowAlreadyStartedError:
                     r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "duplicate-rejected", "spec_hash": None,
-                         "reasons": ["a CandidateWorkflow with this id already ran; read its result instead"]}
-                except Exception as e:  # noqa: BLE001 - one failed child never stops its siblings
+                         "reasons": ["a CandidateWorkflow with this id already completed; read its result instead"]}
+                except Exception as e:  # noqa: BLE001 - one failed child never stops its siblings; a failed id may be started again
                     r = {"scenario_id": sid, "instance_id": cand["instance_id"], "status": "error", "reasons": [_err(e)], "spec_hash": None}
                 self.candidates[sid].update(status=r["status"], stage="done", spec_hash=r.get("spec_hash"), reasons=r.get("reasons", []))
                 self.counts[r["status"]] = self.counts.get(r["status"], 0) + 1

@@ -18,17 +18,34 @@ integrator during Phase 3. Nothing below claims a cloud result until the placeho
 Files on the VM: `/opt/swesim` (git checkout at the deployed commit), `/opt/swesim/workspace/{candidates,scenarios,tasks,trials,jobs,exports,evidence}`, `/opt/swesim/registry.json`, `/var/lib/swesim/temporal.db`, `/etc/swesim/env` (0600; rendered by `render_worker_env` from the laptop's dotenv file and holding only `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SWESIM_WORKER_SECRET`, `SWESIM_STAKEHOLDER_URL`, `GH_TOKEN` as `KEY='value'` lines; read by systemd `EnvironmentFile=` for the worker and dashboard and by python-dotenv in trial units via `SWESIM_ENV_FILE`; never from the repo), `~/.modal.toml` (0600). All service ports bind to 127.0.0.1; nothing is exposed on the VM's public address.
 
 Workflows (task queue `swesim`): `CreateTasksWorkflow` mines each source (GitHub repo URL or SWE-bench pool) and fans out
-one `CandidateWorkflow` per candidate (id `create:<scenario_id>`, `REJECT_DUPLICATE`, at most `max_parallel` at a time,
-default 8): judge -> draft -> approval -> compile -> validate -> register. `approval_mode=auto` (default) lets the code-owned
-gates approve; `approval_mode=hold` pre-checks the draft (schema, assets, withholding leak) and parks the candidate in
+one `CandidateWorkflow` per candidate (id `create:<scenario_id>`, at most `max_parallel` at a time, default 8):
+judge -> **probe** -> draft -> approval -> compile -> validate -> register. The probe measures FAIL_TO_PASS / PASS_TO_PASS on
+base and gold through Harbor on Modal for every source kind (SWE-bench's published lists do not always reproduce offline:
+sphinx-9467's nop run passed all four F2P on base); an empty measured F2P ends the candidate as `not-reproducible-offline`,
+and the probed row (measured lists) is what the drafter reads. `approval_mode=auto` (default) lets the code-owned gates
+approve; `approval_mode=hold` pre-checks the draft (schema, assets, withholding leak) and parks the candidate in
 `awaiting-approval` for up to 7 days until a reviewer sends `approve` (`swesim workflows approve <create-id> <scenario_id>
-<spec_hash> --decision approve|reject --note ...`); a signalled hash that differs from the draft on disk is refused and the
-candidate keeps waiting. The parent's `progress` query lists every candidate's stage and an `awaiting_approval` review queue.
+<spec_hash> --decision approve|reject --note ...`); both decisions are bound to the draft's hash, a stale hash or an unknown
+decision is refused and the candidate keeps waiting. The parent's `progress` query lists every candidate's stage (status
+follows the child's latest stage: `awaiting-approval` only while it waits) and an `awaiting_approval` review queue.
+
+Candidate ids and reruns: a candidate that reached a terminal outcome (`valid`, `invalid`, `rejected`, `rejected-by-human`,
+`not-reproducible-offline`, `approval-timeout`) completes its `create:<scenario_id>` workflow, so a later
+`CreateTasksWorkflow` on the same source records it as `duplicate-rejected` and nothing is redone. An infrastructure failure
+(provider outage, Harbor/Modal error, a cancelled parent) FAILS the candidate workflow (`error` in the parent's result, with
+the cause), and the child id uses `ALLOW_DUPLICATE_FAILED_ONLY`: to recover, start another `CreateTasksWorkflow` with the
+same source (only the failed candidates run again; judged/probed/drafted files on disk are retained, so the rerun resumes
+from the first missing artifact), or start the single candidate with `swesim create --source <repo-or-pool> --max-candidates 1`
+after fixing the cause. Sources: one mine output file per pool/repo, so a batch must not list the same pool/repo twice
+(`CreateTasksWorkflow` refuses duplicate source keys before running anything); run one `CreateTasksWorkflow` per source at a
+time, because two concurrent batches on the same source would rewrite the same candidates file.
+
 `RunTasksWorkflow` runs selected scenario ids on selected models: `plan_trials` per scenario, `TrialWorkflow` children (id = trial
 id, `REJECT_DUPLICATE`) at most `max_parallel_trials` at a time (default 1; raise it on the VM), then score + export per
 scenario; `progress` lists every trial id with its status. `PipelineWorkflow` (single candidate end to end) and
-`RunMatrixWorkflow` remain as thin compositions of the same pieces. Cancelling a parent cancels its children; running trial
-units keep running and a later await reconciles them, never relaunches.
+`RunMatrixWorkflow` remain as thin compositions of the same pieces. Cancelling a parent cancels its children; a cancelled
+trial's systemd unit finishes on the VM on its own, but no workflow collects it afterwards (its trial id is consumed);
+the next run uses a new attempt index and is a fresh launch, never a relaunch.
 
 Why per-trial units: `systemd-run` places the Harbor process in its own unit under the user manager (lingering enabled), so `systemctl --user restart swesim-worker` cannot kill it. The worker records `launch.json` (intent, then acknowledgement) before and after the single `systemd-run`; every later poll reads that file and the unit state and never launches again (`swesim/workflows/activities.py: decide_launch`).
 

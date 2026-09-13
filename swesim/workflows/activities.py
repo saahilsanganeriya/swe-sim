@@ -271,6 +271,53 @@ async def judge_one_activity(p: dict) -> dict:
 
 
 @activity.defn
+async def probe_candidate_activity(p: dict) -> dict:
+    """Measure FAIL_TO_PASS / PASS_TO_PASS on base and gold for one judged row (Harbor on Modal; one attempt, and
+    harbor_cli reconciles an existing job dir instead of relaunching). The probed row replaces the row in the
+    per-candidate judged file, so draft_activity reads the measured lists. Retained: a row with probe.measured is reused."""
+    import importlib
+
+    judged_path = Path(p["judged_path"]); iid = p["instance_id"]; sid = p.get("scenario_id") or scenario_id_for(iid)
+    rows = [json.loads(line) for line in judged_path.read_text().splitlines() if line.strip()]
+    idx = next((i for i, r in enumerate(rows) if r.get("instance_id") == iid), None)
+    if idx is None:
+        raise ApplicationError(f"candidate {iid} not in {judged_path}", non_retryable=True)
+    row = rows[idx]
+    if not (row.get("probe") or {}).get("measured"):
+        M = importlib.import_module("swesim.stages.mine")
+        probe_candidates = getattr(M, "probe_candidates", None)
+        result = None
+        if probe_candidates is not None:
+            result = await blocking(lambda: probe_candidates(WS, judged_path, [iid], int(p.get("max_builds", 1))))
+        else:
+            gr = importlib.import_module("swesim.sources.github_repo")
+            probe_tests = getattr(gr, "probe_tests", None)
+            if probe_tests is None:
+                raise ApplicationError("no probe available: swesim.stages.mine.probe_candidates / github_repo.probe_tests missing", non_retryable=True)
+            result = await blocking(lambda: probe_tests(row, WS))
+        # Accept the probe's contract flexibly: a dict with the measured lists, a path to a rewritten judged file, or an
+        # in-place rewrite of judged_path.
+        measured: dict = {}
+        if isinstance(result, dict) and "fail_to_pass" in result:
+            measured = result
+        else:
+            source = Path(str(result)) if isinstance(result, (str, Path)) and Path(str(result)).is_file() else judged_path
+            fresh = next((json.loads(line) for line in source.read_text().splitlines() if line.strip() and json.loads(line).get("instance_id") == iid), None)
+            if fresh is not None:
+                measured = {k: fresh.get(k) for k in ("fail_to_pass", "pass_to_pass", "probe_dir", "dockerfile", "test_python") if k in fresh}
+                row = {**row, **{k: v for k, v in fresh.items() if k not in ("probe",)}}
+        row.update({k: v for k, v in measured.items() if k in ("fail_to_pass", "pass_to_pass", "dockerfile", "test_python")})
+        row["probe"] = {"measured": True, "fail_to_pass": list(row.get("fail_to_pass") or []), "pass_to_pass": list(row.get("pass_to_pass") or []),
+                        "probe_dir": measured.get("probe_dir"), "at": time.time()}
+        rows[idx] = row
+        tmp = judged_path.with_name(judged_path.name + ".tmp"); tmp.write_text("".join(json.dumps(r) + "\n" for r in rows)); os.replace(tmp, judged_path)
+    f2p = list(row.get("fail_to_pass") or []); p2p = list(row.get("pass_to_pass") or [])
+    return {"judged_path": str(judged_path), "instance_id": iid, "scenario_id": sid, "fail_to_pass": f2p, "pass_to_pass": p2p,
+            "probe_dir": (row.get("probe") or {}).get("probe_dir"), "reproducible": bool(f2p),
+            "reason": None if f2p else "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold in the offline probe"}
+
+
+@activity.defn
 async def precheck_draft_activity(p: dict) -> dict:
     """Hold mode: schema, asset and withholding-leak checks on scenario.draft.json; writes nothing, approves nothing."""
     import importlib
@@ -604,8 +651,11 @@ async def await_trial_activity(p: dict) -> dict:
         ev = read_evidence(tid)
         _heartbeat({"trial_id": tid, "poll": polls, "unit": f"{ev.load_state}/{ev.active_state}/{ev.sub_state}", "status": ev.status})
         if ev.has_record:
-            r = json.loads((d / "record.json").read_text())
-            return {"trial_id": r.get("trial_id", tid), "status": r.get("status", "completed"), "reward": r.get("reward", {})}
+            r = _read_json(d / "record.json")
+            if r.get("status") is not None:
+                return {"trial_id": r.get("trial_id", tid), "status": r["status"], "reward": r.get("reward", {})}
+            # record.json exists but is empty/partial: the run stage writes it non-atomically, so the writer may still be
+            # flushing. Fall through: keep polling while the unit runs; report incomplete evidence once it has stopped.
         if ev.has_runner_error:
             return {"trial_id": tid, "status": "runner-error", "unit": unit, "error": _read_json(d / "runner-error.json").get("error")}
         decision = decide_launch(ev)
@@ -617,9 +667,9 @@ async def await_trial_activity(p: dict) -> dict:
         if decision == "launch" and polls >= LAUNCH_GRACE_POLLS:
             return {"trial_id": tid, "status": "launch-failed", "unit": unit, "reason": "no launch evidence for this trial; the launch activity did not reach the launcher"}
         if decision == "ingest" and not (ev.active_state in RUNNING_STATES and ev.sub_state != "exited"):
-            # Terminal status.json without record.json and the unit is not running: nothing more will appear.
+            # Terminal status.json without a readable record.json and the unit is not running: nothing more will appear.
             return {"trial_id": tid, "status": ev.status or "unknown", "unit": unit, "reward": {},
-                    "reason": "status.json is terminal but record.json is absent; read the unit journal; never relaunch"}
+                    "reason": "terminal evidence incomplete (status.json terminal without record.json, or record.json unreadable) and the unit is not running; read the unit journal; never relaunch"}
         if decision == "reconcile":
             if ev.active_state == "failed":
                 return {"trial_id": tid, "status": "unit-failed", "unit": unit, "reason": "unit failed without a terminal record; read its journal; never relaunch"}
@@ -670,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-ALL = [probe_models_activity, mine_activity, judge_activity, list_candidates_activity, judge_one_activity, draft_activity,
+ALL = [probe_models_activity, mine_activity, judge_activity, list_candidates_activity, judge_one_activity, probe_candidate_activity, draft_activity,
        auto_approve_activity, precheck_draft_activity, human_approve_activity, verify_approval_activity, compile_activity,
        validate_activity, register_activity, plan_trials_activity, launch_trial_activity, await_trial_activity, score_activity,
        export_activity]
