@@ -7,11 +7,13 @@
 #   make cloud-bootstrap             APIs, state bucket, tfvars, terraform apply, secrets, image, pools/console, verify
 #   make deploy SHA=<sha>            build <sha> -> terraform apply -var image=<digest> -> verify-cloud
 #   make build | push-secrets | verify-cloud | pull | plan | apply | outputs | fmt-check
+#   make pull-pin | push-pin         fetch / publish the deployed image pin (infra/image.auto.tfvars.json) via the state bucket
 #   make cloud-destroy [PURGE=1]     destroy everything; the workspace bucket is retained unless PURGE=1
 #
 # Variables: PROJECT (default: gcloud config), REGION (us-central1), SHA (HEAD), SWESIM_ENV_FILE (./.env),
 # EXTRA_ENV_FILES (more dotenv files for push-secrets, e.g. one holding OPENROUTER_API_KEY), MODAL_TOML (~/.modal.toml),
-# EVIDENCE_DIR (workspace/evidence/cloud), TF_ARGS (extra terraform apply/plan arguments).
+# EVIDENCE_DIR (workspace/evidence/cloud), TF_ARGS (extra terraform apply/plan arguments), FORCE_PIN (1 = let `make apply`
+# roll the workloads to a pin they do not run; `make deploy` sets it for its own apply).
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 # gcloud's tarball install location and terraform's user-local location; harmless when they are already on PATH.
@@ -40,6 +42,9 @@ MODAL_TOML ?= $(HOME)/.modal.toml
 EVIDENCE_DIR ?= workspace/evidence/cloud
 TF_ARGS ?=
 OVERRIDE_OPEN_EXECUTIONS ?= 0
+FORCE_PIN ?= 0
+PIN_FILE ?= infra/image.auto.tfvars.json
+PYTHON3 ?= python3
 export SWESIM_ENV_FILE
 
 UV := uv run --frozen
@@ -49,7 +54,8 @@ STATE_BUCKET := $(PROJECT)-swesim-tfstate
 ENV_FILE_FLAGS := --env-file $(SWESIM_ENV_FILE) $(foreach f,$(EXTRA_ENV_FILES),--env-file $(f))
 
 .PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build pin-image \
-        deploy deploy-stakeholder open-executions verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
+        pin-guard write-pin push-pin pull-pin deploy deploy-stakeholder open-executions verify-cloud migrate pull \
+        gh-variables import-bucket cloud-bootstrap cloud-destroy
 
 check:
 	uv sync --extra dev --frozen
@@ -78,7 +84,14 @@ plan:
 	mkdir -p $(EVIDENCE_DIR)
 	set -euo pipefail; $(TF) plan -input=false -no-color $(TF_ARGS) 2>&1 | tee $(EVIDENCE_DIR)/terraform-plan-$$(date -u +%Y%m%dT%H%M%SZ).txt
 
+# The pin guard (scripts/cloud/pin_guard.py) refuses an apply whose PIN_FILE disagrees with the digest the pools and the
+# console run (a stale laptop file after a GitHub deploy would roll them back), unless FORCE_PIN=1. `make deploy` and
+# `make cloud-bootstrap` set FORCE_PIN=1 for the apply that follows their own pin-image: rolling is their purpose.
+pin-guard:
+	$(PYTHON3) scripts/cloud/pin_guard.py --pin-file $(PIN_FILE) check --project "$(PROJECT)" --region $(REGION) $(if $(filter 1,$(FORCE_PIN)),--force,)
+
 apply:
+	$(MAKE) pin-guard
 	mkdir -p $(EVIDENCE_DIR)
 	set -euo pipefail; $(TF) apply -input=false -auto-approve -no-color $(TF_ARGS) 2>&1 | tee $(EVIDENCE_DIR)/terraform-apply-$$(date -u +%Y%m%dT%H%M%SZ).txt
 	$(MAKE) outputs
@@ -109,6 +122,20 @@ pin-image: require-project
 	printf '{"image": "%s"}\n' "$$digest" > infra/image.auto.tfvars.json; \
 	echo "pinned $$digest"
 
+# After an apply: the pin the workloads now run, read back from Terraform (never from a build log), written to PIN_FILE
+# and published to the state bucket so a laptop `make pull-pin` and the GitHub deploy agree on one digest.
+write-pin:
+	$(PYTHON3) scripts/cloud/pin_guard.py --pin-file $(PIN_FILE) write --image "$$($(TF) output -raw image)"
+	$(MAKE) push-pin
+
+push-pin:
+	gcloud storage cp $(PIN_FILE) gs://$(STATE_BUCKET)/image.auto.tfvars.json --quiet
+
+pull-pin:
+	@if gcloud storage ls gs://$(STATE_BUCKET)/image.auto.tfvars.json >/dev/null 2>&1; then \
+	  gcloud storage cp gs://$(STATE_BUCKET)/image.auto.tfvars.json $(PIN_FILE) --quiet && echo "pulled $(PIN_FILE): $$(cat $(PIN_FILE))"; \
+	else echo "gs://$(STATE_BUCKET)/image.auto.tfvars.json does not exist: no deploy has published a pin yet (make deploy or the GitHub deploy)"; exit 1; fi
+
 open-executions:
 	mkdir -p $(EVIDENCE_DIR)
 	@set -euo pipefail; report=$(EVIDENCE_DIR)/open-types-$$(date -u +%Y%m%dT%H%M%SZ).txt; \
@@ -123,7 +150,8 @@ open-executions:
 deploy: require-project
 	$(MAKE) open-executions
 	$(MAKE) pin-image
-	$(MAKE) apply
+	$(MAKE) apply FORCE_PIN=1
+	$(MAKE) write-pin
 	$(MAKE) migrate
 	$(MAKE) verify-cloud
 
@@ -159,7 +187,8 @@ cloud-bootstrap: require-project tf-init
 	$(MAKE) push-secrets
 	$(MAKE) seed-registry
 	$(MAKE) pin-image
-	$(MAKE) apply
+	$(MAKE) apply FORCE_PIN=1
+	$(MAKE) write-pin
 	$(MAKE) migrate
 	$(MAKE) verify-cloud
 
