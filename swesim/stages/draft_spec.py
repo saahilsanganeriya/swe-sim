@@ -23,11 +23,11 @@ from swesim import tamper
 from swesim.llm import chat_json
 from swesim.paths import atomic_json
 from swesim.sources import threads
-from swesim.sources.github_repo import is_code_path, probe_binding, runner_prefix
+from swesim.sources.github_repo import _TEST_PATH, is_code_path, probe_binding, runner_prefix
 from swesim.sources.swebench_annotated import TEST_PYTHON, test_files_from_patch
 import keyword
 
-from swesim.stages.judge import DIFF_HEADER_PREFIXES, _BLOCKQUOTE, diff_body_text, evidence_ok, evidence_text, llm_view, norm_text
+from swesim.stages.judge import DIFF_HEADER_PREFIXES, _BLOCKQUOTE, diff_body_text, evidence_ok, evidence_text, llm_view, norm_text, thread_text
 
 DRAFT_PROMPT_VERSION = "draft-v1"
 CONTEXT_BUDGET_CHARS = 120000
@@ -51,8 +51,11 @@ comments, annotator-note = the annotation notes, original-issue = the problem st
 repository. provenance=authored is only for decisions that nothing in the discussion states and only the merged tests or
 patch pin: source_excerpt verbatim from test_patch or patch, source_url the PR URL, authored_rationale saying why no thread
 statement exists, discovery on-request, tests = the FAIL_TO_PASS ids whose code the excerpt comes from. Code also adds such
-facts from the judge's tests-resolved gaps. protected_paths_extra may name only test-tree fixture or data files the hidden tests
-read; the hidden test files are protected by code and source files the fix modifies are never protected. If the judge marked
+facts from the judge's tests-resolved gaps. Every fact's text states behaviour the reporter or maintainer could observe and
+say; it never describes how a hidden test is built: no assert/pytest wording, fixture names, private or dunder calls, test file
+paths, or identifiers that exist only in the tests (code rejects such text). protected_paths_extra may name only test-tree
+fixture or data files the hidden tests read; the hidden test files are protected by code and source files the fix modifies are
+never protected. If the judge marked
 structural_tests, also write one alternative-correct patch (a different implementation the tests should still accept);
 otherwise set alternative_correct to null."""
 SCHEMA = """{"briefs": [{"profile": "natural", "text": "...", "provenance": "original-issue"}],
@@ -73,7 +76,7 @@ WITHHOLD_DISCOVERY = {"on-request", "repo-derivable"}  # a removed reporter stat
 REPO_DERIVABLE_CATEGORIES = {"location", "proposed_fix"}
 MIN_EXCERPT_CHARS = 12   # a one-word "excerpt" grounds nothing; both bounds apply after _norm
 MIN_EXCERPT_TOKENS = 3
-RESERVED_FACT_PREFIXES = ("withheld-", "tests-")  # code-generated fact ids the drafter may not use
+RESERVED_FACT_PREFIXES = ("withheld-", "tests-", "thread-")  # code-generated fact ids the drafter may not use
 _TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(")
 _CLASS_DEF = re.compile(r"^\s*class\s+(\w+)\b")
 WITHHOLD_PROMPT_VERSION = "withhold-v2"  # v2: the model selects spans, code deletes them; the brief is computed, never trusted
@@ -404,7 +407,8 @@ def closest_lines(needle: str, texts: list[str], n: int = 3) -> list[str]:
 
 
 def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None, *, corpus_by_fact: dict[str, str] | None = None,
-                      allow_reserved: bool = False, require_f2p_link: bool = True) -> list[str]:
+                      allow_reserved: bool = False, require_f2p_link: bool = True, demote_unsafe: bool = False,
+                      filter_log: list[dict] | None = None) -> list[str]:
     """Code-owned grounding of ledger facts. Every fact must quote a verbatim span (after normalization) of the text its
     provenance names (`authored` = the merged tests/patch; `corpus_by_fact[id]` overrides the corpus, used for the withheld
     facts whose corpus is their own removed span) and cite a URL under the repository; and, unless `require_f2p_link` is
@@ -434,6 +438,17 @@ def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None,
             bad.append(f"{fid}: source_excerpt is not a verbatim span of the {where}: {excerpt[:80]!r}; closest lines: {json.dumps(near, ensure_ascii=False)}")
         if not (f.get("source_url") or "").casefold().startswith(url_prefix):
             bad.append(f"{fid}: source_url must be under https://github.com/{row['repo']}/")
+        if f.get("discovery") in ("on-request", "brief"):
+            reasons = unsafe_fact_text(f.get("text"), row)  # stakeholder-visible text must never describe test construction
+            if reasons and demote_unsafe:
+                f["discovery"], f["tests"] = "author-only", []
+                for r in d.get("requirements") or []:
+                    if isinstance(r, dict) and r.get("fact_id") == fid:
+                        r["fact_id"] = None
+                if filter_log is not None:
+                    filter_log.append({"fact_id": fid, "source": "model", "action": "demoted-author-only", "reasons": reasons})
+            elif reasons:
+                bad.append(f"{fid}: fact text would tell the agent how the hidden tests are built ({'; '.join(reasons)}); state the user-visible behaviour instead")
         if require_f2p_link and f.get("discovery") == "on-request" and not (set(f.get("tests") or []) & set(row.get("fail_to_pass") or [])):
             bad.append(f"{fid}: every on-request fact must carry `tests` drawn from the FAIL_TO_PASS ids {sorted(row.get('fail_to_pass') or [])}")
     f2p = set(row.get("fail_to_pass") or [])
@@ -551,14 +566,55 @@ def tests_for_excerpt(test_patch: str, excerpt: str, fail_to_pass: list[str]) ->
     return sorted(out)
 
 
-def tests_resolved_facts(row: dict, judged: dict) -> list[dict]:
+FACT_TEST_VOCABULARY = {"assert", "pytest", "monkeypatch", "tmp_path", "capsys", "capfd", "fixture", "parametrize", "pytester", "testdir"}
+_IDENT_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_PRIVATE_ATTR = re.compile(r"\._[A-Za-z0-9_]+(?:\s*\()?|__[A-Za-z0-9_]+__")
+_PATHLIKE = re.compile(r"[\w./-]+\.py\b")
+_KEYWORDS = {k.casefold() for k in keyword.kwlist}
+
+
+def _ident_tokens(text: str | None) -> set[str]:
+    return {t.casefold() for t in _IDENT_TOKEN.findall(text or "")}
+
+
+def unsafe_fact_text(text: str | None, row: dict) -> list[str]:
+    """Reasons a stakeholder-visible fact text would tell the agent how the hidden tests are built (seaborn-3190: "constructs a
+    pandas Series of booleans and passes it directly to Continuous()._setup with IntervalProperty()"). Forbidden, each only
+    when absent from the reporter/maintainer corpus (problem_statement, thread, gold patch body): assert/pytest/fixture
+    vocabulary and `test_`-prefixed names, identifiers (`[A-Za-z_][A-Za-z0-9_]{2,}`, Python keywords excepted) that occur in
+    test_patch, private or dunder attribute references, and test-tree file paths. The last two are judged against what the
+    humans wrote only (issue + thread): the gold patch naming `_setup` does not make `Continuous()._setup(...)` observable
+    behaviour. A reporter's own statement therefore always passes (a withheld fact's prefix is ignored); the check guards
+    paraphrases. Empty list = safe."""
+    text = (text or "").removeprefix(WITHHELD_TEXT_PREFIX)
+    human_text = "\n".join([row.get("problem_statement") or "", thread_text(row)])
+    allowed, allowed_cf = _ident_tokens(human_text + "\n" + diff_body_text(row.get("patch"))), human_text.casefold()
+    test_tokens = _ident_tokens(diff_body_text(row.get("test_patch")))
+    reasons = []
+    for tok in sorted(_ident_tokens(text)):
+        if tok in allowed:
+            continue
+        if tok in FACT_TEST_VOCABULARY or tok.startswith("test_"):
+            reasons.append(f"test vocabulary {tok!r}")
+        elif tok in test_tokens and tok not in _KEYWORDS:
+            reasons.append(f"identifier {tok!r} exists only in the tests")
+    for m in _PRIVATE_ATTR.finditer(text):
+        if m.group(0).casefold() not in allowed_cf:
+            reasons.append(f"private attribute {m.group(0).strip()!r}")
+    for m in _PATHLIKE.finditer(text):
+        if _TEST_PATH.search(m.group(0)) and m.group(0).casefold() not in allowed_cf:
+            reasons.append(f"test-tree path {m.group(0)!r}")
+    return reasons
+
+
+def tests_resolved_facts(row: dict, judged: dict, filter_log: list[dict] | None = None) -> list[dict]:
     """Code-synthesized ledger facts for judge gaps that only the merged tests resolve: provenance `authored`, source_url =
     the PR, source_excerpt = the verbatim evidence (re-checked here against the added/context lines of the test files and
-    `evidence_ok`), discovery on-request, linked to the FAIL_TO_PASS tests whose function contains the excerpt — a gap whose
-    excerpt sits in no test function is not tests-resolved and yields no fact. The ledger `text` is the judge's prose only
-    when it stays within `_fact_text_violation` (<= 400 chars, content words from the excerpt or the issue), else the
-    question, else the excerpt itself. Distinct decisions sharing evidence are kept apart by (evidence, question). Ids
-    `tests-NNN`."""
+    `evidence_ok`), linked to the FAIL_TO_PASS tests whose function contains the excerpt — a gap whose excerpt sits in no test
+    function is not tests-resolved and yields no fact. The stakeholder-visible `text` is the reporter's observable requirement:
+    the judge gap's `text`, else its `question`, the first that stays within `_fact_text_violation` and `unsafe_fact_text`;
+    when neither can be phrased without test construction the fact is demoted to `author-only` (evaluator-only, no test link,
+    text = the excerpt). Every decision is recorded in `filter_log`. Ids `tests-NNN`."""
     tests_corpus = _norm(diff_body_text(row.get("test_patch")))
     thread = row.get("thread") or {}
     pr_url = thread.get("pr_url") or f"https://github.com/{row['repo']}/pull/{str(row.get('instance_id', '')).rsplit('-', 1)[-1]}"
@@ -577,14 +633,61 @@ def tests_resolved_facts(row: dict, judged: dict) -> list[dict]:
         if not tests:
             continue
         seen.add((key, _norm(question)))
-        text = next((c.strip() for c in (g.get("text") or "", question) if c and c.strip() and _fact_text_violation(c.strip(), evidence, natural) is None),
-                    evidence[:MAX_FACT_TEXT_CHARS])
-        out.append({"id": f"tests-{len(out) + 1:03d}", "text": text, "kind": g.get("category") if g.get("category") in kinds else "behavior",
-                    "provenance": "authored", "source_excerpt": evidence, "source_url": pr_url,
-                    "authored_rationale": "Pinned only by the merged tests; no issue or thread statement resolves it (judge gap "
-                                          f"{g.get('id', '?')}, resolved_by=tests)." + (f" Question a developer would ask: {question}" if question else ""),
-                    "discovery": "on-request", "tests": tests})
+        fid = f"tests-{len(out) + 1:03d}"
+        candidates = [c.strip() for c in (g.get("text") or "", question) if isinstance(c, str) and c.strip()]
+        rejected = {}
+        safe = None
+        for c in candidates:
+            problems = ([v] if (v := _fact_text_violation(c, evidence, natural)) else []) + unsafe_fact_text(c, row)
+            if problems:
+                rejected[c] = problems
+            else:
+                safe = c
+                break
+        base = {"id": fid, "kind": g.get("category") if g.get("category") in kinds else "behavior", "provenance": "authored",
+                "source_excerpt": evidence, "source_url": pr_url}
+        if safe is None:  # cannot be phrased as observable behaviour: evaluator-only, never shown, never load-bearing
+            out.append({**base, "text": evidence[:MAX_FACT_TEXT_CHARS], "discovery": "author-only", "tests": [],
+                        "authored_rationale": f"Pinned only by the merged tests (judge gap {g.get('id', '?')}); no phrasing free of test construction was "
+                                              "available, so this fact is evaluator-only." + (f" Question a developer would ask: {question}" if question else "")})
+            if filter_log is not None:
+                filter_log.append({"fact_id": fid, "source": "synthesized", "action": "demoted-author-only", "candidates_rejected": rejected})
+        else:
+            out.append({**base, "text": safe, "discovery": "on-request", "tests": tests,
+                        "authored_rationale": "Pinned only by the merged tests; no issue or thread statement resolves it (judge gap "
+                                              f"{g.get('id', '?')}, resolved_by=tests)." + (f" Question a developer would ask: {question}" if question else "")})
+            if filter_log is not None:
+                filter_log.append({"fact_id": fid, "source": "synthesized", "action": "kept", "text": safe, "candidates_rejected": rejected})
     return out
+
+
+def thread_requirement_fact(row: dict, judged: dict) -> dict | None:
+    """A short requirement-level on-request fact grounded in the discussion, used to keep the load-bearing gate honest when
+    every synthesized fact had to be demoted: the first judge gap resolved by the thread whose `resolution_excerpt` is a
+    verbatim span of a thread corpus and passes `unsafe_fact_text`, linked to the FAIL_TO_PASS tests its evidence sits in (or
+    to the single FAIL_TO_PASS function). None when no such statement exists."""
+    corpora = _corpora(row)
+    thread = row.get("thread") or {}
+    f2p = list(row.get("fail_to_pass") or [])
+    kinds = {"behavior", "interface", "constraint", "reproduction", "context"}
+    for g in judged.get("gaps") or []:
+        if not isinstance(g, dict) or g.get("resolved_by") != "thread" or g.get("derivable_from_repo") is not False or g.get("consequential") is not True:
+            continue
+        rx = (g.get("resolution_excerpt") or "").strip()
+        norm = _norm(rx)
+        if len(norm) < MIN_EXCERPT_CHARS or len(norm.split()) < MIN_EXCERPT_TOKENS or len(rx) > MAX_FACT_TEXT_CHARS or unsafe_fact_text(rx, row):
+            continue
+        prov = next((p for p in ("pr-review", "pr-thread", "issue-thread") if norm in corpora[p]), None)
+        if prov is None:
+            continue
+        tests = tests_for_excerpt(row.get("test_patch") or "", g.get("evidence") or "", f2p) or (f2p if len(f2p_functions(f2p)) == 1 else [])
+        if not tests:
+            continue
+        url = thread.get("pr_url") if prov != "issue-thread" else next((i.get("issue_url") for i in thread.get("linked_issues") or []), None)
+        url = url or thread.get("pr_url") or f"https://github.com/{row['repo']}/pull/{str(row.get('instance_id', '')).rsplit('-', 1)[-1]}"
+        return {"id": "thread-001", "text": rx, "kind": g.get("category") if g.get("category") in kinds else "behavior",
+                "provenance": prov, "source_excerpt": rx, "source_url": url, "discovery": "on-request", "tests": tests}
+    return None
 
 
 _DIFF_PATHS = re.compile(r"^diff --git a/(\S+) b/(\S+)", re.M)
@@ -950,7 +1053,12 @@ def _schema_violations(exc) -> list[str]:
     return out
 
 
-def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None, validate=None) -> tuple[dict, dict]:
+def _is_gate_violation(v: str) -> bool:
+    return v.startswith("no on-request fact links")
+
+
+def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None, validate=None,
+            rescue_facts: list[dict] | None = None) -> tuple[dict, dict]:
     """One LLM authoring call, validated by `ledger_violations`, one correction round (its message names the FAIL_TO_PASS ids
     and the closest corpus lines for any non-verbatim excerpt), then a code-owned fallback that links on-request facts without
     tests to the FAIL_TO_PASS tests sharing content words with them (`auto_link_tests`), then fail. When all FAIL_TO_PASS ids
@@ -990,16 +1098,29 @@ def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | No
                 if links:
                     f["tests"] = sorted(set(f.get("tests") or []) | set(links))
                     auto_linked.append(f.get("id"))
+    info = {"auto_linked": auto_linked, "auto_linked_single_target": bool(single)}
     if auto_linked:
         bad = ledger_violations(d, row, extra_facts)
         if not bad and validate:
             bad = validate(d)
         if not bad:
-            return d, {"auto_linked": auto_linked, "auto_linked_single_target": bool(single)}
-    if validate and not ledger_violations(d, row, extra_facts):
-        lenient = validate(d, lenient=True)  # control patches that still do not apply are dropped or replaced by code, recorded in the meta
-        if not lenient:
-            return d, {"auto_linked": auto_linked, "auto_linked_single_target": bool(single), "lenient_controls": True}
+            return d, info
+    # Lenient stage: facts whose text still describes test construction become author-only (recorded), the load-bearing gate
+    # may be rescued by a thread-grounded requirement fact, and control patches that still do not apply are dropped/replaced.
+    log: list[dict] = []
+    extra = list(extra_facts or [])
+    used_rescue: list[dict] = []
+    bad = ledger_violations(d, row, extra, demote_unsafe=True, filter_log=log)
+    if bad and rescue_facts and all(_is_gate_violation(v) for v in bad):
+        used_rescue = list(rescue_facts)
+        bad = ledger_violations(d, row, extra + used_rescue, demote_unsafe=True, filter_log=log)
+    if not bad and validate:
+        bad = validate(d, lenient=True, extra_ledger=used_rescue)
+    if not bad:
+        return d, {**info, "lenient": True, "fact_filter": log, "rescue_facts": [f.get("id") for f in used_rescue]}
+    if all(_is_gate_violation(v) for v in bad):
+        raise ValueError("no-stakeholder-safe-fact: no stakeholder-visible on-request fact links a FAIL_TO_PASS test and no thread-grounded "
+                         "statement can supply one; " + "; ".join(bad))
     raise ValueError("draft failed grounding validation after two attempts: " + "; ".join(bad))
 
 
@@ -1027,11 +1148,14 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     out_dir.mkdir(parents=True, exist_ok=True)
     assets = out_dir / "assets"
     assets.mkdir(exist_ok=True)
-    synthesized = tests_resolved_facts(row, judged)
+    fact_filter: list[dict] = []
+    synthesized = tests_resolved_facts(row, judged, fact_filter)
     bad = ledger_violations({"ledger": synthesized}, row, corpus_by_fact={f["id"]: f["source_excerpt"] for f in synthesized},
                             allow_reserved=True, require_f2p_link=False)
     if bad:  # code-built from judge evidence; a failure here is a bug or an unusable evidence span, never a model correction
         raise ValueError("synthesized tests-resolved facts failed grounding: " + "; ".join(bad))
+    rescue = thread_requirement_fact(row, judged)
+    rescued: list[dict] = []
     from pydantic import ValidationError
     from swesim.models import ScenarioSpec
 
@@ -1109,7 +1233,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
         record = {"label": ctrl.get("name"), "rationale": ctrl.get("rationale") or "", "method": method, "verified": ok}
         return record, diff.encode()
 
-    def assemble(d: dict, withheld_parts: dict | None = None, lenient: bool = False) -> tuple[dict, dict, list[dict]]:
+    def assemble(d: dict, withheld_parts: dict | None = None, lenient: bool = False, extra_ledger: list[dict] | None = None) -> tuple[dict, dict, list[dict]]:
         """Spec dict, asset bytes and dropped protected-path extras from a model output. DraftViolation for model-fixable
         problems (fed back in the correction round); plain ValueError for drafter errors (never corrected). Lenient mode
         (after the correction round) drops unusable model controls instead: alternative-correct is optional, plausible-wrong
@@ -1147,7 +1271,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                                              "expected_success": 1, "cls": "alternative-correct"}] if alt_rec else [],
                     "tamper": tamper_controls}
         briefs = [{"profile": "natural", "text": row["problem_statement"], "provenance": "original-issue"}]
-        ledger = [*(d.get("ledger") or []), *synthesized]
+        ledger = [*(d.get("ledger") or []), *synthesized, *(extra_ledger or [])]
         operations = list(d.get("operations") or [])
         if withheld_parts and withheld_parts["result"]["removed"]:  # zero removals is valid: natural brief only
             briefs.append({"profile": "withheld", "text": withheld_parts["result"]["withheld_brief"], "provenance": "withheld"})
@@ -1165,19 +1289,23 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                 "difficulty": {"annotated": row["annotation"]["difficulty"], "judged": judged}, "thread": dict(thread)}
         return spec, files, protected_dropped
 
-    def validate(d: dict, lenient: bool = False) -> list[str]:
+    def validate(d: dict, lenient: bool = False, extra_ledger: list[dict] | None = None) -> list[str]:
         """The withheld parts are code-guaranteed to satisfy `_integrity`, so validating without them is enough to catch
         everything the model can get wrong (requirement on an author-only fact, unknown test id, duplicate ids, a control
-        patch that does not apply, ...)."""
+        patch that does not apply, ...). `extra_ledger` carries the thread-grounded rescue fact of the lenient stage."""
         try:
-            ScenarioSpec.model_validate(assemble(d, lenient=lenient)[0])
+            ScenarioSpec.model_validate(assemble(d, lenient=lenient, extra_ledger=extra_ledger)[0])
         except DraftViolation as e:
             return [str(e)]
         except ValidationError as e:
             return _schema_violations(e)
         return []
 
-    d, links = _author(row, judged, model_id, extra_facts=synthesized, validate=validate)
+    d, links = _author(row, judged, model_id, extra_facts=synthesized, validate=validate, rescue_facts=[rescue] if rescue else None)
+    fact_filter.extend(links.get("fact_filter") or [])
+    if links.get("rescue_facts"):
+        rescued.append(rescue)
+        fact_filter.append({"fact_id": rescue["id"], "source": "thread", "action": "added-rescue", "provenance": rescue["provenance"], "tests": rescue["tests"]})
 
     withheld = withhold(row["problem_statement"], model_id)
     issue_url = next((i["issue_url"] for i in thread.get("linked_issues") or []), thread.get("pr_url"))
@@ -1193,13 +1321,16 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
         # (machine-readable copy in draft.meta.json under "withholding").
         offsets = ", ".join(f"natural[{o['start']}:{o['end']}]" for o in item["occurrences"])
         withheld_ops.append({"type": "withholding", "target": fid, "rationale": f"Removed category: {item['category']}; {offsets} = {item['excerpt']!r}"})
-    # The withheld facts go through the same grounding gate as every other fact, with their own removed span as corpus.
+    # The withheld facts go through the same grounding gate as every other fact, with their own removed span as corpus. Their
+    # text is the reporter's own statement, so the identifier check passes by construction; it is run and recorded anyway.
     bad = ledger_violations({"ledger": withheld_facts}, row, corpus_by_fact={f["id"]: f["source_excerpt"] for f in withheld_facts},
                             allow_reserved=True, require_f2p_link=False)
     if bad:
         raise ValueError("withheld facts failed grounding: " + "; ".join(bad))
+    for f in withheld_facts:
+        fact_filter.append({"fact_id": f["id"], "source": "withheld", "action": "kept", "reasons": unsafe_fact_text(f["text"], row)})
 
-    spec, files, protected_dropped = assemble(d, {"result": withheld, "facts": withheld_facts, "operations": withheld_ops}, lenient=True)
+    spec, files, protected_dropped = assemble(d, {"result": withheld, "facts": withheld_facts, "operations": withheld_ops}, lenient=True, extra_ledger=rescued)
     parsed = ScenarioSpec.model_validate(spec)  # the model's part already validated; a failure here is a drafter error
     for name, data in files.items():
         (assets / name).write_bytes(data)
@@ -1210,6 +1341,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     atomic_json(out_dir / "draft.meta.json", {"model_id": model_id, "prompt_version": DRAFT_PROMPT_VERSION, "pipeline_version": pipeline_version,
                                               "created_at": spec["created_at"], "spec_hash": parsed.spec_hash,
                                               "auto_linked": links["auto_linked"], "auto_linked_single_target": links["auto_linked_single_target"],
+                                              "fact_filter": fact_filter, "rescue_facts": links.get("rescue_facts", []),
                                               "protected_paths_dropped": protected_dropped,
                                               "controls": control_notes.get("controls", {}), "controls_dropped": control_notes.get("controls_dropped", []),
                                               "controls_fallback": control_notes.get("controls_fallback", {}),
