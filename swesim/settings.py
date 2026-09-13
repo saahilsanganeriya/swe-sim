@@ -52,6 +52,9 @@ ENV_VARS: tuple[EnvVar, ...] = (
     EnvVar(name="SWESIM_WORKER_IMAGE_DIGEST", purpose="Digest of the running worker image; set by the deploy, recorded in every result.", where="Set by Terraform on the worker pools and Jobs."),
     EnvVar(name="SWESIM_GCP_PROJECT", purpose="GCP project id (Cloud Run Jobs, Secret Manager).", where="`gcloud config get project`."),
     EnvVar(name="SWESIM_GCP_REGION", purpose="GCP region for Cloud Run Jobs.", default="us-central1"),
+    EnvVar(name="SWESIM_WORKER_IMAGE", purpose="Full worker image reference with digest (<repo>/worker@sha256:...) used for trial Jobs.", where="Printed by `make build`; set by Terraform on the pools."),
+    EnvVar(name="SWESIM_WORKER_SERVICE_ACCOUNT", purpose="Service account email the trial Jobs run as.", where="Terraform output `worker_service_account`."),
+    EnvVar(name="SWESIM_IAP_AUDIENCE", purpose="IAP JWT audience of the console service (/projects/<num>/locations/<region>/services/<name>); empty = no IAP.", where="Terraform output `iap_audience`."),
     EnvVar(name="SWESIM_EVALUATORS", purpose="Comma list of Google account emails allowed to see evaluator-only material in the console.", where="Your own IAP-allowlisted accounts."),
     EnvVar(name="SWESIM_SPEND_CAP_USD", purpose="RunTasksWorkflow stops planning new trials when recorded spend exceeds this (USD)."),
     EnvVar(name="SWESIM_STAKEHOLDER_URL", purpose="Base URL of the stakeholder service deployed to Modal.", where="Printed by `bash scripts/deploy_stakeholder.sh`."),
@@ -89,6 +92,9 @@ class Settings(BaseModel):
     worker_image_digest: str | None = None
     gcp_project: str | None = None
     gcp_region: str = "us-central1"
+    worker_image: str | None = None
+    worker_service_account: str | None = None
+    iap_audience: str | None = None
     evaluators: frozenset[str] = frozenset()
     spend_cap_usd: Decimal | None = Field(default=None, ge=0)
     stakeholder_url: str = ""
@@ -140,6 +146,9 @@ class Settings(BaseModel):
             worker_image_digest=env.get("SWESIM_WORKER_IMAGE_DIGEST") or None,
             gcp_project=env.get("SWESIM_GCP_PROJECT") or None,
             gcp_region=env.get("SWESIM_GCP_REGION") or "us-central1",
+            worker_image=env.get("SWESIM_WORKER_IMAGE") or None,
+            worker_service_account=env.get("SWESIM_WORKER_SERVICE_ACCOUNT") or None,
+            iap_audience=env.get("SWESIM_IAP_AUDIENCE") or None,
             evaluators=frozenset(e.strip().lower() for e in env.get("SWESIM_EVALUATORS", "").split(",") if e.strip()),
             spend_cap_usd=Decimal(env["SWESIM_SPEND_CAP_USD"]) if env.get("SWESIM_SPEND_CAP_USD") else None,
             stakeholder_url=env.get("SWESIM_STAKEHOLDER_URL", ""),

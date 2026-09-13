@@ -11,7 +11,8 @@ cannot read code, so ``review`` is available only when ``StakeholderConfig.revie
 explicitly; otherwise it raises ``Unavailable`` and the shim tells the agent to use ``confirm-behavior``.
 
 Reply filter (code-owned): ``view["forbidden_terms"]`` is a deny-list of tokens computed by the worker from the
-hidden test assets (identifiers absent from the brief, visible facts and requirements, plus fixed test vocabulary).
+hidden test assets (identifiers absent from the natural issue text, plus fixed test vocabulary; requirements and
+visible facts never exempt a term).
 If a model reply contains one, or picks an implementation option the agent offered (``(a)``/``option b``), the
 session regenerates once with a stricter instruction, then redacts every sentence still containing a hit to
 ``[withheld]``. ``redacted_terms``, ``redaction_count``, ``regenerated`` and ``withheld_sentences`` are recorded on
