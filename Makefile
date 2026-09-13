@@ -4,7 +4,7 @@
 # secret: values travel from the env file to Secret Manager through scripts/cloud/push_secrets.py on stdin.
 #
 #   make check                       uv sync + the offline test suite
-#   make cloud-bootstrap             APIs, state bucket, tfvars, terraform apply, secrets, image, pools/console, verify
+#   make cloud-bootstrap             APIs, state bucket, tfvars, terraform apply, secrets, namespace, image, pools/console, verify
 #   make deploy SHA=<sha>            build <sha> -> terraform apply -var image=<digest> -> verify-cloud
 #   make build | push-secrets | verify-cloud | pull | plan | apply | outputs | fmt-check
 #   make pull-pin | push-pin         fetch / publish the deployed image pin (infra/image.auto.tfvars.json) via the state bucket
@@ -54,8 +54,8 @@ STATE_BUCKET := $(PROJECT)-swesim-tfstate
 ENV_FILE_FLAGS := --env-file $(SWESIM_ENV_FILE) $(foreach f,$(EXTRA_ENV_FILES),--env-file $(f))
 
 .PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build pin-image \
-        pin-guard write-pin push-pin pull-pin deploy deploy-stakeholder open-executions verify-cloud migrate pull \
-        gh-variables import-bucket cloud-bootstrap cloud-destroy
+        pin-guard write-pin push-pin pull-pin bootstrap-namespace deploy deploy-stakeholder open-executions verify-cloud \
+        migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
 
 check:
 	uv sync --extra dev --frozen
@@ -101,6 +101,12 @@ outputs:
 
 push-secrets: require-project
 	$(UV) python scripts/cloud/push_secrets.py --project $(PROJECT) $(ENV_FILE_FLAGS) --modal-toml $(MODAL_TOML)
+
+# The six Keyword search attributes every swesim workflow carries, registered idempotently on the configured namespace.
+# Temporal Cloud refuses the SDK path: the script then prints the exact tcld/UI step and exits 2, which stops
+# cloud-bootstrap until the operator has done it once (re-run is a no-op afterwards).
+bootstrap-namespace: require-project
+	$(UV) python scripts/cloud/bootstrap_namespace.py
 
 # A new hosted record starts empty. The tracked legacy catalog has no artifacts in a stranger's bucket.
 seed-registry:
@@ -185,6 +191,7 @@ cloud-bootstrap: require-project tf-init
 	  echo "workloads already exist; preserving them during bootstrap"; \
 	else $(MAKE) apply TF_ARGS="-var deploy_workloads=false"; fi
 	$(MAKE) push-secrets
+	$(MAKE) bootstrap-namespace
 	$(MAKE) seed-registry
 	$(MAKE) pin-image
 	$(MAKE) apply FORCE_PIN=1

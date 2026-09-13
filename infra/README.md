@@ -84,7 +84,11 @@ make cloud-bootstrap PROJECT=<id> REGION=us-central1 SWESIM_ENV_FILE=<path> [EXT
 `cloud-bootstrap` is idempotent and runs, in order: `scripts/cloud/bootstrap.sh` (enable APIs, create the state bucket,
 `terraform init`), `make tfvars`, `terraform apply -var deploy_workloads=false` on a stack without workloads (an existing
 `module.run` is preserved),
-`make push-secrets` (values streamed to Secret Manager on stdin; prints `NAME: updated|unchanged`), `make seed-registry`
+`make push-secrets` (values streamed to Secret Manager on stdin; prints `NAME: updated|unchanged`),
+`make bootstrap-namespace` (`scripts/cloud/bootstrap_namespace.py`: the six Keyword search attributes every swesim
+workflow carries, registered idempotently through the SDK's OperatorService; Temporal Cloud refuses that path, so on a
+fresh Cloud namespace the script prints the exact `tcld namespace search-attributes add …` command and the UI step for
+the missing ones and exits 2 — do it once, re-run, and it exits 0), `make seed-registry`
 (the tracked `registry.json` into an empty bucket, never overwriting), `make pin-image` (`scripts/cloud/build.sh`:
 Cloud Build of `git archive HEAD`, reused when that sha already has an image, digest written to the git-ignored
 `infra/image.auto.tfvars.json`), `terraform apply` (now pinned to the digest), `make write-pin` (the applied digest read
@@ -183,6 +187,7 @@ infra/
   modules/run       worker pools, console service, IAP bindings
   modules/logging   log-based metrics and the crash-loop alert
 scripts/cloud/
-  bootstrap.sh build.sh push_secrets.py tfvars_from_env.py pin_guard.py verify_cloud.sh pull.sh   (import_vm.sh: storage stream)
+  bootstrap.sh build.sh push_secrets.py tfvars_from_env.py pin_guard.py bootstrap_namespace.py verify_cloud.sh pull.sh
+  (import_vm.sh: storage stream)
 Dockerfile.worker  cloudbuild.yaml  .dockerignore  .gcloudignore  Makefile  .github/workflows/{ci,deploy}.yml
 ```

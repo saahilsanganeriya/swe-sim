@@ -223,7 +223,7 @@ def test_bootstrap_never_disables_existing_workloads(tmp_path: Path, state: str,
         path.chmod(0o755)
     override = tmp_path / "override.mk"
     calls = tmp_path / "calls"
-    override.write_text("require-project tf-init tfvars open-executions deploy-stakeholder push-secrets seed-registry pin-image write-pin migrate verify-cloud:\n\t@true\n"
+    override.write_text("require-project tf-init tfvars open-executions deploy-stakeholder push-secrets bootstrap-namespace seed-registry pin-image write-pin migrate verify-cloud:\n\t@true\n"
                         "apply:\n\t@printf '%s\\n' '$(TF_ARGS)' >> $(CALLS)\n")
     root = SCRIPTS.parents[1]
     env = {**os.environ, "TEST_STATE": state}
@@ -448,3 +448,112 @@ def test_make_deploy_forces_its_own_pin_and_writes_it_back(tmp_path: Path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert calls.read_text().splitlines() == ["apply FORCE_PIN=1", "write-pin"]
 
+
+# ----------------------------------------------------------------------------------------------- namespace bootstrap (P2-14)
+bootstrap_namespace = _load("bootstrap_namespace")
+
+
+class FakeOperatorService:
+    """ListSearchAttributes/AddSearchAttributes as a namespace would answer them; `refuse` makes add (or both) raise."""
+
+    def __init__(self, present: set[str], refuse_add=None, refuse_list=None):
+        self.present = set(present)
+        self.refuse_add, self.refuse_list = refuse_add, refuse_list
+        self.added: list[dict] = []
+
+    async def list_search_attributes(self, request):
+        if self.refuse_list is not None:
+            raise self.refuse_list
+        from types import SimpleNamespace
+        return SimpleNamespace(custom_attributes={n: 1 for n in self.present}, system_attributes={"WorkflowType": 1})
+
+    async def add_search_attributes(self, request):
+        if self.refuse_add is not None:
+            raise self.refuse_add
+        self.added.append(dict(request.search_attributes))
+        self.present |= set(request.search_attributes)
+
+
+class FakeClient:
+    """`count_workflows` answers like visibility: INVALID_ARGUMENT for an unregistered attribute, 0 for a registered one."""
+
+    def __init__(self, ops: FakeOperatorService, namespace: str = "swesim.test", query_error=None):
+        self.operator_service, self.namespace, self.query_error = ops, namespace, query_error
+        self.queries: list[str] = []
+
+    async def count_workflows(self, query: str) -> int:
+        from temporalio.service import RPCStatusCode
+        self.queries.append(query)
+        if self.query_error is not None:
+            raise self.query_error
+        if query.split(" ")[0] not in self.operator_service.present:
+            raise _rpc(RPCStatusCode.INVALID_ARGUMENT)
+        return 0
+
+
+def _rpc(status):
+    from temporalio.service import RPCError
+    return RPCError("refused by the namespace", status, b"")
+
+
+def test_bootstrap_namespace_is_idempotent():
+    import asyncio
+    from swesim.workflows.search_attributes import KEYS
+    ops = FakeOperatorService(present=set(KEYS))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops)))
+    assert outcome.code == 0 and "all 6 present" in outcome.summary and ops.added == []
+
+
+def test_bootstrap_namespace_registers_only_the_missing_keywords():
+    import asyncio
+    from temporalio.api.enums.v1 import IndexedValueType
+    from swesim.workflows.search_attributes import KEYS
+    ops = FakeOperatorService(present={"swesim_scenario_id", "swesim_model"})
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops), "swesim.abcde"))
+    assert outcome.code == 0
+    assert set(outcome.attributes) == set(KEYS) - {"swesim_scenario_id", "swesim_model"}
+    assert len(ops.added) == 1 and set(ops.added[0]) == set(outcome.attributes)
+    assert set(ops.added[0].values()) == {IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD}
+    assert asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops), "swesim.abcde")).code == 0 and len(ops.added) == 1
+
+
+@pytest.mark.parametrize("status_name", ["PERMISSION_DENIED", "UNIMPLEMENTED"])
+def test_bootstrap_namespace_prints_the_exact_operator_step_when_cloud_refuses(status_name: str):
+    import asyncio
+    from temporalio.service import RPCStatusCode
+    ops = FakeOperatorService(present={"swesim_status"}, refuse_add=_rpc(getattr(RPCStatusCode, status_name)))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops, "swesim.abcde")))
+    assert outcome.code == 2 and "swesim_status" not in outcome.attributes and len(outcome.attributes) == 5
+    lines: list[str] = []
+    assert bootstrap_namespace.report(outcome, "swesim.abcde", out=lines.append) == 2
+    text = "\n".join(lines)
+    assert "tcld namespace search-attributes add --namespace swesim.abcde" in text
+    assert "--search-attribute swesim_purpose=Keyword" in text and "swesim_status=Keyword" not in text
+    assert "Custom Search Attributes" in text and status_name in text
+
+
+def test_bootstrap_namespace_verifies_by_visibility_probe_when_cloud_refuses_even_listing():
+    """Temporal Cloud (measured): ListSearchAttributes is PERMISSION_DENIED too; the probe decides, read-only."""
+    import asyncio
+    from temporalio.service import RPCStatusCode
+    from swesim.workflows.search_attributes import KEYS
+    denied = _rpc(RPCStatusCode.PERMISSION_DENIED)
+    present = FakeClient(FakeOperatorService(present=set(KEYS), refuse_add=denied, refuse_list=denied), "swesim.abcde")
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(present))
+    assert outcome.code == 0 and "verified by visibility" in outcome.summary and len(present.queries) == 6
+    partial = FakeClient(FakeOperatorService(present={"swesim_model"}, refuse_add=denied, refuse_list=denied))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(partial))
+    assert outcome.code == 2 and set(outcome.attributes) == set(KEYS) - {"swesim_model"} and "5 missing" in outcome.summary
+    unverifiable = FakeClient(FakeOperatorService(present=set(), refuse_add=denied, refuse_list=denied), query_error=_rpc(RPCStatusCode.UNAVAILABLE))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(unverifiable))
+    assert outcome.code == 2 and outcome.attributes == KEYS and "6 unverifiable" in outcome.summary and "0 missing" in outcome.summary
+
+
+def test_bootstrap_namespace_other_rpc_errors_are_failures_not_operator_steps():
+    import asyncio
+    from temporalio.service import RPCStatusCode
+    ops = FakeOperatorService(present=set(), refuse_list=_rpc(RPCStatusCode.UNAVAILABLE))
+    outcome = asyncio.run(bootstrap_namespace.bootstrap(FakeClient(ops)))
+    assert outcome.code == 1 and "UNAVAILABLE" in outcome.summary and outcome.attributes == ()
+    lines: list[str] = []
+    assert bootstrap_namespace.report(outcome, "ns", out=lines.append) == 1 and len(lines) == 1
