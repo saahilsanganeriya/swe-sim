@@ -17,6 +17,39 @@ integrator during Phase 3. Nothing below claims a cloud result until the placeho
 
 Files on the VM: `/opt/swesim` (git checkout at the deployed commit), `/opt/swesim/workspace/{candidates,scenarios,tasks,trials,jobs,exports,evidence}`, `/opt/swesim/registry.json`, `/var/lib/swesim/temporal.db`, `/etc/swesim/env` (0600; rendered by `render_worker_env` from the laptop's dotenv file and holding only `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SWESIM_WORKER_SECRET`, `SWESIM_STAKEHOLDER_URL`, `GH_TOKEN` as `KEY='value'` lines; read by systemd `EnvironmentFile=` for the worker and dashboard and by python-dotenv in trial units via `SWESIM_ENV_FILE`; never from the repo), `~/.modal.toml` (0600). All service ports bind to 127.0.0.1; nothing is exposed on the VM's public address.
 
+Workflows (task queue `swesim`): `CreateTasksWorkflow` mines each source (GitHub repo URL or SWE-bench pool) and fans out
+one `CandidateWorkflow` per candidate (id `create:<scenario_id>`, at most `max_parallel` at a time, default 8):
+judge -> **probe** -> draft -> approval -> compile -> validate -> register. The probe measures FAIL_TO_PASS / PASS_TO_PASS on
+base and gold through Harbor on Modal for every source kind (SWE-bench's published lists do not always reproduce offline:
+sphinx-9467's nop run passed all four F2P on base); an empty measured F2P ends the candidate as `not-reproducible-offline`,
+and the probed row (measured lists) is what the drafter reads. `approval_mode=auto` (default) lets the code-owned gates
+approve; `approval_mode=hold` pre-checks the draft (schema, assets, withholding leak) and parks the candidate in
+`awaiting-approval` for up to 7 days until a reviewer sends `approve` (`swesim workflows approve <create-id> <scenario_id>
+<spec_hash> --decision approve|reject --note ...`); both decisions are bound to the draft's hash, a stale hash or an unknown
+decision is refused and the candidate keeps waiting. The parent's `progress` query lists every candidate's stage (status
+follows the child's latest stage: `awaiting-approval` only while it waits) and an `awaiting_approval` review queue.
+
+Candidate ids and reruns: a candidate that reached a terminal outcome (`valid`, `invalid`, `rejected`, `rejected-by-human`,
+`not-reproducible-offline`, `approval-timeout`) completes its `create:<scenario_id>` workflow, so a later
+`CreateTasksWorkflow` on the same source records it as `duplicate-rejected` and nothing is redone. An infrastructure failure
+(provider outage, Harbor/Modal error, a cancelled parent) FAILS the candidate workflow (`error` in the parent's result, with
+the cause), and the child id uses `ALLOW_DUPLICATE_FAILED_ONLY`: to recover, start another `CreateTasksWorkflow` with the
+same source (only the failed candidates run again; judged/probed/drafted files on disk are retained, so the rerun resumes
+from the first missing artifact). To rerun exactly one candidate, give the batch a single-candidate source: github-repo
+`{kind: "github-repo", repo, pr: <number>}` or swebench-annotated `{kind: "swebench-annotated", pool, instance_ids: ["<id>"]}`
+(the `swesim create --source ...` CLI that builds these is pending integrator wiring; until then start `CreateTasksWorkflow`
+through `swesim.workflows.client.start_create`). Sources: one mine output file per pool/repo, so a batch must not list the
+same pool/repo twice (`CreateTasksWorkflow` refuses duplicate source keys before running anything; keys are normalized, so
+`https://github.com/X/A/`, `x/a.git` and `x/a` count as the same repo); run one `CreateTasksWorkflow` per source at a time,
+because two concurrent batches on the same source would rewrite the same candidates file.
+
+`RunTasksWorkflow` runs selected scenario ids on selected models: `plan_trials` per scenario, `TrialWorkflow` children (id = trial
+id, `REJECT_DUPLICATE`) at most `max_parallel_trials` at a time (default 1; raise it on the VM), then score + export per
+scenario; `progress` lists every trial id with its status. `PipelineWorkflow` (single candidate end to end) and
+`RunMatrixWorkflow` remain as thin compositions of the same pieces. Cancelling a parent cancels its children; a cancelled
+trial's systemd unit finishes on the VM on its own, but no workflow collects it afterwards (its trial id is consumed);
+the next run uses a new attempt index and is a fresh launch, never a relaunch.
+
 Why per-trial units: `systemd-run` places the Harbor process in its own unit under the user manager (lingering enabled), so `systemctl --user restart swesim-worker` cannot kill it. The worker records `launch.json` (intent, then acknowledgement) before and after the single `systemd-run`; every later poll reads that file and the unit state and never launches again (`swesim/workflows/activities.py: decide_launch`).
 
 ## Deploy (VM)
@@ -39,11 +72,28 @@ bash scripts/vm/tunnel.sh            # second terminal; forwards 8233, 7233, 808
 `setup.sh` (runs on the VM as the login user): apt `git gh curl ca-certificates file`; `uv` and `uv python install 3.12`;
 Temporal CLI v1.8.3 pinned (archive inspected with `file` and `tar -t` before extraction, installed to `/usr/local/bin/temporal`);
 directories `/opt/swesim`, `/var/lib/swesim`, `/etc/swesim` owned by the service user; `/etc/swesim/env` and `~/.modal.toml`
-installed mode 0600 from the copied files; `gh repo clone` + `git checkout --detach <commit>` at `/opt/swesim`;
+installed mode 0600 from the copied files; `git clone` at `/opt/swesim` with the read-only `GH_TOKEN` passed through a
+transient credential helper (process environment only; nothing in `.git/config`), then a `main` branch tracking `origin/main`
+at the requested commit;
 `uv sync --extra dev --frozen --python 3.12`; `loginctl enable-linger`; units installed to `~/.config/systemd/user/`,
 verified with `systemd-analyze --user verify`, then `systemctl --user enable --now swesim-temporal swesim-worker swesim-dashboard`.
 
-Update to a new commit (re-runnable):
+Update the VM to the current `origin/main` (routine deploys):
+
+```bash
+git push                         # update.sh fetches origin/main and refuses while HEAD has commits origin/main lacks
+bash scripts/vm/update.sh        # on the VM: cd /opt/swesim && git pull --ff-only && uv sync --extra dev --frozen
+                                 #            && systemctl --user restart swesim-worker swesim-dashboard
+```
+
+It asserts that the VM's `HEAD` equals `origin/main` after the pull, prints the three unit states (`swesim-temporal`,
+`swesim-worker`, `swesim-dashboard`) and the checked-out commit, and exits non-zero if any unit is not `active`. It never
+restarts the Temporal server or a trial unit; a restarted worker resumes polling running trials (the launch-once rule
+applies). A VM bootstrapped by an earlier `setup.sh` (detached `HEAD`) fails the pull with "You are not currently on a
+branch" and restarts nothing; migrate it once with `git -C /opt/swesim checkout -B main origin/main` or rerun `setup.sh`. `/opt/swesim` is a `main` checkout tracking `origin/main` (set up by `setup.sh`) with no stored credentials; the
+pull reads the read-only `GH_TOKEN` from `/etc/swesim/env` with the `env_get` line parser and passes it through a transient
+credential helper (`git -c credential.helper= -c 'credential.helper=!f() { ... }; f' pull --ff-only`, token in the process
+environment only, never in `.git/config`). Full re-bootstrap (packages, Temporal CLI, units) or pinning a specific commit:
 
 ```bash
 gcloud compute ssh swesim-worker --project "$GCP_PROJECT" --zone "$GCP_ZONE" -- \

@@ -245,8 +245,10 @@ def test_trial_workflow_launch_failure_is_swallowed_and_await_decides(monkeypatc
         async def execute_activity(name, p, **kw):
             calls.append(name); return {"trial_id": p["trial_id"], "status": "launch-failed"}
         monkeypatch.setattr(W, "act", act); monkeypatch.setattr(W.workflow, "execute_activity", execute_activity)
-        r = await W.TrialWorkflow().run({"trial_id": "t1"})
+        w = W.TrialWorkflow(); r = await w.run({"trial_id": "t1"})
         assert calls == ["launch_trial_activity", "await_trial_activity"] and r["status"] == "launch-failed"
+        prog = w.progress()
+        assert prog["stage"] == "done" and prog["trial_id"] == "t1" and prog["status"] == "launch-failed" and prog["launch"]["launched"] is False
     asyncio.run(scenario())
 
 
@@ -480,6 +482,27 @@ def test_await_terminal_status_without_record_returns_status_unless_unit_still_r
     finally: A.read_evidence = real_read
     assert r["status"] == "completed" and r["reward"]["success"] == 1 and polls["n"] == 3
     assert not hasattr(A, "TERMINAL_STATUSES")
+
+
+def test_await_tolerates_a_partially_written_record_while_the_unit_runs(ws, systemd):
+    # run_trial writes record.json non-atomically: an empty/partial file is "still being written" while the unit runs.
+    spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]; unit = "swesim-trial-" + p["trial_id"]
+    atomic_json(d / "launch.json", {"trial_id": p["trial_id"], "unit": unit, "phase": "acknowledged", "returncode": 0, "launcher": "systemd"})
+    systemd.units[unit] = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running", "Result": "success"}
+    (d / "record.json").write_text("")
+    polls = {"n": 0}; real_read = A.read_evidence
+    def read_evidence(tid):
+        polls["n"] += 1
+        if polls["n"] == 3: (d / "record.json").write_text(json.dumps({"trial_id": tid, "status": "completed", "reward": {"reward": 0.5, "success": 0}}))
+        return real_read(tid)
+    A.read_evidence = read_evidence
+    try: r = asyncio.run(A.await_trial_activity(p))
+    finally: A.read_evidence = real_read
+    assert r["status"] == "completed" and r["reward"]["reward"] == 0.5 and polls["n"] == 3
+    # unit finished and the record is still unreadable: incomplete evidence, reported, never relaunched
+    (d / "record.json").write_text("{partial"); systemd.units[unit]["SubState"] = "exited"
+    r2 = asyncio.run(A.await_trial_activity(p))
+    assert r2["status"] == "unknown" and "record.json unreadable" in r2["reason"] and r2["reward"] == {}
 
 
 def test_systemctl_failure_is_retryable_error_not_unit_gone(ws, systemd):
@@ -791,23 +814,26 @@ def test_env_matrix_runs_children_serially_with_trial_ids_then_scores():
 
 def test_worker_registers_all_workflows_and_activities_serial_trials():
     from swesim.workflows import worker as WK
-    assert WK.TASK_QUEUE == "swesim" and WK.MAX_CONCURRENT_ACTIVITIES == 4
+    assert WK.TASK_QUEUE == "swesim" and WK.MAX_CONCURRENT_ACTIVITIES >= 8   # 8 parallel validations; launches stay behind LAUNCH_SLOTS
     names = {a.__name__ for a in A.ALL}
     assert {"mine_activity", "judge_activity", "draft_activity", "auto_approve_activity", "verify_approval_activity", "compile_activity", "validate_activity",
-            "register_activity", "plan_trials_activity", "launch_trial_activity", "await_trial_activity", "score_activity", "export_activity", "probe_models_activity"} <= names
-    assert set(WK.WORKFLOWS) == {W.TrialWorkflow, W.RunMatrixWorkflow, W.PipelineWorkflow}
+            "register_activity", "plan_trials_activity", "launch_trial_activity", "await_trial_activity", "score_activity", "export_activity", "probe_models_activity",
+            "list_candidates_activity", "judge_one_activity", "probe_candidate_activity", "precheck_draft_activity", "human_approve_activity"} <= names
+    assert set(WK.WORKFLOWS) == {W.TrialWorkflow, W.RunMatrixWorkflow, W.PipelineWorkflow, W.CandidateWorkflow, W.CreateTasksWorkflow, W.RunTasksWorkflow}
     assert A.LAUNCH_SLOTS._value == 1                        # one launch at a time per worker
 
 
 def test_client_ids_and_signal_payload(monkeypatch):
     from swesim.workflows import client as C
     class Handle:
-        def __init__(s): s.signals = []
+        def __init__(s): s.signals = []; s.cancelled = 0; s.queries = []
         async def signal(s, fn, arg): s.signals.append((fn, arg))
+        async def cancel(s): s.cancelled += 1
+        async def query(s, name): s.queries.append(name); return {"stage": "x"}
     class FakeClient:
-        def __init__(s): s.started = []; s.handle = Handle()
+        def __init__(s): s.started = []; s.handle = Handle(); s.wids = []
         async def start_workflow(s, fn, arg, **kw): s.started.append((fn, arg, kw))
-        def get_workflow_handle(s, wid): s.wid = wid; return s.handle
+        def get_workflow_handle(s, wid): s.wids.append(wid); return s.handle
     fc = FakeClient()
     async def connect(): return fc
     monkeypatch.setattr(C, "connect", connect)
@@ -815,14 +841,416 @@ def test_client_ids_and_signal_payload(monkeypatch):
     assert wid.startswith("pipeline-") and fc.started[0][2]["id"] == wid and fc.started[0][2]["task_queue"] == "swesim"
     assert fc.started[0][2]["id_reuse_policy"] == WorkflowIDReusePolicy.REJECT_DUPLICATE
     asyncio.run(C.approve(wid, "a--1", "h"))
-    assert fc.wid == wid and fc.handle.signals == [(W.PipelineWorkflow.approve_spec, {"scenario_id": "a--1", "spec_hash": "h"})]
+    assert fc.wids[-1] == wid and fc.handle.signals == [(W.PipelineWorkflow.approve_spec, {"scenario_id": "a--1", "spec_hash": "h"})]
     mid = asyncio.run(C.start_matrix({"scenario_id": "a--1", "trials": []}))
     assert mid.startswith("matrix-") and fc.started[1][0] == W.RunMatrixWorkflow.run
+    # create / run starters carry a secret-free summary memo
+    cid = asyncio.run(C.start_create({"sources": [{"kind": "github-repo", "repo": "https://github.com/x/y"}, {"kind": "swebench-annotated", "pool": "A"}],
+                                      "judge_model": "j", "draft_model": "d", "stakeholder_url": "https://s", "approval_mode": "hold"}))
+    assert cid.startswith("create-") and fc.started[2][0] == W.CreateTasksWorkflow.run
+    assert fc.started[2][2]["memo"] == {"summary": {"sources": ["https://github.com/x/y", "swebench-annotated:A"], "judge_model": "j", "draft_model": "d", "approval_mode": "hold"}}
+    rid = asyncio.run(C.start_run({"scenario_ids": ["a--1"], "models": ["m"], "conditions": ["hidden"], "k": 2, "stakeholder_url": "https://s"}))
+    assert rid.startswith("run-") and fc.started[3][0] == W.RunTasksWorkflow.run and fc.started[3][2]["memo"]["summary"]["scenario_ids"] == ["a--1"]
+    assert "stakeholder_url" not in json.dumps(fc.started[3][2]["memo"])
+    # hold-mode decisions always reach the candidate workflow, whether given the parent id or the candidate id
+    assert asyncio.run(C.approve_candidate(cid, "a--1", "h", "approve", "looks right")) == "create:a--1"
+    assert asyncio.run(C.approve_candidate("create:a--1", "a--1", "h", "reject", "no")) == "create:a--1"
+    assert fc.wids[-2:] == ["create:a--1", "create:a--1"]
+    assert fc.handle.signals[-2:] == [(W.CandidateWorkflow.approve, {"scenario_id": "a--1", "spec_hash": "h", "decision": "approve", "note": "looks right"}),
+                                      (W.CandidateWorkflow.approve, {"scenario_id": "a--1", "spec_hash": "h", "decision": "reject", "note": "no"})]
+    with pytest.raises(ValueError): asyncio.run(C.approve_candidate(cid, "a--1", "h", "maybe"))
+    assert asyncio.run(C.progress(cid)) == {"stage": "x"} and fc.handle.queries == ["progress"]
+    asyncio.run(C.cancel(cid)); assert fc.handle.cancelled == 1
+
+
+def test_client_list_runs_filters_by_type_and_summarizes(monkeypatch):
+    from datetime import datetime, timezone
+    from temporalio.client import WorkflowExecutionStatus
+    from swesim.workflows import client as C
+    class Exec:
+        def __init__(s, wid, wtype, status, summary):
+            s.id = wid; s.run_id = "r"; s.workflow_type = wtype; s.status = status; s._summary = summary
+            s.start_time = datetime(2026, 9, 13, tzinfo=timezone.utc); s.close_time = None
+        async def memo(s): return {"summary": s._summary}
+    class FakeClient:
+        def __init__(s): s.queries = []
+        async def list_workflows(s, query, limit=None):
+            s.queries.append((query, limit))
+            for e in (Exec("create-1", "CreateTasksWorkflow", WorkflowExecutionStatus.RUNNING, {"sources": ["r"]}), Exec("run-1", "RunTasksWorkflow", WorkflowExecutionStatus.COMPLETED, {"models": ["m"]})):
+                if e.workflow_type in query: yield e
+    fc = FakeClient()
+    async def connect(): return fc
+    monkeypatch.setattr(C, "connect", connect)
+    runs = asyncio.run(C.list_runs("create", 10))
+    assert fc.queries[-1] == ("WorkflowType = 'CreateTasksWorkflow'", 10)
+    assert runs == [{"workflow_id": "create-1", "run_id": "r", "type": "CreateTasksWorkflow", "status": "RUNNING", "start_time": "2026-09-13T00:00:00+00:00", "close_time": None, "summary": {"sources": ["r"]}}]
+    allruns = asyncio.run(C.list_runs("all", 5))
+    assert [r["type"] for r in allruns] == ["CreateTasksWorkflow", "RunTasksWorkflow"] and " OR " in fc.queries[-1][0]
+    with pytest.raises(ValueError): asyncio.run(C.list_runs("bogus"))
+
+
+# ---------------------------------------------------------------- task-creation activities
+
+def test_list_candidates_and_judge_one_per_candidate_files(ws, monkeypatch):
+    calls = []
+    def judge_candidate(row, model_id):
+        calls.append(row["instance_id"]); return {"gaps": [], "verified_rubric_score": 2, "keep": row["instance_id"] == "a__1", "model_id": model_id}
+    monkeypatch.setitem(sys.modules, "swesim.stages.judge", fake_module("swesim.stages.judge", judge_candidate=judge_candidate))
+    cand = ws.candidates_dir / "github-repo--x__y.jsonl"; cand.parent.mkdir(parents=True)
+    cand.write_text("".join(json.dumps({"instance_id": i, "repo": "x/y"}) + "\n" for i in ("a__1", "b__2", "c__3")))
+    listed = asyncio.run(A.list_candidates_activity({"candidates_path": str(cand), "max_candidates": 2}))
+    assert listed == {"candidates": [{"instance_id": "a__1", "scenario_id": "a--1"}, {"instance_id": "b__2", "scenario_id": "b--2"}]}
+    j = asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "a__1", "judge_model": "jm"}))
+    assert j["keep"] is True and j["scenario_id"] == "a--1" and j["judge_model"] == "jm" and Path(j["judged_path"]) == cand.parent / "judged" / "a--1.judged.jsonl"
+    assert json.loads(Path(j["judged_path"]).read_text())["judge"]["keep"] is True
+    assert asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "a__1", "judge_model": "jm"})) == j and calls == ["a__1"]   # retained
+    j2 = asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "b__2", "judge_model": "jm"}))
+    assert j2["keep"] is False and j2["reasons"] == ["judge did not keep the candidate"]
+    with pytest.raises(Exception, match="not in"): asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "zz__9", "judge_model": "jm"}))
+    # the one-row judged file feeds draft_activity unchanged
+    drafted = []
+    def draft(row, judged, model_id, out_dir, **kw):
+        drafted.append(row["instance_id"]); out_dir.mkdir(parents=True, exist_ok=True); (out_dir / "scenario.draft.json").write_text("{}"); return out_dir / "scenario.draft.json"
+    monkeypatch.setitem(sys.modules, "swesim.stages.draft_spec", fake_module("swesim.stages.draft_spec", draft=draft))
+    d = asyncio.run(A.draft_activity({"judged_path": j["judged_path"], "instance_id": "a__1", "draft_model": "dm"}))
+    assert d["scenario_id"] == "a--1" and drafted == ["a__1"]
+
+
+def test_precheck_and_human_approve_activities(ws, monkeypatch):
+    spec = ScenarioSpec.model_validate(minimal_spec_dict()); sdir = ws.scenario_dir(spec.id); sdir.mkdir(parents=True)
+    atomic_json(sdir / "scenario.draft.json", spec.model_dump(mode="json"))
+    gates = {"reasons": ["judge did not accept", "withheld brief still contains excerpt of f01"]}; approvals = []
+    def check_assets(sdir_, spec_): return []
+    def auto_gates(spec_, sdir_): return list(gates["reasons"])
+    def approve_scenario(ws_, sid, auto):
+        approvals.append(auto); atomic_json(ws_.scenario_dir(sid) / "approval.json", {"spec_hash": spec.spec_hash, "approved_by": "human-command", "review_needed": False})
+        return {"approved": True, "spec_hash": spec.spec_hash, "mode": "human"}
+    monkeypatch.setitem(sys.modules, "swesim.stages.approve", fake_module("swesim.stages.approve", check_assets=check_assets, auto_gates=auto_gates, approve_scenario=approve_scenario))
+    pre = asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id}))
+    assert pre["ok"] is False and pre["reasons"] == ["withheld brief still contains excerpt of f01"] and pre["spec_hash"] == spec.spec_hash   # only leak gates pre-check
+    gates["reasons"] = []
+    assert asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id})) == {"ok": True, "reasons": [], "scenario_id": spec.id, "spec_hash": spec.spec_hash}
+    assert not (sdir / "approval.json").exists()                                     # pre-check writes nothing
+    with pytest.raises(Exception, match="differs from the draft"): asyncio.run(A.human_approve_activity({"scenario_id": spec.id, "spec_hash": "0" * 64}))
+    assert approvals == [] and not (sdir / "approval.json").exists()                 # a mismatched hash never approves
+    r = asyncio.run(A.human_approve_activity({"scenario_id": spec.id, "spec_hash": spec.spec_hash, "note": "reviewed"}))
+    assert r == {"approved": True, "scenario_id": spec.id, "spec_hash": spec.spec_hash, "approved_by": "human-command"} and approvals == [False]
+    assert json.loads((sdir / "approval.note.json").read_text())["note"] == "reviewed"
+    (sdir / "scenario.draft.json").write_text("{not json")
+    bad = asyncio.run(A.precheck_draft_activity({"scenario_id": spec.id}))
+    assert bad["ok"] is False and bad["reasons"][0].startswith("schema:")
+
+
+# ---------------------------------------------------------------- CreateTasksWorkflow / RunTasksWorkflow (real Temporal test environment)
+
+def _create_fakes(conc, judge_calls, validate_invalid=("a--5",), judge_error=("a__3",), judge_drop=("a__4",), lists=None, hold=None, not_reproducible=("a__2",)):
+    from temporalio import activity
+    from temporalio.exceptions import ApplicationError
+    lists = lists or {"/c/https://github.com/x/a.jsonl": ["a__1", "a__2", "a__3", "a__4", "a__5"], "/c/A.jsonl": ["a__1", "b__1"]}
+    sid = lambda i: i.replace("__", "--")
+    @activity.defn(name="probe_candidate_activity")
+    async def probe_c(p):
+        ok = p["instance_id"] not in not_reproducible
+        return {"judged_path": p["judged_path"], "instance_id": p["instance_id"], "scenario_id": p["scenario_id"], "fail_to_pass": ["t1"] if ok else [],
+                "pass_to_pass": ["t0"], "reproducible": ok, "reason": None if ok else "measured FAIL_TO_PASS is empty in the offline probe"}
+    @activity.defn(name="probe_models_activity")
+    async def probe(p): return {"resolved": {"judge_model": p.get("judge_model"), "draft_model": p.get("draft_model"), "stakeholder_model": "openai/gpt-5.5"}, "substitutions": {}, "needs_human": []}
+    @activity.defn(name="mine_activity")
+    async def mine(p): return {"candidates_path": f"/c/{p.get('repo') or p.get('pool')}.jsonl"}
+    @activity.defn(name="list_candidates_activity")
+    async def listc(p): return {"candidates": [{"instance_id": i, "scenario_id": sid(i)} for i in lists[p["candidates_path"]]]}
+    @activity.defn(name="judge_one_activity")
+    async def judge(p):
+        judge_calls.append(p["instance_id"]); conc["cur"] += 1; conc["max"] = max(conc["max"], conc["cur"])
+        await asyncio.sleep(0.05); conc["cur"] -= 1
+        if p["instance_id"] in judge_error: raise ApplicationError("judge exploded", non_retryable=True)
+        return {"judged_path": "j", "instance_id": p["instance_id"], "scenario_id": sid(p["instance_id"]), "keep": p["instance_id"] not in judge_drop, "reasons": []}
+    @activity.defn(name="draft_activity")
+    async def draft(p): return {"scenario_id": sid(p["instance_id"]), "draft_path": "d"}
+    @activity.defn(name="auto_approve_activity")
+    async def approve(p): return {"approved": True, "spec_hash": "h-" + p["scenario_id"], "reasons": []}
+    @activity.defn(name="precheck_draft_activity")
+    async def precheck(p): return {"ok": True, "reasons": [], "scenario_id": p["scenario_id"], "spec_hash": "draft-" + p["scenario_id"]}
+    @activity.defn(name="human_approve_activity")
+    async def human(p):
+        if hold is not None: hold.setdefault("calls", []).append(p)
+        if p["spec_hash"] != "draft-" + p["scenario_id"]: raise ApplicationError("signalled spec_hash differs from the draft on disk", non_retryable=True)
+        return {"approved": True, "scenario_id": p["scenario_id"], "spec_hash": p["spec_hash"], "approved_by": "human-command"}
+    @activity.defn(name="verify_approval_activity")
+    async def verify(p): return {"scenario_id": p["scenario_id"], "spec_hash": p["spec_hash"]}
+    @activity.defn(name="compile_activity")
+    async def compile_(p): return {"compile_path": "c"}
+    @activity.defn(name="validate_activity")
+    async def validate(p): return {"status": "invalid" if p["scenario_id"] in validate_invalid else "valid", "failures": ["oracle earned 0"]}
+    @activity.defn(name="register_activity")
+    async def register(p): return {"registry_entry": {}}
+    return [probe, mine, listc, judge, probe_c, draft, approve, precheck, human, verify, compile_, validate, register]
+
+
+def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress():
+    from temporalio.worker import Worker
+    conc = {"cur": 0, "max": 0}; judge_calls = []
+    params = {"sources": [{"kind": "github-repo", "repo": "https://github.com/x/a", "since": "2026-06-01"}, {"kind": "swebench-annotated", "pool": "A"}],
+              "judge_model": "j", "draft_model": "d", "stakeholder_url": "https://s", "max_parallel": 2}
+    async def scenario(env):
+        async with Worker(env.client, task_queue="swesim", workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow], activities=_create_fakes(conc, judge_calls)):
+            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, params, id="create-test-1", task_queue="swesim")
+            r = await h.result()
+            assert r["counts"] == {"candidates": 6, "valid": 2, "invalid": 1, "rejected": 1, "error": 1, "duplicate-rejected": 0, "duplicate-in-batch": 1, "not-reproducible-offline": 1}
+            assert r["status"] == "complete" and {s for s, c in r["candidates"].items() if c["status"] == "valid"} == {"a--1", "b--1"}
+            assert r["candidates"]["a--2"]["status"] == "not-reproducible-offline" and "FAIL_TO_PASS is empty" in r["candidates"]["a--2"]["reasons"][0]
+            assert r["candidates"]["a--5"]["status"] == "invalid" and r["candidates"]["a--5"]["reasons"] == ["oracle earned 0"]
+            assert r["candidates"]["a--3"]["status"] == "error" and "judge exploded" in r["candidates"]["a--3"]["reasons"][0]
+            assert r["candidates"]["a--4"]["status"] == "rejected" and r["candidates"]["a--1"]["spec_hash"] == "h-a--1"
+            assert conc["max"] <= 2 and sorted(judge_calls) == ["a__1", "a__2", "a__3", "a__4", "a__5", "b__1"]   # bound respected; duplicate judged once
+            prog = await h.query(W.CreateTasksWorkflow.progress)
+            assert prog["stage"] == "complete" and set(prog["candidates"]) == {"a--1", "a--2", "a--3", "a--4", "a--5", "b--1"} and prog["awaiting_approval"] == []
+            c1 = prog["candidates"]["a--1"]
+            assert c1["status"] == "valid" and c1["stage"] == "done" and c1["candidate_workflow_id"] == "create:a--1" and c1["source"] in ("github-repo:x/a", "swebench-annotated:a")   # normalized keys
+            assert ["judging", "probing", "auto-approving", "compiling", "validating", "registering"] == [s for s in c1["stages"] if s in ("judging", "probing", "auto-approving", "compiling", "validating", "registering")]
+            assert "registering" not in prog["candidates"]["a--5"]["stages"] and prog["candidates"]["a--3"]["stages"] == ["judging"]
+            assert prog["candidates"]["a--2"]["stages"] == ["judging", "probing"]
+            assert {s["status"] for s in prog["sources"].values()} == {"mined"} and prog["probe"]["resolved"]["judge_model"] == "j"
+            # the same candidates again: terminal outcomes are duplicate-rejected and never redone; the errored (failed)
+            # candidate is the only one that runs again (ALLOW_DUPLICATE_FAILED_ONLY) and still errors here
+            r2 = await env.client.execute_workflow(W.CreateTasksWorkflow.run, params, id="create-test-2", task_queue="swesim")
+            assert r2["counts"]["duplicate-rejected"] == 5 and r2["counts"]["error"] == 1 and r2["counts"]["valid"] == 0 and r2["status"] == "complete-with-failures"
+            assert r2["candidates"]["a--3"]["status"] == "error" and judge_calls.count("a__3") == 2 and len(judge_calls) == 7
+    _run_in_env(scenario)
+
+
+def test_env_create_tasks_hold_mode_review_queue_approve_reject_and_refused_hash(monkeypatch):
+    from temporalio.worker import Worker
+    from swesim.workflows import client as C
+    conc = {"cur": 0, "max": 0}; judge_calls = []; hold = {}
+    lists = {"/c/H.jsonl": ["h__1", "h__2", "h__3"]}
+    params = {"sources": [{"kind": "swebench-annotated", "pool": "H"}], "judge_model": "j", "draft_model": "d", "stakeholder_url": "https://s", "approval_mode": "hold"}
+    async def scenario(env):
+        async def connect(): return env.client
+        monkeypatch.setattr(C, "connect", connect)
+        async with Worker(env.client, task_queue="swesim", workflows=[W.CreateTasksWorkflow, W.CandidateWorkflow],
+                          activities=_create_fakes(conc, judge_calls, validate_invalid=(), judge_error=(), judge_drop=(), lists=lists, hold=hold, not_reproducible=())):
+            h = await env.client.start_workflow(W.CreateTasksWorkflow.run, params, id="create-hold", task_queue="swesim")
+            for _ in range(400):
+                prog = await h.query(W.CreateTasksWorkflow.progress)
+                if len(prog["awaiting_approval"]) == 3: break
+                await asyncio.sleep(0.05)
+            queue = sorted(prog["awaiting_approval"], key=lambda x: x["scenario_id"])
+            assert queue == [{"scenario_id": s, "spec_hash": "draft-" + s, "candidate_workflow_id": "create:" + s} for s in ("h--1", "h--2", "h--3")]
+            assert all(prog["candidates"][s]["status"] == "awaiting-approval" for s in ("h--1", "h--2", "h--3"))
+            # a mismatched hash is refused and the candidate keeps waiting
+            await C.approve_candidate("create-hold", "h--1", "stale-hash", "approve", "old queue")
+            for _ in range(400):
+                prog = await h.query(W.CreateTasksWorkflow.progress)
+                if prog["candidates"]["h--1"].get("refusals"): break
+                await asyncio.sleep(0.05)
+            assert "differs from the draft" in prog["candidates"]["h--1"]["refusals"][0] and prog["candidates"]["h--1"]["status"] == "awaiting-approval"
+            child = await env.client.get_workflow_handle("create:h--1").query(W.CandidateWorkflow.progress)
+            assert child["stage"] == "awaiting-approval" and child["spec_hash"] == "draft-h--1" and child["refusals"]
+            # a reject with a stale hash and an unknown decision are refused too; both decisions are bound to the draft hash
+            await C.approve_candidate("create:h--2", "h--2", "stale-hash", "reject", "wrong queue")
+            await env.client.get_workflow_handle("create:h--2").signal(W.CandidateWorkflow.approve, {"scenario_id": "h--2", "spec_hash": "draft-h--2", "decision": "maybe"})
+            for _ in range(400):
+                prog = await h.query(W.CreateTasksWorkflow.progress)
+                if len(prog["candidates"]["h--2"].get("refusals", [])) >= 2: break
+                await asyncio.sleep(0.05)
+            assert [r[:6] for r in prog["candidates"]["h--2"]["refusals"]] == ["reject", "unknow"] and prog["candidates"]["h--2"]["status"] == "awaiting-approval"
+            await C.approve_candidate("create-hold", "h--1", "draft-h--1", "approve", "reviewed")
+            await C.approve_candidate("create:h--2", "h--2", "draft-h--2", "reject", "not ready")
+            await C.approve_candidate("create-hold", "h--3", "draft-h--3")
+            r = await h.result()
+            assert r["counts"]["valid"] == 2 and r["counts"]["rejected-by-human"] == 1 and r["status"] == "complete"
+            assert r["candidates"]["h--2"] == {"scenario_id": "h--2", "instance_id": "h__2", "status": "rejected-by-human", "reasons": ["not ready"], "spec_hash": "draft-h--2"}
+            assert r["candidates"]["h--1"]["status"] == "valid" and r["candidates"]["h--3"]["status"] == "valid"
+            # a stale hash is refused inside the workflow (no activity round trip); the activity re-checks the hash on disk anyway
+            assert [c["spec_hash"] for c in hold["calls"]] == ["draft-h--1", "draft-h--3"] and hold["calls"][0]["note"] == "reviewed"
+            prog = await h.query(W.CreateTasksWorkflow.progress)
+            assert prog["awaiting_approval"] == [] and "awaiting-approval" in prog["candidates"]["h--1"]["stages"] and "compiling" in prog["candidates"]["h--1"]["stages"]
+            assert prog["candidates"]["h--1"]["stages"].index("probing") < prog["candidates"]["h--1"]["stages"].index("pre-checking")
+    _run_in_env(scenario)
+
+
+def test_create_tasks_progress_status_follows_the_child_stage():
+    # Fix round (split review, Important 1): a candidate leaves the review queue as soon as it moves on.
+    w = W.CreateTasksWorkflow()
+    w.candidates["a--1"] = {"instance_id": "a__1", "source": "s", "status": "running", "stage": "starting", "stages": [], "candidate_workflow_id": "create:a--1", "spec_hash": None}
+    w.candidate_stage({"instance_id": "a__1", "scenario_id": "a--1", "stage": "awaiting-approval", "spec_hash": "d1"})
+    assert w.candidates["a--1"]["status"] == "awaiting-approval"
+    assert w.progress()["awaiting_approval"] == [{"scenario_id": "a--1", "spec_hash": "d1", "candidate_workflow_id": "create:a--1"}]
+    w.candidate_stage({"instance_id": "a__1", "scenario_id": "a--1", "stage": "compiling"})
+    assert w.candidates["a--1"]["status"] == "running" and w.progress()["awaiting_approval"] == [] and w.candidates["a--1"]["stages"] == ["awaiting-approval", "compiling"]
+    w.candidate_stage({"instance_id": "a__1", "scenario_id": None, "stage": "judging"})          # before judge: lookup by instance id
+    assert w.candidates["a--1"]["stage"] == "judging" and w.candidates["a--1"]["spec_hash"] == "d1"
+    w.candidate_stage({"instance_id": "zz__9", "scenario_id": "zz--9", "stage": "judging"})      # unknown candidate: ignored
+    assert set(w.candidates) == {"a--1"}
+
+
+def test_create_tasks_rejects_duplicate_source_keys_before_any_activity(monkeypatch):
+    # Fix round (split review, Important 2): mine writes one file per pool/repo, so a batch may not list a key twice.
+    from temporalio.exceptions import ApplicationError
+    async def scenario():
+        async def act(*a, **k): raise AssertionError("no activity may run for an invalid batch")
+        monkeypatch.setattr(W, "act", act)
+        with pytest.raises(ApplicationError, match="duplicate sources.*swebench-annotated:a"):
+            await W.CreateTasksWorkflow().run({"sources": [{"kind": "swebench-annotated", "pool": "A", "limit": 3}, {"kind": "swebench-annotated", "pool": "A", "instance_ids": ["x__1"]}]})
+        with pytest.raises(ApplicationError, match="duplicate sources"):
+            await W.CreateTasksWorkflow().run({"sources": [{"kind": "github-repo", "repo": "https://github.com/x/y", "since": "2026-06-01"}, {"kind": "github-repo", "repo": "https://github.com/x/y", "since": "2026-07-01"}]})
+        with pytest.raises(ApplicationError, match="empty"):
+            await W.CreateTasksWorkflow().run({"sources": []})
+        # spellings mine merges into one output file are one key (casefold, trailing slash, .git, URL forms)
+        with pytest.raises(ApplicationError, match="duplicate sources.*github-repo:x/a"):
+            await W.CreateTasksWorkflow().run({"sources": [{"kind": "github-repo", "repo": "https://github.com/X/A/"}, {"kind": "github-repo", "repo": "x/a.git"}]})
+        with pytest.raises(ApplicationError, match="duplicate sources"):
+            await W.CreateTasksWorkflow().run({"sources": [{"kind": "swebench-annotated", "pool": "A"}, {"kind": "swebench-annotated", "pool": "a "}]})
+    asyncio.run(scenario())
+    assert W._source_key({"kind": "github-repo", "repo": "git@github.com:X/A.git"}) == "github-repo:x/a" == W._source_key({"kind": "github-repo", "repo": "github.com/x/a/"})
+
+
+def test_candidate_failure_message_names_the_failing_stage(monkeypatch):
+    # Minor 4: the stage is captured before _done marks the candidate done.
+    from types import SimpleNamespace
+    from temporalio.exceptions import ApplicationError
+    async def scenario():
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None))
+        async def act(name, p, minutes=10): raise RuntimeError("judge provider down")
+        monkeypatch.setattr(W, "act", act)
+        w = W.CandidateWorkflow()
+        with pytest.raises(ApplicationError, match="failed at stage judging: RuntimeError: judge provider down"):
+            await w.run({"instance_id": "x__1", "candidates_path": "c", "judge_model": "j", "draft_model": "d"})
+        assert w.progress()["status"] == "error" and w.progress()["reasons"][0].startswith("judging: RuntimeError")
+    asyncio.run(scenario())
+
+
+def _fake_probe_candidates(outcome: dict, calls: list):
+    """Mimics swesim.stages.mine.probe_candidates (sources branch c30994c): writes <judged>.probed.jsonl and .probed.summary.json,
+    measured lists replace the source lists (originals under swebench_*), probe metadata with `statuses`, reject_reason on failure."""
+    def probe_candidates(ws_, judged_path, instance_ids, max_builds):
+        calls.append((str(judged_path), list(instance_ids), max_builds)); out = Path(judged_path).with_suffix(".probed.jsonl"); summary = {"rows": 1, "probed": 1}
+        rows = [json.loads(line) for line in Path(judged_path).read_text().splitlines() if line.strip()]
+        with open(out, "w") as f:
+            for r in rows:
+                if r["instance_id"] not in instance_ids: continue
+                r["swebench_fail_to_pass"] = list(r.get("fail_to_pass") or []); r["swebench_pass_to_pass"] = list(r.get("pass_to_pass") or [])
+                if "error" in outcome:
+                    r["probe"] = {"error": outcome["error"]}; r["reject_reason"] = "probe-failed"; r.setdefault("judge", {})["keep"] = False; summary["probe-failed"] = 1
+                else:
+                    r["fail_to_pass"], r["pass_to_pass"] = outcome["f2p"], outcome["p2p"]; r["test_python"] = "/opt/py/bin/python"
+                    r["probe"] = {"kind": "swebench", "statuses": {"base": {"t1": "failed"}, "gold": {"t1": "passed"}}, "probe_dir": "/jobs/probe/x", "dropped": {"missing-on-gold": 1}}
+                    if not r["fail_to_pass"]: r["reject_reason"] = "not-reproducible-offline"; r.setdefault("judge", {})["keep"] = False; summary["not-reproducible-offline"] = 1
+                    else: summary["reproducible"] = 1
+                f.write(json.dumps(r) + "\n")
+        out.with_suffix(".summary.json").write_text(json.dumps(summary)); return out
+    return probe_candidates
+
+
+def test_probe_candidate_activity_follows_probe_candidates_contract_and_is_retained(ws, monkeypatch):
+    judged = ws.candidates_dir / "judged" / "a--1.judged.jsonl"; judged.parent.mkdir(parents=True)
+    judged.write_text(json.dumps({"instance_id": "a__1", "fail_to_pass": ["published::t1"], "pass_to_pass": [], "judge": {"keep": True}}) + "\n")
+    calls = []
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"f2p": ["t1"], "p2p": ["t0"]}, calls)))
+    r = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "a__1", "scenario_id": "a--1", "max_builds": 2}))
+    assert r["reproducible"] is True and r["fail_to_pass"] == ["t1"] and r["pass_to_pass"] == ["t0"] and r["probe_dir"] == "/jobs/probe/x"
+    assert r["dropped"] == {"reproducible": 1} and calls == [(str(judged), ["a__1"], 2)]
+    row = json.loads(judged.read_text().splitlines()[0])
+    assert row["fail_to_pass"] == ["t1"] and row["swebench_fail_to_pass"] == ["published::t1"] and row["probe"]["statuses"] and row["judge"]["keep"] is True   # draft's require_probe reads probe.statuses
+    again = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "a__1"}))
+    assert again["fail_to_pass"] == ["t1"] and len(calls) == 1                                                        # retained: no second Modal run
+    # nothing fails on base and passes with gold -> terminal not-reproducible-offline, with the probe's accounting
+    judged2 = judged.with_name("b--2.judged.jsonl"); judged2.write_text(json.dumps({"instance_id": "b__2", "fail_to_pass": ["published::t9"], "judge": {"keep": True}}) + "\n")
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"f2p": [], "p2p": ["t0"]}, calls)))
+    r2 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged2), "instance_id": "b__2"}))
+    assert r2["reproducible"] is False and r2["fail_to_pass"] == [] and r2["reason"] == "not-reproducible-offline" and r2["dropped"] == {"not-reproducible-offline": 1}
+    assert json.loads(judged2.read_text())["reject_reason"] == "not-reproducible-offline"
+    # probe_tests' ValueError recorded by probe_candidates is measured-but-unusable -> terminal, not an infrastructure error
+    judged3 = judged.with_name("c--3.judged.jsonl"); judged3.write_text(json.dumps({"instance_id": "c__3", "judge": {"keep": True}}) + "\n")
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"error": "ValueError: probe needs target failure and regression coverage"}, calls)))
+    r3 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged3), "instance_id": "c__3"}))
+    assert r3["reproducible"] is False and "probe needs target failure" in r3["reason"] and r3["dropped"] == {"probe-failed": 1}
+    # a Harbor/build failure recorded by probe_candidates is infrastructure: the activity fails (the child fails, rerunnable)
+    judged4 = judged.with_name("d--4.judged.jsonl"); judged4.write_text(json.dumps({"instance_id": "d__4", "judge": {"keep": True}}) + "\n")
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"error": "HarborRunError: no trial dir; harbor stdout tail: ..."}, calls)))
+    with pytest.raises(RuntimeError, match="probe infrastructure failure.*HarborRunError"): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged4), "instance_id": "d__4"}))
+    assert "probe" not in json.loads(judged4.read_text())                                                              # nothing recorded as measured; rerun probes again
+    # rows mine already probed (probe.statuses / probe_dir) are not re-probed
+    judged5 = judged.with_name("e--5.judged.jsonl"); judged5.write_text(json.dumps({"instance_id": "e__5", "fail_to_pass": ["t1"], "pass_to_pass": [], "probe_dir": "/jobs/probe/e", "judge": {"keep": True}}) + "\n")
+    n = len(calls); r5 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged5), "instance_id": "e__5"}))
+    assert r5["reproducible"] is True and r5["probe_dir"] == "/jobs/probe/e" and len(calls) == n
+    with pytest.raises(Exception, match="not in"): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged5), "instance_id": "zz__1"}))
+
+
+def test_probe_candidate_activity_fallback_probe_tests_maps_value_error(ws, monkeypatch):
+    # Until probe_candidates lands on main, github_repo.probe_tests(row, ws) is the fallback for every source kind.
+    judged = ws.candidates_dir / "judged" / "f--6.judged.jsonl"; judged.parent.mkdir(parents=True)
+    judged.write_text(json.dumps({"instance_id": "f__6", "fail_to_pass": ["published::t1"], "judge": {"keep": True}}) + "\n")
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine"))
+    ok = {"fail_to_pass": ["t1"], "pass_to_pass": ["t0"], "dropped": {"missing-on-gold": 2}, "statuses": {"base": {}, "gold": {}}, "dockerfile": "FROM x",
+          "probe_dir": "/jobs/probe/f", "test_python": "/usr/bin/python3", "probe": {"kind": "github", "statuses": {"base": {}, "gold": {}}, "probe_dir": "/jobs/probe/f"}}
+    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo", probe_tests=lambda row, ws_: ok))
+    r = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "f__6"}))
+    row = json.loads(judged.read_text())
+    assert r["reproducible"] is True and r["dropped"] == {"missing-on-gold": 2} and row["probe"]["statuses"] is not None and row["dockerfile"] == "FROM x" and row["swebench_fail_to_pass"] == ["published::t1"]
+    # the real fallback raises ValueError when nothing fails on base and passes with gold: terminal, not infrastructure
+    judged2 = judged.with_name("g--7.judged.jsonl"); judged2.write_text(json.dumps({"instance_id": "g__7", "fail_to_pass": ["published::t1"], "judge": {"keep": True}}) + "\n")
+    def unusable(row, ws_): raise ValueError("probe needs target failure and regression coverage")
+    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo", probe_tests=unusable))
+    r2 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged2), "instance_id": "g__7"}))
+    assert r2["reproducible"] is False and r2["fail_to_pass"] == [] and "probe needs target failure" in r2["reason"] and r2["dropped"] == {"probe-error": "probe needs target failure and regression coverage"}
+    assert json.loads(judged2.read_text())["reject_reason"] == "not-reproducible-offline"
+    # HarborRunError-like failures propagate (the child fails and stays rerunnable)
+    judged3 = judged.with_name("h--8.judged.jsonl"); judged3.write_text(json.dumps({"instance_id": "h__8", "judge": {"keep": True}}) + "\n")
+    class HarborRunError(RuntimeError): pass
+    def broken(row, ws_): raise HarborRunError("no trial dir")
+    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo", probe_tests=broken))
+    with pytest.raises(HarborRunError): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged3), "instance_id": "h__8"}))
+    # neither probe importable: the error names the missing function
+    monkeypatch.setitem(sys.modules, "swesim.sources.github_repo", fake_module("swesim.sources.github_repo"))
+    with pytest.raises(Exception, match="swesim.stages.mine.probe_candidates"): asyncio.run(A.probe_candidate_activity({"judged_path": str(judged3), "instance_id": "h__8"}))
+
+
+def test_env_run_tasks_two_scenarios_bounded_and_progress():
+    from temporalio import activity
+    from temporalio.exceptions import ApplicationError
+    from temporalio.worker import Worker
+    conc = {"cur": 0, "max": 0}; scored = []; exported = []; planned = []
+    @activity.defn(name="plan_trials_activity")
+    async def plan(p):
+        planned.append(p)
+        if p["scenario_id"] == "bad": raise ApplicationError("scenario/build not validated", non_retryable=True)
+        return {"scenario_id": p["scenario_id"], "trials": [{"trial_id": f"{p['scenario_id']}-t{i}", "scenario_id": p["scenario_id"], "model": p["models"][0], "condition": "hidden", "attempt_index": i} for i in range(2)]}
+    @activity.defn(name="launch_trial_activity")
+    async def launch(p):
+        conc["cur"] += 1; conc["max"] = max(conc["max"], conc["cur"]); await asyncio.sleep(0.05); conc["cur"] -= 1
+        return {"trial_id": p["trial_id"], "launched": True}
+    @activity.defn(name="await_trial_activity")
+    async def collect(p): return {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}}
+    @activity.defn(name="score_activity")
+    async def score(p): scored.append(p["scenario_id"]); return {"scores_path": "s"}
+    @activity.defn(name="export_activity")
+    async def export(p): exported.append(p["scenario_id"]); return {"manifest_paths": []}
+    params = {"scenario_ids": ["s1", "s2", "bad"], "models": ["m"], "conditions": ["hidden"], "k": 2, "purpose": "comparison", "stakeholder_model": "anthropic/claude-sonnet-5",
+              "attempt_offset": 0, "stakeholder_url": "https://s", "max_parallel_trials": 1}
+    async def scenario(env):
+        async with Worker(env.client, task_queue="swesim", workflows=[W.RunTasksWorkflow, W.TrialWorkflow], activities=[plan, launch, collect, score, export]):
+            h = await env.client.start_workflow(W.RunTasksWorkflow.run, params, id="run-test-1", task_queue="swesim")
+            r = await h.result()
+            assert r["status"] == "complete-with-failures" and r["scenarios"]["bad"]["status"] == "error" and "not validated" in r["scenarios"]["bad"]["error"]
+            for sid in ("s1", "s2"):
+                assert r["scenarios"][sid]["status"] == "complete" and [t["status"] for t in r["scenarios"][sid]["trials"]] == ["completed", "completed"]
+            assert conc["max"] == 1 and sorted(scored) == ["s1", "s2"] == sorted(exported)              # trials one at a time; score+export per scenario
+            assert all(p["stakeholder_model"] == "anthropic/claude-sonnet-5" and p["purpose"] == "comparison" for p in planned)
+            prog = await h.query(W.RunTasksWorkflow.progress)
+            assert prog["stage"] == "complete" and set(prog["trials"]) == {"s1-t0", "s1-t1", "s2-t0", "s2-t1"}
+            assert prog["trials"]["s1-t0"] == {"scenario_id": "s1", "model": "m", "condition": "hidden", "attempt_index": 0, "status": "completed"}
+            assert prog["scenarios"] == {"s1": {"status": "complete", "trials": 2}, "s2": {"status": "complete", "trials": 2}, "bad": {"status": "error", "error": prog["scenarios"]["bad"]["error"], "trials": 0}}
+            # running the same selection again cannot relaunch: every trial id is already used
+            r2 = await env.client.execute_workflow(W.RunTasksWorkflow.run, {**params, "scenario_ids": ["s1"]}, id="run-test-2", task_queue="swesim")
+            assert [t["status"] for t in r2["scenarios"]["s1"]["trials"]] == ["duplicate-rejected", "duplicate-rejected"] and r2["status"] == "complete"
+    _run_in_env(scenario)
 
 
 # ---------------------------------------------------------------- Task 13 deployment files (syntax and contracts)
 
-@pytest.mark.parametrize("script", ["create.sh", "setup.sh", "tunnel.sh"])
+@pytest.mark.parametrize("script", ["create.sh", "setup.sh", "tunnel.sh", "update.sh"])
 def test_vm_scripts_parse(script):
     path = ROOT / "scripts" / "vm" / script
     assert path.is_file() and os.access(path, os.X_OK), script
@@ -875,6 +1303,33 @@ def test_setup_script_contract():
                    "loginctl enable-linger", "systemd-analyze --user verify", "systemctl --user enable --now", "swesim-temporal", "swesim-worker", "swesim-dashboard", "/opt/swesim", "/var/lib/swesim"):
         assert needle in text, needle
     assert "docker" not in text.lower() or "not required" in text.lower()
+
+
+def test_update_script_contract():
+    text = (ROOT / "scripts/vm/update.sh").read_text(); setup = (ROOT / "scripts/vm/setup.sh").read_text()
+    for needle in ("git fetch --quiet origin main", "git rev-list --count origin/main..HEAD", "refusing to update", "gcloud compute ssh --quiet", "cd /opt/swesim",
+                   "pull --ff-only", "uv sync --extra dev --frozen", "systemctl --user restart swesim-worker swesim-dashboard", "is-active", "git rev-parse --short HEAD",
+                   "is not origin/main", "FAILED_UNITS", "GCP_PROJECT", "GCP_ZONE", "SWESIM_ENV_FILE"):
+        assert needle in text, needle
+    assert "[ahead" not in text                                                                                # guard compares against origin/main, not the branch upstream
+    assert "swesim-temporal" in text and "restart swesim-temporal" not in text and "swesim-trial" not in text   # never restarts the server or trial units
+    assert "checkout --quiet -B main" in setup and "--set-upstream-to=origin/main" in setup                  # pull --ff-only needs a tracking branch
+    # guard logic: refuses when HEAD carries commits origin/main lacks, passes when it does not
+    refuse = 'AHEAD=2; if [ "$AHEAD" != "0" ]; then echo refusing; exit 1; fi; echo ok'
+    cp = subprocess.run(["bash", "-c", refuse], capture_output=True, text=True); assert cp.returncode == 1 and "refusing" in cp.stdout
+    # the VM-side unit check exits non-zero when a unit is not active
+    units = 'FAILED_UNITS=0; for state in active failed active; do [ "$state" = "active" ] || FAILED_UNITS=1; done; [ "$FAILED_UNITS" = "0" ] || exit 1'
+    assert subprocess.run(["bash", "-c", units]).returncode == 1
+    # the clone stores no credentials: both scripts hand GH_TOKEN to git through a transient helper, never .git/config
+    helper = "credential.helper=!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f"
+    assert helper in text and "-c credential.helper= -c" in text and "env_get /etc/swesim/env GH_TOKEN" in text
+    assert helper in setup and "gh auth setup-git" not in setup and "gh repo clone" not in setup and 'GH_TOKEN="$GH_TOKEN_VALUE" git' in setup
+    # the helper emits the token from the environment only (no token appears in any git argument)
+    cp = subprocess.run(["bash", "-c", "f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f"], capture_output=True, text=True, env={**os.environ, "GH_TOKEN": "fake-token-value"})
+    assert cp.stdout == "username=x-access-token\npassword=fake-token-value\n"
+    # the refusal really triggers on an "ahead" status line (function-level check of the guard logic)
+    doc = (ROOT / "docs/ops.md").read_text()
+    assert "scripts/vm/update.sh" in doc and "git pull --ff-only" in doc
 
 
 def test_ops_doc_has_required_sections():

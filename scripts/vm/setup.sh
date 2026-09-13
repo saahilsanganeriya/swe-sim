@@ -94,16 +94,19 @@ render_worker_env "$BOOT/env" /etc/swesim/env
 install -m 600 "$BOOT/modal.toml" "$HOME/.modal.toml"
 chmod 600 /etc/swesim/env "$HOME/.modal.toml"
 
-echo "== repository at /opt/swesim (HTTPS clone with the read-only GH_TOKEN via gh; token never on a command line)"
+echo "== repository at /opt/swesim (HTTPS clone; the read-only GH_TOKEN reaches git only through a transient credential helper)"
+# The token lives in the process environment of this one git call; nothing is written to .git/config or ~/.gitconfig.
+GIT_AUTH=(-c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f')
 GH_TOKEN_VALUE=$(env_get /etc/swesim/env GH_TOKEN) || { echo "GH_TOKEN missing from /etc/swesim/env" >&2; exit 1; }
 if [ ! -d /opt/swesim/.git ]; then
-  GH_TOKEN="$GH_TOKEN_VALUE" gh repo clone "$REPO_URL" /opt/swesim
+  GH_TOKEN="$GH_TOKEN_VALUE" git "${GIT_AUTH[@]}" clone --quiet "$REPO_URL" /opt/swesim
 fi
-GH_TOKEN="$GH_TOKEN_VALUE" gh auth setup-git
-GH_TOKEN="$GH_TOKEN_VALUE" git -C /opt/swesim fetch --quiet origin
+GH_TOKEN="$GH_TOKEN_VALUE" git -C /opt/swesim "${GIT_AUTH[@]}" fetch --quiet origin
 unset GH_TOKEN_VALUE
-git -C /opt/swesim checkout --quiet --detach "$COMMIT"
-echo "checked out $(git -C /opt/swesim rev-parse --short HEAD)"
+# A local `main` tracking origin/main at the requested commit, so scripts/vm/update.sh can `git pull --ff-only` later.
+git -C /opt/swesim checkout --quiet -B main "$COMMIT"
+git -C /opt/swesim branch --quiet --set-upstream-to=origin/main main
+echo "checked out $(git -C /opt/swesim rev-parse --short HEAD) on main (tracking origin/main)"
 
 echo "== Python environment (locked)"
 cd /opt/swesim
