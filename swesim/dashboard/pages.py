@@ -13,6 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from swesim.dashboard import charts
+from swesim.index import reports
 from swesim.dashboard.public import project
 from urllib.parse import urlencode
 from swesim.stages.score import OUTCOME_NAMES
@@ -170,18 +171,101 @@ def trials_body(page, views: list[dict], facets: dict, current: dict) -> str:
 
 # ----------------------------------------------------------------------------- candidates
 
-def candidates_body(page, views: list[dict], funnel_steps: list[dict], hist: dict[str, int], source_keys: list[str], current_key: str | None) -> str:
+# The §4 discovery sequence (PRs listed → merged in range → linked issue → band filters → retained) continues into the
+# candidate stages of `FUNNEL_ORDER`; `retained` is the PR set that became `mined` candidate rows.
+DISCOVERY_STAGES: tuple[str, ...] = ("listed", "merged-in-range", "linked-issue", "band-passed", "retained")
+SOURCE_FUNNEL_COLUMNS = (
+    Column("source_key", "source key", "text", href="/candidates?source_key={source_key}", filterable=True),
+    Column("repo", "repo", "text", filterable=True),
+    Column("band", "band", "text", filterable=True),
+    Column("listed", "PRs listed", "num"),
+    Column("merged-in-range", "merged in range", "num"),
+    Column("linked-issue", "linked issue", "num"),
+    Column("band-passed", "band passed", "num"),
+    Column("retained", "retained", "num"),
+    *(Column(stage, stage, "num") for stage in ("judged", "probed", "drafted", "approved", "compiled", "validated", "registered")),
+    Column("rejected_prs", "PR rejects", "num"),
+    Column("errors", "fetch errors", "num"),
+    Column("discovered_at", "last scan", "time"),
+    Column("scan", "scan record", "mono", href="/artifacts?path={scan_path}", title="scan_sha256"),
+)
+DECISION_COLUMNS = (
+    Column("pr_number", "PR", "num", href="{pr_url}"),
+    Column("stage", "stage reached", "text", filterable=True),
+    Column("status", "decision", "chip", filterable=True),
+    Column("reason", "reason", "text", filterable=True),
+    Column("error_class", "error", "text"),
+    Column("linked_issues", "linked issues", "list"),
+)
+
+
+def source_funnels(latest: dict[str, dict], candidates, keys: list[str] | None = None) -> list[dict]:
+    """One row per source: the discovery stages of its newest scan (`observations.latest_scans`) followed by how many
+    candidates reached each stage.
+
+    A source without a scan record (discovery before scans were written) shows dashes for the discovery stages; its
+    rejects histogram still counts. Candidate stage counts are `kept + rejected + error + pending` at each stage."""
+    rows = list(candidates)
+    keys = sorted(keys) if keys is not None else sorted({*latest, *(r.source_key for r in rows)})
+    out = []
+    for key in keys:
+        disc = latest.get(key) or {}
+        mine = [r for r in rows if r.source_key == key]
+        reached = {s.stage: s.kept + s.rejected + s.error + s.pending for s in reports.funnel_steps(mine)}
+        funnel = disc.get("funnel") or {}
+        decisions = disc.get("decisions") or []
+        source, _, slug = key.partition("--")
+        stem, _, suffix = slug.rpartition("--")
+        view = {"source_key": key, "repo": disc.get("repo") or (mine[0].repo if mine else None), "band": disc.get("band") or (suffix if suffix in ("bugfix", "feature") else None),
+                **{stage: funnel.get(stage) for stage in DISCOVERY_STAGES},
+                **{stage: reached.get(stage) for stage in ("judged", "probed", "drafted", "approved", "compiled", "validated", "registered")},
+                "rejected_prs": sum(1 for d in decisions if d.get("status") == "rejected") if disc.get("scan_path") else None,
+                "errors": sum(1 for d in decisions if d.get("status") == "error") if disc.get("scan_path") else None,
+                "discovered_at": disc.get("discovered_at"), "scan": (disc.get("scan_sha256") or "")[:12] or None, "scan_sha256": disc.get("scan_sha256")}
+        if disc.get("scan_path"):
+            view["scan_path"] = disc["scan_path"]  # absent otherwise, so the column renders no link
+        out.append(view)
+    return out
+
+
+def decision_views(discovery: dict | None) -> list[dict]:
+    """Every PR decision of a discovery observation, newest funnel stage first, rejects and errors before retained."""
+    order = {"error": 0, "rejected": 1, "pending": 2, "retained": 3}
+    rows = [dict(d) for d in (discovery or {}).get("decisions") or []]
+    return sorted(rows, key=lambda d: (order.get(d.get("status"), 9), -DISCOVERY_STAGES.index(d["stage"]) if d.get("stage") in DISCOVERY_STAGES else 0, d.get("pr_number") or 0))
+
+
+def candidates_body(page, views: list[dict], funnel_steps: list[dict], hist: dict[str, int], source_keys: list[str], current_key: str | None,
+                    funnels: list[dict] | None = None, current: dict | None = None) -> str:
     sel = "".join(f"<option value='{h(k)}'{' selected' if k == current_key else ''}>{h(k)}</option>" for k in source_keys)
-    body = ["<h1>Candidates</h1><p class='lead'>Where the creation funnel loses candidates, and why. Discovery-time rejects (no linked issue, diff size, thread depth) and candidate gates are "
-            "projected from the index into the histogram below.</p>",
+    body = ["<h1>Candidates</h1><p class='lead'>Where the creation funnel loses candidates, and why. Every listed PR of a source scan keeps its decision: "
+            "discovery-time rejects (not merged, no linked issue, diff size, thread depth) and the later candidate gates are projected from the index.</p>",
             f"<form class='toolbar' method='get' action='/candidates'><label>source key<select name='source_key'><option value=''>all sources</option>{sel}</select></label>"
             "<button type='submit' class='button'>Filter</button></form>",
-            "<p class='muted small'>Discovery counts are decisions per source scan; overlapping sources can include the same PR.</p>",
+            "<h2>Source funnels</h2><p class='muted small'>PRs listed → merged in range → linked issue → band filters → retained (= mined) → judged → probed → drafted → approved → compiled "
+            "→ validated → registered, per source, from its newest scan. Discovery counts are decisions per source scan; overlapping sources can include the same PR. "
+            "Dashes in the discovery stages mean the scan predates per-PR records.</p>",
+            table("source-funnels", SOURCE_FUNNEL_COLUMNS, funnels or [], key="source_key",
+                  empty="<strong>No discovery recorded.</strong> A creation job's discovery step writes <code>candidates/&lt;key&gt;.rejects.json</code> and <code>candidates/&lt;key&gt;/scans/&lt;sha256&gt;.json</code>."),
             "<div class='side-by-side' id='candidate-charts' data-live-charts>", charts.funnel(funnel_steps, "chart-funnel"),
-            charts.hbars(list(hist.items()), "chart-rejects", "rejects by gate"), "</div>",
-            "<h2>Every candidate</h2>",
-            table("candidates", CANDIDATE_COLUMNS, views, key="instance_id", total=page.total, offset=page.offset, limit=page.limit, source="/api/candidates",
-                  empty="<strong>No candidate rows.</strong> A creation job's mining step writes <code>candidates/&lt;key&gt;.jsonl</code>; judged and probed rows follow.")]
+            charts.hbars(list(hist.items()), "chart-rejects", "rejects by gate"), "</div>"]
+    if current_key:
+        decisions = decision_views(current)
+        body.append(f"<h2>Every PR decision · <code>{h(current_key)}</code></h2>")
+        if current and current.get("scan_path"):
+            body.append(kv([("scanned", h(str(current.get("discovered_at") or "—"))), ("PRs listed", h(str((current.get("funnel") or {}).get("listed", len(decisions))))),
+                            ("scan record", f"<a href='/artifacts?path={h(current['scan_path'])}'><code>{h(current['scan_path'])}</code></a>"),
+                            ("sha256", f"<code>{h(current.get('scan_sha256'))}</code>"),
+                            ("workflow", ident(current.get("workflow_id"), 24, "/workflows/" + str(current.get("workflow_id"))) if current.get("workflow_id") else "—")]))
+        elif current:
+            body.append("<p class='muted'>This source's newest scan predates per-PR records; only its reject histogram is indexed.</p>")
+        body.append(table("decisions", DECISION_COLUMNS, decisions, key="pr_number", dense=True,
+                          empty="<strong>No PR decisions recorded for this source.</strong> Scans made after 0005_discovery_integrity list every PR here."))
+    else:
+        body.append("<p class='muted small'>Select a source key to list every PR decision of its newest scan.</p>")
+    body += ["<h2>Every candidate</h2>",
+             table("candidates", CANDIDATE_COLUMNS, views, key="instance_id", total=page.total, offset=page.offset, limit=page.limit, source="/api/candidates",
+                   empty="<strong>No candidate rows.</strong> A creation job's mining step writes <code>candidates/&lt;key&gt;.jsonl</code>; judged and probed rows follow.")]
     return "".join(body)
 
 

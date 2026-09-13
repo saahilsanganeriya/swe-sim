@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from swesim.sources import threads
+from swesim.sources import observations as obs
 from swesim.sources.observations import DiscoveryPRObservation
 
 log = logging.getLogger(__name__)
@@ -225,6 +226,34 @@ def discover(repo: str, since: str, max_prs: int = 400, min_comments: int = 4, d
             cands.append(c)
             _observed_update(observed, seq, stages=[*observed[seq].stages, 'band-passed', 'retained'], status='retained')
     return cands, dict(rejects)
+
+
+def source_key_for(repo: str, band: str) -> str:
+    """The candidates key of a repository scan in one band: `github-repo--<owner>__<repo>--<band>`."""
+    return f"github-repo--{normalize_repo(repo).replace('/', '__')}--{band}"
+
+
+def discover_scan(repo: str, since: str, *, max_prs: int = 400, kind: str = "feature", pr: int | None = None, max_candidates: int | None = None,
+                  source_key: str | None = None, workflow_id: str | None = None, run_id: str | None = None,
+                  scanned_at: datetime | None = None) -> tuple[list[dict], dict[str, int], obs.DiscoveryScan]:
+    """`discover` plus its immutable record: the retained candidates (capped at `max_candidates`), the legacy reject
+    histogram including `max-candidates-cut`, and a `DiscoveryScan` in which every listed PR keeps its decision.
+
+    A capped candidate is a recorded `max-candidates-cut` decision after band acceptance, not a vanished PR. The returned
+    histogram is exactly the scan's `rejects`, so the `.rejects.json` artifact and the scan can never disagree."""
+    repo = normalize_repo(repo)
+    if max_candidates is not None and max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
+    observations: list[DiscoveryPRObservation] = []
+    cands, _ = discover(repo, since, max_prs=max_prs, pr=pr, kind=kind, observations=observations)
+    kept = cands[: max_candidates or len(cands)]
+    observations = obs.retain_selected(observations, {c["_observation_seq"] for c in kept})
+    rejects = obs.legacy_rejects(observations)
+    scan = obs.DiscoveryScan(source_key=source_key or source_key_for(repo, kind), repo=repo, band=kind, since=since, max_prs=max_prs,
+                             max_candidates=max_candidates, pr=pr, scanned_at=scanned_at or datetime.now(timezone.utc),
+                             workflow_id=workflow_id, run_id=run_id, observations=observations, funnel=obs.funnel(observations),
+                             rejects=rejects, rejects_sha256=hashlib.sha256(obs.rejects_bytes(rejects)).hexdigest())
+    return kept, rejects, scan
 
 
 def build_recipe(repo: str, base_commit: str, profile: str = "python-pytest") -> dict:
