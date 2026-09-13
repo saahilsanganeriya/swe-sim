@@ -205,6 +205,7 @@ class TrialRow(Provenance):
     stakeholder_model: str | None = None
     stakeholder_prompt_version: str | None = None
     evaluation_config: dict | None = None
+    failure: str | None = None  # why nothing was graded (runner-error / launch-failed / unresolved): runner-error.json or launch.json `error`
 
 
 class ExchangeRow(Provenance):

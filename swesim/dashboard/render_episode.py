@@ -212,8 +212,13 @@ def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extra
              + (f" · stakeholder <span class='mono'>{h(m.get('stakeholder_model'))}</span>" if m.get("stakeholder_model") else "") + "</p>")]
     if t["unresolved"] and not live:
         u = t["unresolved"]
-        left.append(f"<p class='flag'>Unresolved attempt: no record.json was written. status {h(u['status'])}"
+        head = ("Runner error: the trial could not start; nothing was graded." if st == "runner-error"
+                else "Unresolved attempt: no record.json was written.")
+        left.append(f"<p class='flag'>{head} status {h(u['status'])}"
                     f"{' · error ' + h(u['error_type']) if u.get('error_type') else ''} · from {h(u['source_file'])}. Not counted in n, success or pass@k.</p>")
+        reason = (getattr(row, "failure", None) if row is not None else None) or t.get("failure")
+        if reason:  # the row's projected reason, else the files (a row indexed before the column existed); never truncated here
+            left.append(f"<p class='note' data-failure><strong>Reason</strong> <span class='mono'>{h(reason)}</span></p>")
     pat = meter(p["end"], p["start"]) if p["start"] is not None else "<span class='muted'>no stakeholder session for this condition</span>"
     tier = f" · <span data-evaluator-only class='hidden'>last tier {h(p['tier'])}</span>" if p.get("tier") and evaluator else ""
     left.append(f"<div class='card small'><strong>Patience</strong> <span id='patience-live'>{pat}</span> <span class='muted'>questions {h(p['questions'])} · confirmations {h(p['confirmations'])} · "

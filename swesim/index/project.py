@@ -15,6 +15,9 @@ Contract
 - Trial status from files: record.json / status.json `completed|finished` -> completed, `running` -> running,
   `error` -> runner-error; runner-error.json -> runner-error; launch.json `failed` -> launch-failed; launch.json
   without status.json or record.json -> unresolved; request.json only -> planned.
+- `TrialRow.failure` (runner-error | launch-failed | unresolved rows only, `FAILURE_STATUSES`): the operator-facing reason
+  nothing was graded, from runner-error.json `error` (else `type`), else launch.json `error`, else status.json `error`;
+  None when no file says. A graded or live row never carries one.
 - Scenario validation status from files: scenario.json + validation.json valid -> valid; validation.json not valid
   -> invalid; a reject decision -> rejected; compile.json -> validating; approval.json -> compiling; else drafting;
   `archive/v<n>/` -> archived (one row per version).
@@ -694,6 +697,10 @@ def _candidate_row(layout: Layout, source_key: str, iid: str, sid: str | None, r
 # ----------------------------------------------------------------------------- trials
 
 TRIAL_EVIDENCE: tuple[str, ...] = ("record.json", "status.json", "runner-error.json", "request.json", "launch.json")
+# Statuses that mean "nothing was graded": the console shows their reason (`TrialRow.failure`) and its "graded only" chip hides them.
+FAILURE_STATUSES: tuple[str, ...] = ("runner-error", "launch-failed", "unresolved")
+# (file, keys) in the order a reason is looked for; the first non-empty value wins.
+_FAILURE_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (("runner-error.json", ("error", "message", "type")), ("launch.json", ("error",)), ("status.json", ("error",)))
 
 
 def trial_ids(layout: Layout) -> list[str]:
@@ -704,6 +711,26 @@ def trial_ids(layout: Layout) -> list[str]:
         return []
     return sorted(p.name for p in trials.iterdir()
                   if p.is_dir() and TRIAL_ID_RE.fullmatch(p.name) and any((p / name).exists() for name in TRIAL_EVIDENCE))
+
+
+def _message(value: Any) -> str | None:
+    """A human-readable error out of whatever shape a writer used: a string, a number, or a dict with message/error/type."""
+    if isinstance(value, dict):
+        return next((m for m in (_message(value.get(k)) for k in ("message", "error", "type")) if m), None)
+    if value is None or isinstance(value, (bool, list)):
+        return None
+    return str(value).strip() or None
+
+
+def trial_failure(d: Path) -> str | None:
+    """The reason an attempt was never graded, from the files the runner and the launcher leave (`_FAILURE_SOURCES`);
+    None when none of them carries one. Pure read; the console truncates for the table cell, the row keeps the full text."""
+    for name, keys in _FAILURE_SOURCES:
+        data = _dict(read_json(d / name))
+        found = next((m for m in (_message(data.get(k)) for k in keys) if m), None)
+        if found:
+            return found
+    return None
 
 
 def _success(value: Any) -> bool | None:
@@ -792,6 +819,7 @@ def project_trial(layout: Layout, trial_id: str, *, origin: str | None = None, n
         stakeholder_model=_str(stakeholder.get("model_id")) or _str(request.get("stakeholder_model")),
         stakeholder_prompt_version=_str(stakeholder.get("prompt_version")),
         evaluation_config=semantic_config(rc, report),
+        failure=trial_failure(d) if status in FAILURE_STATUSES else None,
         created_at=now, updated_at=now, workflow_id=workflow_id, run_id=run_id,
         worker_image_digest=_first(rec, launch, key="worker_image_digest") or _first(launch, key="image_digest"), origin=row_origin)
     exchanges = project_exchanges(trial_id, transcript, audit, origin=row_origin, now=now, workflow_id=workflow_id, run_id=run_id)

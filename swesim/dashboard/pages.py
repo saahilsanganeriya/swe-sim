@@ -18,8 +18,11 @@ from swesim.dashboard.public import project
 from urllib.parse import urlencode
 from swesim.stages.score import OUTCOME_NAMES
 from swesim.dashboard.render import (
-    Column, chip, code_block, dash, difficulty_chip, fmt_usd, h, hero, ident, kv, model_chip, table, tier_of, tile, tiles, when,
+    Column, chip, code_block, dash, difficulty_chip, fmt_usd, h, hero, ident, kv, model_chip, short, table, tier_of, tile, tiles, when,
 )
+
+FAILURE_CELL_CHARS = 120  # the reason column shows this much; the full text is the cell's tooltip and the episode page
+RUNNER_ERROR_NOTE = "runner-error = the trial could not start; nothing was graded (see the reason on each row)"
 
 # ----------------------------------------------------------------------------- columns
 
@@ -34,6 +37,7 @@ TRIAL_COLUMNS = (
     Column("purpose", "purpose", "text", filterable=True),
     Column("status", "status", "chip", filterable=True),
     Column("outcome", "outcome", "chip", title="outcome_detail"),
+    Column("failure_short", "reason", "text", title="failure"),
     Column("reward", "reward", "metric"),
     Column("questions_asked", "asked", "num"),
     Column("confirmations", "confirmed", "num"),
@@ -71,15 +75,25 @@ CANDIDATE_COLUMNS = (
 )
 
 
-def trial_view(r, source: str | None = None) -> dict:
+def trial_view(r, source: str | None = None, *, failure: str | None = None) -> dict:
     """A TrialRow as the table/JSON row: adds the outcome name (score.OUTCOME_NAMES), a hover detail and, from the scenario's
-    ``source`` (a TrialRow does not carry it; ``app.trial_views`` looks it up), the task-origin badge."""
+    ``source`` (a TrialRow does not carry it; ``app.trial_views`` looks it up), the task-origin badge.
+
+    A ``runner-error`` row reads ``not graded`` (the trial never started: an error, not a runtime that went missing) and carries
+    the runner's reason: ``failure`` (first ``FAILURE_CELL_CHARS`` in the cell, the full text in its tooltip). ``failure`` fills
+    the reason for a row indexed before the column existed (``app.trial_views`` reads the files); the row's own value wins."""
     d = r.model_dump(mode="json")
     d["scenario_source"] = source
     d["origin_kind"] = origin.badge_label(source)
     d["outcome"] = OUTCOME_NAMES.get(r.outcome_code) if r.outcome_code is not None else None
     d["outcome_detail"] = f"outcome code {r.outcome_code}" if r.outcome_code is not None else None
-    if not d["outcome"] and r.status not in ("completed", "running", "launched", "planned"):
+    reason = getattr(r, "failure", None) or failure or None
+    d["failure"] = reason
+    d["failure_short"] = short(reason, FAILURE_CELL_CHARS) if reason else None
+    if not d["outcome"] and r.status == "runner-error":
+        d["outcome"] = "not graded"
+        d["outcome_detail"] = "runner-error: the trial could not start; nothing was graded"
+    elif not d["outcome"] and r.status not in ("completed", "running", "launched", "planned"):
         d["outcome"] = "unresolved"
         d["outcome_detail"] = "ended without a verifier record; never counted in n or pass@k"
     return d
@@ -182,7 +196,9 @@ def trials_body(page, views: list[dict], facets: dict, current: dict, query=()) 
     filter form and the paging links."""
     query = list(query)
     facet = current.get("pool")
+    graded = bool(current.get("graded"))
     form = ["<form class='toolbar' method='get' action='/trials'>", origin.hidden_input(facet),
+            "<input type='hidden' name='graded' value='1'>" if graded else "",
             _filter_select("scenario_id", facets["scenario_id"], current.get("scenario_id"), "scenario"),
             _filter_select("version", facets["version"], current.get("version"), "version"),
             _filter_select("model", facets["model"], current.get("model"), "model"),
@@ -195,9 +211,17 @@ def trials_body(page, views: list[dict], facets: dict, current: dict, query=()) 
             f"<label>since<input type='date' name='since' value='{h(current.get('since') or '')}'></label>",
             f"<label>until<input type='date' name='until' value='{h(current.get('until') or '')}'></label>",
             "<button type='submit' class='button'>Filter</button> <a class='button' href='/trials'>Reset</a></form>"]
+    # the quick chip toggles ``?graded=1`` (history minus the attempts nothing was graded on) and keeps every other filter; paging resets
+    base = [(k, v) for k, v in origin.keep_query(query) if k != "graded"]
+    toggle = urlencode(base if graded else base + [("graded", "1")])
+    quick = (f"<nav class='facet-bar' aria-label='quick filters'><span class='muted small'>quick filter</span>"
+             f"<a class='button small{' primary' if graded else ''}' href='/trials{'?' + h(toggle) if toggle else ''}' "
+             f"title='hide runner-error, launch-failed and unresolved attempts: nothing was graded on them'"
+             f"{' aria-current=true' if graded else ''} data-quick='graded'>graded only</a></nav>")
+    note = f"<p class='note' data-note='runner-error'>{h(RUNNER_ERROR_NOTE)}</p>" if any(v.get("status") == "runner-error" for v in views) else ""
     body = ["<h1>Trials</h1><p class='lead'>Every trial record and every planned, launched, unresolved or launch-failed attempt. Unresolved attempts never enter n or pass@k.</p>",
-            origin.facet_bar(facet, query, "/trials"), "".join(form),
-            f"<p class='muted small' data-count-line>{page.total} attempt(s) match · showing {h(origin.subset_text(facet))}</p>",
+            origin.facet_bar(facet, query, "/trials"), quick, "".join(form),
+            f"<p class='muted small' data-count-line>{page.total} attempt(s) match · showing {h(origin.subset_text(facet))}</p>", note,
             table("trials", TRIAL_COLUMNS, views, key="trial_id", total=page.total, offset=page.offset, limit=page.limit, source="/api/trials",
                   keep=origin.keep_query(query), empty="<strong>No trials match.</strong> Reset the filters, or start a run on <a href='/run'>Run</a>.")]
     return "".join(body)
