@@ -117,13 +117,19 @@ async def build_scenario(set_stage, p: dict, sid: str, spec_hash: str) -> dict:
     return {"scenario_id": sid, "spec_hash": accepted["spec_hash"], "status": "valid", "reasons": [], "validation": validation, "step": step}
 
 
+def _run_workflow_id() -> str | None:
+    """This RunTasksWorkflow's id, carried into each trial request for the Job label `swesim-run-workflow-id`."""
+    return workflow.info().workflow_id if workflow.in_workflow() else None
+
+
 async def run_trials(set_trial_status, trials: list[dict], sem: asyncio.Semaphore) -> list[dict]:
     """TrialWorkflow children with REJECT_DUPLICATE, at most `sem` at a time; results keep the trial order."""
     async def one(trial: dict) -> dict:
         async with sem:
             await set_trial_status(trial, "running")
             try:
-                r = await workflow.execute_child_workflow(TrialWorkflow.run, trial, id=trial["trial_id"], id_reuse_policy=REJECT_DUP)
+                child = {**trial, "run_workflow_id": _run_workflow_id()}
+                r = await workflow.execute_child_workflow(TrialWorkflow.run, child, id=trial["trial_id"], id_reuse_policy=REJECT_DUP)
             except WorkflowAlreadyStartedError:
                 r = {"trial_id": trial["trial_id"], "status": "duplicate-rejected"}
             except Exception as e:  # noqa: BLE001 - one failed child never stops its siblings

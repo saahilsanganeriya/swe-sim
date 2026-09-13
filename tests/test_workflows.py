@@ -444,6 +444,20 @@ def test_await_launch_by_another_runtime_is_unresolved_not_relaunched(ws, system
     assert A.launch_once(p)["decision"] == "reconcile" and not [c for c in systemd.calls if c[0] == "systemd-run"]
 
 
+def test_cancel_and_cleanup_activities_follow_the_evidence(ws, systemd):
+    spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]; unit = "swesim-trial-" + p["trial_id"]
+    assert asyncio.run(A.cancel_trial_activity(p))["cancelled"] is False                       # nothing launched: nothing to stop
+    A.launch_once(p)
+    r = asyncio.run(A.cleanup_trial_activity(p))
+    assert r["cleaned"] is False and "decision=reconcile" in r["reason"] and "runtime=running" in r["reason"]   # the runtime is still the evidence
+    c = asyncio.run(A.cancel_trial_activity(p))
+    assert c["cancelled"] is True and c["launcher"] == "systemd" and c["handle"] == unit and ["systemctl", "--user", "stop", unit] in systemd.calls
+    assert asyncio.run(A.cleanup_trial_activity(p))["cleaned"] is False                        # stopped without a record: still reconcile-by-hand evidence
+    atomic_json(d / "record.json", {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}})
+    done = asyncio.run(A.cleanup_trial_activity(p))
+    assert done["cleaned"] is True and done["launcher"] == "systemd" and done["origin"] == A.SETTINGS.origin
+
+
 def test_register_activity_result_is_json_serializable(ws, monkeypatch):
     # Fix round 1, Important 5.
     spec = frozen_scenario(ws)
@@ -1293,9 +1307,11 @@ def test_env_run_tasks_two_scenarios_bounded_and_progress():
         planned.append(p)
         if p["scenario_id"] == "bad": raise ApplicationError("scenario/build not validated", non_retryable=True)
         return {"scenario_id": p["scenario_id"], "trials": [{"trial_id": f"{p['scenario_id']}-t{i}", "scenario_id": p["scenario_id"], "model": p["models"][0], "condition": "hidden", "attempt_index": i} for i in range(2)]}
+    run_ids = set()
     @activity.defn(name="launch_trial_activity")
     async def launch(p):
         conc["cur"] += 1; conc["max"] = max(conc["max"], conc["cur"]); await asyncio.sleep(0.05); conc["cur"] -= 1
+        run_ids.add(p.get("run_workflow_id"))
         return {"trial_id": p["trial_id"], "launched": True}
     @activity.defn(name="await_trial_activity")
     async def collect(p): return {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}}
@@ -1313,6 +1329,7 @@ def test_env_run_tasks_two_scenarios_bounded_and_progress():
             for sid in ("s1", "s2"):
                 assert r["scenarios"][sid]["status"] == "complete" and [t["status"] for t in r["scenarios"][sid]["trials"]] == ["completed", "completed"]
             assert conc["max"] == 1 and sorted(scored) == ["s1", "s2"] == sorted(exported)              # trials one at a time; score+export per scenario
+            assert run_ids == {"run-test-1"}                                                              # the parent's id reaches every trial request (Job label)
             assert all(p["stakeholder_model"] == "anthropic/claude-sonnet-5" and p["purpose"] == "comparison" for p in planned)
             prog = await h.query(W.RunTasksWorkflow.progress)
             assert prog["stage"] == "complete" and set(prog["trials"]) == {"s1-t0", "s1-t1", "s2-t0", "s2-t1"}
