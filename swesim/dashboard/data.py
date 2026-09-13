@@ -196,7 +196,7 @@ def trial_row(d: Path, now: float | None = None, live: bool = False) -> dict:
         "success": (rec.get("reward") or {}).get("success"), "reward": (rec.get("reward") or {}).get("reward"),
         "questions": count_exchanges(rec, "ask") if has_record else patience.get("questions"),
         "reviews": count_exchanges(rec, "review") if has_record else patience.get("reviews"),
-        "patience_start": patience.get("start"), "patience_end": patience.get("end"), "patience_tier": patience.get("tier"),
+        "patience_start": patience.get("start"), "patience_end": patience.get("end"),  # the tier is a stakeholder internal: evaluator-only
         "label": label.get("label"), "started_at": started_at, "finished_at": finished_at,
         "started_ts": started_ts, "finished_ts": finished_ts, "elapsed_s": elapsed,
         "simulator_validity": report.get("simulator_validity"), "transcript_binding_valid": report.get("transcript_binding_valid"),
@@ -211,8 +211,7 @@ def apply_live(row: dict, transcript: dict, error: str | None) -> None:
     row["live_error"] = error
     if transcript:
         pt = patience_of(transcript, row.get("_rc") or {})
-        row.update(patience_start=pt["start"], patience_end=pt["end"], patience_tier=pt["tier"],
-                   questions=pt["questions"], reviews=pt["reviews"])
+        row.update(patience_start=pt["start"], patience_end=pt["end"], questions=pt["questions"], reviews=pt["reviews"])
 
 
 def trial_board(root: Path, now: float | None = None, live: bool = False) -> list[dict]:

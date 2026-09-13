@@ -56,7 +56,7 @@
   }
   function tickAgo() {
     const n = document.getElementById("live");
-    if (!n || lastUpdate === null) return;
+    if (!n || lastUpdate === null || n.classList.contains("err")) return;  // keep the backoff message readable
     const ago = Math.max(0, Math.round((Date.now() - lastUpdate) / 1000));
     n.querySelector(".txt").textContent = "updated " + ago + "s ago";
   }

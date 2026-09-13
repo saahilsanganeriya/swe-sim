@@ -17,7 +17,7 @@ from swesim.dashboard.render import (
 
 
 def redact_dump(progress: dict) -> str:
-    """Raw progress for the details pane, with URLs and secret-like values masked (the redactor caps at 300 chars per call)."""
+    """Raw progress for the details pane, with URLs and secret-like values masked (the redactor caps at 300 chars per line)."""
     text = json.dumps(progress, indent=2, default=str)
     return "\n".join(console.redact(line) for line in text.splitlines()[:400])
 
@@ -40,29 +40,31 @@ def _opts(values, selected=None) -> str:
 
 def create_page(d: dict) -> str:
     body = ["<h1>Create tasks</h1>",
-            ("<p class='lead'>Start a creation job: mine candidates, judge them, draft the scenario, approve (auto or held for you), compile, "
-            "validate the controls on Modal and register. The stakeholder URL and worker secret come from the server environment.</p>"),
+            ("<p class='lead'>Start a creation job (CreateTasksWorkflow): mine candidates from every source, then one CandidateWorkflow per candidate - "
+             "judge, draft, approve (auto or held for you), compile, validate the controls on Modal, register. The stakeholder URL and worker secret "
+             "come from the server environment.</p>"),
             banner_slot(),
             "<form id='create-form' class='console' data-endpoint='/api/create' data-jobs='/jobs/'>",
             "<fieldset><legend>Source</legend>",
             "<label class='inline'><input type='radio' name='source' value='github-repo' checked> GitHub repositories</label>",
             "<label class='inline'><input type='radio' name='source' value='swebench-annotated'> SWE-bench annotated pool A</label>",
             ("<div data-source='github-repo'><label for='repos'>Repository URLs, one per line</label>"
-            "<textarea id='repos' name='repos' rows='4' placeholder='https://github.com/py-pdf/pypdf'></textarea>"
-            f"<div class='row'><label for='since'>merged since<input id='since' name='since' type='date' value='{h(d['since'])}'></label>"
-            f"<label for='max_candidates'>max candidates per repo<input id='max_candidates' name='max_candidates' type='number' min='1' max='50' value='{h(d['max_candidates'])}'></label></div></div>"),
+             "<textarea id='repos' name='repos' rows='4' placeholder='https://github.com/py-pdf/pypdf'></textarea>"
+             f"<div class='row'><label for='since'>merged since<input id='since' name='since' type='date' value='{h(d['since'])}'></label>"
+             f"<label for='max_candidates'>max candidates per repo<input id='max_candidates' name='max_candidates' type='number' min='1' max='50' value='{h(d['max_candidates'])}'></label></div></div>"),
             ("<div data-source='swebench-annotated' class='hidden'><label for='instance_ids'>Instance ids (optional, one per line; empty = whole pool)</label>"
-            "<textarea id='instance_ids' name='instance_ids' rows='3' placeholder='psf__requests-1944'></textarea>"
-            f"<label for='limit'>limit<input id='limit' name='limit' type='number' min='1' max='200' value='{h(d['limit'])}'></label></div>"),
+             "<textarea id='instance_ids' name='instance_ids' rows='3' placeholder='psf__requests-1944'></textarea>"
+             f"<label for='limit'>limit<input id='limit' name='limit' type='number' min='1' max='200' value='{h(d['limit'])}'></label></div>"),
             "</fieldset><fieldset><legend>Models</legend><div class='row'>",
             f"<label for='judge_model'>judge model<input id='judge_model' name='judge_model' value='{h(d['judge_model'])}'></label>",
             (f"<label for='draft_model'>draft model<input id='draft_model' name='draft_model' value='{h(d['draft_model'])}'></label></div>"
-            f"<p class='muted small'>Solver for the pipeline's single demonstration trial: <span class='mono'>{h(d['solver_model'])}</span> (never substituted).</p>"),
+             f"<p class='muted small'>Solver for demonstration trials: <span class='mono'>{h(d['solver_model'])}</span> (never substituted).</p>"),
             "</fieldset><fieldset><legend>Approval and concurrency</legend>",
             f"<label for='approval_mode'>approval mode<select id='approval_mode' name='approval_mode'>{_opts(list(console.APPROVAL_MODES), 'auto')}</select></label>",
             ("<p class='muted small'>Auto: the code-owned gates decide and record <code>approved_by: auto-validators, review_needed: true</code>; "
-            "you review in the morning. Hold: each draft waits in the <a href='/review'>review queue</a> until you approve or reject it.</p>"),
-            f"<label for='max_parallel'>max parallel<input id='max_parallel' name='max_parallel' type='number' min='1' max='{console.MAX_PARALLEL}' value='{h(d['max_parallel'])}'></label>",
+             "you review in the morning. Hold: each draft waits in the <a href='/review'>review queue</a> until you approve or reject it.</p>"),
+            (f"<label for='max_parallel'>max parallel candidates<input id='max_parallel' name='max_parallel' type='number' min='1' max='{console.MAX_PARALLEL}' value='{h(d['max_parallel'])}'></label>"
+             "<p class='muted small'>Honored by CreateTasksWorkflow; the legacy one-pipeline-per-repository fallback ignores it.</p>"),
             "</fieldset><div><button type='submit' class='primary'>Start creation job</button> <span class='muted small' id='form-status'></span></div></form>"]
     return layout("swesim · create", "".join(body), "create", "console")
 
@@ -74,8 +76,8 @@ def run_page(d: dict, scenarios: list[dict]) -> str:
     conds = "".join(f"<label class='inline'><input type='checkbox' name='conditions' value='{c}'{' checked' if c == 'interactive' else ''}> {c}</label>"
                     for c in console.CONDITIONS)
     body = ["<h1>Run trials</h1>",
-            ("<p class='lead'>Start a run matrix over registered, valid scenarios: k attempts per model per condition, grouped by frozen run "
-            "configuration. Calibration and comparison runs are never pooled.</p>"), banner_slot(),
+            ("<p class='lead'>Start a run (RunTasksWorkflow) over registered, valid scenarios: k attempts per model per condition, grouped by frozen run "
+             "configuration. Calibration and comparison runs are never pooled.</p>"), banner_slot(),
             "<form id='run-form' class='console' data-endpoint='/api/run' data-jobs='/jobs/'>",
             "<fieldset><legend>Scenarios</legend>"]
     if scenarios:
@@ -91,7 +93,10 @@ def run_page(d: dict, scenarios: list[dict]) -> str:
              f"<label for='brief_profile'>brief profile<select id='brief_profile' name='brief_profile'>{_opts(list(console.PROFILES), 'withheld')}</select></label>",
              f"<label for='stakeholder_model'>stakeholder model<input id='stakeholder_model' name='stakeholder_model' value='{h(d['stakeholder_model'])}'></label>",
              f"<label for='max_parallel'>max parallel trials<input id='max_parallel' name='max_parallel' type='number' min='1' max='{console.MAX_PARALLEL}' value='{h(d['max_parallel'])}'></label>",
-             "</div></fieldset><div><button type='submit' class='primary'"
+             "<label for='attempt_offset'>attempt offset<input id='attempt_offset' name='attempt_offset' type='number' min='0' max='1000' value='0'></label>",
+             ("</div><p class='muted small'>max parallel trials is honored by RunTasksWorkflow (1 on a laptop; raise on the VM); the legacy serial "
+             "RunMatrixWorkflow fallback ignores it. A retry of the same matrix needs a fresh attempt offset: trial ids are never reused.</p>"),
+             "</fieldset><div><button type='submit' class='primary'"
              + (" disabled" if not scenarios else "") + ">Start run</button> <span class='muted small' id='form-status'></span></div></form>"]
     return layout("swesim · run", "".join(body), "run", "console")
 
@@ -109,60 +114,88 @@ def job_row(j: dict) -> str:
 
 
 def jobs_page(jobs: list[dict] | None, error: console.ConsoleUnavailable | None) -> str:
-    body = [("<h1>Jobs</h1><p class='lead'>Temporal workflows started from the console or the CLI: creation jobs (PipelineWorkflow) and run "
-            "matrices. Refreshes every 5 s. Workflow state lives in Temporal; episodes and outcomes live on the <a href='/runs'>Runs</a> page.</p>")]
+    body = [("<h1>Jobs</h1><p class='lead'>Temporal workflows started from the console or the CLI: creation jobs (CreateTasksWorkflow and its "
+            "CandidateWorkflow children), runs (RunTasksWorkflow) and the legacy pipeline/matrix workflows. Refreshes every 5 s. Workflow state lives in "
+            "Temporal; episodes and outcomes live on the <a href='/runs'>Runs</a> page.</p>")]
     if error is not None:
         body.append(unavailable_banner(str(error), error.cli, error.kind))
     rows = "".join(job_row(j) for j in jobs or [])
     body.append(f"<div class='table-wrap'><table class='{'hidden' if not jobs else ''}'><thead>{JOB_HEAD}</thead><tbody id='jobs-body'>{rows}</tbody></table></div>")
     empty = ("<p class='empty' id='jobs-body-empty'><strong>No workflows yet.</strong> Start one from <a href='/create'>Create</a> or <a href='/run'>Run</a>, or "
-             "with <code>uv run swesim pipeline …</code> / <code>uv run swesim matrix …</code>; rows appear here within 5 s.</p>")
+             "with <code>uv run swesim create …</code> / <code>uv run swesim run-tasks …</code>; rows appear here within 5 s.</p>")
     body.append(empty if not jobs and error is None else empty.replace("<p class='empty'", "<p class='empty hidden'"))
     body.append(JOB_TEMPLATE)
     return layout("swesim · jobs", "".join(body), "jobs", "jobs", {"poll-ms": "5000"}, "updated 0s ago" if error is None else None)
 
 
-def _progress_candidates(cands: list[dict]) -> str:
+def _candidate_chips(c: dict) -> str:
+    """Stage chips for one candidate: CreateTasksWorkflow keeps ``stages`` as a list of stage names (last = current)."""
+    stages = c.get("stages")
+    if isinstance(stages, list) and stages and all(isinstance(s, str) for s in stages):
+        status = c.get("status")
+        chips = [{"stage": s, "state": "done", "detail": ""} for s in stages[:-1]]
+        last_state = "failed" if status in ("invalid", "rejected", "error", "duplicate-rejected") else \
+            "pending" if stages[-1] == "awaiting-approval" else "done" if stages[-1] == "done" else "pending"
+        chips.append({"stage": stages[-1], "state": last_state, "detail": str(status or "")})
+        return stage_chips(chips)
+    if isinstance(stages, list) and stages and all(isinstance(s, dict) for s in stages):
+        return stage_chips(stages)
+    stage = c.get("stage") or c.get("status")
+    return chip(stage, "warn pulse" if stage == "awaiting-approval" else "critical" if c.get("status") in ("invalid", "rejected", "error") else "info")
+
+
+def _progress_candidates(progress: dict) -> str:
     rows = []
-    for c in cands:
-        if not isinstance(c, dict):
-            continue
-        stages = c.get("stages") if isinstance(c.get("stages"), list) else None
-        chips = stage_chips(stages) if stages else chip(c.get("stage"), "warn pulse" if c.get("stage") == "awaiting-approval" else "info")
-        sid = c.get("scenario_id")
+    for sid, c in console._candidate_items(progress):
+        sid = sid or c.get("scenario_id")
         link = f"<a href='/scenario/{h(sid)}'>{h(sid)}</a>" if sid else "—"
-        review = f" <a href='/review/{h(sid)}'>review</a>" if sid and c.get("stage") == "awaiting-approval" else ""
-        detail = c.get("detail") or c.get("reasons")
-        rows.append(f"<tr><td class='mono'>{dash(c.get('instance_id') or c.get('candidate'))}</td><td>{link}{review}</td><td>{chips}</td>"
+        held = c.get("status") == "awaiting-approval" or c.get("stage") == "awaiting-approval"
+        review = f" <a href='/review/{h(sid)}'>review</a>" if sid and held else ""
+        detail = c.get("detail") or c.get("reasons") or c.get("refusals")
+        rows.append(f"<tr><td class='mono'>{dash(c.get('instance_id') or c.get('candidate'))}</td><td>{link}{review}</td><td>{_candidate_chips(c)}</td>"
+                    f"<td>{chip(c.get('status'), status_kind(c.get('status')) or ('warn pulse' if held else 'info')) if c.get('status') else '—'}</td>"
                     f"<td class='small muted'>{dash(console.redact(str(detail))) if detail else '—'}</td></tr>")
-    return ("<h2>Candidates</h2><div class='table-wrap'><table><thead><tr><th>candidate</th><th>scenario</th><th>stage</th><th>detail</th></tr></thead>"
+    return ("<h2>Candidates</h2><div class='table-wrap'><table><thead><tr><th>candidate</th><th>scenario</th><th>stages</th><th>status</th><th>detail</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>")
 
 
-def _progress_trials(trials: list[dict]) -> str:
+def _trial_items(progress: dict) -> list[dict]:
+    trials = progress.get("trials")
+    if isinstance(trials, dict):
+        return [{"trial_id": tid, **t} for tid, t in trials.items() if isinstance(t, dict)]
+    return [t for t in trials if isinstance(t, dict)] if isinstance(trials, list) else []
+
+
+def _progress_trials(progress: dict) -> str:
     rows = []
-    for t in trials:
-        if not isinstance(t, dict):
-            continue
+    for t in _trial_items(progress):
         tid = str(t.get("trial_id") or "")
         link = f"<a class='trial-link' href='/trial/{h(tid)}'>{h(tid)}</a>" if tid else "—"
-        rows.append(f"<tr><td>{link}</td><td>{dash(t.get('condition'))}</td><td>{dash(t.get('model'))}</td>"
-                    f"<td>{chip(t.get('status'), status_kind(t.get('status')))}</td><td>{outcome_chip(t.get('outcome'), t.get('success'))}</td>"
-                    f"<td class='num'>{dash(t.get('reward'))}</td></tr>")
-    return ("<h2>Trials</h2><div class='table-wrap'><table><thead><tr><th>trial</th><th>condition</th><th>model</th><th>status</th><th>outcome</th>"
-            f"<th class='num'>reward</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>")
+        rows.append(f"<tr><td>{link}</td><td>{dash(t.get('scenario_id'))}</td><td>{dash(t.get('condition'))}</td><td>{dash(t.get('model'))}</td>"
+                    f"<td class='num'>{dash(t.get('attempt_index'))}</td><td>{chip(t.get('status'), status_kind(t.get('status')))}</td>"
+                    f"<td>{outcome_chip(t.get('outcome'), t.get('success'))}</td><td class='num'>{dash(t.get('reward'))}</td></tr>")
+    return ("<h2>Trials</h2><div class='table-wrap'><table><thead><tr><th>trial</th><th>scenario</th><th>condition</th><th>model</th><th class='num'>#</th>"
+            f"<th>status</th><th>outcome</th><th class='num'>reward</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>")
+
+
+def _scenario_items(progress: dict) -> list[dict]:
+    sc = progress.get("scenarios")
+    if isinstance(sc, dict):
+        return [{"scenario_id": sid, **s} for sid, s in sc.items() if isinstance(s, dict)]
+    return [s for s in sc if isinstance(s, dict)] if isinstance(sc, list) else []
 
 
 def job_page(wid: str, progress: dict | None, error: console.ConsoleUnavailable | None, job: dict | None = None) -> str:
     body = [f"<h1>Job <span class='mono'>{h(wid)}</span></h1>"]
     if job:
-        body.append(f"<p class='lead'>{dash(job.get('type'))} {chip(job.get('status'), status_kind(job.get('status')))} started {dash(job.get('started_at'))}</p>")
+        body.append(f"<p class='lead'>{dash(job.get('type'))} {chip(job.get('status'), status_kind(job.get('status')))} started {dash(job.get('started_at'))}"
+                    + (f" · closed {h(job['closed_at'])}" if job.get("closed_at") else "") + "</p>")
     body.append(banner_slot())
     if error is not None:
         body.append(unavailable_banner(str(error), error.cli, error.kind))
     if progress:
         stage = progress.get("stage") or progress.get("status")
-        body.append(f"<p>Stage {chip(stage, 'warn pulse' if stage in ('awaiting-approval', 'trial', 'validating', 'compiling', 'mining', 'judging') else 'info')}"
+        body.append(f"<p>Stage {chip(stage, 'warn pulse' if stage in ('awaiting-approval', 'trial', 'validating', 'compiling', 'mining', 'judging', 'running') else 'info')}"
                     + (f" · scenario <a href='/scenario/{h(progress['scenario_id'])}'>{h(progress['scenario_id'])}</a>" if progress.get("scenario_id") else "")
                     + (f" · <a href='/review/{h(progress['scenario_id'])}'>review this draft</a>" if stage == "awaiting-approval" and progress.get("scenario_id") else "")
                     + (f" · trial <a class='trial-link' href='/trial/{h(progress['trial_id'])}'>{h(progress['trial_id'])}</a>" if progress.get("trial_id") else "") + "</p>")
@@ -170,22 +203,30 @@ def job_page(wid: str, progress: dict | None, error: console.ConsoleUnavailable 
             body.append(f"<p class='flag'>needs a person: {h(json.dumps(progress['needs_human']))}</p>")
         if progress.get("substitutions"):
             body.append(f"<p class='muted small'>model substitutions: {h(json.dumps(progress['substitutions']))}</p>")
-        if isinstance(progress.get("candidates"), list):
-            body.append(_progress_candidates(progress["candidates"]))
-        if isinstance(progress.get("trials"), list):
-            body.append(_progress_trials(progress["trials"]))
-        if isinstance(progress.get("scenarios"), list) and progress["scenarios"]:
-            items = "".join(f"<li><a href='/scenario/{h(s.get('scenario_id'))}'>{h(s.get('scenario_id'))}</a> {chip(s.get('status'), 'good' if str(s.get('status', '')).startswith('complete') else 'critical')}"
-                            f"{' · ' + h('; '.join(map(str, s.get('reasons') or s.get('failures') or []))) if (s.get('reasons') or s.get('failures')) else ''}</li>"
-                            for s in progress["scenarios"] if isinstance(s, dict))
-            body.append(f"<h2>Scenarios</h2><ul class='small'>{items}</ul>")
-        counts = {k: progress[k] for k in ("tried", "completed", "rejected", "invalid") if k in progress}
+        counts = progress.get("counts") if isinstance(progress.get("counts"), dict) else \
+            {k: progress[k] for k in ("tried", "completed", "rejected", "invalid") if k in progress}
         if counts:
-            body.append("<p class='muted small'>" + " · ".join(f"{k} {h(v)}" for k, v in counts.items()) + "</p>")
-        body.append(f"<details><summary>raw progress</summary><pre>{h(console.redact(json.dumps(progress, indent=2, default=str))[:300] if False else redact_dump(progress))}</pre></details>")
+            body.append("<p class='muted small'>" + " · ".join(f"{h(k)} {h(v)}" for k, v in counts.items()) + "</p>")
+        if progress.get("awaiting_approval"):
+            links = " ".join(f"<a href='/review/{h(a.get('scenario_id'))}'>{h(a.get('scenario_id'))}</a>" for a in progress["awaiting_approval"] if isinstance(a, dict) and a.get("scenario_id"))
+            body.append(f"<p>{chip('awaiting approval', 'warn pulse')} {links}</p>")
+        if console._candidate_items(progress):
+            body.append(_progress_candidates(progress))
+        if _trial_items(progress):
+            body.append(_progress_trials(progress))
+        scenarios = _scenario_items(progress)
+        if scenarios:
+            items = "".join(f"<li><a href='/scenario/{h(s.get('scenario_id'))}'>{h(s.get('scenario_id'))}</a> "
+                            f"{chip(s.get('status'), 'good' if str(s.get('status', '')).startswith('complete') else 'critical' if s.get('status') in ('error', 'invalid', 'score-export-error') else 'info')}"
+                            f"{' · ' + h(s['trials']) + ' trial(s)' if isinstance(s.get('trials'), int) else ''}"
+                            f"{' · ' + h(console.redact(str(s.get('error') or '; '.join(map(str, s.get('reasons') or s.get('failures') or []))))) if (s.get('error') or s.get('reasons') or s.get('failures')) else ''}</li>"
+                            for s in scenarios)
+            body.append(f"<h2>Scenarios</h2><ul class='small'>{items}</ul>")
+        body.append(f"<details><summary>raw progress</summary><pre>{h(redact_dump(progress))}</pre></details>")
     elif error is None:
         body.append("<p class='empty'>No progress yet; the workflow has not reported a stage.</p>")
-    body.append(f"<div class='card'><strong>Cancel</strong> <span class='muted small'>Stops the workflow; running Harbor units are not killed by this button.</span>"
+    body.append(f"<div class='card'><strong>Cancel</strong> <span class='muted small'>Requests cancellation; children are cancelled with the parent. A running "
+                f"trial's Harbor unit finishes on its own and is never collected afterwards.</span>"
                 f"<div><button type='button' class='danger' id='cancel-job' data-endpoint='/api/jobs/{h(wid)}/cancel'>Cancel workflow…</button> "
                 f"<span class='muted small' id='cancel-status'></span></div></div>")
     return layout(f"swesim · job {wid}", "".join(body), "jobs", "job", {"job": wid})
@@ -243,7 +284,7 @@ def review_page(d: dict, spec_hash: str | None, workflow_id: str | None, approva
             "<label for='note'>note (recorded with the decision)</label><textarea id='note' name='note' rows='3' maxlength='2000'></textarea>"
             f"<div><button type='submit' class='primary' name='decision' value='approve'{disabled}>Approve</button> "
             f"<button type='submit' class='danger' name='decision' value='reject'{disabled}>Reject</button> <span class='muted small' id='form-status'></span></div>"
-            "<p class='muted small'>Approve freezes the draft as scenario.json (local) or signals the holding job; the server re-reads the spec hash and refuses "
-            "if the draft changed since this page was rendered. Never hand-edit a draft to pass a gate: re-draft or take the next candidate.</p></form>")
+            "<p class='muted small'>Approve freezes the draft as scenario.json (local) or signals the holding CandidateWorkflow; the server re-reads the spec "
+            "hash and refuses if the draft changed since this page was rendered. Never hand-edit a draft to pass a gate: re-draft or take the next candidate.</p></form>")
     body = "".join(head) + sections["briefs"] + sections["ledger"] + sections["controls"] + assets_html + sections["judge"] + form
     return layout(f"swesim · review {sid}", body, "review", "review-item")

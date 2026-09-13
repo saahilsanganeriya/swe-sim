@@ -42,7 +42,7 @@ def _facet_svg(groups: list[dict], shown: list[str], metric: str, title: str) ->
     width = pad_l + sum(widths.values()) + pad_r
     height = pad_t + plot_h + pad_b
     y = lambda v: pad_t + plot_h * (1 - v)
-    parts = [f"<svg class='chart' viewBox='0 0 {width} {height}' width='{width}' height='{height}' aria-hidden='false'>",
+    parts = [f"<svg class='chart' viewBox='0 0 {width} {height}' width='{width}' height='{height}'>",
              f"<title>{_h(title)}</title>"]
     for tick in (0.0, 0.5, 1.0):
         parts.append(f"<line class='grid' x1='{pad_l}' x2='{width - pad_r}' y1='{y(tick):.1f}' y2='{y(tick):.1f}'/>")
@@ -83,7 +83,7 @@ def _facet_svg(groups: list[dict], shown: list[str], metric: str, title: str) ->
     return "".join(parts) + note
 
 
-def pass_at_k_svg(groups: list[dict], k: int | None = None, metric: str = "pass_at_k") -> str:
+def pass_at_k_svg(groups: list[dict], metric: str = "pass_at_k") -> str:
     """``groups`` are score groups (dicts with condition, model, purpose, brief_profile, requested_k, pass_at_k, ...)."""
     groups = [g for g in groups if isinstance(g, dict) and g.get("condition") and g.get("model")]
     models = sorted({g["model"] for g in groups})

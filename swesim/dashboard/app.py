@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx  # noqa: F401 - re-exported so tests can monkeypatch ``app.httpx.get`` (the module object is shared with data.py)
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -70,13 +71,13 @@ def trial_path(tid: str) -> Path:
 def same_origin(request: Request) -> None:
     """POST guard: when the browser sends an Origin, its host must be our Host (scheme/port aside). No Origin (curl, tests) passes."""
     origin = request.headers.get("origin")
-    if not origin or origin == "null":
-        if origin == "null":
-            raise HTTPException(403, detail="cross-site request rejected (null origin)")
+    if not origin:
         return
-    host = (request.headers.get("host") or "").split(":")[0].lower()
-    origin_host = origin.split("://", 1)[-1].split("/", 1)[0].split(":")[0].lower()
-    if not host or origin_host != host:
+    if origin == "null":
+        raise HTTPException(403, detail="cross-site request rejected (null origin)")
+    host = (request.url.hostname or "").lower()  # parsed from the Host header; IPv6 literals come back without brackets
+    origin_host = (urlsplit(origin).hostname or "").lower()
+    if not host or not origin_host or origin_host != host:
         raise HTTPException(403, detail="cross-site request rejected (origin does not match host)")
 
 

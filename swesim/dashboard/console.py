@@ -1,11 +1,13 @@
 """Operator console: form validation, the Temporal client adapter, jobs and the review queue.
 
-The dashboard never talks to Temporal directly; it calls ``swesim.workflows.client`` lazily. The orchestration
-stream is adding ``start_create``, ``start_run``, ``list_runs``, ``progress``, ``cancel`` and ``approve_candidate``;
-until they exist this module falls back to the existing ``start_pipeline`` / ``start_matrix`` / ``approve`` and,
-when nothing usable is there or Temporal is unreachable, raises ``ConsoleUnavailable`` carrying the equivalent CLI
-command so the page can show it instead of failing silently. The worker secret and the stakeholder URL are never
-form fields: the server reads them from its own environment and never echoes them.
+The dashboard never talks to Temporal directly; it calls ``swesim.workflows.client`` lazily and prefers the
+two-workflow functions (``start_create`` -> CreateTasksWorkflow, ``start_run`` -> RunTasksWorkflow, ``list_runs``,
+``progress``, ``cancel``, ``approve_candidate``). Only when one of them is missing does it fall back to the legacy
+``start_pipeline`` (one PipelineWorkflow per repository) / ``start_matrix`` (one serial RunMatrixWorkflow per
+scenario, planned by the worker's own ``plan_trials``) / ``approve``. When nothing usable is there or Temporal is
+unreachable it raises ``ConsoleUnavailable`` carrying the equivalent CLI command so the page shows it instead of
+failing silently. The worker secret and the stakeholder URL are never form fields: the server reads them from its own
+environment and never echoes them.
 """
 from __future__ import annotations
 
@@ -29,16 +31,20 @@ WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CONDITIONS = ("full", "hidden", "interactive")
 PURPOSES = ("calibration", "comparison", "demonstration")
 PROFILES = ("withheld", "natural")
-APPROVAL_MODES = (("auto", "Auto-approve with morning review (default)"), ("signal", "Hold each task for my approval"))
+# Form values are the CreateTasksWorkflow's modes; the legacy PipelineWorkflow spells "hold" as "signal".
+APPROVAL_MODES = (("auto", "Auto-approve with morning review (default)"), ("hold", "Hold each task for my approval"))
+LEGACY_APPROVAL = {"auto": "auto", "hold": "signal"}
 SOLVER_TIERS = ("anthropic/claude-haiku-4-5-20251001", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "openai/gpt-5.5")
 STAKEHOLDER_DEFAULT = "openai/gpt-5.5"
 MAX_PARALLEL = 8
+CREATION_TYPES = ("CreateTasksWorkflow", "CandidateWorkflow", "PipelineWorkflow", "create", "candidate", "pipeline")
+OPEN_STATUSES = ("running", "open", "unknown", "continued_as_new")
 
 
 class ConsoleUnavailable(RuntimeError):
     """Temporal or the client function is not available; ``cli`` is the equivalent command.
     ``kind`` is ``unreachable`` (connection/RPC failure), ``missing`` (function absent in this client version) or
-    ``no-query`` (the workflow type exposes no progress query, e.g. RunMatrixWorkflow on main)."""
+    ``no-query`` (the workflow type exposes no progress query, e.g. RunMatrixWorkflow)."""
 
     def __init__(self, message: str, cli: str, kind: str = "unreachable"):
         super().__init__(message)
@@ -135,7 +141,7 @@ def validate_create(body: dict) -> tuple[dict, list[str]]:
         errors.append("judge and draft models must differ (the judge must not grade its own drafts)")
     approval_mode = str(body.get("approval_mode") or "auto")
     if approval_mode not in dict(APPROVAL_MODES):
-        errors.append("approval_mode must be auto or signal")
+        errors.append("approval_mode must be auto or hold")
     params = {
         "source": source, "repos": repos, "since": since,
         "max_candidates_per_repo": _int(body.get("max_candidates"), "max candidates per repo", 1, 50, errors, d["max_candidates"]),
@@ -145,6 +151,16 @@ def validate_create(body: dict) -> tuple[dict, list[str]]:
         "conditions": ["interactive"], "k": 1,
     }
     return params, errors
+
+
+def create_sources(p: dict) -> list[dict]:
+    """The ``sources`` list CreateTasksWorkflow expects (same shape as ``swesim create --source``)."""
+    if p["source"] == "github-repo":
+        return [{"kind": "github-repo", "repo": r, "since": p["since"], "max_candidates": p["max_candidates_per_repo"]} for r in p["repos"]]
+    src = {"kind": "swebench-annotated", "pool": "A", "limit": p["limit"]}
+    if p["instance_ids"]:
+        src["instance_ids"] = list(p["instance_ids"])
+    return [src]
 
 
 def valid_registered(registry_path: Path) -> list[dict]:
@@ -173,7 +189,7 @@ def validate_run(body: dict, registry_path: Path) -> tuple[dict, list[str]]:
     for m in models:
         if not MODEL_RE.fullmatch(m):
             errors.append(f"model id must look like provider/model-id (got {m!r})")
-    conditions = [c for c in _lines(body.get("conditions"))]
+    conditions = list(_lines(body.get("conditions")))
     if not conditions:
         errors.append("select at least one condition")
     for c in conditions:
@@ -190,6 +206,7 @@ def validate_run(body: dict, registry_path: Path) -> tuple[dict, list[str]]:
         "k": _int(body.get("k"), "k", 1, 10, errors, d["k"]), "purpose": purpose, "brief_profile": profile,
         "stakeholder_model": _model(body.get("stakeholder_model"), "stakeholder model", errors, d["stakeholder_model"]),
         "max_parallel": _int(body.get("max_parallel"), "max parallel trials", 1, MAX_PARALLEL, errors, d["max_parallel"]),
+        "attempt_offset": _int(body.get("attempt_offset"), "attempt offset", 0, 1000, errors, 0),
     }
     return params, errors
 
@@ -202,19 +219,19 @@ def _q(value) -> str:
 
 
 def cli_for_create(p: dict) -> str:
-    base = (f"--judge-model {_q(p['judge_model'])} --draft-model {_q(p['draft_model'])} "
-            f"--approval-mode {_q(p['approval_mode'])} --max-candidates-tried {_q(p['max_candidates_per_repo'])}")
+    base = (f"--judge-model {_q(p['judge_model'])} --draft-model {_q(p['draft_model'])} --approval-mode {_q(p['approval_mode'])} "
+            f"--max-parallel {_q(p['max_parallel'])}")
     if p["source"] == "github-repo":
-        return "\n".join(f"uv run swesim pipeline --source github-repo --repo {_q(r)} {base}" for r in p["repos"]) or \
-            f"uv run swesim pipeline --source github-repo --repo <url> {base}"
-    ids = "".join(f" --instance {_q(i)}" for i in p["instance_ids"])
-    return f"uv run swesim mine --source swebench-annotated{ids}\nuv run swesim pipeline --source swebench-annotated {base}"
+        srcs = "".join(f" --source {_q(r)}" for r in p["repos"]) or " --source <repo-url>"
+        return f"uv run swesim create{srcs} --since {_q(p['since'])} --max-candidates {_q(p['max_candidates_per_repo'])} {base}"
+    pool = "swebench:A" + (":" + ",".join(p["instance_ids"]) if p["instance_ids"] else "")
+    return f"uv run swesim create --source {_q(pool)} --max-candidates {_q(p['limit'])} {base}"
 
 
 def cli_for_run(p: dict) -> str:
-    return "\n".join(f"uv run swesim matrix {_q(sid)} --models {_q(','.join(p['models']))} "
-                     f"--conditions {_q(','.join(p['conditions']))} --k {_q(p['k'])} --purpose {_q(p['purpose'])} --brief-profile {_q(p['brief_profile'])}"
-                     for sid in p["scenario_ids"]) or "uv run swesim matrix <scenario-id> --models <ids>"
+    return (f"uv run swesim run-tasks --scenario-ids {_q(','.join(p['scenario_ids']) or '<ids>')} --models {_q(','.join(p['models']) or '<ids>')} "
+            f"--conditions {_q(','.join(p['conditions']) or 'interactive')} --k {_q(p['k'])} --purpose {_q(p['purpose'])} "
+            f"--brief-profile {_q(p['brief_profile'])} --stakeholder-model {_q(p['stakeholder_model'])} --max-parallel-trials {_q(p['max_parallel'])}")
 
 
 # ----------------------------------------------------------------------------- client adapter
@@ -239,15 +256,20 @@ def _unreachable(e: Exception, cli: str) -> ConsoleUnavailable:
     return ConsoleUnavailable(f"Temporal call failed: {type(e).__name__}: {redact(e)}", cli)
 
 
+def _ids(result) -> list[str]:
+    return [str(x) for x in result] if isinstance(result, (list, tuple)) else [str(result)]
+
+
 async def start_create(params: dict) -> dict:
+    """Prefer CreateTasksWorkflow (one workflow for every source); fall back to one PipelineWorkflow per repository."""
     cli = cli_for_create(params)
-    full = {**params, "stakeholder_url": stakeholder_url()}
+    url = stakeholder_url()
     fn = client_fn("start_create")
     try:
         if fn is not None:
-            wid = await call(fn, full)
-            ids = list(wid) if isinstance(wid, (list, tuple)) else [str(wid)]
-            return {"workflow_ids": ids, "via": "start_create"}
+            wf_params = {"sources": create_sources(params), "judge_model": params["judge_model"], "draft_model": params["draft_model"],
+                         "max_parallel": params["max_parallel"], "approval_mode": params["approval_mode"], "stakeholder_url": url}
+            return {"workflow_ids": _ids(await call(fn, wf_params)), "via": "start_create (CreateTasksWorkflow)"}
         legacy = client_fn("start_pipeline")
         if legacy is None:
             raise ConsoleUnavailable("swesim.workflows.client has neither start_create nor start_pipeline", cli, "missing")
@@ -256,64 +278,57 @@ async def start_create(params: dict) -> dict:
         for repo in targets:
             legacy_params = {"source": params["source"], "repo": repo, "judge_model": params["judge_model"], "draft_model": params["draft_model"],
                              "models": [params["model"]], "conditions": params["conditions"], "k": params["k"],
-                             "approval_mode": params["approval_mode"], "max_scenarios": 1, "since": params["since"], "limit": params["limit"],
-                             "max_candidates_tried": params["max_candidates_per_repo"], "stakeholder_url": full["stakeholder_url"]}
+                             "approval_mode": LEGACY_APPROVAL[params["approval_mode"]], "max_scenarios": 1, "since": params["since"],
+                             "limit": params["limit"], "max_candidates_tried": params["max_candidates_per_repo"], "stakeholder_url": url}
             if params["instance_ids"]:
                 legacy_params["instance_ids"] = params["instance_ids"]
             ids.append(str(await call(legacy, legacy_params)))
-        return {"workflow_ids": ids, "via": "start_pipeline (one workflow per repository)"}
+        return {"workflow_ids": ids, "via": "start_pipeline (legacy: one PipelineWorkflow per repository; max_parallel is ignored)"}
     except ConsoleUnavailable:
         raise
     except Exception as e:
         raise _unreachable(e, cli) from e
 
 
-def plan_matrix(root: Path, params: dict, sid: str, stakeholder_url_value: str) -> dict:
-    """Trial requests for one scenario, mirroring activities.plan_trials but against the dashboard's workspace and with the
-    operator's stakeholder model in the frozen RunConfig (the legacy planner reads its own workspace and RunConfig defaults)."""
-    from swesim.models import RunConfig, ScenarioSpec, StakeholderConfig, trial_id
-    sdir = root / "scenarios" / sid
-    spec = ScenarioSpec.model_validate_json((sdir / "scenario.json").read_text())
-    comp = read_json(sdir / "compile.json")
-    if not comp.get("compiled_hash"):
-        raise ConsoleUnavailable(f"{sid} has no compile.json in this workspace; run swesim compile first", cli_for_run(params), "missing")
-    trials = []
-    for cond in params["conditions"]:
-        for model in params["models"]:
-            for i in range(params["k"]):
-                profile = params["brief_profile"]
-                if cond == "full" or not any(b.profile == profile for b in spec.briefs):
-                    profile = "natural"
-                rc = RunConfig(condition=cond, model=model, compiled_hash=comp["compiled_hash"], purpose=params["purpose"], brief_profile=profile,
-                               stakeholder=StakeholderConfig(model_id=params["stakeholder_model"]), k=params["k"])
-                tid = trial_id(spec.spec_hash, cond, rc.run_config_hash, i)
-                trials.append({"trial_id": tid, "scenario_id": spec.id, "spec_hash": spec.spec_hash, "condition": cond, "model": model,
-                               "run_config": rc.model_dump(mode="json"), "run_config_hash": rc.run_config_hash, "attempt_index": i,
-                               "stakeholder_url": stakeholder_url_value})
-    if len({t["trial_id"] for t in trials}) != len(trials):
-        raise ValueError("duplicate matrix entries")
-    return {"scenario_id": spec.id, "trials": trials, "max_parallel": params["max_parallel"]}
+@contextlib.contextmanager
+def planner_workspace(root: Path | None):
+    """Point the worker's planner at the dashboard's workspace for the duration of the call when the two differ
+    (they are the same directory in production: both read SWESIM_WORKSPACE)."""
+    from swesim.workflows import activities
+    previous = activities.WS
+    if root is not None and Path(previous.root).resolve() != Path(root).resolve():
+        activities.WS = Workspace(root, previous.registry_path)
+    try:
+        yield activities
+    finally:
+        activities.WS = previous
 
 
 async def start_run(params: dict, root: Path | None = None) -> dict:
+    """Prefer RunTasksWorkflow (one workflow, bounded parallelism); fall back to one serial RunMatrixWorkflow per scenario,
+    planned by the worker's own ``plan_trials`` so trial ids and score groups agree with the CLI."""
     cli = cli_for_run(params)
-    full = {**params, "stakeholder_url": stakeholder_url()}
+    url = stakeholder_url()
     fn = client_fn("start_run")
     try:
         if fn is not None:
-            wid = await call(fn, full)
-            ids = list(wid) if isinstance(wid, (list, tuple)) else [str(wid)]
-            return {"workflow_ids": ids, "via": "start_run"}
+            wf_params = {"scenario_ids": params["scenario_ids"], "models": params["models"], "conditions": params["conditions"], "k": params["k"],
+                         "purpose": params["purpose"], "brief_profile": params["brief_profile"], "stakeholder_model": params["stakeholder_model"],
+                         "attempt_offset": params["attempt_offset"], "max_parallel_trials": params["max_parallel"], "stakeholder_url": url}
+            return {"workflow_ids": _ids(await call(fn, wf_params)), "via": "start_run (RunTasksWorkflow; max_parallel_trials honored)"}
         legacy = client_fn("start_matrix")
         if legacy is None:
             raise ConsoleUnavailable("swesim.workflows.client has neither start_run nor start_matrix", cli, "missing")
-        if root is None:
-            raise ConsoleUnavailable("start_matrix fallback needs the workspace root to plan trials", cli, "missing")
         ids = []
-        for sid in params["scenario_ids"]:
-            plan = plan_matrix(root, params, sid, full["stakeholder_url"])
-            ids.append(str(await call(legacy, plan)))
-        return {"workflow_ids": ids, "via": "start_matrix (one workflow per scenario; trials planned by the dashboard with the chosen stakeholder model)"}
+        with planner_workspace(root) as activities:
+            for sid in params["scenario_ids"]:
+                plan = activities.plan_trials({"scenario_id": sid, "models": params["models"], "conditions": params["conditions"], "k": params["k"],
+                                               "purpose": params["purpose"], "brief_profile": params["brief_profile"],
+                                               "stakeholder_model": params["stakeholder_model"], "attempt_offset": params["attempt_offset"],
+                                               "stakeholder_url": url})
+                ids.append(str(await call(legacy, plan)))
+        return {"workflow_ids": ids, "via": "start_matrix (legacy: one RunMatrixWorkflow per scenario, serial on this worker - max_parallel is "
+                                            "ignored and honored only by RunTasksWorkflow; trials planned by the worker's plan_trials)"}
     except ConsoleUnavailable:
         raise
     except Exception as e:
@@ -324,22 +339,23 @@ def _job_type(wid: str, raw: dict) -> str:
     t = str(raw.get("type") or raw.get("workflow_type") or "")
     if t:
         return t
-    return "pipeline" if wid.startswith(("pipeline-", "create-")) else "matrix" if wid.startswith(("matrix-", "run-")) else "workflow"
+    return "PipelineWorkflow" if wid.startswith("pipeline-") else "RunMatrixWorkflow" if wid.startswith("matrix-") else \
+        "CreateTasksWorkflow" if wid.startswith("create-") else "RunTasksWorkflow" if wid.startswith("run-") else "workflow"
 
 
 def normalize_job(raw: dict) -> dict:
     wid = str(raw.get("workflow_id") or raw.get("id") or "")
     summary = raw.get("summary")
     if isinstance(summary, dict):
-        summary = ", ".join(f"{k}={v}" for k, v in summary.items())
+        summary = ", ".join(f"{k}={','.join(map(str, v)) if isinstance(v, (list, tuple)) else v}" for k, v in summary.items())
     return {"workflow_id": wid, "type": _job_type(wid, raw), "status": str(raw.get("status") or "unknown").lower(),
-            "started_at": raw.get("started_at") or raw.get("start_time"), "summary": summary or raw.get("stage") or "",
-            "scenario_id": raw.get("scenario_id")}
+            "started_at": raw.get("started_at") or raw.get("start_time"), "closed_at": raw.get("close_time"),
+            "summary": summary or raw.get("stage") or "", "scenario_id": raw.get("scenario_id")}
 
 
 async def list_jobs() -> list[dict]:
     fn = client_fn("list_runs")
-    cli = "uv run swesim pipeline-progress <workflow-id>   # or open the Temporal UI at http://localhost:8233"
+    cli = "uv run swesim workflows list   # or open the Temporal UI at http://localhost:8233"
     if fn is None:
         raise ConsoleUnavailable("swesim.workflows.client.list_runs is not available in this worker version", cli, "missing")
     try:
@@ -350,15 +366,23 @@ async def list_jobs() -> list[dict]:
     return [j for j in jobs if j["workflow_id"]]
 
 
+def _is_query_failure(e: Exception) -> bool:
+    try:
+        from temporalio.client import WorkflowQueryFailedError, WorkflowQueryRejectedError
+        return isinstance(e, (WorkflowQueryFailedError, WorkflowQueryRejectedError))
+    except Exception:  # noqa: BLE001 - temporalio absent: fall back to the class name only
+        return type(e).__name__ in ("WorkflowQueryFailedError", "WorkflowQueryRejectedError")
+
+
 async def job_progress(wid: str) -> dict:
     fn = client_fn("progress")
-    cli = f"uv run swesim pipeline-progress {shlex.quote(wid)}"
+    cli = f"uv run swesim workflows progress {shlex.quote(wid)}"
     if fn is None:
         raise ConsoleUnavailable("swesim.workflows.client.progress is not available", cli, "missing")
     try:
         p = await call(fn, wid)
     except Exception as e:
-        if "Query" in type(e).__name__ or "query" in str(e).lower():
+        if _is_query_failure(e):
             raise ConsoleUnavailable("this workflow type exposes no progress query (RunMatrixWorkflow reports only on completion); "
                                      "Temporal itself answered", "open the Temporal UI at http://localhost:8233", "no-query") from e
         raise _unreachable(e, cli) from e
@@ -411,18 +435,39 @@ def local_drafts(root: Path) -> list[dict]:
     return out
 
 
+def _candidate_items(p: dict):
+    """Candidates from a progress dict: CreateTasksWorkflow keeps a dict keyed by scenario id, older shapes a list."""
+    cands = p.get("candidates")
+    if isinstance(cands, dict):
+        return [(sid, c) for sid, c in cands.items() if isinstance(c, dict)]
+    if isinstance(cands, list):
+        return [(c.get("scenario_id"), c) for c in cands if isinstance(c, dict)]
+    return []
+
+
 def _awaiting_from_progress(wid: str, p: dict) -> list[dict]:
-    items = []
-    cands = p.get("candidates") if isinstance(p.get("candidates"), list) else None
-    if cands is not None:
-        for c in cands:
-            if isinstance(c, dict) and c.get("stage") == "awaiting-approval" and c.get("scenario_id"):
-                items.append({"scenario_id": c["scenario_id"], "spec_hash": c.get("spec_hash"), "source": "creation-job", "workflow_id": wid,
-                              "instance_id": c.get("instance_id"), "judge_keep": (c.get("judge") or {}).get("keep") if isinstance(c.get("judge"), dict) else None,
-                              "rubric": (c.get("judge") or {}).get("verified_rubric_score") if isinstance(c.get("judge"), dict) else None})
-    elif p.get("stage") == "awaiting-approval" and p.get("scenario_id"):
-        items.append({"scenario_id": p["scenario_id"], "spec_hash": p.get("spec_hash"), "source": "creation-job", "workflow_id": wid,
-                      "instance_id": p.get("instance_id"), "judge_keep": None, "rubric": None})
+    """Held candidates from one creation job's progress: CreateTasksWorkflow (``awaiting_approval`` list / ``candidates``
+    dict with ``status``), CandidateWorkflow (its own ``stage``) and the legacy PipelineWorkflow (``stage``)."""
+    items: list[dict] = []
+    seen: set[str] = set()
+
+    def add(sid, spec_hash, target_wid, instance_id=None, judge=None):
+        if not sid or sid in seen:
+            return
+        seen.add(sid)
+        items.append({"scenario_id": sid, "spec_hash": spec_hash, "source": "creation-job", "workflow_id": target_wid or wid,
+                      "parent_workflow_id": wid, "instance_id": instance_id,
+                      "judge_keep": (judge or {}).get("keep") if isinstance(judge, dict) else None,
+                      "rubric": (judge or {}).get("verified_rubric_score") if isinstance(judge, dict) else None})
+
+    for a in p.get("awaiting_approval") or []:
+        if isinstance(a, dict):
+            add(a.get("scenario_id"), a.get("spec_hash"), a.get("candidate_workflow_id"))
+    for sid, c in _candidate_items(p):
+        if c.get("status") == "awaiting-approval" or c.get("stage") == "awaiting-approval":
+            add(sid or c.get("scenario_id"), c.get("spec_hash"), c.get("candidate_workflow_id"), c.get("instance_id"), c.get("judge"))
+    if p.get("stage") == "awaiting-approval" and p.get("scenario_id"):
+        add(p["scenario_id"], p.get("spec_hash"), None, p.get("instance_id"))
     return items
 
 
@@ -436,7 +481,7 @@ async def review_queue(root: Path) -> dict:
         jobs = []
         errors.append(f"{e} (creation jobs not listed; local drafts only)")
     for job in jobs:
-        if job["type"] not in ("pipeline", "create", "PipelineWorkflow", "CreateWorkflow") or job["status"] not in ("running", "open", "unknown"):
+        if job["type"] not in CREATION_TYPES or job["status"] not in OPEN_STATUSES:
             continue
         try:
             items.extend(_awaiting_from_progress(job["workflow_id"], await job_progress(job["workflow_id"])))
@@ -482,18 +527,19 @@ async def decide(root: Path, registry_path: Path, sid: str, body: dict) -> tuple
         if not WORKFLOW_ID_RE.fullmatch(wid):
             return 400, {"ok": False, "error": "invalid workflow id"}
         fn = client_fn("approve_candidate")
-        cli = f"uv run swesim approve-signal {shlex.quote(wid)} {shlex.quote(sid)} {current}"
+        cli = f"uv run swesim workflows approve {shlex.quote(wid)} {shlex.quote(sid)} {current} --decision {decision}"
         try:
             if fn is not None:
-                await call(fn, wid, sid, current, decision, note)
+                target = await call(fn, wid, sid, current, decision, note)
             elif decision == "approve" and client_fn("approve") is not None:
-                await call(client_fn("approve"), wid, sid, current)
+                target = await call(client_fn("approve"), wid, sid, current)
             else:
                 return 502, {"ok": False, "error": "this worker's client cannot signal a rejection; cancel the job or approve via CLI", "cli": cli}
         except Exception as e:  # noqa: BLE001
             return 502, {"ok": False, "error": f"Temporal call failed: {type(e).__name__}: {redact(e)}", "cli": cli}
-        atomic_json(sdir / "review.json", record)
-        return 200, {"ok": True, "decision": decision, "scenario_id": sid, "spec_hash": current, "workflow_id": wid, "via": "signal"}
+        atomic_json(sdir / "review.json", {**record, "signalled": str(target) if target is not None else wid})
+        return 200, {"ok": True, "decision": decision, "scenario_id": sid, "spec_hash": current, "workflow_id": wid,
+                     "signalled": str(target) if target is not None else wid, "via": "signal"}
     if decision == "reject":
         atomic_json(sdir / "review.json", record)
         return 200, {"ok": True, "decision": "reject", "scenario_id": sid, "spec_hash": current, "via": "local review.json"}
