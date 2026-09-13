@@ -41,8 +41,10 @@ def test_audit_ledger_replays_when_result_was_already_written(tmp_path, monkeypa
     assert result['written'] is False and result['cost_recorded'] is True and calls == [1]
     rows = costs.read_costs(ws.root / 'costs' / 'audit-test.json')
     assert len(rows) == 1 and rows[0].usd == Decimal('0.006000')
+    modified = audit_path.stat().st_mtime_ns
     asyncio.run(environment(3).run(A.audit_scenario_activity, {'scenario_id': spec.id}))
     assert costs.read_costs(ws.root / 'costs' / 'audit-test.json') == rows and calls == [1]
+    assert audit_path.stat().st_mtime_ns == modified
 
 
 def test_failed_paid_attempts_flush_and_equal_token_attempts_stay_distinct(tmp_path, monkeypatch):

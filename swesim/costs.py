@@ -13,9 +13,9 @@ Contract
   per assistant message `extra.response.usage`), Harbor's ATIF conversion (`agent/trajectory.json`: `final_metrics`) or
   Harbor's `result.json` `agent_result`; `usage_from_trial_dir` tries them in that order and returns None when the
   trial left no usage evidence (unknown is never recorded as zero).
-- `record_cost` appends one `CostRecord` (the `costs` row minus provenance) to `trials/<tid>/costs.json`, or to
-  `costs/<workflow_id>.json` when the cost belongs to no trial, with a write-then-rename and a dedupe on
-  (trial, workflow, role, model, tokens) so a retried activity is a no-op. `usd` is quantized to 6 decimals (numeric(12,6)).
+- `record_cost` appends one `CostRecord` to `trials/<tid>/costs.json` or `costs/<workflow_id>.json`. An explicit
+  idempotency key identifies a billed event, so distinct equal-token calls count separately and retries count once.
+  Legacy callers retain token-tuple deduplication. `usd` is quantized to 6 decimals (numeric(12,6)).
 """
 from __future__ import annotations
 
@@ -313,8 +313,8 @@ def _event_id(trial_id, workflow_id, role, model_id, key: str) -> str:
 
 def record_cost(layout: Any, trial_id: str | None, workflow_id: str | None, role: str, model_id: str, usage: Usage, *,
                 idempotency_key: str | None = None) -> CostRecord:
-    """Append one cost record (idempotent on trial, workflow, role, model and tokens). `layout` is the storage Layout
-    (`trial_dir(trial_id)`) or a `Workspace` (`root`)."""
+    """Record an explicit billed event once; without a key, retain legacy token-tuple deduplication.
+    The deterministic cost ID remains a valid ULID; its timestamp is not used (the row's `at` is the accounting time)."""
     if role not in ROLES:
         raise ValueError(f"unknown cost role {role!r}; roles: {sorted(ROLES)}")
     mid = parse_model_id(model_id)
@@ -418,7 +418,7 @@ def accounting_status(layout: Any) -> dict:
     These are observation counts, not estimates of missing dollar amounts.
     """
     root = Path(getattr(getattr(layout, 'layout', layout), 'root'))
-    unknown_calls = incomplete_audits = incomplete_stakeholders = unreadable = 0
+    unknown_calls = incomplete_audits = incomplete_stakeholders = incomplete_solvers = incomplete_drafts = unreadable = 0
     for group in ('scenarios', 'trials'):
         for path in (root / group).glob('*/audit.json'):
             try:
@@ -440,9 +440,31 @@ def accounting_status(layout: Any) -> dict:
                 incomplete_stakeholders += status.get('usage_complete') is not True
         except (OSError, ValueError, TypeError, AttributeError):
             unreadable += 1
+    for path in (root / 'trials').glob('*/record.json'):
+        try:
+            record = json.loads(path.read_text())
+            config_path = path.parent / 'run_config.json'
+            config = json.loads(config_path.read_text()) if config_path.exists() else record.get('run_config') or {}
+            if not (record.get('model') or config.get('model')):
+                continue
+            ledger_path = path.parent / 'costs.json'
+            rows = json.loads(ledger_path.read_text()) if ledger_path.exists() else []
+            incomplete_solvers += not any(row.get('role') == 'solver' for row in rows)
+        except (OSError, ValueError, TypeError, AttributeError):
+            unreadable += 1
+    for path in (root / 'scenarios').glob('*/draft.meta.json'):
+        try:
+            metadata = json.loads(path.read_text())
+            usage = metadata.get('usage') or {}
+            if metadata.get('model_id'):
+                incomplete_drafts += not (usage.get('recorded') is True and usage.get('drafter') is not None and usage.get('withholder') is not None)
+        except (OSError, ValueError, TypeError, AttributeError):
+            unreadable += 1
     return {'unknown_usage_count': unknown_calls, 'incomplete_audits': incomplete_audits,
+            'incomplete_solver_records': incomplete_solvers,
+            'incomplete_draft_records': incomplete_drafts,
             'incomplete_stakeholder_records': incomplete_stakeholders, 'unreadable_accounting_records': unreadable,
-            'usage_complete': not (unknown_calls or incomplete_audits or incomplete_stakeholders or unreadable)}
+            'usage_complete': not (unknown_calls or incomplete_audits or incomplete_stakeholders or incomplete_solvers or incomplete_drafts or unreadable)}
 
 
 class AccountingSummary(TypedDict):
