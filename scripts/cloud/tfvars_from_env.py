@@ -7,8 +7,10 @@ Contract
   and `--region` (default `SWESIM_GCP_REGION` from the env files, then us-central1).
 - Output keys: `project`, `region`, `temporal_address`, `temporal_namespace`, `stakeholder_url`, `iap_members`
   (`["user:<account>"]`), `evaluators` (`[<account>]`), `github_repository` (`owner/name`), `spend_cap_usd` only when
-  `SWESIM_SPEND_CAP_USD` is set, and `iap_programmatic_clients` only when `SWESIM_IAP_PROGRAMMATIC_CLIENTS` is set (an
-  explicit opt-in for organization-owned OAuth clients; Terraform rejects any other client at plan time).
+  `SWESIM_SPEND_CAP_USD` is set, `iap_programmatic_clients` only when `SWESIM_IAP_PROGRAMMATIC_CLIENTS` is set (an
+  explicit opt-in for organization-owned OAuth clients; Terraform rejects any other client at plan time), and
+  `gh_app_id` / `gh_app_installation_id` (strings) only when both `GH_APP_ID` and `GH_APP_INSTALLATION_ID` are set
+  (one without the other is refused here). The App's private key path and content never leave the env file.
 - No secret ever reaches the output: `build_tfvars` reads a fixed allow-list of keys and refuses (by construction, tested)
   every name in `swesim.settings.SECRET_NAMES`. Values are written to the file, never printed.
 """
@@ -33,7 +35,10 @@ NON_SECRET_KEYS: dict[str, str] = {
     "SWESIM_STAKEHOLDER_URL": "stakeholder_url",
     "SWESIM_SPEND_CAP_USD": "spend_cap_usd",
     "SWESIM_IAP_PROGRAMMATIC_CLIENTS": "iap_programmatic_clients",
+    "GH_APP_ID": "gh_app_id",
+    "GH_APP_INSTALLATION_ID": "gh_app_installation_id",
 }
+OPTIONAL_PAIR = ("GH_APP_ID", "GH_APP_INSTALLATION_ID")  # written only when both are set
 assert not (set(NON_SECRET_KEYS) & SECRET_NAMES), "tfvars_from_env must never map a secret"
 
 _REPO_URL_RE = re.compile(r"^(?:https?://[^/]+/|git@[^:]+:|ssh://(?:[^@]+@)?[^/]+/)(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$")
@@ -87,8 +92,13 @@ def build_tfvars(values: Mapping[str, str], *, account: str, repo_url: str | Non
         elif tf_key == "spend_cap_usd":
             if value:
                 out[tf_key] = float(value)
+        elif env_key in OPTIONAL_PAIR:
+            if value.strip():
+                out[tf_key] = value.strip()
         else:
             out[tf_key] = value
+    if sum(NON_SECRET_KEYS[k] in out for k in OPTIONAL_PAIR) == 1:
+        raise TfvarsError("GH_APP_ID and GH_APP_INSTALLATION_ID must be set together (or neither)")
     assert not (set(out) & SECRET_NAMES)
     return out
 

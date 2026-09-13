@@ -49,6 +49,27 @@ variable "stakeholder_url" {
   default     = ""
 }
 
+# Optional GitHub App for repository discovery: one more 5,000/h quota bucket next to GH_TOKEN (docs/setup.md, "GitHub
+# App"). Both ids or neither; the App's private key is the GH_APP_PRIVATE_KEY secret, pushed by `make push-secrets`, and
+# is mounted on the worker pools only when the App is configured, so a stack without an App never references it.
+variable "gh_app_id" {
+  type        = string
+  description = "GitHub App id (GH_APP_ID) for discovery; null = no App."
+  default     = null
+  nullable    = true
+}
+
+variable "gh_app_installation_id" {
+  type        = string
+  description = "Installation id of that App on the mined account (GH_APP_INSTALLATION_ID); null = no App."
+  default     = null
+  nullable    = true
+  validation {
+    condition     = (var.gh_app_id == null) == (var.gh_app_installation_id == null)
+    error_message = "gh_app_id and gh_app_installation_id must be set together (or both left null)."
+  }
+}
+
 variable "spend_cap_usd" {
   type        = number
   description = "SWESIM_SPEND_CAP_USD for the workers; null leaves it unset."

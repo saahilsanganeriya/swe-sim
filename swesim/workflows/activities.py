@@ -235,7 +235,7 @@ def _github_quota() -> tuple[int, int, float] | None:
 
 async def await_github_quota(margin: int | None = None) -> None:
     """Before a scan or a batch: with fewer than `margin` core calls left, wait for the quota's reset rather than run into it."""
-    status = await asyncio.to_thread(_github_quota)
+    status = await blocking(_github_quota)  # heartbeats while queued behind other stage threads (never a bare to_thread here)
     if status is None:
         return
     remaining, _limit, reset_at = status

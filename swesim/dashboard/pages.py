@@ -111,11 +111,31 @@ def workflow_view(w: dict, settings) -> dict:
 
 # ----------------------------------------------------------------------------- home
 
+def gap_text(gap: dict | None) -> str:
+    """The frontier-vs-last-gen tile's value: signed percentage points (typographic minus), a dash until it can be computed."""
+    if not gap:
+        return "—"
+    pp = float(gap["gap_pp"])
+    return "0 pp" if abs(pp) < 0.05 else f"{pp:+.0f} pp".replace("-", "−")
+
+
+def gap_note(gap: dict | None) -> str:
+    if not gap:
+        return ("needs hidden trials (purpose comparison) from a tier A model and a tier D/E model on the same scenarios; "
+                "the <a href='/trends'>capability gradient</a> explains the axis")
+    hi, lo = gap["best_high"], gap["best_low"]
+    return (f"hidden · best tier D/E <span class='mono'>{h(hi['model'].split('/')[-1])}</span> {hi['success_count']}/{hi['n']} vs best tier A "
+            f"<span class='mono'>{h(lo['model'].split('/')[-1])}</span> {lo['success_count']}/{lo['n']} · n={gap['n']} on {gap['scenarios']} shared scenario(s) · "
+            f"{h(gap['brief_profile'])} brief · <span title='{h(gap['cohort_label'])}'>one cohort</span>")
+
+
 def home_body(data: dict, settings) -> str:
     """``data``: what app.py assembles for /api/home (tiles, running, recent, workflows, funnel, spend)."""
     t = data["tiles"]
     cap = settings.spend_cap_usd
     spend_note = f"cap ${cap:,.2f}" if cap is not None else "no cap configured (SWESIM_SPEND_CAP_USD)"
+    gap = t.get("frontier_gap")
+    gap_kind = "" if not gap else ("good" if float(gap["gap_pp"]) > 0 else "serious" if float(gap["gap_pp"]) < 0 else "")
     body = ["<h1>Home</h1><p class='lead'>What is running and what changed. Counts come from the index; every number links to its list.</p>",
             tiles([tile("running trials", t["trials_running"], href="/trials?status=running", key="trials_running", kind="run"),
                    tile("completed trials", t["trials_completed"], href="/trials?status=completed", key="trials_completed"),
@@ -124,7 +144,9 @@ def home_body(data: dict, settings) -> str:
                    tile("awaiting review", t["review_pending"], href="/review", key="review_pending", kind="run" if t["review_pending"] else ""),
                    tile("candidates pending", t["candidates_pending"], href="/candidates?status=pending", key="candidates_pending"),
                    tile("spend (recorded)", f"${t['spend_usd']:,.2f}", href="/spend", key="spend_text", note=spend_note),
-                   tile("workflows running", t["workflows_running"], href="/workflows?status=running", key="workflows_running")])]
+                   tile("workflows running", t["workflows_running"], href="/workflows?status=running", key="workflows_running"),
+                   tile("frontier vs last-gen gap", t.get("frontier_gap_text", "—"), href="/trends?purpose=comparison&condition=hidden", key="frontier_gap_text",
+                        kind=gap_kind, note=gap_note(gap))])]
     body.append("<h2>Running now</h2>")
     body.append(table("running", TRIAL_COLUMNS, data["running"], key="trial_id",
                       empty="<strong>Nothing is running.</strong> Start a run on <a href='/run'>Run</a>; rows appear here within 5 s of launch.", export=False))
@@ -379,16 +401,39 @@ def cohort_select(current: dict) -> str:
     return f"<label>Evaluation cohort<select name='evaluation_cohort'>{options}</select></label>"
 
 
-def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_html: str, chart_html: str, saturated_views: list[dict], query=()) -> str:
-    """``current['pool']`` is the task-origin facet: the header names the subset shown; ``gate`` is already restricted to it."""
+DIFFICULTY_LABEL_HELP = {
+    "informative": "screen model: hidden ≤ 1/2", "saturated": "screen model: hidden 2/2 and full 1/1",
+    "broken": "screen model: full 0/1 (look at the report)", "unlabelled": "no difficulty screen has run",
+}
+
+
+def difficulty_checkboxes(selected: list[str]) -> str:
+    """The difficulty label as a filter: nothing checked means every label (the default); the labels are informational."""
+    boxes = "".join(f"<label class='inline' title='{h(DIFFICULTY_LABEL_HELP[label])}'><input type='checkbox' name='difficulty_tier' value='{label}'"
+                    f"{' checked' if label in selected else ''}> {label}</label>" for label in DIFFICULTY_LABEL_HELP)
+    return f"<div class='check-group' role='group' aria-label='difficulty label filter'><span class='small muted'>difficulty label (filter; none checked = all)</span>{boxes}</div>"
+
+
+def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_html: str, chart_html: str, query=()) -> str:
+    """``current['pool']`` is the task-origin facet: the header names the subset shown; ``gate`` is already restricted to it.
+    ``current['difficulty_tier']`` is the operator's label filter (empty = every label)."""
     query = list(query)
     facet = current.get("pool")
     subset = origin.subset_text(facet)
+    selected_labels = list(current.get("difficulty_tier") or [])
     eligible = [g for g in gate if g["eligible"]]
+
+    def board_cell(g: dict) -> str:
+        if g["eligible"]:
+            return chip("on board", "good")
+        why = ("not valid" if not g["checks"]["valid"] else "fails the task-sense audit" if not g["checks"]["task_sense"] and g["task_sense"]
+               else "not audited" if not g["checks"]["task_sense"] else "outside the difficulty filter")
+        return chip("excluded", "neutral", why) + f" <span class='small muted'>{h(why)}</span>"
+
     checks = "".join(f"<tr><td><a href='/scenario/{h(g['scenario_id'])}'>{h(g['scenario_id'])}</a> {origin.badge(g.get('source'))} <span class='mono muted'>v{h(g['version'])}</span></td><td>{chip(g['validation_status'])}</td>"
                      f"<td>{difficulty_chip(g['difficulty_tier'])}</td>"
                      f"<td>{chip('coherent + fair', 'good') if g['checks']['task_sense'] else chip('not audited' if not g['task_sense'] else 'fails audit', 'neutral' if not g['task_sense'] else 'critical')}</td>"
-                     f"<td>{chip('on board', 'good') if g['eligible'] else chip('excluded', 'neutral')}</td></tr>" for g in gate)
+                     f"<td>{board_cell(g)}</td></tr>" for g in gate)
     form = ("<form class='toolbar' method='get' action='/leaderboard'>" + origin.hidden_input(facet)
             + cohort_select(current)
             + _filter_select("metric_k", list(range(1, 11)), [current.get("metric_k")] if current.get("metric_k") else [], "estimator k (default: recorded)")
@@ -396,26 +441,27 @@ def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_
             + _filter_select("brief_profile", ["natural", "withheld"], current.get("brief_profile"), "brief profile")
             + _filter_select("source", ["github-repo", "swebench-annotated", "authored"], current.get("source"), "scenario source")
             + _filter_select("tier", ["A", "B", "C", "D", "E"], current.get("tier"), "model tier")
-            + _filter_select("difficulty_tier", ["informative", "saturated"], current.get("difficulty_tier"), "difficulty")
             + _filter_select("condition", ["full", "hidden", "interactive"], current.get("condition"), "condition")
-            + f"<label class='inline'><input type='checkbox' name='include_saturated' value='1'{' checked' if current.get('include_saturated') else ''}> include saturated scenarios</label>"
-            "<button type='submit' class='button'>Apply</button> <a class='button' href='/leaderboard'>Reset</a></form>")
+            + difficulty_checkboxes(selected_labels)
+            + "<button type='submit' class='button'>Apply</button> <a class='button' href='/leaderboard'>Reset</a></form>")
+    label_note = (f"Difficulty filter applied: {h(', '.join(selected_labels))}." if selected_labels
+                  else "No difficulty filter: every label is on the board.")
     body = [f"<h1>Leaderboard <span class='muted' data-subset>· {h(subset)}</span></h1>",
             origin.facet_bar(facet, query, "/leaderboard"),
-            f"<p class='lead'>How do models compare on informative tasks? This board shows <strong>{h(subset)}</strong>: the per-model cells, the per-scenario matrix and the gate below "
-            "are restricted to that subset. Only scenarios that are valid, labelled <em>informative</em> by the difficulty screen and "
-            "pass the task-sense audit (coherent, fair tests) enter the board; saturated scenarios are excluded by default; broken never appear. Nothing is shown without n; "
-            "purposes are never pooled.</p>",
+            f"<p class='lead'>How do models compare? This board shows <strong>{h(subset)}</strong>: the per-model cells, the per-scenario matrix and the gate below "
+            "are restricted to that subset. <strong>Every scenario that is valid and passes the task-sense audit (coherent, fair tests) is on the board.</strong> "
+            "The difficulty-screen label (informative · saturated · broken · unlabelled) is an informational chip on each scenario row and a filter you can apply; "
+            "it never excludes a scenario by default. Difficulty is measured on <a href='/trends'>Trends</a> as a capability gradient across solver tiers A→E. "
+            f"Nothing is shown without n; purposes are never pooled. <span data-label-note>{label_note}</span></p>",
             hero(f"{len(eligible)} / {len(gate)}", f"scenarios on the board (eligible / current versions · {subset})", "/scenarios" + (f"?{origin.PARAM}={facet}" if facet else "")), form,
-            "<p><a class='button' href='/trends'>Historical trends…</a></p>",
+            "<p><a class='button' href='/trends'>Capability gradient (Trends)…</a></p>",
             "<div id='leaderboard-comparison' data-live-fragment>", leaderboard_comparison(views), "</div><h2>Scores and interaction details</h2>",
             table("leaderboard", LB_COLUMNS, views, key="key", total=len(views), source="/api/leaderboard", empty="<strong>No cells with n ≥ 1 on eligible scenarios.</strong> The gate table below says why each scenario is excluded; "
-                                                                                       "run the difficulty screen (<a href='/run'>Run</a>, purpose = screen) and the task-sense audit to admit scenarios.", export=True),
+                                                                                       "run the task-sense audit to admit valid scenarios, or widen the filters.", export=True),
             "<div id='leaderboard-charts' data-live-charts><h2>Per-scenario matrix</h2>", matrix_html, "<h2>Pass rate by condition</h2>", chart_html, "</div>"]
-    if saturated_views:
-        body.append("<h2>Saturated scenarios (shown separately)</h2>" + table("saturated", LB_COLUMNS, saturated_views, key="key", empty="none", export=False))
-    body.append("<h2>Gate</h2><p class='muted small'>Interfaces §9.1: valid · difficulty informative (saturated only with the toggle; broken never) · task-sense coherent and fair_tests.</p>"
-                f"<div class='table-wrap'><table><thead><tr><th>scenario</th><th>validation</th><th>difficulty</th><th>task sense</th><th>board</th></tr></thead><tbody>{checks}</tbody></table></div>")
+    body.append("<h2>Gate</h2><p class='muted small'>valid · task-sense coherent and fair_tests · inside the difficulty filter when one is applied (the label itself is informational). "
+                "Interfaces §9.1's screen gate (informative only) remains the readers' default for other callers; the console admits every label unless you filter.</p>"
+                f"<div class='table-wrap'><table><thead><tr><th>scenario</th><th>validation</th><th>difficulty label</th><th>task sense</th><th>board</th></tr></thead><tbody>{checks}</tbody></table></div>")
     return "".join(body)
 
 
