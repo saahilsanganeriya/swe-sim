@@ -1058,7 +1058,7 @@ def test_console_create_form_rebuild_checkbox_maps_to_the_param(monkeypatch):
     calls = []
     async def start_create(wf_params): calls.append(wf_params); return "create-fake"
     monkeypatch.setattr(console, "client_fn", lambda name: start_create if name == "start_create" else None)
-    monkeypatch.setattr(console, "stakeholder_url", lambda: "https://s")
+    monkeypatch.setattr(console, "stakeholder_url", lambda settings=None: "https://s")
     out = asyncio.run(console.start_create(params))
     assert out["workflow_ids"] == ["create-fake"] and calls[-1]["rebuild"] is True and calls[-1]["sources"][0]["kind"] == "swebench-annotated"
     asyncio.run(console.start_create(plain))
