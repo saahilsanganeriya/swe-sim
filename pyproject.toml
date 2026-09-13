@@ -21,6 +21,13 @@ dependencies = [
   "temporalio>=1.8",
   "python-dotenv>=1.2.3",
   "tomli-w>=1.2.0",
+  "sqlalchemy>=2.0",
+  "psycopg[binary]>=3.2",
+  "alembic>=1.13",
+  "google-cloud-run>=0.10",
+  "google-auth>=2.30",
+  "python-ulid>=2.7",
+  "google-cloud-storage>=2.18",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +48,7 @@ line-length = 100
 
 [dependency-groups]
 dev = [
+    "playwright>=1.45",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]
