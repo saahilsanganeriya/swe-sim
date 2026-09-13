@@ -542,16 +542,23 @@ COST_COLUMNS = (Column("at", "at", "time"), Column("trial_id", "trial", "id", hr
                 Column("usd", "USD", "usd"), Column("price_source", "price source", "text"))
 
 
-def spend_body(spend_rows: list, costs: list, cap: Decimal | None, by_run: list[dict], pools: list[dict] | None) -> str:
+def spend_body(spend_rows: list, costs: list, cap: Decimal | None, by_run: list[dict], pools: list[dict] | None, *, accounting: dict | None = None) -> str:
     total = sum((r.usd for r in spend_rows), Decimal(0))
     pct = f"{(float(total) / float(cap) * 100):.1f}% of cap ${cap:,.2f}" if cap else "no cap configured"
     views = [r.model_dump(mode="json") for r in spend_rows]
+    accounting = accounting or {}
+    completeness = ""
+    if accounting.get("spend_complete") is False:
+        completeness = (f"<p class='notice'>Known spend only: {h(accounting.get('unpriced_records', 0))} unpriced records, "
+                        f"{h(accounting.get('unknown_usage_count', 0))} calls without measured usage. "
+                        "Some usage or ledger evidence is incomplete; missing amounts remain unknown.</p>")
     body = ["<h1>Spend</h1><p class='lead'>Recorded provider spend per provider and model (the live ledger from <code>costs</code>); per run below. "
             "Unknown prices are recorded with <code>price_source = unknown</code> and never guessed.</p>",
-            hero(f"${total:,.2f}", f"recorded spend · {pct}", "/db/costs"),
+            hero(f"${total:,.2f}", f"known recorded spend · {pct}", "/db/costs"), completeness,
             table("spend", SPEND_COLUMNS, views, key="model", empty="<strong>No costs recorded yet.</strong> Costs land in <code>trials/&lt;tid&gt;/costs.json</code> as trials complete.", export=True),
             "<h2>Per run (workflow)</h2>",
-            table("spend-runs", (Column("workflow_id", "workflow", "id", href="/workflows/{workflow_id}", n=28), Column("usd", "USD", "usd"), Column("records", "records", "num")), by_run,
+            table("spend-runs", (Column("workflow_id", "workflow", "id", href="/workflows/{workflow_id}", n=28), Column("usd", "known USD", "usd"), Column("records", "records", "num"),
+                                  Column("unpriced_records", "unpriced", "num")), by_run,
                   key="workflow_id", empty="No workflow-attributed costs.", export=False),
             "<h2>Ledger (latest 500)</h2>",
             table("costs", COST_COLUMNS, [c.model_dump(mode="json") for c in costs[:500]], key="cost_id", empty="No cost records.", export=True)]

@@ -56,6 +56,12 @@ variable "spend_cap_usd" {
   nullable    = true
 }
 
+variable "iap_programmatic_clients" {
+  type        = list(string)
+  default     = []
+  description = "OAuth client IDs allowed to authenticate programmatic console requests; the IAP user access policy still applies."
+}
+
 variable "pool_instances" {
   type = object({
     authoring = number

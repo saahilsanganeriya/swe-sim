@@ -31,6 +31,7 @@ NON_SECRET_KEYS: dict[str, str] = {
     "TEMPORAL_NAMESPACE": "temporal_namespace",
     "SWESIM_STAKEHOLDER_URL": "stakeholder_url",
     "SWESIM_SPEND_CAP_USD": "spend_cap_usd",
+    "SWESIM_IAP_PROGRAMMATIC_CLIENTS": "iap_programmatic_clients",
 }
 assert not (set(NON_SECRET_KEYS) & SECRET_NAMES), "tfvars_from_env must never map a secret"
 
@@ -76,7 +77,9 @@ def build_tfvars(values: Mapping[str, str], *, account: str, repo_url: str | Non
     }
     for env_key, tf_key in NON_SECRET_KEYS.items():
         value = values.get(env_key, "")
-        if tf_key == "spend_cap_usd":
+        if tf_key == "iap_programmatic_clients":
+            out[tf_key] = [item.strip() for item in value.split(",") if item.strip()]
+        elif tf_key == "spend_cap_usd":
             if value:
                 out[tf_key] = float(value)
         else:

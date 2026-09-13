@@ -171,6 +171,7 @@ def test_build_tfvars_has_the_terraform_inputs_and_no_secret(tmp_path: Path):
         "temporal_address": "region.gcp.api.temporal.io:7233", "temporal_namespace": "ns.abcde",
         "stakeholder_url": "https://stakeholder.example",
         "iap_members": ["user:op@example.com"], "evaluators": ["op@example.com"],
+        "iap_programmatic_clients": [],
         "github_repository": "acme/swesim",
     }
     assert not (set(doc) & SECRET_NAMES)

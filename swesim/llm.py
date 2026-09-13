@@ -154,6 +154,7 @@ def chat_json_with_usage(model_id: str, system: str, messages: list[dict], schem
                     continue
                 raise
             used = used + _anthropic_usage(r)
+            note_usage(used)  # preserve billed responses if a later fallback request fails
             text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
             if text.strip():
                 note_usage(used)
@@ -168,6 +169,7 @@ def chat_json_with_usage(model_id: str, system: str, messages: list[dict], schem
     for effort in efforts:
         r = client.chat.completions.create(model=name, messages=[{"role": "system", "content": sys_prompt}, *messages], **_openai_kwargs(name, temperature, max_tokens, effort))
         used = used + _openai_usage(r)
+        note_usage(used)
         text = r.choices[0].message.content or ""
         if text.strip():
             note_usage(used)

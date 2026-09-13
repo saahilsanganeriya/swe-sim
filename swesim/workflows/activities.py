@@ -572,6 +572,8 @@ async def draft_activity(p: dict) -> dict:
             wanted["reject_reasons"] = p["reject_reasons"]
         if p.get("version"):
             wanted["version"] = int(p["version"])  # rebuilds draft the next version; draft writes spec["version"] and draft.meta.json["version"]
+        wanted["layout"] = WS.layout
+        wanted["workflow_id"] = activity.info().workflow_id if activity.in_activity() else "direct"
         kwargs = _accepted_kwargs(draft, wanted)
         await blocking(lambda: draft(row, row.get("judge", {}), p["draft_model"], sdir, **kwargs))
     return {"scenario_id": sid, "draft_path": str(path), "version": int(p.get("version") or 1)}
@@ -896,30 +898,41 @@ def _read_json_list(path: Path) -> list:
 
 
 def recorded_spend(settings: Settings, ws: Workspace) -> dict:
-    """Total recorded USD: the index's ledger when it is enabled and readable, else the sum of `usd` over trials/*/costs.json.
-    Records without a price (`usd` None: unknown model) are counted, never guessed."""
+    """Known recorded USD plus explicit completeness; both trial and creation ledgers are authoritative fallbacks."""
+    from swesim.costs import accounting_status
+    accounting = accounting_status(ws)
+    fallback = "files"
     if settings.index_enabled:
         try:
+            from swesim.index.models import TableFilter
             from swesim.index.store import IndexStore
             store = IndexStore.from_settings(settings)
             if store is not None and hasattr(store, "spend"):
                 rows = store.spend()
-                return {"spend_usd": float(sum(float(r.usd) for r in rows if r.usd is not None)), "source": "index", "records": int(sum(getattr(r, "records", 1) for r in rows)), "unpriced_records": 0}
-        except Exception as e:  # noqa: BLE001 - an unreadable index falls back to the files; the reason is reported, not hidden
+                unknown = store.table("costs", TableFilter(where={"usd": None}, limit=1)).total
+                return {"spend_usd": float(sum(float(r.usd) for r in rows if r.usd is not None)), "source": "index",
+                        "records": int(sum(getattr(r, "records", 1) for r in rows)), "unpriced_records": unknown,
+                        **accounting, "spend_complete": accounting["usage_complete"] and unknown == 0}
+        except Exception as e:  # noqa: BLE001 - files remain the record if the disposable index is unavailable
             fallback = f"files (index unreadable: {type(e).__name__}: {str(e)[:120]})"
         else:
             fallback = "files (index has no spend ledger yet)"
-    else:
-        fallback = "files"
-    total = 0.0; records = 0; unpriced = 0
-    for path in sorted((ws.root / "trials").glob("*/costs.json")):
-        for rec in _read_json_list(path):
-            records += 1
-            if rec.get("usd") is None:
-                unpriced += 1
-            else:
-                total += float(rec["usd"])
-    return {"spend_usd": total, "source": fallback, "records": records, "unpriced_records": unpriced}
+    total = 0.0; records = unpriced = unreadable = 0
+    paths = [*sorted((ws.root / "trials").glob("*/costs.json")), *sorted((ws.root / "costs").glob("*.json"))]
+    for path in paths:
+        try:
+            data = json.loads(path.read_text())
+            rows = data if isinstance(data, list) else data.get("records", [])
+            for rec in rows:
+                records += 1
+                if rec.get("usd") is None:
+                    unpriced += 1
+                else:
+                    total += float(rec["usd"])
+        except (OSError, ValueError, TypeError, AttributeError):
+            unreadable += 1
+    return {"spend_usd": total, "source": fallback, "records": records, "unpriced_records": unpriced,
+            **accounting, "unreadable_cost_files": unreadable, "spend_complete": accounting["usage_complete"] and not (unpriced or unreadable)}
 
 
 @swesim_activity
@@ -942,7 +955,10 @@ def _solver_usage(costs, record: dict, d: Path):
         if usage is not None:
             return usage
     trajectory = _read_json(d / "trajectory.json")
-    return costs.solver_usage_from_trajectory(trajectory) if trajectory else None
+    try:
+        return costs.solver_usage_from_trajectory(trajectory) if trajectory else None
+    except getattr(costs, "MissingUsage", ()):  # old injected cost modules do not expose this classification
+        return None
 
 
 @swesim_activity

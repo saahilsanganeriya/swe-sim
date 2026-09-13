@@ -179,3 +179,50 @@ def test_record_cost_accepts_a_layout_exposing_trial_dir(tmp_path):
 
     rec = costs.record_cost(Layout(), "b" * 24, None, "solver", "openai/gpt-5-mini", costs.Usage(input_tokens=1_000_000, output_tokens=0))
     assert (tmp_path / "t" / ("b" * 24) / "costs.json").exists() and rec.usd == Decimal("0.25")
+
+
+def test_cost_identity_distinguishes_paid_events_and_retries(tmp_path):
+    ws = Workspace(tmp_path)
+    usage = costs.Usage(input_tokens=1000, output_tokens=100, calls=1)
+    first = costs.record_cost(ws, None, 'workflow', 'audit', 'openai/gpt-5.6-sol', usage, idempotency_key='attempt-1/call-1')
+    again = costs.record_cost(ws, None, 'workflow', 'audit', 'openai/gpt-5.6-sol', usage, idempotency_key='attempt-1/call-1')
+    second = costs.record_cost(ws, None, 'workflow', 'audit', 'openai/gpt-5.6-sol', usage, idempotency_key='attempt-2/call-1')
+    assert first == again and first.cost_id != second.cost_id
+    assert len(costs.read_costs(ws.root / 'costs' / 'workflow.json')) == 2
+    with pytest.raises(ValueError, match='different usage'):
+        costs.record_cost(ws, None, 'workflow', 'audit', 'openai/gpt-5.6-sol', costs.Usage(input_tokens=999, output_tokens=1), idempotency_key='attempt-1/call-1')
+
+
+def test_missing_native_metrics_fall_back_without_inventing_zero(tmp_path):
+    (tmp_path / 'agent').mkdir()
+    native = mini_traj()
+    native['messages'][2]['extra']['response'].pop('usage')
+    (tmp_path / 'agent' / 'mini-swe-agent.trajectory.json').write_text(json.dumps(native))
+    assert costs.usage_from_trial_dir(tmp_path) is None
+    (tmp_path / 'result.json').write_text(json.dumps({'agent_result': {'n_input_tokens': 9000, 'n_output_tokens': 500}}))
+    found = costs.usage_from_trial_dir(tmp_path)
+    assert found.input_tokens == 9000 and found.output_tokens == 500
+    with pytest.raises(costs.MissingUsage):
+        costs.solver_usage_from_trajectory({'messages': [{'role': 'assistant', 'content': 'no usage'}]})
+
+
+def test_stakeholder_costs_use_frozen_session_events_and_do_not_bill_duplicate_requests(tmp_path):
+    import asyncio
+    from swesim.stakeholder.session import Session
+    from test_session import VIEW, cfg
+    ws = Workspace(tmp_path); tid = 'c' * 24
+    session = Session(tid, VIEW, cfg(start=3))
+    usage = costs.Usage(input_tokens=1000, output_tokens=100, calls=1)
+    def reply(*args): return {'reply': 'ValueError.', 'disclosed_fact_ids': ['f01'], 'usage': usage.model_dump(mode='json')}
+    asyncio.run(session.ask('q1', 'Which exception?', reply))
+    asyncio.run(session.ask('q1', 'Which exception?', reply))
+    asyncio.run(session.ask('q2', 'Anything else?', reply))
+    asyncio.run(session.freeze())
+    transcript = session.snapshot()
+    first = costs.record_stakeholder_usage(ws, tid, transcript, 'openai/gpt-5.6-sol')
+    again = costs.record_stakeholder_usage(ws, tid, transcript, 'openai/gpt-5.6-sol')
+    rows = costs.read_costs(ws.root / 'trials' / tid / 'costs.json')
+    assert first == again and first['measured_events'] == 2 and first['usage_complete'] is True
+    assert len(rows) == 2 and {row.role for row in rows} == {'stakeholder'}
+    assert sum(row.usd for row in rows) == Decimal('0.012000')
+    assert sum(row.input_tokens for row in rows) == 2000
