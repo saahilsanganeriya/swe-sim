@@ -27,7 +27,7 @@ from swesim.workflows.workflows import (
 
 TASK_QUEUE = queues.AUTHORING  # operator workflows start here; children are started here too
 TYPES = {"create": "CreateTasksWorkflow", "candidate": "CandidateWorkflow", "run": "RunTasksWorkflow",
-         "pipeline": "PipelineWorkflow", "matrix": "RunMatrixWorkflow", "trial": "TrialWorkflow"}
+         "pipeline": "PipelineWorkflow", "matrix": "RunMatrixWorkflow", "trial": "TrialWorkflow", "operator": "OperatorActionWorkflow"}
 REJECT_DUP = WorkflowIDReusePolicy.REJECT_DUPLICATE
 TEMPORAL_KEYS = ("TEMPORAL_ADDRESS", "TEMPORAL_NAMESPACE", "TEMPORAL_API_KEY")  # the variables the connection depends on
 
@@ -160,3 +160,20 @@ async def list_runs(kind: str = "all", limit: int = 50) -> list[dict]:
                     "close_time": wf.close_time.isoformat() if wf.close_time else None,
                     "summary": (memo or {}).get("summary", {})})
     return out
+
+
+async def operator_action(params: dict, request_id: str) -> dict:
+    """Submit one confirmation-bound mutation; repeat confirmation reads its original result."""
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+    from swesim.workflows.operator_actions import OperatorActionWorkflow
+    check_payload(params, "operator action input")
+    c = await connect()
+    wid = "operator-" + request_id
+    try:
+        handle = await c.start_workflow(OperatorActionWorkflow.run, {**params, "request_id": request_id},
+                                        id=wid, task_queue=queues.CONTROL, id_reuse_policy=REJECT_DUP,
+                                        memo={"summary": {"action": params["action"]}},
+                                        search_attributes=search_attributes.for_params(params))
+    except WorkflowAlreadyStartedError:
+        handle = c.get_workflow_handle(wid)
+    return {**(await handle.result()), "workflow_id": wid}

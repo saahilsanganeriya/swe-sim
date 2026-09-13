@@ -11,16 +11,16 @@ environment and never echoes them.
 """
 from __future__ import annotations
 
+import json
 import contextlib
 import inspect
 import re
 import shlex
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 
 from swesim.dashboard.data import ID_RE, read_json
-from swesim.paths import Workspace, atomic_json
+from swesim.paths import Workspace
 from swesim.settings import Settings, get_settings
 
 GITHUB_REPO_RE = re.compile(r"^(?:https://github\.com/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
@@ -166,6 +166,10 @@ def validate_create(body: dict) -> tuple[dict, list[str]]:
         "conditions": ["interactive"], "k": 1,
         "rebuild": _flag(body.get("rebuild")),
     }
+    if body.get("pr") is not None:
+        params["pr"] = _int(body["pr"], "PR number", 1, 2**31 - 1, errors, 1)
+        if source != "github-repo" or len(repos) != 1:
+            errors.append("an exact PR requires one repository")
     return params, errors
 
 
@@ -181,7 +185,7 @@ def _flag(value) -> bool:
 def create_sources(p: dict) -> list[dict]:
     """The ``sources`` list CreateTasksWorkflow expects (same shape as ``swesim create --source``)."""
     if p["source"] == "github-repo":
-        return [{"kind": "github-repo", "repo": r, "since": p["since"], "max_candidates": p["max_candidates_per_repo"], "pr_kind": p.get("pr_kind", "bugfix")} for r in p["repos"]]
+        return [{"kind": "github-repo", "repo": r, "since": p["since"], "max_candidates": p["max_candidates_per_repo"], "pr_kind": p.get("pr_kind", "bugfix"), **({"pr": p["pr"]} if p.get("pr") else {})} for r in p["repos"]]
     src = {"kind": "swebench-annotated", "pool": "A", "limit": p["limit"]}
     if p["instance_ids"]:
         src["instance_ids"] = list(p["instance_ids"])
@@ -252,7 +256,7 @@ def _q(value) -> str:
 
 def cli_for_create(p: dict) -> str:
     base = (f"--judge-model {_q(p['judge_model'])} --draft-model {_q(p['draft_model'])} --approval-mode {_q(p['approval_mode'])} "
-            f"--max-parallel {_q(p['max_parallel'])}" + (" --rebuild" if p.get("rebuild") else ""))
+            f"--max-parallel {_q(p['max_parallel'])}" + (f" --pr {p['pr']}" if p.get("pr") else "") + (" --rebuild" if p.get("rebuild") else ""))
     if p["source"] == "github-repo":
         srcs = "".join(f" --source {_q(r)}" for r in p["repos"]) or " --source <repo-url>"
         return f"uv run swesim create{srcs} --since {_q(p['since'])} --max-candidates {_q(p['max_candidates_per_repo'])} --pr-kind {_q(p.get('pr_kind', 'bugfix'))} {base}"
@@ -401,7 +405,9 @@ def validate_retry(body: dict, candidate: dict | None) -> tuple[dict, list[str]]
         repo = candidate.get("repo") or ""
         params, errs = validate_create({"source": "github-repo", "repos": [repo], "max_candidates": 1, "pr_kind": candidate.get("pr_kind") or "bugfix",
                                         "since": (body or {}).get("since") or defaults()["since"], "approval_mode": (body or {}).get("approval_mode") or "auto",
-                                        "rebuild": bool(candidate.get("scenario_id"))})
+                                        "rebuild": bool(candidate.get("scenario_id")), "pr": candidate.get("pr_number")})
+    if candidate.get("source") != "swebench-annotated" and not candidate.get("pr_number"):
+        errors.append("candidate has no recorded PR number; retry cannot identify its source")
     errors.extend(errs)
     params["retry_of"] = {"instance_id": candidate["instance_id"], "source_key": candidate["source_key"]}
     return params, errors
@@ -582,29 +588,24 @@ async def decide(root: Path, registry_path: Path, sid: str, body: dict) -> tuple
     if (sdir / "approval.json").exists():
         return 409, {"ok": False, "error": "already approved; the review page is read-only", "approval": read_json(sdir / "approval.json")}
     wid = str(body.get("workflow_id") or "")
-    record = {"scenario_id": sid, "spec_hash": current, "decision": decision, "note": note, "workflow_id": wid or None,
-              "decided_at": datetime.now(UTC).isoformat(timespec="seconds"), "decided_by": "dashboard"}
-    if wid:
-        if not WORKFLOW_ID_RE.fullmatch(wid):
-            return 400, {"ok": False, "error": "invalid workflow id"}
-        fn = client_fn("approve_candidate")
-        cli = f"uv run swesim workflows approve {shlex.quote(wid)} {shlex.quote(sid)} {current} --decision {decision}"
-        try:
-            if fn is not None:
-                target = await call(fn, wid, sid, current, decision, note)
-            elif decision == "approve" and client_fn("approve") is not None:
-                target = await call(client_fn("approve"), wid, sid, current)
-            else:
-                return 502, {"ok": False, "error": "this worker's client cannot signal a rejection; cancel the job or approve via CLI", "cli": cli}
-        except Exception as e:  # noqa: BLE001
-            return 502, {"ok": False, "error": f"Temporal call failed: {type(e).__name__}: {redact(e)}", "cli": cli}
-        atomic_json(sdir / "review.json", {**record, "signalled": str(target) if target is not None else wid})
-        return 200, {"ok": True, "decision": decision, "scenario_id": sid, "spec_hash": current, "workflow_id": wid,
-                     "signalled": str(target) if target is not None else wid, "via": "signal"}
-    if decision == "reject":
-        atomic_json(sdir / "review.json", record)
-        return 200, {"ok": True, "decision": "reject", "scenario_id": sid, "spec_hash": current, "via": "local review.json"}
-    return 409, {"ok": False, "error": "approval requires a holding workflow; create or rebuild through Temporal"}
+    if wid and not WORKFLOW_ID_RE.fullmatch(wid):
+        return 400, {"ok": False, "error": "invalid workflow id"}
+    result = await submit_record_action("review", {"scenario_id": sid, "spec_hash": current, "decision": decision,
+                                                    "note": note, "workflow_id": wid},
+                                        body.get("actor") or "anonymous", body["request_id"])
+    return 200, result
+
+
+async def submit_record_action(action: str, params: dict, actor: str, request_id: str) -> dict:
+    """All record mutations run on a writable control worker, including hosted hold decisions."""
+    fn = client_fn("operator_action")
+    cli = "uv run swesim workflows action " + action + " --params-json " + shlex.quote(json.dumps(params)) + " --request-id " + shlex.quote(request_id)
+    if fn is None:
+        raise ConsoleUnavailable("operator action worker is unavailable", cli, "missing")
+    try:
+        return await call(fn, {"action": action, "params": params, "actor": actor}, request_id)
+    except Exception as error:
+        raise _unreachable(error, cli) from error
 
 
 def now_ts() -> float:

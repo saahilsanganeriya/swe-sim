@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import hashlib
 import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -39,7 +40,6 @@ from swesim.dashboard.data import merge_timeline  # noqa: F401 - contract re-exp
 from swesim.dashboard.identity import Identity, identity_from_headers
 from swesim.dashboard.public import PRIVATE_KEYS, project
 from swesim.dashboard.access import all_rows
-from swesim.paths import atomic_json
 from swesim.settings import Settings, get_settings
 
 app = FastAPI(title="swesim console", docs_url=None, redoc_url=None)
@@ -972,7 +972,7 @@ def _describe(action: str, params: dict, reader, settings: Settings) -> tuple[di
         if label not in LABELS:
             errs.append(f"label must be one of {list(LABELS)}")
         p = {"trial_id": tid, "label": label, "note": str(params.get("note") or "")[:2000]}
-        cli = f"printf '%s' {console._q(json.dumps({'label': label, 'note': p['note']}))} > {console._q(str(settings.workspace / 'trials' / tid / 'label.json'))}"
+        cli = "uv run swesim workflows action label --params-json " + console._q(json.dumps(p))
         return p, errs, cli, "Record a reviewer label on this episode (evaluator annotation; never changes reward).", tid
     if action == "retry":
         ref = params.get("retry_of") if isinstance(params.get("retry_of"), dict) else params  # the confirm step carries the previewed params
@@ -996,14 +996,11 @@ async def _execute(action: str, p: dict, reader, layout, settings: Settings) -> 
         return 200, {"ok": True, **(await console.cancel_job(p["workflow_id"])), "workflow_id": p["workflow_id"]}
     if action == "review":
         status, payload = await console.decide(settings.workspace, settings.registry_path, p["scenario_id"],
-                                               {"decision": p["decision"], "spec_hash": p["spec_hash"], "workflow_id": p["workflow_id"], "note": p["reason"]})
+                                               {"decision": p["decision"], "spec_hash": p["spec_hash"], "workflow_id": p["workflow_id"], "note": p["reason"], "actor": p["_actor"], "request_id": p["_request_id"]})
         return status, payload
     if action == "label":
-        d = layout.trial_dir(p["trial_id"])
-        if not d.is_dir():
-            return 404, {"ok": False, "error": "no such trial"}
-        atomic_json(d / "label.json", {"label": p["label"], "note": p["note"]})
-        return 200, {"ok": True, "saved": True, "message": f"Label {p['label']} saved."}
+        result = await console.submit_record_action("label", {k: p[k] for k in ("trial_id", "label", "note")}, p["_actor"], p["_request_id"])
+        return 200, result
     if action == "retry":
         started = await console.start_create(p, settings)
         return 200, {"ok": True, **started, "params": p}
@@ -1061,7 +1058,7 @@ async def api_action(action: str, request: Request, reader=Depends(reader_dep), 
         audit("rejected", None, True)
         return _json(400, {"ok": False, "errors": errs, "cli": cli})
     try:
-        status, payload = await _execute(action, p, reader, layout, settings)
+        status, payload = await _execute(action, {**p, "_actor": identity.actor, "_request_id": hashlib.sha256(body["token"].encode()).hexdigest()}, reader, layout, settings)
     except console.ConsoleUnavailable as e:
         audit("failed", None, True)
         return _json(502, {"ok": False, "error": str(e), "cli": e.cli, "kind": e.kind})
