@@ -1,15 +1,12 @@
 """Split controls retain the actual reports and use the legacy verdict rules."""
 import asyncio
 import json
-import threading
 from pathlib import Path
 
 import pytest
-from temporalio.exceptions import ApplicationError
 
 from swesim import harbor_cli
 from swesim.models import RunConfig
-from swesim.paths import atomic_json
 from swesim.workflows import activities as A, validation as V, workflows as W
 from test_validate import GOOD, CLEAN_PROBE, _spec_ws, _fake_compile, _fake_harbor
 
@@ -29,6 +26,8 @@ def test_split_controls_match_legacy_evidence(tmp_path, monkeypatch, bad):
     paths = {name: V.run_control(ws, spec, name, 'c' * 64)['trial_dir'] for name in V.control_names(spec)}
     result = V.assemble_validation(ws, spec, paths, 'c' * 64, compiled.image_digest, RunConfig.default('full').run_config_hash)
     monkeypatch.setattr(V.V, 'compile_scenario', compiler)
+    # This parity fixture isolates verdict assembly; manifest binding has independent compile/control tests.
+    monkeypatch.setattr(V.V, 'verify_compiled_artifacts', lambda *args: None, raising=False)
     monkeypatch.setattr(harbor_cli, 'run_task', lambda task, agent, jobs, job_name, **kw: jobs / job_name / 'trial')
     legacy = V.V.validate_scenario(ws, spec, RunConfig.default('full'), 'https://example.test')
     assert {k: v for k, v in result.items() if k != 'validated_by'} == legacy
