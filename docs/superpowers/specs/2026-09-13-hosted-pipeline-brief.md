@@ -53,6 +53,7 @@ artifacts on disk or on the VM; nothing is asserted without a path.
 | Tasks | Must be **hard enough**: difficulty is measured, not asserted (§5). |
 | Runtime (confirmed ~07:50 UTC) | **Cloud Run**, not GKE. The user first asked about the ECS equivalent, then leaned GKE, then confirmed Cloud Run for tonight; the launcher contract and queue split are runtime-neutral so GKE remains a later Terraform module. |
 | "GPT 5.6 Soul" | Mapped to `gpt-5.6-sol` (the id that exists; `luna` and `terra` also exist). Opus 5 is primary for judge and stakeholder, `gpt-5.6-sol` the fallback, unless the user swaps them. |
+| Primary objective (added ~08:20 UTC) | **Creating tasks from new repositories given as links is the main goal of swesim.** Pool A (the 109) is the starting point and the calibration set, not the product. The sweep runs the repositories first, in both bands, with a per-repository discovery funnel in the console, and targets at least 10 valid repository-sourced scenarios by 08:00 PDT. No reward hacking (§7) and tasks and trajectories that are hard enough (§5) are explicit goals, not side effects. |
 | Console scope (added ~08:10 UTC) | **The website is the way we interact with the pipeline.** It must show the entire database and every artifact in the bucket, and the complete history of everything that ever happened: every workflow, every trial including failed, unresolved and launch-failed ones, every candidate and gate reject, every scenario version. See §2.5. |
 
 ## 2. Target architecture on GCP
@@ -294,10 +295,15 @@ holding on the majority of scenarios (§5), and the per-trial cost model (§6) p
 
 ## 4. Sweep plan
 
-1. **Creation** (after the smoke workflows pass on the new stack): one `CreateTasksWorkflow` for `swebench:A` (109 ids,
-   `--max-parallel 12`) and one per repository (`--pr-kind bugfix`, `--max-candidates 20`, since 2026-06-01). Also one
-   feature-band pass over the same ten repositories (`--pr-kind feature`) because larger diffs are the main lever on
-   difficulty. Auto approval; every valid scenario has its seven-control validation.
+1. **Creation, repositories first** (after the smoke workflows pass on the new stack): one `CreateTasksWorkflow` per
+   repository in the bugfix band (`--pr-kind bugfix`, `--max-candidates 20`, since 2026-06-01) and one in the feature band
+   (`--pr-kind feature`), for the ten repositories in §1; then one for `swebench:A` (109 ids, `--max-parallel 12`).
+   Discovery is the product here: every repository gets a funnel row in the console (PRs listed → linked issue found →
+   band filters → probe → judge → draft → gates → valid) with the reject histogram, so the bands and link tiers are tuned
+   from data during the night (the first pypdf pass rejected 119 of 188 PRs for "no linked issue" and 36 for diff size).
+   Target: at least 10 valid repository-sourced scenarios by 08:00 PDT. Auto approval; every valid scenario has its
+   seven-control validation. If the ten repositories yield fewer than 10 valid scenarios by 05:00 PDT, add repositories
+   from a generated list of active pytest-based Python projects (the console's Create page accepts any URL).
 2. **Difficulty screen** (§5) on every valid scenario with one Tier A model: hidden k=2, full k=1.
 3. **Tier A–C matrix**: full k=1, hidden k=2, interactive k=2 on every scenario that passed the screen; brief profile
    `withheld` where it exists.
@@ -311,6 +317,10 @@ Concurrency: build queue 8–12 validations in parallel (Modal), trial Jobs 30�
 provider respecting rate limits (OpenRouter 20 concurrent per key is a safe start).
 
 ## 5. Difficulty: measured, tiered, reported
+
+The user's requirement: the trajectories we see and the tasks we create must be difficult enough, and the creation process must
+find the right kind of tasks. Difficulty is a property we measure on every scenario and report per model tier; it is never
+asserted from diff size (CLAUDE.md) and never manufactured by editing a task after a gate.
 
 "Hard enough" has a definition here: a scenario is informative for a model tier when the hidden arm does not saturate
 and the full arm is at least as good as hidden.
@@ -459,17 +469,17 @@ priority.
 The `/goal` text the user runs; it points here and this brief is binding where they differ.
 
 ```
-Ship swesim as a hosted production pipeline on GCP (Cloud Run, Temporal Cloud) and run the tiered multi-model sweep on it, by 2026-09-13 08:00 PDT. The brief docs/superpowers/specs/2026-09-13-hosted-pipeline-brief.md is binding on every detail; where this text and the brief differ, the brief wins. Infra first; the sweep runs only on the new stack; the website is the way the pipeline is operated.
+Ship swesim as a hosted production pipeline on GCP (Cloud Run, Temporal Cloud) and use it to create tasks from new repositories given as links and run the tiered multi-model sweep on them, by 2026-09-13 08:00 PDT. The brief docs/superpowers/specs/2026-09-13-hosted-pipeline-brief.md is binding on every detail; where this text and the brief differ, the brief wins. Infra first; the sweep runs only on the new stack; the website is the way the pipeline is operated.
 
 Infrastructure (brief 2.1-2.7, Terraform in infra/, second apply clean): Temporal Cloud for every client and worker; one worker image built by Cloud Build, digest pinned in Terraform and recorded in every activity result and trial record; four Cloud Run worker pools, one per task queue; one Cloud Run Job per trial named by trial id (SWESIM_TRIAL_LAUNCHER=cloudrun), deleted after its record is written, launch-once proven by a worker-pool restart during a running trial with saved evidence; workspace on a versioned GCS bucket mounted everywhere, the VM record imported and labelled; Cloud SQL Postgres index written by the workflows and rebuildable from the files; secrets only from Secret Manager; the console as a Cloud Run service behind an HTTPS load balancer with IAP, evaluator gate bound to the IAP identity; one CreateTasksWorkflow and one RunTasksWorkflow completing end to end on the new stack before any sweep; the VM worker then stopped and documented as fallback.
 
 Temporal design (brief 2.8, all eight items): per-queue activity routing; retry classification (transient retries with backoff, gate rejections non-retryable, no blind relaunch); mine split into discover plus per-candidate probe, validate split per control; workflow.patched with an open-executions check before every deploy; search attributes; continue-as-new every 100 children; cancellation observed; payload sizes asserted.
 
-Independent review (brief 7.1): Codex reports in docs/reviews/2026-09-13-codex/ unchanged; the before-sweep rows fixed with tests (A-P1-2, A-P1-3, A-P1-4, B-P1-2, B-P2-1, B-P2-5, B-P2-6, B-P2-7); the rest done or documented as the table says.
+Independent review (brief 7.1): Codex reports in docs/reviews/2026-09-13-codex/; before-sweep rows fixed with tests (A-P1-2, A-P1-3, A-P1-4, B-P1-2, B-P2-1, B-P2-5, B-P2-6, B-P2-7); the rest as the table says. No reward hacking: brief 7 in full.
 
 Models (brief 3): judge and stakeholder anthropic/claude-opus-5 with openai/gpt-5.6-sol fallback, drafter anthropic/claude-sonnet-5; judge calibration re-run with per-instance predictions saved; OpenRouter in the solver path with a smoke trial before any open-model run; per-trial cost captured.
 
-Sweep (brief 4-6, Temporal only): swebench:A plus the ten repositories in the bugfix band and a feature-band pass; seven-control validation and the difficulty screen on every valid scenario; Tier A-C matrix on the six matrix models, remaining Tier A-C on a 10-scenario subset; Tier D and E (claude-sonnet-5, gpt-5.6-sol; gpt-6-astra, claude-fable-5-1, claude-opus-5, gpt-5.5) only when the brief 3.2 gate holds, k=1 first; spend tracked per run and capped by SWESIM_SPEND_CAP_USD at about $1,500.
+Sweep (brief 4-6, Temporal only): repositories first, the ten in the brief in both bands with a per-repository discovery funnel in the console and at least 10 valid repository-sourced scenarios as the target, then swebench:A; seven-control validation and the difficulty screen on every valid scenario; Tier A-C matrix on the six matrix models, remaining Tier A-C on a 10-scenario subset; Tier D and E (claude-sonnet-5, gpt-5.6-sol; gpt-6-astra, claude-fable-5-1, claude-opus-5, gpt-5.5) only when the brief 3.2 gate holds, k=1 first; spend tracked per run and capped by SWESIM_SPEND_CAP_USD at about $1,500.
 
 Console (brief 2.5, all of it): complete history of every workflow, trial (including failed, unresolved, launch-failed), candidate, gate reject and scenario version; database browser with CSV export; artifact browser over the bucket with evaluator gating; every operator action from the UI with confirmation, Origin check and audit; live views; accuracy tables with null on insufficient n; trend charts; difficulty and tier labels.
 
