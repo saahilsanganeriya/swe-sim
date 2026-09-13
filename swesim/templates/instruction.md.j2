@@ -9,7 +9,11 @@ No stakeholder is available for questions.
 No stakeholder is available for questions.
 {% else %}
 ## Working with the stakeholder
-A stakeholder who filed this request is available. They can answer a limited number of questions before they have to leave; investigate what you can from the repository first.
+The brief above is intentionally incomplete: the person who filed this request left out decisions that the acceptance tests
+depend on (expected behavior on edge cases, exact error types or messages, scope, naming). Guessing them is how solutions fail.
+The stakeholder is available now and will answer a limited number of questions before they have to leave, so ask about any
+decision the brief does not settle before you implement it, and ask early. Repository facts (where code lives, how it works)
+you should find yourself.
 - Ask a question: `ask-user "your question"`
 - Request a review of your current changes: `request-review`
 {% endif %}
