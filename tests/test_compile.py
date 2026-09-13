@@ -1,5 +1,5 @@
 """Compile stage: template rendering, asset verification, root collector decisions. Offline."""
-import ast, hashlib, importlib.util, json, os, stat, sys, tarfile, tomllib
+import ast, hashlib, importlib.util, json, os, shutil, stat, sys, tarfile, tomllib
 from pathlib import Path
 
 import pytest
@@ -428,3 +428,120 @@ def test_llm_helpers(tmp_path, monkeypatch):
     assert kw == {"response_format": {"type": "json_object"}, "max_completion_tokens": 100 + llm.OPENAI_REASONING_HEADROOM, "reasoning_effort": "low"}
     assert llm._openai_kwargs("gpt-4.1", 0.0, 100)["temperature"] == 0.0
     assert "temperature" not in llm._openai_kwargs("o3", 0.2, 100) and "temperature" not in llm._openai_kwargs("gpt-4.1", None, 100)
+
+
+# ---- submodules: declared-but-empty is allowed (pypdf sample-files), populated is rejected -------
+
+GITMODULES = '[submodule "sample-files"]\n\tpath = sample-files\n\turl = https://github.com/py-pdf/sample-files\n[submodule "other"]\n\tpath = resources/other\n\turl = https://example.com/o.git\n'
+
+
+def _checkout(root: Path, gitmodules: str | None = GITMODULES, populate: bool = False) -> Path:
+    root.mkdir(parents=True, exist_ok=True); (root / "pkg").mkdir(exist_ok=True); (root / "pkg" / "a.py").write_text("x = 1\n")
+    if gitmodules is not None:
+        (root / ".gitmodules").write_text(gitmodules); (root / "sample-files").mkdir(exist_ok=True)
+        if populate: (root / "sample-files" / "a.pdf").write_bytes(b"%PDF")
+    return root
+
+
+def test_inspect_submodules_fake_checkout(tmp_path):
+    co = _checkout(tmp_path / "co")
+    assert comp.parse_gitmodules(GITMODULES) == ["sample-files", "resources/other"]
+    assert comp.inspect_submodules(co) == {"declared": ["sample-files", "resources/other"], "populated": []}
+    assert comp.check_submodules(co)["populated"] == []  # declared + empty/absent: allowed
+    _checkout(co, populate=True)
+    assert comp.inspect_submodules(co)["populated"] == ["sample-files"]
+    with pytest.raises(ValueError, match="populated submodule"): comp.check_submodules(co)
+    (tmp_path / "co2" / "resources").mkdir(parents=True); _checkout(tmp_path / "co2"); (tmp_path / "co2" / "resources" / "other").write_text("file, not a dir")
+    assert comp.inspect_submodules(tmp_path / "co2")["populated"] == ["resources/other"]
+    assert comp.inspect_submodules(_checkout(tmp_path / "plain", gitmodules=None)) == {"declared": [], "populated": []}
+    link = _checkout(tmp_path / "link"); (link / "sample-files").rmdir(); (link / "empty").mkdir(); os.symlink(link / "empty", link / "sample-files")
+    assert comp.inspect_submodules(link)["populated"] == ["sample-files"]  # a symlink is never an empty placeholder
+    spaced = _checkout(tmp_path / "spaced", gitmodules='[submodule "s"]\n\tpath = my dir\n\turl = u\n')
+    with pytest.raises(ValueError, match="whitespace"): comp.check_submodules(spaced)  # the shell guard cannot check such a path: fail closed
+
+
+@pytest.mark.skipif(not all(shutil.which(x) for x in ("sh", "git", "awk")), reason="needs sh, git and awk")
+def test_submodule_guard_shell_matches_python_rule(tmp_path):
+    import shlex, subprocess
+    def run(co): return subprocess.run(["sh", "-c", f"cd {shlex.quote(str(co))} && {comp.SUBMODULE_GUARD} && echo GUARD_OK"], capture_output=True, text=True)
+    co = _checkout(tmp_path / "ok"); r = run(co)
+    assert r.returncode == 0 and "GUARD_OK" in r.stdout, r.stderr
+    assert not (co / "sample-files").exists() and (co / ".gitmodules").exists()  # empty placeholder removed; paths stable across images
+    bad = _checkout(tmp_path / "bad", populate=True); r = run(bad)
+    assert r.returncode != 0 and "populated submodule path" in r.stderr and "sample-files" in r.stderr and "GUARD_OK" not in r.stdout
+    r = run(_checkout(tmp_path / "plain", gitmodules=None)); assert r.returncode == 0 and "GUARD_OK" in r.stdout
+    spaced = _checkout(tmp_path / "spaced", gitmodules='[submodule "s"]\n\tpath = my dir\n\turl = u\n'); (spaced / "my dir").mkdir(); (spaced / "my dir" / "x").write_text("x")
+    r = run(spaced); assert r.returncode != 0 and "whitespace" in r.stderr and "GUARD_OK" not in r.stdout  # word splitting would have skipped it
+    link = _checkout(tmp_path / "link"); (link / "sample-files").rmdir(); (link / "empty").mkdir(); os.symlink(link / "empty", link / "sample-files")
+    r = run(link); assert r.returncode != 0 and "populated submodule path" in r.stderr  # symlink to an empty dir is not a placeholder
+    malformed = _checkout(tmp_path / "malformed", gitmodules='[submodule "x"\npath = y\n')
+    r = run(malformed); assert r.returncode != 0 and "malformed" in r.stderr and "GUARD_OK" not in r.stdout
+
+
+def test_both_dockerfiles_run_submodule_guard_before_manifest(tmp_path):
+    ws, spec = _materialize(tmp_path, minimal_spec_dict())
+    res = comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
+    for build in ("environment", "tests"):
+        df = (res.task_dirs["full"] / build / "Dockerfile").read_text()
+        assert "test ! -e .gitmodules" not in df
+        assert "git submodule deinit --all -f" in df and "populated submodule path" in df and "rmdir" in df
+        assert df.index('git rev-parse HEAD') < df.index("git submodule deinit") < df.index("base-manifest.txt")
+    assert comp.SUBMODULE_GUARD in (res.task_dirs["full"] / "tests" / "Dockerfile").read_text()
+
+
+def test_compile_records_submodules(tmp_path):
+    ws, spec = _materialize(tmp_path, minimal_spec_dict())
+    res = comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
+    # nothing local to inspect: say so; never an empty list that reads as "verified: no submodules"
+    assert json.loads(res.compile_json.read_text())["submodules"] == {"declared": None, "populated": None, "evidence": "build-time guard"}
+    co = _checkout(ws.scenario_dir(spec.id) / comp.CHECKOUT_DIRNAME)
+    res = comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
+    assert json.loads(res.compile_json.read_text())["submodules"] == {"declared": ["sample-files", "resources/other"], "populated": [], "evidence": "checkout"}
+    _checkout(co, populate=True)
+    with pytest.raises(ValueError, match="populated submodule"):
+        comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
+    # a .gitmodules asset gives the declared paths; populated-ness is still decided by the build-time guard
+    d = minimal_spec_dict(); d["assets"]["gitmodules"] = {"path": "assets/.gitmodules", "sha256": "0" * 64, "bytes": 1}
+    ws2, spec2 = _materialize(tmp_path / "b", d)
+    (ws2.scenario_dir(spec2.id) / "assets" / ".gitmodules").write_text(GITMODULES)
+    d["assets"]["gitmodules"] = {"path": "assets/.gitmodules", "sha256": hashlib.sha256(GITMODULES.encode()).hexdigest(), "bytes": len(GITMODULES.encode())}
+    spec2 = ScenarioSpec.model_validate(d)
+    res = comp.compile_scenario(ws2, spec2, RunConfig.default("full"), URL, resolve_digest=False)
+    assert json.loads(res.compile_json.read_text())["submodules"] == {"declared": ["sample-files", "resources/other"], "populated": None,
+                                                                      "evidence": "asset gitmodules; populated checked by build-time guard"}
+
+
+def _dockerfile_kind(tmp_path, dockerfile: str):
+    d = minimal_spec_dict(); d["environment"] = {"kind": "dockerfile", "dockerfile_asset": "Dockerfile.base", "repo_url": "https://github.com/py-pdf/pypdf",
+                                                  "base_commit": "2" * 40, "test_command": "pytest -q", "repo_dir": "/app"}
+    d["assets"]["Dockerfile.base"] = {"path": "assets/Dockerfile.base", "sha256": "0" * 64, "bytes": 1}
+    ws, spec = _materialize(tmp_path, d)
+    (ws.scenario_dir(spec.id) / "assets" / "Dockerfile.base").write_text(dockerfile)
+    d["assets"]["Dockerfile.base"] = {"path": "assets/Dockerfile.base", "sha256": hashlib.sha256(dockerfile.encode()).hexdigest(), "bytes": len(dockerfile.encode())}
+    return ws, ScenarioSpec.model_validate(d)
+
+
+PYPDF_DOCKERFILE = ("FROM python@sha256:" + "e" * 64 + "\nRUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*\n"
+                    "RUN git clone 'https://github.com/py-pdf/pypdf' /app && cd /app && git checkout " + "2" * 40 + " && pip install -e '.[full]' -r requirements/ci.txt\nWORKDIR /app\n")
+
+
+def test_pypdf_style_dockerfile_compiles_without_submodule_recursion(tmp_path):
+    import inspect
+    from swesim.sources import github_repo
+    src = inspect.getsource(github_repo)
+    assert "git clone " in src and "--recurse-submodules" not in src and "--recursive" not in src and "submodule update" not in src
+    assert "not samples" in github_repo.build_recipe("py-pdf/pypdf", "2" * 40)["test_command"]  # submodule-dependent tests excluded
+    ws, spec = _dockerfile_kind(tmp_path, PYPDF_DOCKERFILE)
+    res = comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=True)
+    for build in ("environment", "tests"):
+        df = (res.task_dirs["full"] / build / "Dockerfile").read_text()
+        assert df.startswith(PYPDF_DOCKERFILE) and "--recurse-submodules" not in df and "git submodule deinit --all -f" in df
+    for bad in (PYPDF_DOCKERFILE.replace("git clone ", "git clone --recurse-submodules "),
+                PYPDF_DOCKERFILE.replace("git clone ", "git clone --recursive "),
+                PYPDF_DOCKERFILE.replace("WORKDIR /app", "RUN cd /app && git submodule update --init\nWORKDIR /app"),
+                PYPDF_DOCKERFILE.replace("git clone ", "git clone \\\n    --recurse-submodules "),      # line continuation
+                PYPDF_DOCKERFILE.replace("git clone ", "git -c submodule.recurse=true clone "),
+                PYPDF_DOCKERFILE.replace("WORKDIR /app", "RUN git -C /app submodule update --init\nWORKDIR /app")):
+        ws2, spec2 = _dockerfile_kind(tmp_path / hashlib.sha256(bad.encode()).hexdigest()[:8], bad)
+        with pytest.raises(ValueError, match="submodule"):
+            comp.compile_scenario(ws2, spec2, RunConfig.default("full"), URL, resolve_digest=True)
