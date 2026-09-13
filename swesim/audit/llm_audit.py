@@ -17,12 +17,13 @@ Contract
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from swesim.audit.record import ScenarioBundle, TrialBundle, strip_confirm_prefix
 from swesim.audit.rubric import rubric_text
 from swesim.costs import Usage, usd_for
-from swesim.llm import ChatResult, LLMError, chat_json_with_usage
+from swesim.llm import ChatResult, LLMError, chat_json_with_usage, take_last_usage
 
 AUDIT_MODEL = "anthropic/claude-opus-5"
 AUDIT_FALLBACK_MODEL = "openai/gpt-5.6-sol"
@@ -209,6 +210,12 @@ class Judge:
     chat: object | None = None
     models: tuple[str, ...] = (AUDIT_MODEL, AUDIT_FALLBACK_MODEL)
     calls: list[dict] = field(default_factory=list)
+    on_call: Callable[[dict, int], None] | None = None
+
+    def _record_call(self, entry: dict) -> None:
+        self.calls.append(entry)
+        if self.on_call is not None:
+            self.on_call(entry, len(self.calls) - 1)
 
     def _ask(self, purpose: str, system: str, payload: dict, schema: str) -> tuple[dict, str]:
         content = json.dumps(payload, ensure_ascii=False, indent=1, default=str)
@@ -216,18 +223,26 @@ class Judge:
         failures = []
         for model in self.models:
             entry = {"purpose": purpose, "model": model, "input_chars": len(system) + len(schema) + len(content), "output_chars": 0, "ok": False}
+            take_last_usage()  # discard usage left by a different call on this worker thread
             try:
                 out = fn(model, system, [{"role": "user", "content": content}], schema, max_tokens=MAX_TOKENS)
-            except LLMError as e:
+            except Exception as e:  # noqa: BLE001 - preserve billed usage even when a provider or JSON parser fails
                 entry["error"] = str(e)[:300]
-                self.calls.append(entry)
+                entry["error_type"] = type(e).__name__
+                measured = take_last_usage()
+                if measured is not None:
+                    entry["usage"] = measured.model_dump(mode="json")
+                entry["usage_complete"] = measured is not None and isinstance(e, LLMError)
+                self._record_call(entry)
+                if not isinstance(e, LLMError):
+                    raise
                 failures.append(f"{model}: {str(e)[:200]}")
                 continue
             if isinstance(out, ChatResult):
                 entry["usage"] = out.usage.model_dump(mode="json")
                 out = out.data
             entry.update(ok=True, output_chars=len(json.dumps(out, default=str)))
-            self.calls.append(entry)
+            self._record_call(entry)
             return out, model
         raise AuditLLMError("audit model chain exhausted: " + "; ".join(failures))
 
