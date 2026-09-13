@@ -292,7 +292,9 @@ pools and Jobs, read-only on the console.
 - `scenarios/<sid>/difficulty.json` — written by `difficulty_label_activity` (launcher+temporal, `swesim/stages/difficulty.py`) after a
   `purpose="screen"` run: `{tier, model, hidden: {n, successes}, full: {n, successes}, labelled_at, trial_ids}`; projected to `ScenarioRow.difficulty_tier/difficulty_screen`.
 - `scenarios/<sid>/audit.json` and `trials/<tid>/audit.json` — written by the task-sense stream's activities (`swesim/audit/activities.py`,
-  CONTROL queue): scenario labels `{coherent, fair_tests, plausible_withholding, reasons: {...}, model, audited_at, rubric_version}`; trial labels
+  CONTROL queue): scenario labels `{coherent, fair_tests, plausible_withholding, facts_within_contract: bool, fact_scope: [{fact_id, within_contract, reason, offending_tests, markers}], reasons: {...}, model, audited_at, rubric_version}`
+  (`facts_within_contract`/`fact_scope` added 2026-09-13 after pytest-7283's fact f05, additive: the model defaults so older `audit.json` files still validate;
+  `.superpowers/sdd/2026-09-13-hosted-pipeline/reports/fact-scope-2.md`); trial labels
   `{questions: [{seq, specific, decision_oriented, before_implementation, redundant, fishing, reason}], replies: [{seq, targeted, volunteered,
   test_or_identifier_disclosed, behaviour_level, reason}], asked_before_implementing: bool, useful_question_rate, model, audited_at, rubric_version}`;
   projected to `ScenarioRow.task_sense`, `ExchangeRow.audit`, `TrialRow.asked_before_implementing`.
