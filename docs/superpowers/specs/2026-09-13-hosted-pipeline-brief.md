@@ -54,7 +54,7 @@ artifacts on disk or on the VM; nothing is asserted without a path.
 | Runtime (confirmed ~07:50 UTC) | **Cloud Run**, not GKE. The user first asked about the ECS equivalent, then leaned GKE, then confirmed Cloud Run for tonight; the launcher contract and queue split are runtime-neutral so GKE remains a later Terraform module. |
 | "GPT 5.6 Soul" | Mapped to `gpt-5.6-sol` (the id that exists; `luna` and `terra` also exist). Opus 5 is primary for judge and stakeholder, `gpt-5.6-sol` the fallback, unless the user swaps them. |
 | Primary objective (added ~08:20 UTC) | **Creating tasks from new repositories given as links is the main goal of swesim.** Pool A (the 109) is the starting point and the calibration set, not the product. The sweep runs the repositories first, in both bands, with a per-repository discovery funnel in the console, and targets at least 10 valid repository-sourced scenarios by 08:00 PDT. No reward hacking (§7) and tasks and trajectories that are hard enough (§5) are explicit goals, not side effects. |
-| Reusability (added ~08:35 UTC) | **A stranger must be able to clone the repository, put in their own API keys, set up the environment and run it.** `.env.example` lists every variable with a comment; `make check` runs the offline suite; `make dev` runs a local stack (Temporal dev server, worker with the local launcher, console) against Modal with the user's keys; `make cloud-bootstrap` applies Terraform and deploys with the user's GCP project; no path, hostname or file that exists only on the author's machine (Codex B10 is the checklist). Verified by a fresh clone into a new directory on the laptop. |
+| Reusability (added ~08:35 UTC, refined ~08:45) | **Cloud-only.** A stranger clones the repository, creates a GCP project and a Temporal Cloud namespace, puts their own keys in their env file, and follows `docs/setup.md` to a running hosted pipeline; `docs/runbook.md` covers operating it. No local or offline runtime is required (the offline test suite remains a developer check, not a way to run the pipeline). No path, hostname, account or file that exists only on the author's machine (Codex B10 is the checklist). Verified by a fresh clone into a new directory with a fresh env file. |
 | Console scope (added ~08:10 UTC) | **The website is the way we interact with the pipeline.** It must show the entire database and every artifact in the bucket, and the complete history of everything that ever happened: every workflow, every trial including failed, unresolved and launch-failed ones, every candidate and gate reject, every scenario version. See §2.5. |
 
 ## 2. Target architecture on GCP
@@ -439,17 +439,32 @@ priority.
   `docs/grading.md` (difficulty method, tiered results, integrity report, disclosure audit),
   `docs/superpowers/specs/2026-09-13-gcp-hosting-design.md` updated to "as built".
 
-## 9.1 Reusable by a stranger (acceptance)
+## 9.1 Reusable by a stranger (acceptance, cloud-only)
 
-- `git clone` into a fresh directory; `cp .env.example ~/Documents/.env` (or any path via `SWESIM_ENV_FILE`) and fill:
-  provider keys (Anthropic, OpenAI, OpenRouter), `SWESIM_WORKER_SECRET`, `GH_TOKEN` (read-only), Modal token, GCP project and
-  region, Temporal Cloud values (optional for local mode). Every variable documented in the file.
-- `make check`: `uv sync --extra dev --frozen` + the offline suite + `verify.sh` levels that need no cloud.
-- `make dev`: `temporal server start-dev`, the worker with `SWESIM_TRIAL_LAUNCHER=local`, the console on 127.0.0.1; a
-  documented smoke `swesim create --source swebench:A:<id>` and `swesim run-tasks` that reach Modal with the user's keys.
-- `make cloud-bootstrap PROJECT=<id>`: Terraform init/apply, Cloud Build image, deploy, `verify_cloud.sh`; `make cloud-destroy`
-  tears it down. Secrets are read from the env file into Secret Manager by a script that never echoes values.
-- `README.md` Quickstart is exactly these steps; the fresh-clone run is recorded (commands and outcomes) in `docs/ops.md`.
+- **`docs/setup.md` — from nothing to a running hosted pipeline**, in order, each step with the command and the check:
+  1. Prerequisites: a GCP project with billing, `gcloud` authenticated as an owner, Terraform, `uv`, a Temporal Cloud
+     account, a Modal account, provider keys (Anthropic, OpenAI, OpenRouter), a read-only GitHub token.
+  2. `git clone`; `cp .env.example <env file>`; fill every variable (each documented in the file: purpose, where to get it,
+     whether it is a secret). `SWESIM_ENV_FILE` points at it; nothing is ever `export`ed or sourced.
+  3. Temporal Cloud: create the namespace and an API key (UI or `temporal cloud` CLI); put the three values in the env file.
+  4. `make check`: `uv sync --extra dev --frozen` and the offline suite; proves the checkout is healthy before any cloud spend.
+  5. `make cloud-bootstrap PROJECT=<id> REGION=<r>`: enables APIs, `terraform init/apply`, pushes secrets from the env file
+     into Secret Manager (a script that never echoes values), builds the worker image, deploys the pools, the console and
+     the Job template, deploys the stakeholder service to Modal, and runs `scripts/cloud/verify_cloud.sh`.
+  6. First use: open the console URL, sign in through IAP, create a task from a repository URL, run it, read the result.
+  7. `make cloud-destroy` tears everything down (the bucket is retained unless `--purge`).
+- **`docs/runbook.md` — operating it:** deploy a new commit (image build, `terraform apply` with the digest, `patched`
+  check for open executions), rotate a secret, scale a worker pool, read the spend ledger, handle a stuck or unresolved trial
+  (reconcile, never relaunch), recover from a worker-pool restart (what the evidence should show), rebuild the index from
+  the files, restore from bucket versioning, respond to a Modal or provider outage, revoke console access, and the
+  fallback VM path.
+- **Nothing author-specific:** no `~/Documents/.env` default in code (the env file path is a documented variable with a
+  neutral default of `./.env` ignored by git), no fixed project id, zone, VM name, bucket name or hostname in code or
+  scripts (all Terraform variables or env), no workspace-specific Modal URL in any tracked file (the stakeholder URL is an
+  output of the Modal deploy step), no absolute laptop paths in docs or examples.
+- **Verification:** a fresh clone into a new directory on the laptop with a fresh env file runs `make check` and
+  `make cloud-bootstrap` against the existing project (idempotent apply) and the console loads; the commands and outcomes
+  are recorded in `docs/ops.md`.
 
 ## 10. Rules that do not bend
 
@@ -477,9 +492,9 @@ priority.
 | Cost overrun | Spend ledger per run; `SWESIM_SPEND_CAP_USD`; frontier tiers gated. |
 | Presentation at 16:00 PDT the same day | Everything reported is measured; the fallback path (VM) stays documented and runnable. |
 
-## 12. Goal command (verbatim)
+## 12. Goal command (draft; rewritten at the end)
 
-The `/goal` text the user runs; it points here and this brief is binding where they differ.
+A draft of the `/goal` text; it points here and this brief is binding where they differ. The final text is rewritten when the brief is complete.
 
 ```
 Ship swesim as a hosted production pipeline on GCP (Cloud Run, Temporal Cloud) and use it to create tasks from new repositories given as links and run the tiered multi-model sweep on them, by 2026-09-13 08:00 PDT. The brief docs/superpowers/specs/2026-09-13-hosted-pipeline-brief.md is binding on every detail; where this text and the brief differ, the brief wins. Infra first; the sweep runs only on the new stack; the website is the way the pipeline is operated.
