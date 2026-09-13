@@ -7,7 +7,9 @@ run; execution states -> runtime_state; cancel and cleanup are idempotent; confi
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from google.api_core import exceptions as gexc
@@ -134,7 +136,13 @@ def test_start_creates_the_job_spec_the_brief_fixes_and_runs_it_once(cloud):
     assert "fake-anthropic-value-123456" not in spec_text and "fake-worker-secret-xyz" not in spec_text   # secret values never enter the spec
     volumes = {v.name: v for v in task.volumes}; mounts = {m.name: m.mount_path for m in container.volume_mounts}
     assert volumes["swesim-workspace"].gcs.bucket == "swesim-proj-workspace" and volumes["swesim-workspace"].gcs.read_only is False
-    assert set(volumes["swesim-workspace"].gcs.mount_options) == {"uid=1000", "gid=1000", "file-mode=0660", "dir-mode=0770"}
+    # The worker compiler and trial verifier hash file modes; their FUSE views must agree.
+    terraform = Path(__file__).parents[1] / "infra/modules/run/main.tf"
+    source = re.search(r'gcs_mount_options\s*=\s*jsondecode\(file\("\$\{path.module\}([^"\n]+)"\)\)', terraform.read_text())
+    assert source, "worker mount options must come from the shared configuration"
+    worker_options = json.loads((terraform.parent / source.group(1).lstrip('/')).read_text())
+    assert list(volumes["swesim-workspace"].gcs.mount_options) == worker_options
+    assert {"uid=1000", "gid=1000"} <= set(worker_options)
     assert list(volumes["cloudsql"].cloud_sql_instance.instances) == ["proj:us-central1:swesim"]
     assert mounts == {"swesim-workspace": "/workspace", "cloudsql": "/cloudsql"}
     launch = json.loads((layout.trial_dir(p["trial_id"]) / "launch.json").read_text())

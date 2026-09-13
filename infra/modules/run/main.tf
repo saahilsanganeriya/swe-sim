@@ -29,7 +29,7 @@ locals {
   console_secret_env = ["TEMPORAL_API_KEY", "SWESIM_WORKER_SECRET", "SWESIM_DATABASE_URL"] # no provider keys on the console
 
   # The image runs as uid/gid 1000 (Dockerfile.worker); the FUSE mount must present files to that user.
-  gcs_mount_options = ["uid=1000", "gid=1000", "file-mode=0664", "dir-mode=0775"]
+  gcs_mount_options = jsondecode(file("${path.module}/../../../swesim/storage/mount_options.json"))
 }
 
 resource "google_cloud_run_v2_worker_pool" "pool" {

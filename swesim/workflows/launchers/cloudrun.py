@@ -23,6 +23,7 @@ Contract
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -33,6 +34,7 @@ from google.api_core import exceptions as gexc
 from google.cloud import run_v2
 
 from swesim.settings import Settings
+from swesim.storage import layout as storage_layout
 from swesim.workflows.launchers.base import LaunchAck, LauncherConfigError, RuntimeState, RuntimeStateUnavailable, read_json, unit_name
 
 LABEL_TRIAL, LABEL_SCENARIO, LABEL_RUN = "swesim-trial-id", "swesim-scenario-id", "swesim-run-workflow-id"
@@ -42,6 +44,7 @@ CLOUDSQL_VOLUME, CLOUDSQL_MOUNT = "cloudsql", "/cloudsql"
 JOB_SECRETS = ("SWESIM_WORKER_SECRET", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET")
 EXTRA_TIMEOUT = timedelta(hours=2)
 DEFAULT_SOLVER_TIMEOUT_SEC = 2400
+GCS_MOUNT_OPTIONS = json.loads(Path(storage_layout.__file__).with_name("mount_options.json").read_text())
 CREATE_TIMEOUT_SEC = 120
 RESOURCES = {"cpu": "1", "memory": "2Gi"}  # Harbor is a client; the heavy work runs on Modal
 # Not a Settings field yet (asked of the integrator, see the stream report): read here until then.
@@ -140,7 +143,7 @@ class CloudRunLauncher:
         mounts = [run_v2.VolumeMount(name=WORKSPACE_VOLUME, mount_path=WORKSPACE_MOUNT)]
         volumes = [run_v2.Volume(name=WORKSPACE_VOLUME, gcs=run_v2.GCSVolumeSource(
             bucket=self.settings.bucket, read_only=False,
-            mount_options=["uid=1000", "gid=1000", "file-mode=0660", "dir-mode=0770"]))]
+                                                        mount_options=GCS_MOUNT_OPTIONS))]
         if self.sql_connection_name:
             mounts.append(run_v2.VolumeMount(name=CLOUDSQL_VOLUME, mount_path=CLOUDSQL_MOUNT))
             volumes.append(run_v2.Volume(name=CLOUDSQL_VOLUME, cloud_sql_instance=run_v2.CloudSqlInstance(instances=[self.sql_connection_name])))
