@@ -19,6 +19,46 @@
       "validation_path": "/path/to/swesim/workspace/scenarios/mwaskom--seaborn-3190/validation.json",
       "validation_status": "valid",
       "version": 1
+    },
+    "py-pdf--pypdf-3826": {
+      "calibration_runs": [],
+      "comparison_runs": [],
+      "compiled_hash": "9d8afbd03fa9290f329142890d5e84801079be754717e547b8e6d97b99cf76f9",
+      "conditions": [
+        "full",
+        "hidden",
+        "interactive"
+      ],
+      "demonstration_runs": [],
+      "id": "py-pdf--pypdf-3826",
+      "image_digest": "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+      "source": "github-repo",
+      "source_ref": "py-pdf__pypdf-3826",
+      "spec_hash": "b2cb44ef6e94825009c2668f4fa1c3c136d1deb882eb8615d644474cec64db2e",
+      "unresolved_runs": [],
+      "validation_path": "/path/to/swesim/workspace/scenarios/py-pdf--pypdf-3826/validation.json",
+      "validation_status": "valid",
+      "version": 1
+    },
+    "scikit-learn--scikit-learn-13584": {
+      "calibration_runs": [],
+      "comparison_runs": [],
+      "compiled_hash": "da19c98540ed7389efa9ce418df0c81afaa3ebc8ae8b11a0f33b5fefb6fd640e",
+      "conditions": [
+        "full",
+        "hidden",
+        "interactive"
+      ],
+      "demonstration_runs": [],
+      "id": "scikit-learn--scikit-learn-13584",
+      "image_digest": "sha256:5ca83e8c588bfede26f650da0d725c7093d3e57105586522f9d2829e30117b8c",
+      "source": "swebench-annotated",
+      "source_ref": "scikit-learn__scikit-learn-13584",
+      "spec_hash": "1484d969c3d57b25eb9fbe91ed987f11114447cbef1f5c727e04d3bdf2f44b2f",
+      "unresolved_runs": [],
+      "validation_path": "/path/to/swesim/workspace/scenarios/scikit-learn--scikit-learn-13584/validation.json",
+      "validation_status": "valid",
+      "version": 1
     }
   }
 }

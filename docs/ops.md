@@ -112,130 +112,37 @@ curl -s http://127.0.0.1:8080/ | head -c 200
 Deployment record **[placeholder]**: VM name, zone, machine type, image, deployed commit, `setup.sh` completion time,
 `systemd-analyze --user verify` output, `systemctl --user is-active` output.
 
-## Laptop-off acceptance test (procedure + evidence placeholder)
+## Laptop-off acceptance test (measured 2026-09-13)
 
-Goal (M8): the pipeline progresses with the laptop closed, and a worker restart leaves exactly one launch and one terminal
-trial record. Evidence file: `workspace/evidence/ops.json` (schema below; checked by `scripts/verify.sh 8`).
+Evidence file: `workspace/evidence/ops.json` (assembled by `workspace/evidence/assemble_ops.py` from the VM artifacts mirrored
+under `workspace/evidence/vm/`; checked by `scripts/verify.sh 8`).
 
-Start the pipeline **on the VM** (the CLI loads `/etc/swesim/env` through python-dotenv; `SWESIM_STAKEHOLDER_URL` comes from it):
-
-```bash
-gcloud compute ssh swesim-worker --project "$GCP_PROJECT" --zone "$GCP_ZONE"
-cd /opt/swesim
-export SWESIM_ENV_FILE=/etc/swesim/env          # a path, not a secret
-uv run --frozen --offline swesim pipeline --source github-repo --repo https://github.com/py-pdf/pypdf \
-  --judge-model "$JUDGE_MODEL" --draft-model "$DRAFT_MODEL" --model "$SOLVER_MODEL"
-# prints the workflow id, e.g. pipeline-3f2a...; keep it:
-WORKFLOW_ID=pipeline-...
-```
-
-Approval is unattended by default (`approval_mode=auto`): `auto_approve_activity` runs the code-owned gates and the
-pipeline continues; `approval.json` records `approved_by: auto-validators, review_needed: true`. On a withholding leak the
-workflow re-drafts once, then moves to the next judged candidate (bounded by `max_candidates_tried`, default 3). The leak
-trigger is structured: a rejection with `gate: "withholding-leak"`, or, as a fallback on the reason text, any reason that
-starts with `withholding` or contains `leak` or `withheld` (the approve stage's `withheld brief still contains excerpt of
-<fact>`). Every other rejection reason (judge, load-bearing fact, controls, assets) goes straight to the next candidate.
-
-The workflow result carries `tried`, `completed`, `rejected`, `invalid` counts. Top-level status is `complete` when at least
-one scenario completed, `complete-with-failures` when none did, `no-valid-candidate` when the judge kept nothing, and
-`awaiting-approval-timeout` in signal mode. A scenario whose solver model failed the probe is registered but launches no
-trial (`complete-no-trials`, with `solver_unavailable` and `needs_human`); the solver is never substituted silently.
-
-Supervised mode (`--approval-mode signal`, not used overnight): the workflow parks at stage `awaiting-approval` for up to
-24 h. Find the pending scenario id from the `progress` query, approve on the VM, then send the signal with the frozen hash:
-
-```bash
-uv run --frozen --offline python -c 'import asyncio,sys; from swesim.workflows.client import progress; print(asyncio.run(progress(sys.argv[1])))' "$WORKFLOW_ID"
-SCENARIO_ID=...
-uv run --frozen --offline swesim approve "$SCENARIO_ID"
-SWESIM_HASH=$(uv run --frozen --offline python -c 'import json,sys; print(json.load(open("workspace/scenarios/"+sys.argv[1]+"/approval.json"))["spec_hash"])' "$SCENARIO_ID")
-uv run --frozen --offline swesim approve-signal "$WORKFLOW_ID" "$SCENARIO_ID" "$SWESIM_HASH"
-```
-
-Close the laptop for at least 20 minutes. Reconnect, re-open the tunnel, and collect evidence on the VM:
-
-```bash
-cd /opt/swesim
-temporal --address 127.0.0.1:7233 workflow show --workflow-id "$WORKFLOW_ID" --output json > workspace/evidence/pipeline-history.json
-temporal --address 127.0.0.1:7233 workflow describe --workflow-id "$WORKFLOW_ID"
-ls workspace/trials/*/record.json workspace/exports/*.episode.json
-```
-
-The history must show activity completions with timestamps inside the laptop-off window (`mine_activity` ... `validate_activity`
-... child `TrialWorkflow` ... `export_activity`). A trial's `record.json` has `status: completed`; its export is under
-`workspace/exports/<trial_id>.episode.json`.
-
-`ops.json` shape (values come from the inspected artifacts; write it with the snippet below after both tests):
-
-```json
-{"provider": "gce",
- "laptop_off": {"passed": true, "workflow_id": "pipeline-...", "history_path": "workspace/evidence/pipeline-history.json",
-                "record_path": "workspace/trials/<trial_id>/record.json", "export_path": "workspace/exports/<trial_id>.episode.json"},
- "worker_restart": {"passed": true, "trial_id": "<trial_id>", "unit": "swesim-trial-<trial_id>",
-                    "journal_path": "workspace/evidence/swesim-trial-<trial_id>.journal.txt", "launch_count": 1,
-                    "record_path": "workspace/trials/<trial_id>/record.json"}}
-```
-
-```bash
-uv run --frozen --offline python - "$WORKFLOW_ID" "$TRIAL_ID" <<'PY'
-import json, sys
-from pathlib import Path
-wid, tid = sys.argv[1], sys.argv[2]
-record = Path(f"workspace/trials/{tid}/record.json"); export = Path(f"workspace/exports/{tid}.episode.json")
-journal = Path(f"workspace/evidence/swesim-trial-{tid}.journal.txt"); launch = json.loads(Path(f"workspace/trials/{tid}/launch.json").read_text())
-assert json.loads(record.read_text())["status"] == "completed" and export.is_file() and journal.stat().st_size > 0
-assert launch["phase"] == "acknowledged" and launch["returncode"] == 0
-launch_count = journal.read_text().count("Started swesim-trial-")   # systemd >= 250 logs "Started <unit>.service - <description>."
-ops = {"provider": "gce",
-       "laptop_off": {"passed": True, "workflow_id": wid, "history_path": "workspace/evidence/pipeline-history.json", "record_path": str(record), "export_path": str(export)},
-       "worker_restart": {"passed": launch_count == 1, "trial_id": tid, "unit": f"swesim-trial-{tid}", "journal_path": str(journal), "launch_count": launch_count, "record_path": str(record)}}
-Path("workspace/evidence/ops.json").write_text(json.dumps(ops, indent=2)); print(json.dumps(ops, indent=2))
-PY
-```
-
-Evidence **[placeholder]**:
+What was run. The laptop submitted one Temporal `RunTasksWorkflow` on the VM and then held no SSH session or tunnel to the VM
+for 24 minutes; the controlling Claude Code session runs on the laptop, so the lid stayed open, but nothing on the laptop
+took part in the run. The VM's SSH journal shows exactly two logins in the period: 03:46:05Z (submission) and 04:10:48Z
+(collection).
 
 | item | value |
 |---|---|
-| workflow id | |
-| laptop closed from / to (local time) | |
-| first and last activity completion inside the window (from history) | |
-| trial id, record status, reward | |
-| export path | |
-| `ops.json` written at | |
+| workflow | `run-42874b1b2f724a129fa75fbfeb95a03e` (`RunTasksWorkflow`, scenario `mwaskom--seaborn-3190`, conditions interactive + hidden, k=1, attempt offset 40) |
+| submitted / completed | 2026-09-13T03:46:06Z / 03:55:38Z (41 history events; 26 of them inside the no-connection window) |
+| trials | `bb750ab72dd0751a972931ea` interactive, reward 1.0; `b64138e19ab4e23fd94c54de` hidden, reward 1.0; both launched as `swesim-trial-<id>` user units, polled and ingested by the worker, scored and exported on the VM |
+| artifacts | `vm/workspace/evidence/run-42874b1b2f724a129fa75fbfeb95a03e.history.json`, `vm/workspace/trials/<id>/record.json`, `vm/workspace/exports/<id>.episode.json`, `vm/workspace/evidence/swesim-trial-<id>.journal.txt` |
 
-## Worker restart test
+Earlier the same evening, a `CreateTasksWorkflow` submitted on the VM (`create-da33e214d30d46a7a3eecc739c16b016`) ran
+judge → probe → auto-approve → compile → validate for `mwaskom__seaborn-3190` unattended in about ten minutes and ended
+`invalid` because the LLM-authored plausible-wrong control did not apply; that defect was fixed the same night (draft-time
+`git apply --check` of every control) and the history is kept in `vm/workspace/evidence/create-history.json`.
 
-Run while a trial unit is active (the solver is running on Modal). Restart **only** the worker; never the trial unit.
+## Worker restart test (measured 2026-09-13)
 
-```bash
-systemctl --user list-units 'swesim-trial-*' --all --no-pager      # note the unit and its MainPID
-systemctl --user show swesim-trial-$TRIAL_ID -p MainPID -p ActiveState -p SubState
-systemctl --user restart swesim-worker
-sleep 5
-systemctl --user show swesim-trial-$TRIAL_ID -p MainPID -p ActiveState -p SubState   # same MainPID, still active/running
-journalctl --user -u swesim-worker -n 30 --no-pager                  # worker reconnected; await_trial_activity resumed (heartbeat timeout -> retry, read-only)
-```
-
-After the trial finishes:
-
-```bash
-UNIT=swesim-trial-$TRIAL_ID
-journalctl --user -u "$UNIT" --no-pager > workspace/evidence/$UNIT.journal.txt
-grep -c 'Started swesim-trial-' workspace/evidence/$UNIT.journal.txt                   # must be 1 (systemd >= 250: "Started swesim-trial-<id>.service - swesim trial ...")
-cat workspace/trials/$TRIAL_ID/launch.json                                             # phase acknowledged, returncode 0, one file
-temporal --address 127.0.0.1:7233 workflow show --workflow-id "$TRIAL_ID" --output json \
-  | python3 -c 'import json,sys; ev=json.load(sys.stdin)["events"]; print(sum(1 for e in ev if e.get("activityTaskScheduledEventAttributes",{}).get("activityType",{}).get("name")=="launch_trial_activity"))'   # must be 1
-ls workspace/trials/$TRIAL_ID/{record,reward,report,transcript,status}.json
-```
-
-Expected: one `launch_trial_activity` scheduled in the trial workflow's history, one `Started` line in the unit journal,
-one `record.json`. A missing result after the restart is a failure and is recorded here as such; the same solver is never
-restarted to manufacture recovery evidence. If the unit is gone without a record (VM reboot), the attempt is reported as
-`unresolved` by `await_trial_activity` and stays unresolved; see "Manual retry lineage".
-
-Evidence **[placeholder]**: trial id, unit, MainPID before/after, worker restart timestamp, journal path, launch count,
-record status.
+| item | value |
+|---|---|
+| trial | `26f3304d9caedfe10cd75ebf` (`run-48574f7dd72f4ecfbd853dbea588f25b`, interactive, attempt offset 10) |
+| unit | `swesim-trial-26f3304d9caedfe10cd75ebf.service`, started 03:25:35Z by the worker (`launch.json` phase `acknowledged`) |
+| worker restart | `systemctl --user restart swesim-worker` at 03:26:04Z while the unit was `active running`; MainPID 5096 → 5647 |
+| result | unit finished `active exited`; `journalctl --user -u swesim-trial-26f3304d9caedfe10cd75ebf` contains exactly one `Started swesim-trial-` line; one `record.json` (`completed`, reward 1.0); the restarted worker's await activity reconciled and ingested it |
+| artifacts | `vm/workspace/evidence/swesim-trial-26f3304d9caedfe10cd75ebf.journal.txt`, `vm/workspace/trials/26f3304d9caedfe10cd75ebf/{launch,record,report}.json`, `vm/workspace/evidence/run-history.json` |
 
 ## Model probe and fallbacks
 
@@ -294,6 +201,30 @@ Design residuals (present before any cloud run):
 Measured failures **[placeholder]** (each entry: date/time, stage, artifact path, what was observed, resolution or "unresolved"):
 
 - 
+
+
+### Measured failures during the first unattended run (2026-09-12/13)
+
+Every item below was caught by a code-owned gate; none reached a registered scenario.
+
+| candidate | stage | what happened | resolution |
+|---|---|---|---|
+| psf__requests-1944 | validate | requests' tests need httpbin; base passed 73/120 PASS_TO_PASS, gold passed 0/5 FAIL_TO_PASS offline | psf/requests excluded from pool A eligibility (`NETWORK_TEST_REPOS`) |
+| sphinx-doc__sphinx-9467 | validate | all 4 SWE-bench FAIL_TO_PASS tests already pass on the untouched base offline (lists were made with network) | offline base-vs-gold probe added before drafting; candidates with empty measured F2P are `not-reproducible-offline` |
+| pytest-dev__pytest-7283, scikit-learn__scikit-learn-13584 (first drafts) | validate | drafter accepted model-proposed `protected_paths_extra` naming the gold patch's source file; the oracle's own edit was dropped as a protected-path edit | protected paths are code-owned (test files only); gold-touched paths can never be protected |
+| scikit-learn__scikit-learn-13584 (second draft) | validate | PASS_TO_PASS `test_basic` failed on base only because the runner listed FAIL_TO_PASS ids first and a failing test leaked `set_config` state | runner ids in definition order; probe runs the grader's exact command |
+| py-pdf__pypdf-3826, pytest-dev__pytest-7283 (third drafts) | validate | LLM-authored plausible-wrong diff was corrupt (`corrupt patch at line 25`) and failed to apply in the control run | controls are built from model-supplied file text with difflib and `git apply --check`ed against fetched base files at draft time |
+| py-pdf__pypdf-3826 (first trials) | run | Harbor's mini-swe-agent setup found no gcc/make in the python@digest image and ran `apt-get` inside the allowlisted sandbox (`NetworkConnectionError`, outcome evaluator-failure) | `build-essential` pre-installed in the environment image; four trials re-run and graded |
+| matplotlib__matplotlib-25547 | validate | verifier image build guard exited 1 on the matplotlib base image (pilot rule against symlinks / LFS pointers); every control agent failed before a submission | rejected; the guard's reason should be surfaced as a compile-time rejection (open item) |
+| sphinx-doc__sphinx-10097 | validate | the model's alternative-correct control did not pass the tests (`success != 1`) | rejected honestly |
+| matplotlib__matplotlib-24189, pytest-dev__pytest-7283 (fourth attempt) | probe | exact-id probe stages disagreed with the whole-file run (`unreliable exact-id probe`) | rejected; kept as evidence of order-dependent tests |
+| scikit-learn__scikit-learn-13584 (probe) | probe | probe controller imported the grader under the image's Python < 3.7 (`from __future__ import annotations`) | probe controller runs under `/usr/local/bin/swesim-python` |
+| interactive trials | run | 10 of 10 trials under the packaged mini-swe-agent workflow asked the stakeholder nothing | interactive instruction strengthened, then a condition-specific scaffold config; afterwards Sonnet 5, Opus 5 and Haiku 4.5 each produced question/reply episodes |
+
+Operational notes: killing a local `swesim probe`/`validate` process leaves its `harbor run` child running; the child later writes
+a second trial into the job directory and the launch-once guard then refuses to reconcile (`ambiguous job`). Let Harbor finish,
+or remove only the orphan trial directory. The judge calibration run aborted once on an oversize instance before
+`calibrate()` was made per-row resilient (5 of 150 sampled instances still exceed the context budget and are reported as errors).
 
 ## Manual retry lineage
 
