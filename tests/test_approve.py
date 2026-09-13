@@ -6,7 +6,7 @@ from swesim.models import ScenarioSpec, minimal_spec_dict
 from swesim.paths import Workspace
 from swesim.stages.approve import approve_scenario, auto_gates
 
-AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "withholding-leak", "controls"]
+AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "withholding-leak", "withheld-reconstructs", "controls"]
 
 
 def _draft(tmp_path, d=None, write_assets=True):
@@ -99,6 +99,37 @@ def test_human_mode_records_command_and_skips_auto_gates(tmp_path):
     assert out["approved"] is True and out["mode"] == "human"
     ap = json.loads((sdir / "approval.json").read_text())
     assert ap["approved_by"] == "human-command" and ap["review_needed"] is False and ap["gates"] == ["schema", "assets"]
+
+
+def test_withheld_brief_must_be_the_natural_text_minus_exactly_the_recorded_excerpts(tmp_path):
+    """B-P1-2: the gate recomputes the withheld brief from the recorded removals; an unrecorded deletion or an extra
+    sentence fails approval even when every recorded excerpt is absent and the title survives."""
+    natural = ("Numeric export drops values\n"
+               "Expected values are numeric when the option is enabled.\n"
+               "The exporter should keep the column order.\n"
+               "Expected values are numeric and preserve all nulls.\n"
+               "Seen on 1.2.")
+    d = minimal_spec_dict(); d["briefs"][0]["text"] = natural
+    d["ledger"].append({"id": "withheld-001", "text": "Reporter's original statement: Expected values are numeric when the option is enabled.", "kind": "behavior",
+                        "provenance": "original-issue", "source_excerpt": "Expected values are numeric when the option is enabled.",
+                        "source_url": "https://example.com/issue", "discovery": "on-request"})
+    d["operations"] = [{"type": "withholding", "target": "withheld-001", "rationale": "Removed category: expected_output"}]
+    # the second sentence vanished without a record (the old bug): rejected
+    d["briefs"].append({"profile": "withheld", "text": "Numeric export drops values\nThe exporter should keep the column order.\nSeen on 1.2.", "provenance": "withheld"})
+    fails = auto_gates(ScenarioSpec.model_validate(d), tmp_path)
+    assert any(r.startswith("withheld brief is not the natural issue minus exactly the recorded excerpts") for r in fails)
+    # exactly the recorded excerpt removed: accepted
+    d["briefs"][1]["text"] = "Numeric export drops values\nThe exporter should keep the column order.\nExpected values are numeric and preserve all nulls.\nSeen on 1.2."
+    assert not any("recorded excerpts" in r for r in auto_gates(ScenarioSpec.model_validate(d), tmp_path))
+    # both sentences recorded as their own removals: accepted with both gone
+    d["ledger"].append({**d["ledger"][-1], "id": "withheld-002", "text": "Reporter's original statement: Expected values are numeric and preserve all nulls.",
+                        "source_excerpt": "Expected values are numeric and preserve all nulls."})
+    d["operations"].append({"type": "withholding", "target": "withheld-002", "rationale": "Removed category: expected_output"})
+    d["briefs"][1]["text"] = "Numeric export drops values\nThe exporter should keep the column order.\nSeen on 1.2."
+    assert not any("recorded excerpts" in r for r in auto_gates(ScenarioSpec.model_validate(d), tmp_path))
+    ws, sdir, d2 = _draft(tmp_path, d)
+    assert approve_scenario(ws, d2["id"], auto=True)["approved"] is True
+    assert "withheld-reconstructs" in json.loads((sdir / "approval.json").read_text())["gates"]
 
 
 def test_requirements_must_be_grounded_in_a_visible_fact_or_the_thread(tmp_path):
