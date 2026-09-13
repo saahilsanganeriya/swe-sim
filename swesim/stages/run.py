@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json, shutil, tomllib, urllib.request
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -30,6 +31,11 @@ class TrialRecord:
     trial_id: str; scenario_id: str; condition: str; attempt_index: int; run_config_hash: str; task_dir: str; trial_dir: str | None
     reward: dict; report: dict; transcript: dict; status: str
     spec_hash: str = ""; model: str = ""; purpose: str = "demonstration"; compiled_hash: str = ""; brief_profile: str = "natural"
+    started_at: str = ""; finished_at: str | None = None      # ISO-8601 UTC; appended last so positional construction is unchanged
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def materialize_trial_task(ws: Workspace, compiled_task_dir: Path, tid: str, token: str) -> Path:
@@ -68,6 +74,7 @@ def render_instruction(spec: ScenarioSpec, rc: RunConfig) -> str:
 
 
 def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: int, stakeholder_url: str, worker_secret: str) -> TrialRecord:
+    started_at = _now()
     sdir = ws.scenario_dir(spec.id)
     comp = json.loads((sdir / "compile.json").read_text()); val = json.loads((sdir / "validation.json").read_text())
     if val["status"] != "valid" or val["spec_hash"] != spec.spec_hash or val["compiled_hash"] != comp["compiled_hash"]:
@@ -100,7 +107,7 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     for phase in ("environment", "agent"):
         tc[phase]["allowed_hosts"] = sorted(set(tc[phase].get("allowed_hosts", [])) | {provider_host})
     (task / "task.toml").write_text(tomli_w.dumps(tc))
-    (tdir / "status.json").write_text(json.dumps({"status": "running", "trial_id": tid}))
+    (tdir / "status.json").write_text(json.dumps({"status": "running", "trial_id": tid, "started_at": started_at, "finished_at": None}))
 
     status = "completed"; trial_dir: Path | None = None; reward: dict = {}; report: dict = {}; transcript: dict = {}
     try:
@@ -134,10 +141,12 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
     report["image_digest"] = comp.get("image_digest")
     report["simulator_validity"] = "unadjudicated" if rc.condition == "interactive" else "n/a"
 
+    finished_at = _now()
     rec = TrialRecord(tid, spec.id, rc.condition, attempt_index, rc.run_config_hash, str(task), str(trial_dir) if trial_dir else None,
-                      reward, report, transcript, status, spec.spec_hash, rc.model, rc.purpose, rc.compiled_hash, rc.brief_profile)
+                      reward, report, transcript, status, spec.spec_hash, rc.model, rc.purpose, rc.compiled_hash, rc.brief_profile,
+                      started_at, finished_at)
     for name, obj in (("run_config.json", rc.model_dump(mode="json")), ("spec.json", spec.model_dump(mode="json")), ("reward.json", reward),
                       ("report.json", report), ("transcript.json", transcript), ("record.json", asdict(rec))):
         (tdir / name).write_text(json.dumps(obj, indent=2))
-    (tdir / "status.json").write_text(json.dumps({"status": status, "trial_id": tid}))
+    (tdir / "status.json").write_text(json.dumps({"status": status, "trial_id": tid, "started_at": started_at, "finished_at": finished_at}))
     return rec

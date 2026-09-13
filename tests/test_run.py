@@ -119,7 +119,8 @@ def test_run_trial_interactive_end_to_end(scene):
     assert len(calls["run"]) == 1 and calls["run"][0][0] == task and calls["run"][0][3] == tid and calls["run"][0][4] == "openai/gpt-5.5" and calls["run"][0][2] == ws.jobs_dir / "runs"
     # Written artifacts with the frozen names.
     for name in ("reward.json", "report.json", "transcript.json", "status.json", "record.json", "run_config.json", "spec.json"): assert (tdir / name).exists(), name
-    assert json.loads((tdir / "status.json").read_text()) == {"status": "completed", "trial_id": tid}
+    st = json.loads((tdir / "status.json").read_text())
+    assert set(st) == {"status", "trial_id", "started_at", "finished_at"} and st["status"] == "completed" and st["trial_id"] == tid
     assert json.loads((tdir / "reward.json").read_text()) == rec.reward
     report = json.loads((tdir / "report.json").read_text())
     assert report["transcript_binding_valid"] is True and report["reviewed_equals_submitted"] is None and report["simulator_validity"] == "unadjudicated"
@@ -130,6 +131,27 @@ def test_run_trial_interactive_end_to_end(scene):
     # Idempotent: a second call returns the prior record without relaunching or re-creating a session.
     again = run_trial(ws, spec, rc, 0, URL, "secret")
     assert again == rec and len(calls["run"]) == 1 and len(calls["post"]) == 2
+
+
+def test_run_trial_records_timestamps(scene, monkeypatch):
+    """status.json carries started_at/finished_at (finished_at null while running); record.json carries both as ISO-8601 UTC."""
+    from datetime import datetime, timezone
+    ws, spec, calls, state = scene
+    inner = harbor_cli.run_task; seen = {}
+    def spying(task_dir, *a, **k):
+        seen["running"] = json.loads((task_dir.parent / "status.json").read_text()); return inner(task_dir, *a, **k)
+    monkeypatch.setattr(harbor_cli, "run_task", spying)
+    rec = run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 0, URL, "secret")
+    running = seen["running"]
+    assert running["status"] == "running" and running["finished_at"] is None and datetime.fromisoformat(running["started_at"]).tzinfo is not None
+    tdir = ws.root / "trials" / rec.trial_id
+    status = json.loads((tdir / "status.json").read_text()); record = json.loads((tdir / "record.json").read_text())
+    for d in (status, record):
+        start, end = datetime.fromisoformat(d["started_at"]), datetime.fromisoformat(d["finished_at"])
+        assert start.tzinfo == timezone.utc and end.tzinfo == timezone.utc and start <= end
+    assert status["started_at"] == running["started_at"] == record["started_at"] == rec.started_at and record["finished_at"] == rec.finished_at
+    assert list(record)[-2:] == ["started_at", "finished_at"]            # appended after the frozen TrialRecord fields
+    assert TrialRecord(**record) == rec and run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 0, URL, "secret") == rec
 
 
 def test_run_trial_transcript_mismatch_marks_binding_invalid(scene):
