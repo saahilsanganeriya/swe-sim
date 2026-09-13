@@ -68,6 +68,17 @@ resource "google_storage_bucket_iam_member" "deployer_cloudbuild" {
   member = google_service_account.deployer.member
 }
 
+# The launcher creates trial Jobs with the worker identity; Cloud Run validates image access with the CALLER's permissions
+# at CreateJob (measured 2026-09-13: 403 artifactregistry.repositories.downloadArtifacts on the first hosted trial). The pools
+# themselves pull through the Cloud Run service agent and never hit this.
+resource "google_artifact_registry_repository_iam_member" "worker_reader" {
+  project    = var.project
+  location   = var.region
+  repository = var.artifact_repo_id
+  role       = "roles/artifactregistry.reader"
+  member     = google_service_account.worker.member
+}
+
 resource "google_artifact_registry_repository_iam_member" "deployer_writer" {
   project    = var.project
   location   = var.region
