@@ -213,7 +213,7 @@ def test_bootstrap_never_disables_existing_workloads(tmp_path: Path, state: str,
         path.chmod(0o755)
     override = tmp_path / "override.mk"
     calls = tmp_path / "calls"
-    override.write_text("require-project tf-init tfvars push-secrets seed-registry pin-image migrate verify-cloud:\n\t@true\n"
+    override.write_text("require-project tf-init tfvars open-executions deploy-stakeholder push-secrets seed-registry pin-image migrate verify-cloud:\n\t@true\n"
                         "apply:\n\t@printf '%s\\n' '$(TF_ARGS)' >> $(CALLS)\n")
     root = SCRIPTS.parents[1]
     env = {**os.environ, "TEST_STATE": state}
