@@ -8,6 +8,7 @@ draft for the approval gates. The result must validate against `ScenarioSpec` or
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import re
@@ -19,7 +20,7 @@ from swesim import tamper
 from swesim.llm import chat_json
 from swesim.paths import atomic_json
 from swesim.sources import threads
-from swesim.sources.github_repo import probe_binding
+from swesim.sources.github_repo import probe_binding, runner_prefix
 from swesim.sources.swebench_annotated import TEST_PYTHON, test_files_from_patch
 import keyword
 
@@ -73,16 +74,17 @@ WITHHOLD_PROMPT_VERSION = "withhold-v2"  # v2: the model selects spans, code del
 WITHHOLD_KINDS = {"reproduction", "context", "behavior", "interface", "constraint"}
 MAX_REMOVED_FRACTION = 0.6  # of sentence/line segments
 WITHHOLD_SCHEMA = ('{"removed":[{"category":"reproduction|error_message|expected_output|location|version|proposed_fix",'
-                   '"excerpt":"verbatim contiguous span copied from the issue","fact_text":"one sentence stating the withheld fact",'
+                   '"excerpt":"verbatim contiguous span copied from the issue","paraphrase":"optional one-sentence paraphrase (metadata only)",'
                    '"kind":"reproduction|context|behavior|interface|constraint","discovery":"on-request|repo-derivable"}]}')
 WITHHOLD_PROMPT = ("Select spans of this issue to withhold from the agent, by category. Do not rewrite the issue and do not return a brief: "
                    "code deletes the sentence or line containing each selected span and keeps everything else byte for byte. Each excerpt must be a "
-                   "verbatim contiguous span copied from the issue, at least three words long. fact_text restates the removed span for the "
-                   "maintainer's ledger: every word of five or more letters in it must occur in the span or in the issue, or simply copy the span. "
-                   "Never select the first line (the title); keep a recognizable symptom and a desired outcome; select at most about half of the "
-                   "sentences. File locations and explicit fix proposals are repo-derivable; expected behaviour, error text, versions and "
-                   "reproductions the maintainer can supply are on-request.")
+                   "verbatim contiguous span copied from the issue, at least three words long; the maintainer's ledger quotes the removed span "
+                   "itself. Never select the first line (the title); keep a recognizable symptom and a desired outcome; select at most about half "
+                   "of the sentences. Selecting nothing is allowed when the issue has no safely removable statement. File locations and explicit "
+                   "fix proposals are repo-derivable; expected behaviour, error text, versions and reproductions the maintainer can supply are "
+                   "on-request.")
 MAX_FACT_TEXT_CHARS = 400
+WITHHELD_TEXT_PREFIX = "Reporter's original statement: "
 _SENTENCE_END = re.compile(r"[.!?]+[\"')\]]*(?=\s|$)")
 _ABBREV = re.compile(r"(?i)(?:^|[\s(\[])(?:e\.g|i\.e|etc|vs|cf|viz)$")  # a terminator ending one of these is not a sentence end
 
@@ -202,6 +204,15 @@ def _deletion_range(text: str, a: int, b: int) -> tuple[int, int]:
     return s, b
 
 
+def verbatim_fact_text(span: str) -> str:
+    """The ledger text of a withheld fact is code-owned: the removed span itself, whitespace-normalized and trimmed, cut to
+    MAX_FACT_TEXT_CHARS with an ellipsis, prefixed so the stakeholder quotes the reporter rather than paraphrasing."""
+    body = " ".join(span.split())
+    if len(body) > MAX_FACT_TEXT_CHARS:
+        body = body[:MAX_FACT_TEXT_CHARS - 1].rstrip() + "…"
+    return WITHHELD_TEXT_PREFIX + body
+
+
 def _fact_text_violation(fact_text: str, span: str, natural: str) -> str | None:
     """The ledger text of a withheld fact is model prose: bound it and forbid content words absent from the span/issue."""
     if not fact_text.strip():
@@ -227,7 +238,12 @@ def withhold(natural_issue: str, model_id: str) -> dict:
     may not introduce content words absent from the span/issue, and every removed span must be absent from the brief.
     Malformed selections and violations get one correction round, then ValueError.
 
-    Returns {"withheld_brief", "removed": [{category, kind, discovery, fact_text, selected, excerpt, start, end,
+    Zero removals is a valid outcome, not a failure: when the model selects nothing, or every selection is rejected after the
+    correction round, the result has `removed == []`, `withheld_brief is None` and `stats.reason`; the draft then keeps only
+    the natural brief. The ledger text of each removal is code-owned (`verbatim_fact_text`); the model's `paraphrase` is kept
+    as metadata that nothing reads.
+
+    Returns {"withheld_brief", "removed": [{category, kind, discovery, fact_text, paraphrase, selected, excerpt, start, end,
     occurrences}], "deleted": [(start, end)], "kept": [(start, end)], "stats": {...}}; `natural[start:end] == excerpt`
     for every removal, kept + deleted partition the natural text, and the brief is the kept text byte for byte."""
     messages = [{"role": "user", "content": natural_issue}]
@@ -235,41 +251,58 @@ def withhold(natural_issue: str, model_id: str) -> dict:
     title = natural_issue[title_a:title_b]
     segs = _segments(natural_issue)
     bad: list[str] = []
+    removed: list[dict] = []
+    attempts = 0
+
+    rejected: list[str] = []
+
+    def none_removed(reason: str) -> dict:
+        return {"withheld_brief": None, "removed": [], "deleted": [], "kept": [(0, len(natural_issue))],
+                "stats": {"sentences_total": len(segs), "sentences_removed": 0, "fraction_removed": 0.0, "duplicate_selections": 0,
+                          "prompt_version": WITHHOLD_PROMPT_VERSION, "attempts": attempts, "reason": reason, "rejected_selections": rejected}}
+
     for _attempt in range(2):
+        attempts += 1
         out = chat_json(model_id, WITHHOLD_PROMPT, messages, WITHHOLD_SCHEMA, max_tokens=5000)
-        bad, removed, ranges, seen_ranges, duplicates = [], [], [], set(), 0
+        # `rejected` = per-selection problems (that selection is dropped); `bad` = result-level problems (fatal after the correction round)
+        bad, rejected, removed, ranges, seen_ranges, duplicates = [], [], [], [], set(), 0
         items = (out.get("removed") if isinstance(out, dict) else None) or []
-        if not isinstance(items, list) or not items:
-            bad.append("no removed spans")
+        if not isinstance(items, list):
+            rejected.append("removed must be a list of selections")
             items = []
+        if not items and not rejected:
+            return none_removed("model selected no spans")
         for item in items:
             if not isinstance(item, dict):
-                bad.append(f"selection must be an object with category/excerpt/kind/discovery: {str(item)[:60]!r}")
+                rejected.append(f"selection must be an object with category/excerpt/kind/discovery: {str(item)[:60]!r}")
                 continue
+            attrs = []
             if item.get("category") not in WITHHOLD_CATEGORIES:
-                bad.append(f"invalid category {item.get('category')!r}")
+                attrs.append(f"invalid category {item.get('category')!r}")
             if item.get("kind") not in WITHHOLD_KINDS:
-                bad.append(f"invalid kind {item.get('kind')!r}")
+                attrs.append(f"invalid kind {item.get('kind')!r}")
             if item.get("discovery") not in WITHHOLD_DISCOVERY:
-                bad.append(f"invalid discovery {item.get('discovery')!r}; use on-request or repo-derivable")
-            selected, fact_text = item.get("excerpt"), item.get("fact_text")
+                attrs.append(f"invalid discovery {item.get('discovery')!r}; use on-request or repo-derivable")
+            selected, paraphrase = item.get("excerpt"), item.get("paraphrase", item.get("fact_text"))
             if not isinstance(selected, str):
-                bad.append(f"excerpt must be a string, got {type(selected).__name__}")
+                rejected.append(f"excerpt must be a string, got {type(selected).__name__}")
                 continue
-            if fact_text is not None and not isinstance(fact_text, str):
-                bad.append(f"fact_text must be a string, got {type(fact_text).__name__}")
-                fact_text = None
+            if attrs:  # a Fact needs valid enum values; the selection is dropped rather than recorded with them
+                rejected.extend(f"{a} (span {selected!r})" for a in attrs)
+                continue
+            if not isinstance(paraphrase, str) or not paraphrase.strip():
+                paraphrase = None  # metadata only; never validated, never shown
             needle = _norm(selected)
             if len(needle) < MIN_EXCERPT_CHARS or len(needle.split()) < MIN_EXCERPT_TOKENS:
-                bad.append(f"selected span too short (need >= {MIN_EXCERPT_CHARS} chars and >= {MIN_EXCERPT_TOKENS} words): {selected!r}")
+                rejected.append(f"selected span too short (need >= {MIN_EXCERPT_CHARS} chars and >= {MIN_EXCERPT_TOKENS} words): {selected!r}")
                 continue
             spans = _find_spans(natural_issue, selected)
             if not spans:
-                bad.append(f"excerpt is not a verbatim span of the issue: {selected!r}")
+                rejected.append(f"excerpt is not a verbatim span of the issue: {selected!r}")
                 continue
             extended = [_extend(s, segs) for s in spans]
             if any(a < title_b and b > title_a for a, b in extended):
-                bad.append(f"the title line cannot be withheld: {selected!r}")
+                rejected.append(f"the title line cannot be withheld: {selected!r}")
                 continue
             if extended[0] in seen_ranges:
                 duplicates += 1
@@ -278,14 +311,9 @@ def withhold(natural_issue: str, model_id: str) -> dict:
             ranges.extend(extended)
             a, b = extended[0]
             span = natural_issue[a:b]
-            text = (fact_text or "").strip() or span
-            problem = _fact_text_violation(text, span, natural_issue)
-            if problem:
-                bad.append(f"{problem} (span {selected!r})")
-                continue
             removed.append({"category": item.get("category"), "kind": item.get("kind"), "discovery": item.get("discovery"),
-                            "fact_text": text, "selected": selected, "excerpt": span, "start": a, "end": b,
-                            "occurrences": [{"start": x, "end": y} for x, y in extended]})
+                            "fact_text": verbatim_fact_text(span), "paraphrase": paraphrase, "selected": selected, "excerpt": span,
+                            "start": a, "end": b, "occurrences": [{"start": x, "end": y} for x, y in extended]})
         merged = _merge(ranges)
         removed_segs = sum(1 for s in segs if any(a <= s[0] and s[1] <= b for a, b in merged))
         if segs and removed_segs / len(segs) > MAX_REMOVED_FRACTION:
@@ -306,14 +334,22 @@ def withhold(natural_issue: str, model_id: str) -> dict:
         for r in removed:
             if r["excerpt"].casefold() in brief.casefold():
                 bad.append(f"removed span still visible in the brief: {r['excerpt']!r}")
-        if not bad:
+        def success() -> dict:
             return {"withheld_brief": brief, "removed": removed, "deleted": deleted, "kept": kept,
                     "stats": {"sentences_total": len(segs), "sentences_removed": removed_segs,
                               "fraction_removed": round(removed_segs / max(1, len(segs)), 3), "duplicate_selections": duplicates,
-                              "prompt_version": WITHHOLD_PROMPT_VERSION}}
-        messages.append({"role": "assistant", "content": json.dumps(out)})
-        messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(bad)})
-    raise ValueError("withholding failed validation after two attempts: " + "; ".join(bad))
+                              "prompt_version": WITHHOLD_PROMPT_VERSION, "attempts": attempts, "reason": None, "rejected_selections": rejected}}
+
+        if not bad and not rejected:
+            return success()
+        if _attempt == 0:
+            messages.append({"role": "assistant", "content": json.dumps(out)})
+            messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(rejected + bad, ensure_ascii=False)})
+    if bad:  # a result-level problem with otherwise valid selections (cap, leak, lost title): the draft cannot use this withholding
+        raise ValueError("withholding failed validation after two attempts: " + "; ".join(rejected + bad))
+    if not removed:  # every selection was rejected: nothing safely removable, which is a valid outcome
+        return none_removed("all selections rejected: " + "; ".join(rejected))
+    return success()  # the valid selections proceed; the rejected ones are recorded
 
 
 def _sha(b: bytes) -> str:
@@ -326,9 +362,9 @@ def _norm(text: str | None) -> str:
     return norm_text(text)
 
 
-def _corpora(row: dict) -> dict[str, str]:
-    """Whitespace-normalized source text per provenance; a fact's excerpt must be a verbatim span of its corpus. `authored`
-    facts are decisions pinned only by the merged tests/patch, so their corpus is test_patch + patch."""
+def _corpus_sources(row: dict) -> dict[str, list[str]]:
+    """Raw source texts per provenance. `authored` facts are decisions pinned only by the merged tests/patch, so their source
+    is the diff body (markers/headers stripped, so excerpts may span adjacent added lines)."""
     t = row.get("thread") or {}
     ann = row.get("annotation") or {}
 
@@ -338,12 +374,26 @@ def _corpora(row: dict) -> dict[str, str]:
     issue_parts = [row.get("hints_text") or ""]
     for i in t.get("linked_issues") or []:
         issue_parts += [i.get("title") or "", i.get("body") or "", *bodies(i.get("comments"))]
-    return {"original-issue": _norm(row.get("problem_statement")),
-            "issue-thread": _norm("\n".join(issue_parts)),
-            "pr-thread": _norm("\n".join([t.get("pr_title") or "", t.get("pr_body") or "", *bodies(t.get("pr_comments"))])),
-            "pr-review": _norm("\n".join(bodies(t.get("reviews")) + bodies(t.get("review_comments")))),
-            "annotator-note": _norm("\n".join([ann.get("underspecified_notes") or "", ann.get("false_negative_notes") or ""])),
-            "authored": _norm(evidence_text(row))}  # diff markers/headers stripped, so excerpts may span adjacent added lines
+    return {"original-issue": [row.get("problem_statement") or ""],
+            "issue-thread": issue_parts,
+            "pr-thread": [t.get("pr_title") or "", t.get("pr_body") or "", *bodies(t.get("pr_comments"))],
+            "pr-review": bodies(t.get("reviews")) + bodies(t.get("review_comments")),
+            "annotator-note": [ann.get("underspecified_notes") or "", ann.get("false_negative_notes") or ""],
+            "authored": [evidence_text(row)]}
+
+
+def _corpora(row: dict) -> dict[str, str]:
+    """Whitespace-normalized source text per provenance; a fact's excerpt must be a verbatim span of its corpus."""
+    return {prov: _norm("\n".join(texts)) for prov, texts in _corpus_sources(row).items()}
+
+
+def closest_lines(needle: str, texts: list[str], n: int = 3) -> list[str]:
+    """The `n` source lines most similar (difflib) to a normalized excerpt, returned raw so a correction round can quote exactly."""
+    lines = [line.strip() for text in texts for line in (text or "").splitlines() if line.strip()]
+    by_norm: dict[str, str] = {}
+    for line in lines:
+        by_norm.setdefault(_norm(line), line)
+    return [by_norm[m] for m in difflib.get_close_matches(needle, list(by_norm), n=n, cutoff=0.0)]
 
 
 def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None, *, corpus_by_fact: dict[str, str] | None = None,
@@ -354,7 +404,8 @@ def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None,
     off, at least one on-request fact (in the model ledger or in `extra_facts`, the code-synthesized ones) must link a
     FAIL_TO_PASS test, otherwise interaction is not load-bearing and approval would fail anyway. Reserved id prefixes are
     violations for model output (`allow_reserved=False`) and permitted for code-generated facts."""
-    corpora = _corpora(row)
+    sources = _corpus_sources(row)
+    corpora = {prov: _norm("\n".join(texts)) for prov, texts in sources.items()}
     url_prefix = f"https://github.com/{row['repo']}/".casefold()
     bad = []
     ledger = d.get("ledger") or []
@@ -365,13 +416,15 @@ def ledger_violations(d: dict, row: dict, extra_facts: list[dict] | None = None,
         if prov not in corpora:
             bad.append(f"{fid}: unknown provenance {prov!r}")
             continue
-        corpus = _norm(corpus_by_fact[fid]) if corpus_by_fact and fid in corpus_by_fact else corpora[prov]
+        own = bool(corpus_by_fact and fid in corpus_by_fact)
+        corpus = _norm(corpus_by_fact[fid]) if own else corpora[prov]
         excerpt = _norm(f.get("source_excerpt"))
-        where = "removed span" if corpus_by_fact and fid in corpus_by_fact else ("merged tests/patch" if prov == "authored" else f"{prov} text")
+        where = "removed span" if own else ("merged tests/patch" if prov == "authored" else f"{prov} text")
         if len(excerpt) < MIN_EXCERPT_CHARS or len(excerpt.split()) < MIN_EXCERPT_TOKENS:
             bad.append(f"{fid}: source_excerpt too short to ground a fact (need >= {MIN_EXCERPT_CHARS} chars and >= {MIN_EXCERPT_TOKENS} words): {excerpt!r}")
         elif excerpt not in corpus:
-            bad.append(f"{fid}: source_excerpt is not a verbatim span of the {where}: {excerpt[:80]!r}")
+            near = closest_lines(excerpt, [corpus_by_fact[fid]] if own else sources[prov])
+            bad.append(f"{fid}: source_excerpt is not a verbatim span of the {where}: {excerpt[:80]!r}; closest lines: {json.dumps(near, ensure_ascii=False)}")
         if not (f.get("source_url") or "").casefold().startswith(url_prefix):
             bad.append(f"{fid}: source_url must be under https://github.com/{row['repo']}/")
         if require_f2p_link and f.get("discovery") == "on-request" and not (set(f.get("tests") or []) & set(row.get("fail_to_pass") or [])):
@@ -430,14 +483,20 @@ def content_words(text: str | None) -> set[str]:
 
 
 def auto_link_tests(text: str | None, test_patch: str, fail_to_pass: list[str], min_shared: int = 2) -> list[str]:
-    """Code-owned fallback link for an on-request fact without tests: the FAIL_TO_PASS tests whose function body in the
-    hidden-test diff shares at least `min_shared` distinct content words with the fact text."""
+    """Code-owned fallback link for an on-request fact without tests: the FAIL_TO_PASS tests whose function *body* in the
+    hidden-test diff shares at least `min_shared` distinct content words with the fact text. The `def` line is excluded and
+    the function's own name tokens never count (`test_weighted_operations_nonexistent_dim` must not link every fact that
+    says "weighted operations"), so the link rests on what the test actually does."""
     words = content_words(text)
     out: set[str] = set()
     if not words:
         return []
     for file, fn, lines in _test_blocks(test_patch):
-        if fn is not None and len(words & content_words("\n".join(lines))) >= min_shared:
+        if fn is None:
+            continue
+        body = [line for line in lines if not _TEST_DEF.match(line)]
+        body_words = content_words("\n".join(body)) - content_words(fn)
+        if len(words & body_words) >= min_shared:
             out |= _f2p_for_block(file, fn, fail_to_pass)
     return sorted(out)
 
@@ -530,10 +589,54 @@ def protected_paths_for(test_files: list[str], extras: list, gold_paths: set[str
     return sorted(kept), dropped
 
 
-def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None) -> tuple[dict, list[str]]:
-    """One LLM authoring call, validated by `ledger_violations`, one correction round, then a code-owned fallback that links
-    on-request facts without tests to the FAIL_TO_PASS tests sharing content words with them (`auto_link_tests`), then fail.
-    Returns (draft dict, ids of auto-linked facts)."""
+def definition_order(ids: list[str], test_order: list[str] | None, test_patch: str) -> tuple[list[str], str]:
+    """Order the exact node ids the grader runs in the DEFINITION order of the post-test-patch test files, never
+    FAIL_TO_PASS-then-PASS_TO_PASS (scikit-learn-13584: a polluting F2P test ran before a P2P test it corrupted). Source of
+    truth is the probe's collected order (`test_order`); without it, the order of `def test_*` appearance in the hidden-test
+    diff; ids unknown to either keep their given relative order at the end. Returns (ordered ids, source)."""
+    ids = list(dict.fromkeys(ids))
+    if test_order:
+        rank = {t: i for i, t in enumerate(test_order)}
+        known = sorted((t for t in ids if t in rank), key=rank.__getitem__)
+        return known + [t for t in ids if t not in rank], "probe"
+    funcs = [(f, fn) for f, fn, _ in _test_blocks(test_patch) if fn is not None]
+    rank = {}
+    for i, key in enumerate(funcs):
+        rank.setdefault(key, i)
+
+    def key_of(t: str):
+        path, *rest = t.split("::")
+        return (path, re.split(r"[\[(]", rest[-1])[0] if rest else "")
+
+    known = [t for t in ids if key_of(t) in rank]
+    known.sort(key=lambda t: rank[key_of(t)])  # stable: parametrizations keep their given order
+    return known + [t for t in ids if key_of(t) not in rank], "diff" if known else "given"
+
+
+def f2p_functions(fail_to_pass: list[str]) -> set[tuple[str, str]]:
+    """(file, function) pairs behind the FAIL_TO_PASS ids; parametrizations of one test collapse to one pair."""
+    return {(t.split("::")[0], re.split(r"[\[(]", t.split("::")[-1])[0]) for t in fail_to_pass}
+
+
+def link_single_target(d: dict, fail_to_pass: list[str]) -> list[str]:
+    """Code-owned rule: when every FAIL_TO_PASS id belongs to one test function (any parametrizations), every on-request fact
+    without an F2P link is about that function and is linked to all of its ids. Returns the ids of the facts linked."""
+    if len(f2p_functions(fail_to_pass)) != 1:
+        return []
+    linked = []
+    for f in d.get("ledger") or []:
+        if isinstance(f, dict) and f.get("discovery") == "on-request" and not (set(f.get("tests") or []) & set(fail_to_pass)):
+            f["tests"] = list(f.get("tests") or []) + [t for t in fail_to_pass if t not in (f.get("tests") or [])]  # contract order
+            linked.append(f.get("id"))
+    return linked
+
+
+def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | None = None) -> tuple[dict, dict]:
+    """One LLM authoring call, validated by `ledger_violations`, one correction round (its message names the FAIL_TO_PASS ids
+    and the closest corpus lines for any non-verbatim excerpt), then a code-owned fallback that links on-request facts without
+    tests to the FAIL_TO_PASS tests sharing content words with them (`auto_link_tests`), then fail. When all FAIL_TO_PASS ids
+    belong to a single test function, `link_single_target` links every on-request fact to it before validation and the
+    content-word rule never applies. Returns (draft dict, {"auto_linked": [...], "auto_linked_single_target": bool})."""
     f2p = list(row.get("fail_to_pass") or [])
     prefix = "FAIL_TO_PASS ids (every on-request fact must carry `tests` drawn from this list): " + json.dumps(f2p) + "\n\n"
     judged_json = json.dumps(judged, ensure_ascii=False)
@@ -544,25 +647,28 @@ def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | No
     messages = [{"role": "user", "content": user}]
     bad: list[str] = []
     d: dict = {}
+    single: list[str] = []
     for attempt in range(2):
         d = chat_json(model_id, SYSTEM, messages, SCHEMA, max_tokens=8000)
+        single = link_single_target(d, f2p)
         bad = ledger_violations(d, row, extra_facts)
         if not bad:
-            return d, []
+            return d, {"auto_linked": single, "auto_linked_single_target": bool(single)}
         if attempt == 0:
             messages.append({"role": "assistant", "content": json.dumps(d)})
-            messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(bad)})
-    auto_linked = []
-    for f in d.get("ledger") or []:
-        if isinstance(f, dict) and f.get("discovery") == "on-request" and not (set(f.get("tests") or []) & set(f2p)):
-            links = auto_link_tests(f.get("text"), row.get("test_patch") or "", f2p)
-            if links:
-                f["tests"] = sorted(set(f.get("tests") or []) | set(links))
-                auto_linked.append(f.get("id"))
+            messages.append({"role": "user", "content": "Correct these violations: " + json.dumps(bad, ensure_ascii=False)})
+    auto_linked = list(single)
+    if len(f2p_functions(f2p)) >= 2:  # the content-word rule applies only when the target is ambiguous
+        for f in d.get("ledger") or []:
+            if isinstance(f, dict) and f.get("discovery") == "on-request" and not (set(f.get("tests") or []) & set(f2p)):
+                links = auto_link_tests(f.get("text"), row.get("test_patch") or "", f2p)
+                if links:
+                    f["tests"] = sorted(set(f.get("tests") or []) | set(links))
+                    auto_linked.append(f.get("id"))
     if auto_linked:
         bad = ledger_violations(d, row, extra_facts)
         if not bad:
-            return d, auto_linked
+            return d, {"auto_linked": auto_linked, "auto_linked_single_target": bool(single)}
     raise ValueError("draft failed grounding validation after two attempts: " + "; ".join(bad))
 
 
@@ -595,7 +701,7 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
                             allow_reserved=True, require_f2p_link=False)
     if bad:  # code-built from judge evidence; a failure here is a bug or an unusable evidence span, never a model correction
         raise ValueError("synthesized tests-resolved facts failed grounding: " + "; ".join(bad))
-    d, auto_linked = _author(row, judged, model_id, extra_facts=synthesized)
+    d, links = _author(row, judged, model_id, extra_facts=synthesized)
 
     pw = d.get("plausible_wrong") or {}
     if not (pw.get("diff") or "").strip():
@@ -626,9 +732,10 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
         manifest[name] = {"path": f"assets/{name}", "sha256": _sha(data), "bytes": len(data)}
 
     nodeid_map = row.get("nodeid_map") or {}
-    selected = [nodeid_map.get(t, t) for t in row["fail_to_pass"] + row["pass_to_pass"]]
+    ordered, order_source = definition_order(row["fail_to_pass"] + row["pass_to_pass"], row.get("test_order"), row["test_patch"])
+    selected = [nodeid_map.get(t, t) for t in ordered]
     interpreter = row.get("test_python") or TEST_PYTHON
-    prefix = shlex.quote(interpreter) + " -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} "
+    prefix = runner_prefix(interpreter)  # identical to the probe's exact-id stages
     # The verifier substitutes {junit_path}/{nodeid} with str.replace (integrator ruling), so node ids keep literal braces.
     runner_cmd = prefix + " ".join(shlex.quote(t) for t in selected)
     if len(runner_cmd) > RUNNER_COMMAND_MAX_CHARS:
@@ -661,11 +768,12 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
             "difficulty": {"annotated": row["annotation"]["difficulty"], "judged": judged}, "thread": dict(thread)}
 
     withheld = withhold(row["problem_statement"], model_id)
-    spec["briefs"].append({"profile": "withheld", "text": withheld["withheld_brief"], "provenance": "withheld"})
-    issue_url = next((i["issue_url"] for i in thread.get("linked_issues") or []), thread.get("pr_url"))
-    if not issue_url:
-        raise ValueError("withheld facts need source URL")
     withheld_facts = []
+    if withheld["removed"]:  # zero removals is valid: the scenario then has only the natural brief and hidden/interactive use it
+        spec["briefs"].append({"profile": "withheld", "text": withheld["withheld_brief"], "provenance": "withheld"})
+    issue_url = next((i["issue_url"] for i in thread.get("linked_issues") or []), thread.get("pr_url"))
+    if withheld["removed"] and not issue_url:
+        raise ValueError("withheld facts need source URL")
     for i, item in enumerate(withheld["removed"]):
         fid = f"withheld-{i + 1:03d}"
         if any(f.get("id") == fid for f in spec["ledger"]):
@@ -692,10 +800,13 @@ def draft(row: dict, judged: dict, model_id: str, out_dir: Path, pipeline_versio
     atomic_json(out_dir / "judge.json", {"gaps": judged.get("gaps", []), "verified_rubric_score": judged.get("verified_rubric_score"),
                                          "keep": judged.get("keep"), **judged})
     atomic_json(out_dir / "draft.meta.json", {"model_id": model_id, "prompt_version": DRAFT_PROMPT_VERSION, "pipeline_version": pipeline_version,
-                                              "created_at": spec["created_at"], "spec_hash": parsed.spec_hash, "auto_linked": auto_linked,
+                                              "created_at": spec["created_at"], "spec_hash": parsed.spec_hash,
+                                              "auto_linked": links["auto_linked"], "auto_linked_single_target": links["auto_linked_single_target"],
                                               "protected_paths_dropped": protected_dropped,
+                                              "runner": {"order": "definition", "order_source": order_source, "ids": selected},
                                               "probe": ({k: probe.get(k) for k in ("kind", "probe_dir", "image_digest", "counts", "dropped", "swebench")} if probe.get("statuses")
                                                         else {"unmeasured": True}),
-                                              "withholding": {"removed": [{**r, "fact_id": f"withheld-{i + 1:03d}"} for i, r in enumerate(withheld["removed"])],
+                                              "withholding": {"removed": len(withheld["removed"]), "reason": withheld["stats"].get("reason"),
+                                                              "spans": [{**r, "fact_id": f"withheld-{i + 1:03d}"} for i, r in enumerate(withheld["removed"])],
                                                               "kept": withheld["kept"], "stats": withheld["stats"]}})
     return p

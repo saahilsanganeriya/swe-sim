@@ -264,7 +264,7 @@ def test_probe_tests_builds_probe_task_and_derives_f2p_p2p(monkeypatch, tmp_path
     assert (root / "tests" / "test.patch").read_text() == "TP" and (root / "tests" / "oracle.diff").read_text() == "OP"
     cfg = json.loads((root / "tests" / "probe_config.json").read_text())
     assert cfg["command"].startswith("/usr/local/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} ") and cfg["command"].endswith("tests/test_stream.py") and ".pdf" not in cfg["command"]
-    assert cfg["repo_dir"] == "/app" and cfg["kind"] == "dockerfile" and out["probe"]["kind"] == "dockerfile" and out["dropped"] == {"network_or_env": [], "gold_regressions": []}
+    assert cfg["repo_dir"] == "/app" and cfg["kind"] == "dockerfile" and out["probe"]["kind"] == "dockerfile" and out["dropped"] == {"network_or_env": [], "gold_regressions": [], "other": [], "order_dependent": []}
     toml = (root / "task.toml").read_text()
     assert 'environment_mode="separate"' in toml and 'network_mode="no-network"' in toml and (root / "instruction.md").exists()
     assert out["probe_dir"] == str(seen["jobs_dir"] / "o--r-42" / "trial-1")
@@ -286,7 +286,7 @@ def test_probe_tests_rejects_unreliable_or_uncovered_probes(monkeypatch, tmp_pat
     only_f = {"statuses": {"t::b": "failed"}, "exit_code": 1, "error": None, "tail": ""}
     _setup_probe(monkeypatch, tmp_path, {"base": only_f, "test": only_f, "gold": {"statuses": {"t::b": "passed"}, "exit_code": 0, "error": None, "tail": ""}})
     out = gr.probe_tests(_probe_row(), Workspace(tmp_path / "ws4"))                # no regression coverage is recorded, not fatal
-    assert out["fail_to_pass"] == ["t::b"] and out["pass_to_pass"] == [] and out["dropped"] == {"network_or_env": [], "gold_regressions": []}
+    assert out["fail_to_pass"] == ["t::b"] and out["pass_to_pass"] == [] and out["dropped"] == {"network_or_env": [], "gold_regressions": [], "other": [], "order_dependent": []}
 
 
 def _swebench_probe_row():
@@ -313,8 +313,12 @@ def test_probe_tests_measures_swebench_image_rows_offline(monkeypatch, tmp_path)
     out = gr.probe_tests(row, ws)
     f = "xarray/tests/test_weighted.py::"
     assert out["fail_to_pass"] == [f + "test_new"] and out["pass_to_pass"] == [f + "test_old", f + "test_extra"]
-    assert out["dropped"] == {"network_or_env": [f + "test_needs_network"], "gold_regressions": [f + "test_flaky"]}
+    assert out["dropped"] == {"network_or_env": [f + "test_needs_network"], "gold_regressions": [f + "test_flaky"], "other": [], "order_dependent": []}
     assert out["probe"]["swebench"] == {"fail_to_pass_not_reproduced": [f + "test_needs_network"], "pass_to_pass_not_reproduced": [f + "test_flaky"], "fail_to_pass_new": []}
+    assert out["probe"]["counts"] == {"fail_to_pass": 1, "pass_to_pass": 2, "network_or_env": 1, "gold_regressions": 1, "other": 0, "order_dependent": 0, "measured": 5}
+    assert out["probe"]["runner"]["exact"] == "missing" and out["probe"]["order"] == list(_swebench_statuses()["test"]["statuses"])   # no exact stages in this fixture
+    assert out["probe"]["errors"] == {"base": "no tests collected", "test": None, "gold": None}   # the base collect error is expected and kept for audit
+    assert sum(v for k, v in out["probe"]["counts"].items() if k != "measured") == out["probe"]["counts"]["measured"]
     assert out["probe"]["kind"] == "image" and out["test_python"] == gr.SWEBENCH_PYTHON and out["probe"]["repo_dir"] == "/testbed"
     assert out["statuses"]["test"][f + "test_new"] == "failed" and out["statuses"]["gold"][f + "test_new"] == "passed" and out["statuses"]["base"] == {}
     root = ws.root / "probes" / "pydata--xarray-5362"
@@ -345,10 +349,69 @@ def test_probe_tests_measures_swebench_image_rows_offline(monkeypatch, tmp_path)
         gr.probe_tests({**_swebench_probe_row(), "test_patch": "diff --git a/docs/x.rst b/docs/x.rst\n"}, Workspace(tmp_path / "ws3"))
 
 
+def test_classify_probe_partitions_every_test_including_skip_xfail_xpass():
+    """Review v4: skipped/xfail/xpass transitions vanished from `dropped` and `counts`; every measured test must land in one bucket."""
+    import tomllib
+    before = {"f2p": "failed", "p2p": "passed", "net": "error", "reg": "passed", "xp": "passed",
+              "sk_pass": "skipped", "xf_pass": "xfail", "xpass_same": "xpass", "fail_skip": "failed", "sk_same": "skipped"}
+    after = {"f2p": "passed", "p2p": "passed", "net": "failed", "reg": "failed", "xp": "xpass",
+             "sk_pass": "passed", "xf_pass": "passed", "xpass_same": "xpass", "fail_skip": "skipped", "sk_same": "skipped"}
+    got = gr.classify_probe(before, after)
+    assert got["fail_to_pass"] == ["f2p"] and got["pass_to_pass"] == ["p2p"]
+    assert got["dropped"] == {"network_or_env": ["net"], "gold_regressions": ["reg", "xp"], "other": ["sk_pass", "xf_pass", "xpass_same", "fail_skip", "sk_same"]}
+    buckets = [got["fail_to_pass"], got["pass_to_pass"], *got["dropped"].values()]
+    assert sorted(t for b in buckets for t in b) == sorted(before) and sum(map(len, buckets)) == len(before)   # a partition: no test vanishes
+    # the verifier budget must outlast three full stages
+    cfg = tomllib.loads(gr.PROBE_TASK_TOML)
+    assert cfg["verifier"]["timeout_sec"] == gr.PROBE_VERIFIER_TIMEOUT_SEC >= 3 * gr.PROBE_TIMEOUT_SEC + 300 and cfg["verifier"]["environment_mode"] == "separate"
+
+
+def test_probe_is_grading_faithful_exact_ids_in_definition_order(monkeypatch, tmp_path):
+    """scikit-learn-13584: the whole-file probe passed test_basic, the exact-id grading run failed it (pollution from an F2P
+    test that ran first). The probe now re-runs the exact ids with the grader's own command shape and drops order-dependent tests."""
+    from swesim.paths import Workspace
+    f = "sklearn/utils/tests/test_pprint.py::"
+    order = [f + "test_basic", f + "test_changed_only", f + "test_deeply_nested", f + "test_n_max_elements"]
+    full_test = {order[0]: "passed", order[1]: "failed", order[2]: "failed", order[3]: "passed"}
+    full_gold = {t: "passed" for t in order}
+    exact_test = {**full_test, order[0]: "failed"}                     # test_basic flips in the exact-id run (pollution the grader sees, the whole-file run hid)
+    data = {"base": {"statuses": {}, "exit_code": 4, "error": "no tests collected", "tail": ""},
+            "test": {"statuses": full_test, "exit_code": 1, "error": None, "tail": ""}, "order": order,
+            "exact_command": "CMD", "test_exact": {"statuses": exact_test, "exit_code": 1, "error": None, "tail": ""},
+            "gold": {"statuses": full_gold, "exit_code": 0, "error": None, "tail": ""},
+            "gold_exact": {"statuses": {**full_gold, order[3]: "failed"}, "exit_code": 1, "error": None, "tail": ""}}
+    seen = _setup_probe(monkeypatch, tmp_path, data)
+    row = {**_swebench_probe_row(), "test_patch": "diff --git a/sklearn/utils/tests/test_pprint.py b/sklearn/utils/tests/test_pprint.py\n--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n x\n+def test_changed_only(): pass\n",
+           "fail_to_pass": [order[1], order[2]], "pass_to_pass": [order[0], order[3]]}
+    out = gr.probe_tests(row, Workspace(tmp_path / "ws"))
+    assert out["probe"]["order"] == order and out["probe"]["runner"]["order"] == "definition" and out["probe"]["runner"]["exact"] == "exact"
+    assert out["probe"]["runner"]["prefix"] == gr.runner_prefix(gr.SWEBENCH_PYTHON) and out["probe"]["runner"]["exact_command"] == "CMD"
+    assert out["dropped"]["order_dependent"] == [order[0], order[3]]                                     # status differs between whole-file and exact runs
+    assert out["fail_to_pass"] == [order[1], order[2]] and out["pass_to_pass"] == []                      # order-dependent tests leave the contract entirely
+    assert out["probe"]["counts"]["order_dependent"] == 2 and out["probe"]["stages"] == ["base", "test", "test_exact", "gold", "gold_exact"]
+    assert out["statuses"]["test_exact"] == exact_test and "test_exact" in out["probe"]["errors"]
+    cfg = json.loads((tmp_path / "ws" / "probes" / "pydata--xarray-5362" / "tests" / "probe_config.json").read_text())
+    assert cfg["prefix"] == gr.runner_prefix(gr.SWEBENCH_PYTHON) and cfg["max_command_chars"] == gr.MAX_COMMAND_CHARS and cfg["command"].startswith(cfg["prefix"])
+    probe_py = (tmp_path / "ws" / "probes" / "pydata--xarray-5362" / "tests" / "probe.py").read_text()
+    assert "test_exact" in probe_py and "gold_exact" in probe_py and "run(exact,order)" in probe_py and "results['order']=order" in probe_py
+    # an exact stage that errors (e.g. collection differs from the manifest) makes the probe unreliable
+    bad = {**data, "gold_exact": {**data["gold_exact"], "error": "collection differs from manifest"}}
+    _setup_probe(monkeypatch, tmp_path, bad)
+    with pytest.raises(ValueError, match="unreliable exact-id probe"):
+        gr.probe_tests(dict(row), Workspace(tmp_path / "ws2"))
+    # without exact stages (older job dirs, argv budget) the whole-file statuses are used and the reason is recorded
+    skipped = {k: v for k, v in data.items() if k not in ("test_exact", "gold_exact", "exact_command")}
+    skipped["exact_skipped"] = "command exceeds argv budget"
+    _setup_probe(monkeypatch, tmp_path, skipped)
+    out = gr.probe_tests(dict(row), Workspace(tmp_path / "ws3"))
+    assert out["probe"]["runner"]["exact"] == "command exceeds argv budget" and out["dropped"]["order_dependent"] == [] and out["pass_to_pass"] == [order[0], order[3]]
+    assert gr.PROBE_VERIFIER_TIMEOUT_SEC >= 5 * gr.PROBE_TIMEOUT_SEC + 300
+
+
 def test_classify_probe_buckets():
     before = {"a": "failed", "b": "passed", "c": "failed", "d": "passed", "e": "error"}
     after = {"a": "passed", "b": "passed", "c": "failed", "d": "error", "e": "passed"}
-    assert gr.classify_probe(before, after) == {"fail_to_pass": ["a", "e"], "pass_to_pass": ["b"], "dropped": {"network_or_env": ["c"], "gold_regressions": ["d"]}}
+    assert gr.classify_probe(before, after) == {"fail_to_pass": ["a", "e"], "pass_to_pass": ["b"], "dropped": {"network_or_env": ["c"], "gold_regressions": ["d"], "other": []}}
     assert gr.probe_kind({"image": "x:latest"}) == "image" and gr.probe_kind({"install_command": "pip install -e ."}) == "dockerfile"
 
 
@@ -375,7 +438,7 @@ def test_reconstruct_probe_from_job_dir_and_probe_candidates_reuses_measurements
     f = "tests/test_writer.py::"
     rec = gr.reconstruct_probe(row)
     assert rec["fail_to_pass"] == [f + "test_new_a", f + "test_new_b"] and rec["pass_to_pass"] == [f + "test_old"]
-    assert rec["dropped"] == {"network_or_env": [f + "test_socket"], "gold_regressions": []} and rec["probe"]["reconstructed"] is True
+    assert rec["dropped"] == {"network_or_env": [f + "test_socket"], "gold_regressions": [], "other": [], "order_dependent": []} and rec["probe"]["reconstructed"] is True
     assert rec["probe"]["kind"] == "dockerfile" and rec["probe"]["repo_dir"] == "/app" and rec["probe"]["test_python"] == "/usr/local/bin/python"
     assert rec["probe"]["binding"] == gr.probe_binding(row) and rec["probe"]["job_dir"] == row["probe_dir"] and rec["probe"]["probed_at"]
     assert rec["probe"]["command"] == "/usr/local/bin/python -I /tests/run_pytest.py -rA -p no:cacheprovider --junitxml={junit_path} tests/test_writer.py"
@@ -416,13 +479,14 @@ def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_row
 
     def fake_probe(row, ws):
         probed.append(row["instance_id"])
+        bound = {"kind": "image", "statuses": {"test": {"x": "failed"}, "gold": {"x": "passed"}}, "binding": gr.probe_binding(row)}
         if row["instance_id"] == "pydata__xarray-2":
-            return {"fail_to_pass": [], "pass_to_pass": [f + "test_old"], "dropped": {"network_or_env": [f + "test_new"], "gold_regressions": []}, "statuses": {},
-                    "dockerfile": "FROM x", "probe_dir": "/j/2", "test_python": gr.SWEBENCH_PYTHON, "probe": {"kind": "image", "statuses": {"test": {}, "gold": {}}, "probe_dir": "/j/2"}}
+            return {"fail_to_pass": [], "pass_to_pass": [f + "test_old"], "dropped": {"network_or_env": [f + "test_new"], "gold_regressions": [], "other": [], "order_dependent": []}, "statuses": {},
+                    "dockerfile": "FROM x", "probe_dir": "/j/2", "test_python": gr.SWEBENCH_PYTHON, "probe": {**bound, "probe_dir": "/j/2"}}
         if row["instance_id"] == "pydata__xarray-4":
             raise ValueError("unreliable base/gold probe; keep evidence and reject")
-        return {"fail_to_pass": [f + "test_new"], "pass_to_pass": [f + "test_old", f + "test_extra"], "dropped": {"network_or_env": [f + "test_needs_network"], "gold_regressions": []},
-                "statuses": {}, "dockerfile": "FROM x", "probe_dir": "/j/1", "test_python": gr.SWEBENCH_PYTHON, "probe": {"kind": "image", "statuses": {"test": {}, "gold": {}}, "probe_dir": "/j/1"}}
+        return {"fail_to_pass": [f + "test_new"], "pass_to_pass": [f + "test_old", f + "test_extra"], "dropped": {"network_or_env": [f + "test_needs_network"], "gold_regressions": [], "other": [], "order_dependent": []},
+                "statuses": {}, "dockerfile": "FROM x", "probe_dir": "/j/1", "test_python": gr.SWEBENCH_PYTHON, "probe": {**bound, "probe_dir": "/j/1"}}
     monkeypatch.setattr(gr, "probe_tests", fake_probe)
     out = probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=5)
     assert out == tmp_path / "swebench-annotated.judged.probed.jsonl" and probed == ["pydata__xarray-1", "pydata__xarray-2", "pydata__xarray-4"]   # keep=False row skipped
@@ -439,6 +503,20 @@ def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_row
     summary = json.loads(out.with_suffix(".summary.json").read_text())
     assert summary == {"rows": 4, "probed": 3, "reproducible": 1, "not-reproducible-offline": 1, "probe-failed": 1, "skipped-not-accepted": 1}
     # build budget and explicit instance selection (which ignores keep)
+    # re-running on the probed file writes it back in place and never overwrites the SWE-bench originals with a measurement
+    probed.clear()
+    again = probe_candidates(Workspace(tmp_path / "ws"), out, max_builds=5)
+    assert again == out and probed == []                                                              # the bound probe passes through; rejected rows are not accepted any more
+    got2 = {r["instance_id"]: r for r in (json.loads(l) for l in out.read_text().splitlines())}
+    assert got2["pydata__xarray-1"]["swebench_fail_to_pass"] == [f + "test_new", f + "test_needs_network"] and got2["pydata__xarray-1"]["fail_to_pass"] == [f + "test_new"]
+    assert json.loads(out.with_suffix(".summary.json").read_text()) == {"rows": 3, "probed": 0, "already-probed": 1, "skipped-not-accepted": 2}
+    assert not (tmp_path / "swebench-annotated.judged.probed.probed.jsonl").exists()
+    # explicit ids re-probe even rejected rows, and the originals survive a second measurement
+    out2 = probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=5)
+    probed.clear()
+    again = probe_candidates(Workspace(tmp_path / "ws"), out2, instance_ids=["pydata__xarray-1", "pydata__xarray-2"], max_builds=5)
+    got3 = {r["instance_id"]: r for r in (json.loads(l) for l in again.read_text().splitlines())}
+    assert probed == [] and got3["pydata__xarray-2"]["swebench_fail_to_pass"] == [f + "test_new", f + "test_needs_network"] and got3["pydata__xarray-2"]["fail_to_pass"] == []
     probed.clear()
     probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=1)
     assert probed == ["pydata__xarray-1"] and json.loads(out.with_suffix(".summary.json").read_text())["build-budget-exhausted"] == 2

@@ -66,7 +66,9 @@ def probe_candidates(ws: Workspace, judged_path: Path | str, instance_ids: list[
     from swesim.sources import github_repo as gr
 
     judged_path = Path(judged_path)
-    out = judged_path.with_suffix(".probed.jsonl")
+    # Re-running on a probed file writes it back in place (rows are fully read first); the swebench_* originals set by the
+    # first probe are kept via setdefault, so the SWE-bench lists are never overwritten by an earlier measurement.
+    out = judged_path if judged_path.name.endswith(".probed.jsonl") else judged_path.with_suffix(".probed.jsonl")
     rows = [json.loads(line) for line in judged_path.read_text().splitlines() if line.strip()]
     wanted = set(instance_ids) if instance_ids else None
     summary: Counter = Counter()
@@ -78,6 +80,7 @@ def probe_candidates(ws: Workspace, judged_path: Path | str, instance_ids: list[
         row["fail_to_pass"], row["pass_to_pass"] = res["fail_to_pass"], res["pass_to_pass"]
         row["test_python"] = res["test_python"]
         row["probe"] = res["probe"]
+        row["test_order"] = list(res["probe"].get("order") or [])  # collected definition order; the runner lists ids in it
         if not row["fail_to_pass"]:
             row["reject_reason"] = "not-reproducible-offline"
             row.setdefault("judge", {})["keep"] = False
