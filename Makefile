@@ -46,8 +46,8 @@ TFVARS := infra/env.auto.tfvars.json
 STATE_BUCKET := $(PROJECT)-swesim-tfstate
 ENV_FILE_FLAGS := --env-file $(SWESIM_ENV_FILE) $(foreach f,$(EXTRA_ENV_FILES),--env-file $(f))
 
-.PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build deploy \
-        verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
+.PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build pin-image \
+        deploy verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
 
 check:
 	uv sync --extra dev --frozen
@@ -95,9 +95,16 @@ seed-registry:
 build: require-project
 	bash scripts/cloud/build.sh $(PROJECT) $(REGION) $(SHA)
 
-deploy: require-project
+# The pinned digest is persisted in the git-ignored infra/image.auto.tfvars.json, so a later plain `make apply`
+# keeps the pools on that digest instead of silently reverting them to :latest.
+pin-image: require-project
 	digest=$$(bash scripts/cloud/build.sh $(PROJECT) $(REGION) $(SHA) | tail -n1); \
-	$(MAKE) apply TF_ARGS="-var image=$$digest"
+	case "$$digest" in *@sha256:*) ;; *) echo "build did not yield a digest; not applying"; exit 1 ;; esac; \
+	printf '{"image": "%s"}\n' "$$digest" > infra/image.auto.tfvars.json; \
+	echo "pinned $$digest"
+
+deploy: require-project pin-image
+	$(MAKE) apply
 	$(MAKE) verify-cloud
 
 verify-cloud:
@@ -128,8 +135,8 @@ cloud-bootstrap: require-project tf-init tfvars
 	$(MAKE) apply TF_ARGS="-var deploy_workloads=false"
 	$(MAKE) push-secrets
 	$(MAKE) seed-registry
-	digest=$$(bash scripts/cloud/build.sh $(PROJECT) $(REGION) $(SHA) | tail -n1); \
-	$(MAKE) apply TF_ARGS="-var image=$$digest"
+	$(MAKE) pin-image
+	$(MAKE) apply
 	$(MAKE) migrate
 	$(MAKE) verify-cloud
 
