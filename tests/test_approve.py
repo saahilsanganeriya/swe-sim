@@ -4,9 +4,11 @@ import pytest
 
 from swesim.models import ScenarioSpec, minimal_spec_dict
 from swesim.paths import Workspace
-from swesim.stages.approve import approve_scenario, auto_gates
+from swesim.stages.approve import approve_scenario, auto_gates, fact_scope_failures
+from test_audit_rubric import F2P_7283, P2P_7283, TEST_PATCH_7283, spec_dict_7283
 
-AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "withholding-leak", "withheld-reconstructs", "controls"]
+AUTO_GATES = ["schema", "assets", "judge-accept", "on-request-fact-linked-to-f2p", "requirements-grounded", "fact-scope", "withholding-leak",
+              "withheld-reconstructs", "controls"]
 
 
 def _draft(tmp_path, d=None, write_assets=True):
@@ -165,3 +167,57 @@ def test_requirements_must_be_grounded_in_a_visible_fact_or_the_thread(tmp_path)
     ws, sdir, d2 = _draft(tmp_path, d)
     assert approve_scenario(ws, d2["id"], auto=True)["approved"] is True
     assert "requirements-grounded" in json.loads((sdir / "approval.json").read_text())["gates"]
+
+
+def _draft_7283(tmp_path, d=None):
+    """The pytest-7283 draft with its real hidden test patch as the test asset."""
+    ws, sdir, d = _draft(tmp_path, d or spec_dict_7283())
+    patch = TEST_PATCH_7283.encode()
+    (sdir / "assets" / "test.patch").write_bytes(patch)
+    d["assets"]["test.patch"].update(sha256=hashlib.sha256(patch).hexdigest(), bytes=len(patch))
+    (sdir / "scenario.draft.json").write_text(json.dumps(d))
+    return ws, sdir, d
+
+
+def test_fact_scope_gate_rejects_a_visible_fact_naming_a_pass_to_pass_only_parametrisation(tmp_path):
+    """pytest-7283 (2026-09-13): f05 names `pytest's skip marker`, the `@pytest.mark.skip` parametrisation only a PASS_TO_PASS
+    test carries; acting on it regressed a pass-to-pass test in the full condition. The gate rejects with the fact id and the
+    offending test id; f01 (the FAIL_TO_PASS parametrisation) and the author-only f09 pass. Nothing is written."""
+    ws, sdir, d = _draft_7283(tmp_path)
+    out = approve_scenario(ws, d["id"], auto=True)
+    assert out["approved"] is False and out["mode"] == "auto"
+    scope = [r for r in out["reasons"] if r.startswith("fact f05 is outside the contract")]
+    assert len(scope) == 1 and P2P_7283[0] in scope[0] and "@pytest.mark.skip" in scope[0] and "FAIL_TO_PASS" in scope[0]
+    assert not any("f01" in r or "f09" in r for r in out["reasons"]) and not any("on-request" in r for r in out["reasons"])
+    assert not (sdir / "scenario.json").exists() and not (sdir / "approval.json").exists()
+    # the gate reads the ids alone when the asset is not on disk yet (pre-check), and stays silent for the F2P-linked fact
+    spec = ScenarioSpec.model_validate(d)
+    fails = fact_scope_failures(spec, tmp_path / "nowhere")
+    assert len(fails) == 1 and fails[0].startswith("fact f05") and P2P_7283[0] in fails[0]
+    assert any(r.startswith("fact f05") for r in auto_gates(spec, sdir))
+
+
+def test_fact_scope_gate_passes_a_draft_whose_facts_stay_within_the_contract(tmp_path):
+    d = spec_dict_7283()
+    d["ledger"] = [f for f in d["ledger"] if f["id"] != "f05"]           # f09 (author-only, same text) stays and is exempt
+    ws, sdir, d = _draft_7283(tmp_path, d)
+    assert fact_scope_failures(ScenarioSpec.model_validate(d), sdir) == []
+    out = approve_scenario(ws, d["id"], auto=True)
+    assert out["approved"] is True
+    assert json.loads((sdir / "approval.json").read_text())["gates"] == AUTO_GATES and "fact-scope" in AUTO_GATES
+
+
+def test_fact_scope_gate_rejects_an_identifier_found_only_in_a_pass_to_pass_body(tmp_path):
+    d = spec_dict_7283()
+    patch = TEST_PATCH_7283 + ("\n+\n+def test_pdb_teardown_called(testdir, monkeypatch):\n+    tracked = teardown_call_log(testdir)\n"
+                               "+    assert tracked == [\"setUp:test_1\", \"tearDown:test_1\"]\n")
+    d["ledger"][1] = {"id": "f05", "text": "The teardown_call_log must keep recording setUp and tearDown for tests that run", "kind": "behavior",
+                      "provenance": "authored", "authored_rationale": "x", "discovery": "on-request", "tests": []}
+    ws, sdir, d = _draft(tmp_path, d)
+    (sdir / "assets" / "test.patch").write_bytes(patch.encode())
+    d["assets"]["test.patch"].update(sha256=hashlib.sha256(patch.encode()).hexdigest(), bytes=len(patch.encode()))
+    (sdir / "scenario.draft.json").write_text(json.dumps(d))
+    out = approve_scenario(ws, d["id"], auto=True)
+    assert out["approved"] is False
+    reason = next(r for r in out["reasons"] if r.startswith("fact f05"))
+    assert "teardown_call_log" in reason and "testing/test_unittest.py::test_pdb_teardown_called" in reason
