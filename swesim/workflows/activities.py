@@ -540,14 +540,21 @@ async def probe_candidate_activity(p: dict) -> dict:
     """Measure FAIL_TO_PASS / PASS_TO_PASS on base and gold for one judged row (Harbor on Modal; harbor_cli reuses a job dir
     with a terminal result and gives an abandoned one, left by a worker-pool roll, a bounded fresh attempt with recorded
     lineage; the 4th abandonment is a HarborRunError). The probed row replaces the row in the
-    per-candidate judged file, so draft_activity reads the measured lists. Retained: a row with probe.measured is reused."""
+    per-candidate judged file, so draft_activity reads the measured lists. Retained: a row with probe.measured is reused,
+    unless it is stale (`_probe_staleness`, B-P2-1: measured without the grading identity, or bound to another
+    base_commit/test_patch): then its terminal Harbor result is retired beside its evidence (`_retire_stale_probe`) and the
+    row is probed again in a fresh job, so drafting never refuses a row this activity handed it."""
     judged_path = Path(p["judged_path"]); iid = p["instance_id"]; sid = p.get("scenario_id") or scenario_id_for(iid)
     rows = [json.loads(line) for line in judged_path.read_text().splitlines() if line.strip()]
     idx = next((i for i, r in enumerate(rows) if r.get("instance_id") == iid), None)
     if idx is None:
         raise ApplicationError(f"candidate {iid} not in {judged_path}", non_retryable=True)
     row = rows[idx]
-    if not _probe_measured(row):
+    stale = _probe_staleness(row)
+    if stale or not _probe_measured(row):
+        retired = _retire_stale_probe(row, stale) if stale else []
+        if stale:
+            log.info("re-probe candidate=%s reason=%s retired=%s", iid, stale, retired)
         M = importlib.import_module("swesim.stages.mine")
         probe_candidates = getattr(M, "probe_candidates", None)
         dropped: dict = {}
@@ -577,7 +584,9 @@ async def probe_candidate_activity(p: dict) -> dict:
                 res = await blocking(lambda: probe_tests(row, WS))
             except ValueError as e:
                 # Measured but unusable (nothing fails on base and passes with gold; unreliable base/gold statuses): terminal.
-                row.update(fail_to_pass=[], probe={**(row.get("probe") or {}), "error": f"ValueError: {e}"}, reject_reason="not-reproducible-offline")
+                # A stale block is not carried into the error row: it would read as stale again and re-probe on every rerun.
+                previous = {"error": f"ValueError: {e}", "retired": retired} if stale else {**(row.get("probe") or {}), "error": f"ValueError: {e}"}
+                row.update(fail_to_pass=[], probe=previous, reject_reason="not-reproducible-offline")
                 dropped = {"probe-error": str(e)}
             else:
                 row.update(fail_to_pass=list(res.get("fail_to_pass") or []), pass_to_pass=list(res.get("pass_to_pass") or []),
@@ -588,7 +597,7 @@ async def probe_candidate_activity(p: dict) -> dict:
                 dropped = dict(res.get("dropped") or {})
                 if not row["fail_to_pass"]:
                     row["reject_reason"] = "not-reproducible-offline"
-        row["probe_workflow"] = {"measured_at": time.time(), "dropped": dropped}
+        row["probe_workflow"] = {"measured_at": time.time(), "dropped": dropped, **({"reprobed": {"reason": stale, "retired": retired}} if stale else {})}
         rows[idx] = row
         tmp = judged_path.with_name(judged_path.name + ".tmp"); tmp.write_text("".join(json.dumps(r) + "\n" for r in rows)); os.replace(tmp, judged_path)
     probe = row.get("probe") or {}
@@ -606,6 +615,54 @@ def _probe_measured(row: dict) -> bool:
     probe_candidates/probe_tests, or mine's own probe output (`probe_dir`), or this activity's marker."""
     probe = row.get("probe") or {}
     return bool(probe.get("statuses") or probe.get("error") or row.get("probe_dir") or row.get("probe_workflow"))
+
+
+def _probe_staleness(row: dict) -> str | None:
+    """Why a measured probe row cannot be reused (B-P2-1), or None. A `probe` block with statuses must carry the grading identity
+    (`github_repo.GRADING_USER`) and the binding of this row's base_commit/test_patch (`probe_binding`): a row measured before
+    the identity was recorded, or edited since its measurement, is stale — re-probed, never drafted from and never rejected for
+    it. Error rows and legacy probe_dir-only rows carry nothing to re-verify here (draft's own gate still applies to them)."""
+    probe = row.get("probe") or {}
+    if not probe.get("statuses"):
+        return None
+    gr = importlib.import_module("swesim.sources.github_repo")  # lazily: tests substitute the module
+    grading_user, binding_of = getattr(gr, "GRADING_USER", None), getattr(gr, "probe_binding", None)
+    if grading_user is not None and probe.get("test_user") != grading_user:
+        return f"probe did not record the grading identity {grading_user!r} (recorded {probe.get('test_user') or 'none'!r}); re-probing"
+    if binding_of is not None and probe.get("binding") != binding_of(row):
+        return "probe binding differs from this row's base_commit/test_patch (edited since its measurement); re-probing"
+    return None
+
+
+def _retire_stale_probe(row: dict, reason: str) -> list[str]:
+    """Retire the stale measurement's terminal Harbor result(s) on this worker so the re-probe runs a fresh job: `result.json` of
+    every terminal trial dir of the recorded job is renamed `result.stale-<utc>.json` beside its evidence (nothing is deleted;
+    `verifier/probe.json` stays for audit), a `stale.json` names the reason, and harbor_cli's lineage for the job records the
+    retirement. `harbor_cli.run_task` then sees an abandoned job and launches `<job>--attempt-<n>` (bounded by
+    MAX_FRESH_ATTEMPTS) instead of reusing the result whose probe.json lacks the identity. The recorded path may come from
+    another host's mount, so the job is resolved by name under this worker's `jobs/probe`. Returns the retired trial dirs."""
+    from swesim import harbor_cli
+
+    probe = row.get("probe") or {}
+    recorded = probe.get("job_dir") or probe.get("probe_dir") or row.get("probe_dir")
+    if not recorded:
+        return []
+    jobs = WS.jobs_dir / "probe"; job_dir = jobs / Path(str(recorded)).parent.name
+    if not job_dir.is_dir():
+        return []
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"); retired: list[str] = []
+    for result in sorted(job_dir.glob("*/result.json")):
+        os.replace(result, result.with_name(f"result.stale-{stamp}.json"))
+        atomic_json(result.parent / "stale.json", {"reason": reason, "at": stamp, "retired_by": "probe_candidate_activity",
+                                                   "result": result.with_name(f"result.stale-{stamp}.json").name, "worker_image_digest": SETTINGS.worker_image_digest})
+        retired.append(str(result.parent))
+    if retired:
+        lineage = harbor_cli.read_lineage(jobs, job_dir.name)
+        lineage["attempts"] = [*lineage.get("attempts", []),
+                               {"attempt": "retired", "job_dir": str(job_dir), "previous_dir": retired[-1], "reason": f"stale-probe-evidence: {reason}",
+                                "at": datetime.now(timezone.utc).isoformat(), "worker_image_digest": SETTINGS.worker_image_digest}]
+        atomic_json(harbor_cli.lineage_path(jobs, job_dir.name), lineage)
+    return retired
 
 
 def _read_row(path: Path, iid: str) -> dict | None:
@@ -808,6 +865,8 @@ def plan_trials(p: dict) -> dict:
         for trial in trials:
             trial["audit_model"] = p["audit_model"]
     provenance = {k: admission[k] for k in ("identity", "evidence_path") if admission.get(k)}  # the decision these trials were planned under
+    if admission.get("overridden"):
+        provenance["overridden"] = True
     return {"scenario_id": spec.id, "trials": trials, **({"admission": provenance} if provenance else {})}
 
 
@@ -817,10 +876,58 @@ def _frontier_preflight(p: dict) -> dict:
     return preflight(WS, SETTINGS, p)
 
 
+def _override_of(p: dict) -> dict | None:
+    """A well-formed operator override on the run's params (`{"actor", "reason"}`, both non-empty strings); None otherwise."""
+    o = p.get("frontier_override")
+    if not isinstance(o, dict) or not all(isinstance(o.get(k), str) and o[k].strip() for k in ("actor", "reason")):
+        return None
+    return {"actor": o["actor"].strip(), "reason": o["reason"].strip()}
+
+
+def _record_override(evidence_path: str, override: dict, workflow_id: str | None) -> None:
+    """Write the operator's override into the recorded frontier decision (an `override` block beside the untouched `decision`), so
+    the file says who proceeded past the refusal and why; `_verify_override` reads it back at every planning step."""
+    path = Path(evidence_path)
+    record = json.loads(path.read_text())
+    record["override"] = {**override, "at": datetime.now(timezone.utc).isoformat(), "workflow_id": workflow_id}
+    atomic_json(path, record)
+
+
+def _verify_override(p: dict, ref: dict) -> dict:
+    """The recorded frontier decision a workflow carries with `overridden`: the same file checks `frontier.verify_admission` makes
+    (a decision under evidence/sweep, named by its own request, binding the same policy keys), except that the decision may be a
+    refusal when the file records an operator `override` (actor, reason) — written by `frontier_gate_activity` when the run's
+    params carried one. A forged flag over a file without that block is refused. The requested scenarios are not narrowed."""
+    from swesim.stages import frontier as F
+
+    ref_path = ref.get("evidence_path")
+    path = Path(str(ref_path or "")).resolve(); root = WS.layout.evidence_dir("sweep").resolve()
+    if not ref_path or not path.is_relative_to(root) or not path.name.startswith("frontier-"):
+        raise ValueError("frontier admission evidence must be a recorded decision under evidence/sweep")
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise ValueError(f"frontier admission evidence unreadable: {type(e).__name__}") from e
+    decision, recorded, override = record.get("decision") or {}, record.get("request") or {}, record.get("override")
+    if path.name != f"frontier-{F.identity_of(recorded)}.json":
+        raise ValueError("frontier admission evidence does not match its recorded request")
+    if not isinstance(override, dict) or not (override.get("actor") and override.get("reason")):
+        raise ValueError("frontier admission evidence records no operator override; the refusal stands")
+    mine = F.request_of(p)
+    diff = [k for k in F.POLICY_KEYS if recorded.get(k) != mine.get(k)]
+    if diff:
+        raise ValueError(f"frontier admission was recorded for a different request ({', '.join(diff)} differ)")
+    return {**decision, "allowed": True, "overridden": True, "override": override, "evidence_path": str(path), "identity": F.identity_of(recorded), "verified": True}
+
+
 def _frontier_admission(p: dict) -> dict:
     """The admission `plan_trials` enforces (`frontier.admission_for_plan`); refuses with a ValueError (non-retryable) unless the
-    request is admitted and the planned scenario is among the admitted ids."""
+    request is admitted and the planned scenario is among the admitted ids — or the workflow carries a recorded operator override
+    (`admission.overridden`, verified by `_verify_override`), which plans the scenarios as requested."""
     from swesim.stages.frontier import admission_for_plan, frontier_requested
+    ref = p.get("admission")
+    if isinstance(ref, dict) and ref.get("overridden") and frontier_requested(p):
+        return _verify_override(p, ref)
     admission = admission_for_plan(WS, SETTINGS, p)
     if not admission.get("allowed"):
         raise ValueError("frontier admission rejected: " + "; ".join(admission.get("reasons") or ["no admission"]))
@@ -834,8 +941,16 @@ def _frontier_admission(p: dict) -> dict:
 async def frontier_gate_activity(p: dict) -> dict:
     """RunTasksWorkflow's admission gate (CONTROL): the durable decision for the whole request. Tier A–C requests pass through;
     a Tier D/E request returns `allowed`, the admitted `scenario_ids`, `reasons`, the forecast and `evidence_path`/`identity`
-    that later planning verifies (`plan_trials`)."""
-    return await blocking(lambda: _frontier_preflight(p))
+    that later planning verifies (`plan_trials`). A refused request whose params carry an operator `frontier_override`
+    gets the override recorded in the decision file (`override_recorded`); the decision itself is untouched — the workflow
+    decides to proceed (`RunTasksWorkflow`, behind its patch) and planning verifies the recorded override."""
+    result = await blocking(lambda: _frontier_preflight(p))
+    override = _override_of(p)
+    if override and not result.get("allowed") and result.get("evidence_path"):
+        info = _activity_info()
+        await blocking(lambda: _record_override(result["evidence_path"], override, p.get("workflow_id") or (info.workflow_id if info else None)))
+        return {**result, "override_recorded": True}
+    return result
 
 
 @swesim_activity
@@ -846,12 +961,16 @@ async def plan_trials_activity(p: dict) -> dict:
 @swesim_activity
 async def prepare_trial_plan_activity(p: dict) -> dict:
     """The immutable trial plan for one scenario of a RunTasksWorkflow. A cached plan is returned only under the same admission
-    check a fresh plan needs (a plan page is never a way around the frontier gate)."""
+    check a fresh plan needs (a plan page is never a way around the frontier gate). A `planned` row per trial is indexed
+    in-process before the workflow fans out (P1-4)."""
     path = batching.plan_path(WS, p["workflow_id"], p["scenario_id"])
     if path.exists():
         await blocking(lambda: _frontier_admission(p))
-        return batching.write_plan(path, [])
-    return await blocking(lambda: batching.trial_plan(WS, path, plan_trials(p)["trials"]))
+        prepared = batching.write_plan(path, [])
+    else:
+        prepared = await blocking(lambda: batching.trial_plan(WS, path, plan_trials(p)["trials"]))
+    await _index_planned(path)
+    return prepared
 
 
 @swesim_activity
@@ -972,13 +1091,75 @@ def launch_once(p: dict) -> dict:
     return _launch_once(_layout(), launcher(), p, image_digest=SETTINGS.worker_image_digest, origin=SETTINGS.origin)
 
 
+def _index_live_trial_sync(payload: dict) -> dict:
+    from swesim.index import activities as IA  # the index stream's module, imported lazily: this module imports without it
+
+    return IA.index_trial(payload, SETTINGS)
+
+
+async def index_live_trial(trial_id: str, status: str, request_path: str | None) -> dict:
+    """A live trial row (P1-4: `planned` from the planner on CONTROL, `running` from the await on TRIALS) written in-process:
+    these pools have no workflow to hook from. The index is disposable bookkeeping: a disabled or unreachable database is
+    reported and logged, never raised."""
+    payload = {"trial_id": trial_id, "status": status, "request_path": request_path}
+    try:
+        return await blocking(lambda: _index_live_trial_sync(payload))  # heartbeats while queued behind other stage threads (never a bare to_thread)
+    except Exception as e:  # noqa: BLE001 - bookkeeping never decides a stage's outcome
+        reason = f"{type(e).__name__}: {str(e)[:200]}"
+        log.warning("live trial row not indexed trial=%s status=%s: %s", trial_id, status, reason)
+        return {"indexed": False, "reason": reason}
+
+
+async def _index_planned(plan_path: Path) -> None:
+    """`planned` rows for every trial of a plan, before the workflow fans out; the cached plan re-upserts the same rows."""
+    try:
+        items = json.loads(plan_path.read_text()).get("items") or []
+    except (OSError, ValueError, AttributeError):
+        return
+    for item in items:
+        if isinstance(item, dict) and item.get("trial_id"):
+            await index_live_trial(item["trial_id"], "planned", item.get("request_path"))
+
+
+def _record_verdict(d: Path, tid: str, status: str, reason: str) -> None:
+    """Make the await's verdict durable when no file carries it yet (status.json, write-then-rename), so a rebuild of the index
+    reads what the workflow saw. record.json, runner-error.json or a terminal status.json already there are left alone (the
+    launcher's evidence rules read them first); a record.json that lands later still wins."""
+    if not d.is_dir() or (d / "record.json").exists() or (d / "runner-error.json").exists():
+        return
+    existing = _read_json(d / "status.json")
+    if existing.get("status") not in (None, "", "running"):
+        return
+    atomic_json(d / "status.json", {**existing, "trial_id": tid, "status": status, "started_at": existing.get("started_at"), "finished_at": time.time(),
+                                    "reason": reason, "verdict_source": "await_trial_activity", "origin": SETTINGS.origin,
+                                    "worker_image_digest": SETTINGS.worker_image_digest})
+
+
+def _activity_info():
+    """`activity.info()` inside an activity, None outside it (direct callers, tests)."""
+    return activity.info() if activity.in_activity() else None
+
+
+def _with_trial_identity(p: dict) -> dict:
+    """The TrialWorkflow's own workflow id and run id on the request (P2-11: record.json's `workflow_id` / `run_id`, stamped into
+    launch.json too): from the workflow when it passed `trial_workflow_id` / `run_id`, else from this activity's context; unchanged
+    outside an activity."""
+    if p.get("trial_workflow_id") and p.get("run_id"):
+        return p
+    info = _activity_info()
+    if info is None:
+        return p
+    return {**p, "trial_workflow_id": p.get("trial_workflow_id") or info.workflow_id, "run_id": p.get("run_id") or info.workflow_run_id}
+
+
 @swesim_activity
 async def launch_trial_activity(p: dict) -> dict:
     if p.get("request_path"):
         request = json.loads(batching.checked_path(WS, p["request_path"]).read_text())
         if request["trial_id"] != p["trial_id"]:
             raise ValueError("trial request path belongs to a different trial")
-        p = {**request, "run_workflow_id": p.get("run_workflow_id")}
+        p = {**request, "run_workflow_id": p.get("run_workflow_id"), **{k: p[k] for k in ("trial_workflow_id", "run_id") if p.get(k)}}
+    p = _with_trial_identity(p)
     async with LAUNCH_SLOTS:
         out = await blocking(lambda: launch_once(p))
     # One line per launch decision; the Cloud Logging metric `swesim/trial_reconcile` counts `decision=reconcile`.
@@ -989,8 +1170,11 @@ async def launch_trial_activity(p: dict) -> dict:
 
 @swesim_activity
 async def await_trial_activity(p: dict) -> dict:
-    """Read-only, retryable, heartbeating poll until terminal evidence exists. Never launches."""
+    """Read-only, retryable, heartbeating poll until terminal evidence exists. Never launches. The first poll that sees the runtime
+    running indexes a `running` row (P1-4); a verdict the files do not carry (unresolved, unit-failed) is made durable in
+    status.json (`_record_verdict`) so the index rebuilds to what the workflow saw."""
     tid = p["trial_id"]; d = trial_dir(tid); unit = unit_name(tid); deadline = time.monotonic() + AWAIT_DEADLINE_SEC; polls = 0
+    reported_running = False
     while True:
         polls += 1
         ev = read_evidence(tid)
@@ -1004,12 +1188,16 @@ async def await_trial_activity(p: dict) -> dict:
             # flushing. Fall through: keep polling while the runtime runs; report incomplete evidence once it has stopped.
         if ev.has_runner_error:
             return {"trial_id": tid, "status": "runner-error", "unit": unit, "error": _read_json(d / "runner-error.json").get("error")}
+        if not reported_running and ev.runtime_state == "running":
+            reported_running = True
+            await index_live_trial(tid, "running", p.get("request_path"))
         decision = decide_launch(ev)
         if decision == "launch-failed":
             return {"trial_id": tid, "status": "launch-failed", "unit": unit, "reason": "launcher refused or returned nonzero; nothing ran; never relaunch automatically"}
         if decision == "unresolved":
-            return {"trial_id": tid, "status": "unresolved", "unit": unit,
-                    "reason": "launch evidence exists but the runtime is gone without a terminal record (VM loss or manual cleanup); inspect the runtime's logs and Harbor job; never relaunch"}
+            reason = "launch evidence exists but the runtime is gone without a terminal record (VM loss or manual cleanup); inspect the runtime's logs and Harbor job; never relaunch"
+            _record_verdict(d, tid, "unresolved", reason)
+            return {"trial_id": tid, "status": "unresolved", "unit": unit, "reason": reason}
         if decision == "launch" and polls >= LAUNCH_GRACE_POLLS:
             return {"trial_id": tid, "status": "launch-failed", "unit": unit, "reason": "no launch evidence for this trial; the launch activity did not reach the launcher"}
         if decision == "ingest" and ev.runtime_state != "running":
@@ -1018,11 +1206,14 @@ async def await_trial_activity(p: dict) -> dict:
                     "reason": "terminal evidence incomplete (status.json terminal without record.json, or record.json unreadable) and the runtime is not running; read its logs; never relaunch"}
         if decision == "reconcile":
             if ev.runtime_state == "failed":
-                return {"trial_id": tid, "status": "unit-failed", "unit": unit, "runtime": ev.runtime_detail,
-                        "reason": "runtime failed without a terminal record; read its logs; never relaunch"}
+                reason = "runtime failed without a terminal record; read its logs; never relaunch"
+                _record_verdict(d, tid, "unit-failed", reason)
+                return {"trial_id": tid, "status": "unit-failed", "unit": unit, "runtime": ev.runtime_detail, "reason": reason}
             if ev.runtime_state in ("succeeded", "unknown"):
-                return {"trial_id": tid, "status": "unresolved", "unit": unit, "runtime": ev.runtime_detail,
-                        "reason": "runtime finished (or cannot be seen from this worker) without terminal evidence; inspect its logs; never relaunch"}
+                reason = "runtime finished (or cannot be seen from this worker) without terminal evidence; inspect its logs; never relaunch"
+                if ev.runtime_state == "succeeded":  # a runtime this worker cannot see gets no verdict written on its behalf
+                    _record_verdict(d, tid, "unresolved", reason)
+                return {"trial_id": tid, "status": "unresolved", "unit": unit, "runtime": ev.runtime_detail, "reason": reason}
         if time.monotonic() >= deadline:
             raise ApplicationError("no terminal evidence before the await deadline; inspect the same runtime; never relaunch", non_retryable=True)
         await asyncio.sleep(POLL_SECONDS)
@@ -1074,6 +1265,16 @@ def recorded_spend(settings: Settings, ws: Workspace) -> dict:
             unreadable += 1
     return {"spend_usd": total, "source": fallback, "records": records, "unpriced_records": unpriced,
             **accounting, "unreadable_cost_files": unreadable, "spend_complete": accounting["usage_complete"] and not (unpriced or unreadable)}
+
+
+@swesim_activity
+async def reconcile_workflows_activity(p: dict) -> dict:
+    """P1-6 (CONTROL): close stale `running` workflow rows from Temporal's own view of each execution
+    (`swesim.workflows.client.reconcile_workflows`). `{"max_age_hours"?: int}` (default 48; 0 or null: every running row)."""
+    from swesim.workflows import client
+
+    hours = p.get("max_age_hours", 48)
+    return await client.reconcile_workflows(SETTINGS, max_age_hours=int(hours) if hours else None)
 
 
 @swesim_activity
@@ -1209,6 +1410,7 @@ ALL = [probe_models_activity, discover_activity, mine_activity, judge_activity, 
        prepare_trial_plan_activity, prepare_candidate_plan_activity, read_plan_page_activity, checkpoint_workflow_activity]
 ALL.append(difficulty_label_activity)
 ALL.append(frontier_gate_activity)
+ALL.append(reconcile_workflows_activity)
 
 if __name__ == "__main__":
     raise SystemExit(main())

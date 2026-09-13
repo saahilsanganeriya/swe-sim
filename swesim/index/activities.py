@@ -8,6 +8,9 @@ Contract
   or passed at (`phase`, `stage`, `status`, `gate`, `reasons`, `terminal`, ids); the receipt is published as an immutable
   snapshot in the record *before* SQL, even when the index is disabled, and the candidate row is reprojected from files
   plus receipts so a rejected candidate is never shown as kept. Its id is content-derived: a retry is idempotent.
+- `index_trial_activity` also takes a workflow's live report (P1-4): `{"trial_id", "status": planned | launched | running |
+  <terminal verdict>, "request"? | "request_path"?}`; it builds the row before any trial file exists and never regresses a
+  terminal row (`index_trial`).
 - Each reads the files through `Layout`, projects rows with `swesim.index.project`, upserts them, and returns
   `{"indexed": True, "rows": n}`. Idempotent: the same payload twice leaves the same rows.
 - When the index is disabled (`Settings.database_url` unset), index-only activities return
@@ -201,17 +204,46 @@ def index_discovery(p: dict, settings: Settings | None = None) -> dict:
     return {"indexed": True, "rows": 1, "discovery_id": row.discovery_id} if store is not None else {**DISABLED, "discovery_id": row.discovery_id}
 
 
+def _trial_request(p: dict, layout: Layout, tid: str) -> dict | None:
+    """The request payload a live report carries: inline (`request`) or by path (`request_path`, confined to the workspace)."""
+    if isinstance(p.get("request"), dict):
+        return p["request"]
+    ref = p.get("request_path")
+    if not ref:
+        return None
+    try:
+        data = P.read_json(layout.resolve_artifact(str(ref)))
+    except ValueError as e:  # LayoutError: outside the workspace
+        raise _projection_error(f"trial {tid}: request_path {ref!r}: {e}") from e
+    if not isinstance(data, dict):
+        raise _projection_error(f"trial {tid}: request_path {ref!r} does not hold a request")
+    return data
+
+
 def index_trial(p: dict, settings: Settings | None = None) -> dict:
-    """`{"trial_id"}`: the trial row plus its exchanges and priced costs from the record."""
+    """`{"trial_id"}`: the trial row plus its exchanges and priced costs from the record.
+
+    With `status` (P1-4) the payload is a workflow's report: `planned` | `launched` | `running` while the trial is live, or the
+    verdict it ended with; `request` / `request_path` (the planner's `<plan>/<trial_id>.json`) identify a trial whose directory
+    holds no request yet. The files decide whenever they carry a terminal record; a live report never regresses a terminal row
+    (in the files or already in the index) and never lowers the live ladder (`project.trial_status`)."""
     s = settings or get_settings()
     store = store_for(s)
     if store is None:
         return dict(DISABLED)
     (tid,) = _require(p, "trial_id")
+    status = p.get("status") if isinstance(p.get("status"), str) else None
+    layout = _layout(s)
+    if status in P.LIVE_TRIAL_STATUSES:
+        existing = store.trial(str(tid))
+        if existing is not None and existing.status not in P.LIVE_TRIAL_STATUSES:
+            return {"indexed": True, "rows": 0, "status": existing.status}
     try:
-        from swesim.costs import repair_stakeholder_costs
-        repair_stakeholder_costs(_layout(s), tid)
-        row, exchanges, costs = P.project_trial(_layout(s), tid, origin=s.origin)
+        request = _trial_request(p, layout, tid) if status is not None else None
+        if layout.trial_dir(tid).is_dir():
+            from swesim.costs import repair_stakeholder_costs
+            repair_stakeholder_costs(layout, tid)
+        row, exchanges, costs = P.project_trial(layout, tid, origin=s.origin, request=request, status=status)
     except ValueError as e:
         raise _projection_error(f"trial {tid}: {e}") from e
     store.upsert_trial(row)

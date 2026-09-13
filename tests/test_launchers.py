@@ -275,3 +275,22 @@ def test_subprocess_launcher_end_to_end_and_reconcile(layout, tmp_path):
     assert asyncio.run(wait_done()) == "succeeded"
     assert (layout.trial_dir(p["trial_id"]) / "record.json").exists() and B.launch_once(layout, l, p)["decision"] == "ingest"
     assert SP.runtime_state_of_pid(None)[0] == "absent" and SP.runtime_state_of_pid(2**22 - 1)[0] == "unknown"
+
+
+
+def test_launch_once_stamps_the_workflow_lineage_and_ignores_it_in_the_binding(layout):
+    """P2-11: the intent (launch.json) names the TrialWorkflow (`workflow_id` / `run_id`) and its parent (`run_workflow_id`) from
+    the request; those keys are lineage, not identity: the same request under another run id is the same trial (the evidence
+    decides), while a different model is still a binding conflict; a request without lineage stamps None, never invented ids."""
+    fake = FakeLauncher(); p = {**request(), "run_workflow_id": "run-1", "trial_workflow_id": "wf-1", "run_id": "r-1"}
+    assert B.launch_once(layout, fake, p)["launched"] is True
+    d = layout.trial_dir(p["trial_id"]); launch = json.loads((d / "launch.json").read_text())
+    assert (launch["workflow_id"], launch["run_id"], launch["run_workflow_id"]) == ("wf-1", "r-1", "run-1") and json.loads((d / "request.json").read_text()) == p
+    again = B.launch_once(layout, fake, {**p, "run_id": "r-2"})
+    assert again["decision"] == "reconcile" and fake.starts == [p["trial_id"]] and json.loads((d / "request.json").read_text())["run_id"] == "r-1"
+    with pytest.raises(B.TrialBindingConflict): B.launch_once(layout, fake, {**p, "model": "someone-else"})
+    assert B.PROVENANCE_KEYS == ("run_workflow_id", "trial_workflow_id", "run_id")
+    bare = request(attempt=1)
+    B.launch_once(layout, FakeLauncher(), bare)                          # a fresh runtime: the fake reports one state for every trial
+    launch = json.loads((layout.trial_dir(bare["trial_id"]) / "launch.json").read_text())
+    assert launch["workflow_id"] is None and launch["run_id"] is None and launch["run_workflow_id"] is None

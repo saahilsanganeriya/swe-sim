@@ -33,7 +33,9 @@ Purpose = Literal["calibration", "comparison", "demonstration", "screen"]
 TrialStatus = Literal["planned", "launched", "running", "completed", "runner-error", "launch-failed", "unit-failed", "unresolved", "cancelled"]
 ExchangeRole = Literal["agent", "stakeholder", "system"]
 ExchangeKind = Literal["ask", "confirm", "review", "system"]
-WorkflowStatus = Literal["running", "completed", "failed", "cancelled", "terminated", "timed_out", "continued_as_new"]
+# `unknown`: the reconciler (`swesim.workflows.client.reconcile_workflows`) found no execution in Temporal for a `running` row
+# (retention passed, or a row imported from another namespace); terminal, `lifecycle_source == "temporal"`.
+WorkflowStatus = Literal["running", "completed", "failed", "cancelled", "terminated", "timed_out", "continued_as_new", "unknown"]
 WorkflowLifecycleSource = Literal["workflow", "temporal", "harbor"]
 CostRole = Literal["solver", "judge", "drafter", "stakeholder", "withholder", "audit", "probe", "validation"]
 ActionResult = Literal["accepted", "rejected", "failed"]

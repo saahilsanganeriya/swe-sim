@@ -235,6 +235,8 @@ def test_auto_rejection_for_withholding_leak_redrafts_once_then_moves_on(monkeyp
     (["judge did not accept (no non-derivable gap)"], None, False),
     (["controls incomplete"], None, False),
     (["controls incomplete"], "withholding-leak", True),                 # structured gate wins over the text
+    (["fact f05 is outside the contract: names behaviour only a PASS_TO_PASS test carries"], None, True),   # fact-scope gate (2026-09-13)
+    (["controls incomplete"], "fact-scope", True),
 ])
 def test_redraft_trigger_is_structured(monkeypatch, reasons, gate, redraft):
     # Fix round 1, Minor 7.
@@ -1909,7 +1911,9 @@ def _fake_probe_candidates(outcome: dict, calls: list):
                     r["probe"] = {"error": outcome["error"]}; r["reject_reason"] = "probe-failed"; r.setdefault("judge", {})["keep"] = False; summary["probe-failed"] = 1
                 else:
                     r["fail_to_pass"], r["pass_to_pass"] = outcome["f2p"], outcome["p2p"]; r["test_python"] = "/opt/py/bin/python"
-                    r["probe"] = {"kind": "swebench", "statuses": {"base": {"t1": "failed"}, "gold": {"t1": "passed"}}, "probe_dir": "/jobs/probe/x", "dropped": {"missing-on-gold": 1}}
+                    from swesim.sources.github_repo import GRADING_USER, probe_binding   # B-P2-1: every measured row carries the identity and the binding
+                    r["probe"] = {"kind": "swebench", "statuses": {"base": {"t1": "failed"}, "gold": {"t1": "passed"}}, "probe_dir": "/jobs/probe/x", "dropped": {"missing-on-gold": 1},
+                                  "test_user": GRADING_USER, "binding": probe_binding(r)}
                     if not r["fail_to_pass"]: r["reject_reason"] = "not-reproducible-offline"; r.setdefault("judge", {})["keep"] = False; summary["not-reproducible-offline"] = 1
                     else: summary["reproducible"] = 1
                 f.write(json.dumps(r) + "\n")
@@ -2257,3 +2261,295 @@ def test_connect_kwargs_falls_back_to_the_env_file_for_temporal_keys(tmp_path, m
         assert C.connect_kwargs() == {"target_host": "localhost:7233", "namespace": "default"}   # process env wins; no key -> plain
     finally:
         reset_settings()
+
+
+# ---------------------------------------------------------------- live trial rows (P1-4)
+
+def test_trial_workflow_reports_launched_and_its_terminal_verdict_to_the_index(monkeypatch):
+    """After `launch_trial_activity` says `launched`, a `launched` row is hooked before the await; the terminal bookkeeping carries
+    the await's verdict (`status`) and the plan's request path; a launch that started nothing reports nothing live; cancellation
+    reports `cancelled`; executions started before the patch replay without the launched hook."""
+    async def scenario():
+        calls = []
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "launch_trial_activity": return {"trial_id": p["trial_id"], "launched": True, "handle": "h"}
+            if name == "await_trial_activity": return {"trial_id": p["trial_id"], "status": "unresolved", "reason": "runtime gone"}
+            if name == "cleanup_trial_activity": return {"trial_id": p["trial_id"], "cleaned": False}
+            return {"indexed": True, "rows": 1, "status": "launched"}
+        monkeypatch.setattr(W, "act", act)
+        r = await W.TrialWorkflow().run({"trial_id": "t1", "request_path": "/ws/evidence/workflows/x/t1.json"})
+        names = [n for n, _ in calls]
+        live = [p for n, p in calls if n == "index_trial_activity"]
+        assert [p.get("status") for p in live] == ["launched", "unresolved"]
+        assert all(p["request_path"] == "/ws/evidence/workflows/x/t1.json" for p in live)
+        assert names.index("launch_trial_activity") < names.index("index_trial_activity") < names.index("await_trial_activity")
+        assert r["status"] == "unresolved" and r["live"] == {"indexed": True, "rows": 1, "status": "launched"}
+        # a launch that did not start anything (reconcile / failure) reports nothing live; the terminal row still carries the verdict
+        calls.clear()
+        async def act2(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "launch_trial_activity": return {"trial_id": p["trial_id"], "launched": False, "decision": "reconcile"}
+            if name == "await_trial_activity": return {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0}}
+            return {}
+        monkeypatch.setattr(W, "act", act2)
+        r2 = await W.TrialWorkflow().run({"trial_id": "t1"})
+        assert [p.get("status") for n, p in calls if n == "index_trial_activity"] == ["completed"] and "live" not in r2
+        # cancellation while awaiting: the runtime is stopped and the row says cancelled
+        calls.clear()
+        async def act3(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "launch_trial_activity": return {"trial_id": p["trial_id"], "launched": True}
+            if name == "await_trial_activity": raise asyncio.CancelledError()
+            return {}
+        monkeypatch.setattr(W, "act", act3)
+        with pytest.raises(asyncio.CancelledError):
+            await W.TrialWorkflow().run({"trial_id": "t1"})
+        assert [p.get("status") for n, p in calls if n == "index_trial_activity"] == ["launched", "cancelled"]
+        # executions started before the patch replay without the launched hook
+        monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_LIVE_TRIALS)
+        calls.clear(); monkeypatch.setattr(W, "act", act)
+        await W.TrialWorkflow().run({"trial_id": "t1"})
+        assert [p.get("status") for n, p in calls if n == "index_trial_activity"] == ["unresolved"]
+    asyncio.run(scenario())
+
+
+def test_prepare_trial_plan_indexes_planned_rows_in_process_and_never_fails_the_plan(ws, monkeypatch):
+    """P1-4: the planner (CONTROL pool) upserts a `planned` row per trial of the plan before the workflow fans out, by request
+    path; the cached plan indexes the same rows again (idempotent upserts); the index is bookkeeping and never fails the plan."""
+    from swesim.index import activities as IA
+    spec = frozen_scenario(ws); seen = []
+    def fake_index(payload, settings=None): seen.append(payload); return {"indexed": True, "rows": 1, "status": "planned"}
+    monkeypatch.setattr(IA, "index_trial", fake_index)
+    base = {"scenario_id": spec.id, "models": ["openrouter/deepseek/deepseek-v3.2"], "conditions": ["hidden", "full"], "k": 2, "stakeholder_url": "https://s", "workflow_id": "run-x"}
+    prepared = asyncio.run(A.prepare_trial_plan_activity(base))
+    items = json.loads(Path(prepared["plan_path"]).read_text())["items"]
+    assert prepared["total"] == 4 and [p["trial_id"] for p in seen] == [i["trial_id"] for i in items]
+    assert all(p == {"trial_id": i["trial_id"], "status": "planned", "request_path": i["request_path"]} for p, i in zip(seen, items))
+    seen.clear(); asyncio.run(A.prepare_trial_plan_activity(base))
+    assert len(seen) == 4
+    def broken(payload, settings=None): raise RuntimeError("index down")
+    monkeypatch.setattr(IA, "index_trial", broken)
+    assert asyncio.run(A.prepare_trial_plan_activity(base))["total"] == 4
+
+
+def test_await_reports_running_once_and_records_its_verdict_durably(ws, systemd, monkeypatch):
+    """P1-4: the first poll that sees the runtime running upserts one `running` row in-process (the TRIALS pool has no workflow
+    to hook from); a verdict the files do not carry (unresolved, unit-failed) is written to status.json so a rebuild reads what
+    the workflow saw; a verdict launch.json already carries is not re-written; a late record.json still wins."""
+    from swesim.index import activities as IA
+    spec = frozen_scenario(ws); p = {**trial_request(ws, spec), "request_path": "/ws/evidence/workflows/x/r.json"}; d = ws.root / "trials" / p["trial_id"]
+    unit = "swesim-trial-" + p["trial_id"]; seen = []
+    monkeypatch.setattr(IA, "index_trial", lambda payload, settings=None: seen.append(payload) or {"indexed": True})
+    atomic_json(d / "launch.json", {"trial_id": p["trial_id"], "unit": unit, "phase": "acknowledged", "returncode": 0, "launcher": "systemd"})
+    systemd.units[unit] = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running", "Result": "success"}
+    polls = {"n": 0}; real_read = A.read_evidence
+    def read_evidence(tid):
+        polls["n"] += 1
+        if polls["n"] == 4: systemd.units.pop(unit)                   # the unit vanished without a record
+        return real_read(tid)
+    monkeypatch.setattr(A, "read_evidence", read_evidence)
+    r = asyncio.run(A.await_trial_activity(p))
+    assert r["status"] == "unresolved" and polls["n"] == 4
+    assert seen == [{"trial_id": p["trial_id"], "status": "running", "request_path": p["request_path"]}]      # once, on the first running poll
+    status = json.loads((d / "status.json").read_text())
+    assert status["status"] == "unresolved" and status["trial_id"] == p["trial_id"] and status["verdict_source"] == "await_trial_activity"
+    assert "never relaunch" in status["reason"] and status["origin"] == A.SETTINGS.origin and status["finished_at"]
+    assert asyncio.run(A.await_trial_activity(p))["status"] == "unresolved" and len(seen) == 1   # the verdict answers a retry at once
+    # a verdict launch.json already carries (the launcher refused) is not re-written
+    q = trial_request(ws, spec, attempt=1); e = ws.root / "trials" / q["trial_id"]
+    atomic_json(e / "launch.json", {"trial_id": q["trial_id"], "unit": "u", "phase": "acknowledged", "returncode": 1, "launcher": "systemd"})
+    assert asyncio.run(A.await_trial_activity(q))["status"] == "launch-failed" and not (e / "status.json").exists()
+    # a failed unit without a record: unit-failed, durable
+    f = trial_request(ws, spec, attempt=2); fd = ws.root / "trials" / f["trial_id"]; funit = "swesim-trial-" + f["trial_id"]
+    atomic_json(fd / "launch.json", {"trial_id": f["trial_id"], "unit": funit, "phase": "acknowledged", "returncode": 0, "launcher": "systemd"})
+    systemd.units[funit] = {"LoadState": "loaded", "ActiveState": "failed", "SubState": "failed", "Result": "exit-code"}
+    assert asyncio.run(A.await_trial_activity(f))["status"] == "unit-failed" and json.loads((fd / "status.json").read_text())["status"] == "unit-failed"
+    # a record.json that lands late still wins over the verdict marker
+    atomic_json(d / "record.json", {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}})
+    assert asyncio.run(A.await_trial_activity(p))["status"] == "completed"
+
+
+# ---------------------------------------------------------------- stale probe rows are re-probed, never drafted from or rejected for (B-P2-1 on a rebuild)
+
+def test_probe_candidate_activity_reprobes_a_row_without_the_grading_identity(ws, monkeypatch):
+    """`swesim create --rebuild` reused last night's probe row, recorded before B-P2-1 made the probe carry the grading identity, and
+    drafting refused it ("probe did not record the grading identity 'tester'; re-probe before drafting"). A measured row without
+    the identity, or bound to another base_commit/test_patch, is stale: the activity retires the stale terminal Harbor result
+    (renamed beside its evidence, lineage recorded) so the re-probe runs a fresh job instead of reusing it, re-probes, and drafting
+    proceeds; a current row is reused without a second Modal run; error rows and legacy probe_dir rows are not re-verified here."""
+    from swesim import harbor_cli
+    from swesim.sources import github_repo as gr
+    judged = ws.candidates_dir / "judged" / "s--1.judged.jsonl"; judged.parent.mkdir(parents=True)
+    base = {"instance_id": "s__1", "base_commit": "abc", "test_patch": "diff --git a/t.py b/t.py", "fail_to_pass": ["t1"], "pass_to_pass": [], "judge": {"keep": True}}
+    stale_trial = ws.jobs_dir / "probe" / "s--1--deadbeefdeadbeef" / "s--1__probe__1"; (stale_trial / "verifier").mkdir(parents=True)
+    (stale_trial / "result.json").write_text(json.dumps({"id": "old"})); (stale_trial / "verifier" / "probe.json").write_text(json.dumps({"binding": gr.probe_binding(base)}))
+    stale = {**base, "probe": {"kind": "swebench", "statuses": {"base": {"t1": "failed"}, "gold": {"t1": "passed"}}, "binding": gr.probe_binding(base),
+                              "probe_dir": str(stale_trial), "job_dir": str(stale_trial)}, "probe_workflow": {"measured_at": 1.0, "dropped": {}}}   # no test_user
+    judged.write_text(json.dumps(stale) + "\n")
+    assert A._probe_staleness(stale).startswith("probe did not record the grading identity 'tester'")
+    calls = []
+    monkeypatch.setitem(sys.modules, "swesim.stages.mine", fake_module("swesim.stages.mine", probe_candidates=_fake_probe_candidates({"f2p": ["t1"], "p2p": ["t0"]}, calls)))
+    r = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "s__1"}))
+    assert r["reproducible"] is True and calls == [(str(judged), ["s__1"], 1)]                                  # re-probed, not reused
+    # the stale result is retired beside its evidence, never deleted: harbor_cli now sees an abandoned job and launches a fresh attempt
+    assert not (stale_trial / "result.json").exists() and len(list(stale_trial.glob("result.stale-*.json"))) == 1
+    assert (stale_trial / "verifier" / "probe.json").exists() and "grading identity" in json.loads((stale_trial / "stale.json").read_text())["reason"]
+    assert harbor_cli._terminal_trials(stale_trial.parent) == []
+    lineage = harbor_cli.read_lineage(ws.jobs_dir / "probe", stale_trial.parent.name)
+    assert len(lineage["attempts"]) == 1 and lineage["attempts"][0]["reason"].startswith("stale-probe-evidence") and lineage["attempts"][0]["previous_dir"] == str(stale_trial)
+    row = json.loads(judged.read_text().splitlines()[0])
+    assert row["probe"]["test_user"] == gr.GRADING_USER and row["probe"]["binding"] == gr.probe_binding(row) and A._probe_staleness(row) is None
+    assert row["probe_workflow"]["reprobed"]["reason"].startswith("probe did not record the grading identity") and row["probe_workflow"]["reprobed"]["retired"] == [str(stale_trial)]
+    # the current row is reused; a row edited since its measurement (other test_patch) is stale again
+    asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "s__1"}))
+    assert len(calls) == 1
+    judged.write_text(json.dumps({**row, "test_patch": "diff --git a/other.py b/other.py"}) + "\n")
+    asyncio.run(A.probe_candidate_activity({"judged_path": str(judged), "instance_id": "s__1"}))
+    assert len(calls) == 2 and "binding differs" in json.loads(judged.read_text())["probe_workflow"]["reprobed"]["reason"]
+    # nothing to re-verify: a recorded probe error, a legacy probe_dir-only row, an unprobed row
+    assert A._probe_staleness({"probe": {"error": "ValueError: x"}}) is None and A._probe_staleness({"probe_dir": "/x"}) is None and A._probe_staleness({}) is None
+    # a stale row whose evidence is not on this worker still re-probes (nothing to retire)
+    judged2 = judged.with_name("u--2.judged.jsonl")
+    judged2.write_text(json.dumps({**base, "instance_id": "u__2", "probe": {"statuses": {"base": {}}, "probe_dir": "/elsewhere/jobs/probe/u--2--0123/t"}}) + "\n")
+    r2 = asyncio.run(A.probe_candidate_activity({"judged_path": str(judged2), "instance_id": "u__2"}))
+    assert r2["reproducible"] is True and len(calls) == 3 and json.loads(judged2.read_text())["probe_workflow"]["reprobed"]["retired"] == []
+
+
+
+# ---------------------------------------------------------------- record provenance (P2-11)
+
+def test_launch_activity_carries_the_trial_workflow_identity_into_the_request(ws, systemd, monkeypatch):
+    """P2-11: the request the launcher binds (and the Job reads for record.json) names the TrialWorkflow: from the workflow's payload
+    when it passed `trial_workflow_id` / `run_id`, else from the activity's own context; a plan request read by path keeps them;
+    outside an activity nothing is invented."""
+    from types import SimpleNamespace
+    spec = frozen_scenario(ws); p = trial_request(ws, spec)
+    monkeypatch.setattr(A, "_activity_info", lambda: SimpleNamespace(workflow_id=p["trial_id"], workflow_run_id="run-ctx"))
+    asyncio.run(A.launch_trial_activity({**p, "run_workflow_id": "run-1"}))
+    d = ws.root / "trials" / p["trial_id"]; request = json.loads((d / "request.json").read_text()); launch = json.loads((d / "launch.json").read_text())
+    assert (request["trial_workflow_id"], request["run_id"], request["run_workflow_id"]) == (p["trial_id"], "run-ctx", "run-1")
+    assert (launch["workflow_id"], launch["run_id"], launch["run_workflow_id"]) == (p["trial_id"], "run-ctx", "run-1")
+    q = trial_request(ws, spec, attempt=1); plan = ws.root / "evidence" / "workflows" / "x" / f"{q['trial_id']}.json"; atomic_json(plan, q)
+    asyncio.run(A.launch_trial_activity({"trial_id": q["trial_id"], "request_path": str(plan), "run_workflow_id": "run-1", "trial_workflow_id": "explicit", "run_id": "r-9"}))
+    request = json.loads((ws.root / "trials" / q["trial_id"] / "request.json").read_text())
+    assert (request["trial_workflow_id"], request["run_id"], request["model"]) == ("explicit", "r-9", q["model"])
+    monkeypatch.setattr(A, "_activity_info", lambda: None)
+    r = trial_request(ws, spec, attempt=2); asyncio.run(A.launch_trial_activity({**r}))
+    assert "trial_workflow_id" not in json.loads((ws.root / "trials" / r["trial_id"] / "request.json").read_text())
+
+
+def test_trial_workflow_passes_its_identity_to_the_launcher(monkeypatch):
+    from types import SimpleNamespace
+    async def scenario():
+        calls = []
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, p)); return {"trial_id": p["trial_id"], "launched": False, "status": "completed"}
+        monkeypatch.setattr(W, "act", act)
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=SimpleNamespace(workflow_id="run-1"), workflow_id="t1", run_id="r-1", workflow_type="TrialWorkflow"))
+        await W.TrialWorkflow().run({"trial_id": "t1", "run_workflow_id": "run-1"})
+        launch = next(p for n, p in calls if n == "launch_trial_activity")
+        assert (launch["trial_workflow_id"], launch["run_id"], launch["run_workflow_id"]) == ("t1", "r-1", "run-1")
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------- frontier override (operator directive, 2026-09-13)
+
+def test_run_tasks_frontier_override_proceeds_past_a_refused_gate_and_records_it(monkeypatch):
+    """A refused frontier gate blocks the run unless params carry `frontier_override: {actor, reason}`: the gate still runs and
+    records its decision, the run proceeds on the requested scenarios with `admission.overridden` and the override in every
+    workflow row's params_summary, `stopped_reason` stays None, and every planning step carries the override with the recorded
+    decision. Without the field (or with an empty reason) the refusal is unchanged; an allowed gate is never "overridden";
+    executions started before the patch replay as refusals."""
+    from types import SimpleNamespace
+    async def scenario():
+        calls = []
+        decision = {"allowed": False, "scenario_ids": [], "reasons": ["Requires 15 current audited scenarios with at least two outcomes per arm on every core Tier A–C baseline."],
+                    "evidence_path": "/ws/evidence/sweep/frontier-abc.json", "identity": "abc", "excluded_scenarios": {"s1": "Saturated scenarios are excluded by default."}}
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "frontier_gate_activity": return dict(decision)
+            if name == "probe_models_activity": return {"resolved": {}, "solver_unavailable": []}
+            if name == "spend_check_activity": return {"spend_usd": 1.0, "cap_usd": 100.0, "exceeded": False}
+            if name == "prepare_trial_plan_activity": return {"plan_path": p["scenario_id"], "total": 1}
+            if name == "read_plan_page_activity":
+                return {"items": [{"trial_id": p["plan_path"] + "-t0", "scenario_id": p["plan_path"], "model": "openai/gpt-5.5", "condition": "hidden", "attempt_index": 0}], "total": 1, "next_offset": 1}
+            if name == "checkpoint_workflow_activity": return {"checkpoint_path": "/checkpoint/test"}
+            return {}
+        async def child(fn, arg, **kw): return {"trial_id": arg["trial_id"], "status": "completed"}
+        monkeypatch.setattr(W, "act", act); monkeypatch.setattr(W.workflow, "execute_child_workflow", child)
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="run-1", run_id="r1", workflow_type="RunTasksWorkflow"))
+        params = {"scenario_ids": ["s1", "s2"], "models": ["openai/gpt-5.5"], "conditions": ["hidden"], "k": 1, "stakeholder_url": "https://s"}
+        r = await W.RunTasksWorkflow().run(params)                                                   # no override: the refusal is unchanged
+        assert r["status"] == "blocked" and r["stopped_reason"] == "frontier-gate" and not [n for n, _ in calls if n == "prepare_trial_plan_activity"]
+        calls.clear()
+        override = {"actor": "saahil", "reason": "demo run before the 15-scenario evidence exists"}
+        w = W.RunTasksWorkflow(); r = await w.run({**params, "frontier_override": override})
+        assert r["status"] == "complete" and r["stopped_reason"] is None and set(r["scenarios"]) == {"s1", "s2"}
+        assert r["admission"]["overridden"] is True and r["admission"]["override"] == override and r["admission"]["reasons"] == decision["reasons"]
+        names = [n for n, _ in calls]
+        assert names.index("frontier_gate_activity") < names.index("probe_models_activity")           # the gate still ran first
+        prepared = [p for n, p in calls if n == "prepare_trial_plan_activity"]
+        assert [p["scenario_id"] for p in prepared] == ["s1", "s2"]
+        assert all(p["admission"] == {"evidence_path": decision["evidence_path"], "identity": "abc", "overridden": True} for p in prepared)
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert rows and all(row["params_summary"]["frontier_override"] == override for row in rows) and rows[-1]["status"] == "completed"
+        assert w.progress()["stopped_reason"] is None and w.progress()["admission"]["overridden"] is True
+        calls.clear()                                                                                  # a malformed override is no override
+        r = await W.RunTasksWorkflow().run({**params, "frontier_override": {"actor": "x", "reason": " "}})
+        assert r["status"] == "blocked" and "frontier_override" not in [p for n, p in calls if n == "index_workflow_activity"][0]["params_summary"]
+        decision.update(allowed=True, scenario_ids=["s2"]); calls.clear()                              # an allowed gate is not overridden
+        r = await W.RunTasksWorkflow().run({**params, "frontier_override": override})
+        assert r["status"] == "complete" and set(r["scenarios"]) == {"s2"} and "overridden" not in [p for n, p in calls if n == "prepare_trial_plan_activity"][0]["admission"]
+        assert "overridden" not in r.get("admission", {}) or r["admission"].get("overridden") is not True
+        decision.update(allowed=False, scenario_ids=[]); monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_OVERRIDE)
+        r = await W.RunTasksWorkflow().run({**params, "frontier_override": override})                 # pre-patch executions replay as refusals
+        assert r["status"] == "blocked"
+    asyncio.run(scenario())
+
+
+def test_frontier_gate_records_an_operator_override_and_planning_honours_it(ws):
+    """The gate's decision file gains an `override` block (actor, reason, at) when the request carries one and the gate refused
+    (the decision itself is untouched); `plan_trials` under `admission.overridden` plans from that recorded override (same
+    policy keys, a file under evidence/sweep named by its request) and refuses a forged flag whose file records no override."""
+    from swesim.workflows import client as C
+    spec = frozen_scenario(ws)
+    base = {"scenario_ids": [spec.id], "models": ["openai/gpt-5.5"], "conditions": ["hidden"], "k": 1, "purpose": "comparison", "stakeholder_url": "https://s"}
+    refused = asyncio.run(A.frontier_gate_activity(dict(base)))
+    assert refused["allowed"] is False and "override_recorded" not in refused
+    assert "override" not in json.loads(Path(refused["evidence_path"]).read_text())
+    forged = {"evidence_path": refused["evidence_path"], "identity": refused["identity"], "overridden": True}
+    with pytest.raises(ValueError, match="records no operator override"): A.plan_trials({**base, "scenario_id": spec.id, "admission": forged})
+    override = {"actor": "saahil", "reason": "demo before evidence"}
+    gated = asyncio.run(A.frontier_gate_activity({**base, "frontier_override": override}))
+    assert gated["allowed"] is False and gated["override_recorded"] is True and gated["evidence_path"] == refused["evidence_path"]
+    record = json.loads(Path(gated["evidence_path"]).read_text())
+    assert record["decision"]["allowed"] is False and record["override"]["actor"] == "saahil" and record["override"]["reason"] == "demo before evidence" and record["override"]["at"]
+    ref = {"evidence_path": gated["evidence_path"], "identity": gated["identity"], "overridden": True}
+    out = A.plan_trials({**base, "scenario_id": spec.id, "admission": ref})
+    assert len(out["trials"]) == 1 and out["admission"] == {"identity": gated["identity"], "evidence_path": gated["evidence_path"], "overridden": True}
+    with pytest.raises(ValueError, match="frontier admission rejected"):                   # without the flag the recorded refusal still refuses
+        A.plan_trials({**base, "scenario_id": spec.id, "admission": {k: ref[k] for k in ("evidence_path", "identity")}})
+    with pytest.raises(ValueError, match="different request"): A.plan_trials({**base, "k": 3, "scenario_id": spec.id, "admission": ref})
+    with pytest.raises(ValueError, match="under evidence/sweep"): A.plan_trials({**base, "scenario_id": spec.id, "admission": {**ref, "evidence_path": str(ws.root / "frontier-x.json")}})
+    # an allowed gate ignores the field (Tier A–C: nothing to override, no file)
+    passed = asyncio.run(A.frontier_gate_activity({**base, "models": ["openrouter/deepseek/deepseek-v3.2"], "frontier_override": override}))
+    assert passed["allowed"] is True and "override_recorded" not in passed
+    # the request shape the CLI flag builds
+    assert C.override_request(" demo ", actor="me") == {"actor": "me", "reason": "demo"} and C.override_request("x")["actor"]
+    with pytest.raises(ValueError): C.override_request("  ")
+    assert W.frontier_override_of({"frontier_override": override}) == override and W.frontier_override_of({"frontier_override": {"actor": "a"}}) is None
+    assert W.frontier_override_of({"frontier_override": "yes"}) is None and W.frontier_override_of({}) is None
+
+
+def test_fact_scope_rejection_redrafts_once_behind_its_patch(monkeypatch):
+    """The `fact-scope` approval gate (2026-09-13) rejects a draft whose stakeholder-visible fact reaches beyond the contract with
+    reasons "fact <id> is outside the contract: ..."; like a withholding leak it is the drafter's to fix, so it triggers the single
+    re-draft (the drafter receives `reject_reasons`) before the next candidate; executions started before the patch keep the
+    leak-only rule."""
+    scoped = {"approved": False, "spec_hash": "h", "reasons": ["fact f05 is outside the contract: names behaviour only a PASS_TO_PASS test carries"]}
+    assert W._leak_rejection(scoped) is True and W._leak_rejection({"approved": False, "reasons": ["controls incomplete"], "gate": "fact-scope"}) is True
+    assert W._redraftable_reason("Fact f01 is outside the contract: x") and W._redraftable_reason("withheld brief still contains excerpt of f01")
+    assert not W._redraftable_reason("judge rejected") and not W._redraftable_reason("facts must be grounded")
+    monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_FACT_SCOPE)
+    assert W._leak_rejection(scoped) is False and W._leak_rejection({"approved": False, "reasons": ["withheld brief still contains excerpt of f01"]}) is True

@@ -48,6 +48,9 @@ PATCH_FROZEN_RETRY = "20260913-frozen-candidate-retry"
 PATCH_LIFECYCLE = "20260913-lifecycle-bookkeeping"  # operator workflows: running row before any probe/gate; failed/cancelled rows on exit
 PATCH_RECEIPTS = "20260913-candidate-receipts"      # index_candidate_event_activity at every terminal candidate decision (P1-7)
 PATCH_RESOLVED = "20260913-resolved-models"         # operator workflows: a second running row after the probe with the resolved roles
+PATCH_LIVE_TRIALS = "20260913-live-trial-rows"      # TrialWorkflow: a `launched` trial row right after the launch acknowledgement (P1-4)
+PATCH_OVERRIDE = "20260913-frontier-override"       # RunTasksWorkflow: a recorded operator override proceeds past a refused frontier gate
+PATCH_FACT_SCOPE = "20260913-fact-scope-redraft"    # draft_and_auto_approve: a fact-scope rejection triggers the single re-draft like a leak
 CHILDREN_PER_RUN = 100
 HOOK_MINUTES = 2
 CONTROL_MINUTES = 60                           # one Harbor control run on Modal (validate_scenario's whole set had 180)
@@ -59,6 +62,7 @@ CREATE_APPROVAL_MODES = {"auto", "hold"}
 # a reason starting with "withholding", or containing "leak" or "withheld" (the approve stage's "withheld brief still
 # contains excerpt of <fact>"). Anything else (judge, load-bearing, controls, assets) moves to the next candidate.
 LEAK_GATE = "withholding-leak"
+FACT_SCOPE_GATE = "fact-scope"  # approve.py (2026-09-13): a stakeholder-visible fact reaching beyond the contract; the drafter can rescope it
 REJECT_DUP = WorkflowIDReusePolicy.REJECT_DUPLICATE
 # Candidate children: a terminal outcome (valid/invalid/rejected/not-reproducible/...) completes the child, so the id
 # `create:<scenario_id>` is consumed and a later CreateTasksWorkflow records `duplicate-rejected`. An infrastructure
@@ -77,8 +81,25 @@ def _is_leak_reason(reason) -> bool:
     return r.startswith("withholding") or "leak" in r or "withheld" in r
 
 
+def _is_fact_scope_reason(reason) -> bool:
+    """The `fact-scope` gate's wording: "fact <id> is outside the contract: ..."."""
+    r = str(reason).strip().lower()
+    return r.startswith("fact ") and "outside the contract" in r
+
+
+def _redraftable_reason(reason) -> bool:
+    """A rejection the drafter can fix in the single re-draft (it receives `reject_reasons`): a withholding leak, or — behind
+    PATCH_FACT_SCOPE — a stakeholder-visible fact reaching beyond the contract."""
+    return _is_leak_reason(reason) or (_patched(PATCH_FACT_SCOPE) and _is_fact_scope_reason(reason))
+
+
 def _leak_rejection(approved: dict) -> bool:
-    return approved.get("gate") == LEAK_GATE or any(_is_leak_reason(r) for r in approved.get("reasons", []) or [])
+    """Whether an auto-approval rejection earns the one re-draft: the structured gate or the reasons' text name a withholding leak,
+    or (PATCH_FACT_SCOPE) the fact-scope gate."""
+    reasons = approved.get("reasons", []) or []
+    if approved.get("gate") == LEAK_GATE or any(_is_leak_reason(r) for r in reasons):
+        return True
+    return bool(_patched(PATCH_FACT_SCOPE) and (approved.get("gate") == FACT_SCOPE_GATE or any(_is_fact_scope_reason(r) for r in reasons)))
 
 
 def _patched(name: str) -> bool:
@@ -107,9 +128,25 @@ async def act(name: str, p: dict, minutes: int = 10, *, retry: RetryPolicy = ret
     return await workflow.execute_activity(name, p, retry_policy=LEGACY_READ if name == "await_trial_activity" else ONE, **timeouts)
 
 
+def frontier_override_of(params: dict) -> dict | None:
+    """`params["frontier_override"]` when it is a well-formed operator override (`{"actor": str, "reason": str}`, both non-empty,
+    built by `client.override_request` for the CLI flag); None otherwise. The gate still runs and records its decision; the run
+    then proceeds with `admission.overridden` and the override in every workflow row's summary (`params_summary`)."""
+    o = params.get("frontier_override")
+    if not isinstance(o, dict):
+        return None
+    actor, reason = o.get("actor"), o.get("reason")
+    if not (isinstance(actor, str) and actor.strip() and isinstance(reason, str) and reason.strip()):
+        return None
+    return {"actor": actor.strip(), "reason": reason.strip()}
+
+
 def params_summary(params: dict) -> dict:
     """Small, secret-free summary of a workflow's params (ids, model ids, counts only): the start memo and the index row."""
     out: dict = {}
+    override = frontier_override_of(params)
+    if override:
+        out["frontier_override"] = override
     if "sources" in params:
         out["sources"] = [s.get("repo") or f"{s.get('kind', 'swebench-annotated')}:{s.get('pool', 'A')}" for s in params.get("sources", [])]
     for k in ("scenario_ids", "models", "conditions", "k", "judge_model", "draft_model", "stakeholder_model", "approval_mode", "purpose", "source", "repo",
@@ -322,7 +359,8 @@ class TrialWorkflow:
         audit = None
         if result.get("status") == "completed" and p.get("condition") == "interactive":
             audit = await audit_stage("audit_transcript_activity", {"trial_id": tid, "audit_model": p.get("audit_model")})
-        index = await hook("index_trial_activity", {"trial_id": tid})
+        # The verdict travels with the payload: without record.json the files alone cannot say how the trial ended (P1-4).
+        index = await hook("index_trial_activity", {"trial_id": tid, "status": result.get("status"), "request_path": p.get("request_path")})
         cleanup: dict
         if _patched(PATCH_HOOKS):
             try:
@@ -345,13 +383,17 @@ class TrialWorkflow:
         except Exception as e:  # noqa: BLE001 - the runtime may already be gone; the operator reads the reason
             _raise_if_cancelled(e)
             self.state["cancel"] = {"cancelled": False, "reason": _err(e)}
-        self.state["index"] = await asyncio.shield(hook("index_trial_activity", {"trial_id": tid}))
+        self.state["index"] = await asyncio.shield(hook("index_trial_activity", {"trial_id": tid, "status": "cancelled",
+                                                                                 "request_path": self.params.get("request_path")}))
         await asyncio.shield(index_workflow("cancelled", params_summary(self.params)))
         self.state["stage"] = "cancelled"
 
     @workflow.run
     async def run(self, p: dict) -> dict:
-        launch = None; tid = p.get("trial_id"); self.params = p
+        ident = _workflow_identity()
+        if ident and ident.get("workflow_id"):
+            p = {**p, "trial_workflow_id": ident["workflow_id"], "run_id": ident["run_id"]}  # P2-11: record.json names the workflow that launched it
+        launch = None; live = None; tid = p.get("trial_id"); self.params = p
         self.state = {"stage": "launching", "trial_id": tid}
         await index_workflow("running", params_summary(p))
         try:
@@ -362,6 +404,9 @@ class TrialWorkflow:
                 # Poll the same unit/id; never relaunch it. The await activity reads the recorded evidence.
                 launch = {"trial_id": tid, "launched": False, "error": str(e)[:500]}
             self.state = {"stage": "awaiting", "trial_id": tid, "launch": launch}
+            if _patched(PATCH_LIVE_TRIALS) and launch.get("launched"):
+                # P1-4: the trial is live from this acknowledgement; its row says so before the first terminal file exists.
+                self.state["live"] = live = await hook("index_trial_activity", {"trial_id": tid, "status": "launched", "request_path": p.get("request_path")})
             try:
                 result = await act("await_trial_activity", p, 180, retry=retries.READ)
             except Exception as e:  # noqa: BLE001 - deadline or repeated read failures: unresolved, not relaunched
@@ -371,7 +416,7 @@ class TrialWorkflow:
             await self._on_cancel(tid, launch)
             raise
         try:
-            out = {**result, "launch": launch}
+            out = {**result, "launch": launch, **({"live": live} if live is not None else {})}
             out["bookkeeping"] = await self._bookkeeping(p, out)
             self.state = {"stage": "done", "trial_id": tid, "status": out.get("status"), "launch": launch, "indexed": out["bookkeeping"]["indexed"]}
             self.state["audit"] = out["bookkeeping"]["audit"]
@@ -409,12 +454,13 @@ class RunTasksWorkflow:
         self.state: dict = {"stage": "starting"}
         self.scenarios: dict[str, dict] = {}
         self.trials: dict[str, dict] = {}
+        self.admission: dict | None = None  # the frontier gate's decision (with `overridden` / `override` when the operator proceeded past a refusal)
 
     @workflow.query
     def progress(self) -> dict:
         return {"stage": self.state["stage"], "scenarios": self.scenarios, "trials": self.trials, "spend": self.state.get("spend", {}),
                 "stopped_reason": self.state.get("stopped_reason"), "summary": self.state.get("summary", {}),
-                "checkpoint_path": self.state.get("checkpoint_path")}
+                "checkpoint_path": self.state.get("checkpoint_path"), "admission": self.admission}
 
     async def _spend_exceeded(self, p: dict) -> bool:
         """`spend_check_activity` against the cap (params `spend_cap_usd`, else Settings); an unreadable ledger never stops the run
@@ -1061,19 +1107,29 @@ async def _create_batched(self: CreateTasksWorkflow, p: dict) -> dict:
 
 async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
     resume = p.get('_continuation') or {}
+    self.admission = resume.get('admission')
     if not resume:
         if _patched(PATCH_FRONTIER):
             admission = await act('frontier_gate_activity', p, 5, retry=retries.READ)
-            if not admission.get('allowed'):
-                self.state = {'stage': 'complete', 'stopped_reason': 'frontier-gate', 'admission': admission}
+            override = frontier_override_of(p) if _patched(PATCH_OVERRIDE) else None
+            if not admission.get('allowed') and override is None:
+                self.state = {'stage': 'complete', 'stopped_reason': 'frontier-gate', 'admission': admission}; self.admission = admission
                 await index_workflow('completed', {**params_summary(p), 'stopped_reason': 'frontier-gate'})
                 return {'status': 'blocked', 'scenarios': {}, 'trials': {}, 'admission': admission, 'stopped_reason': 'frontier-gate'}
-            p = {**p, 'scenario_ids': admission.get('scenario_ids', p.get('scenario_ids', []))}
+            if not admission.get('allowed'):
+                # The operator's recorded override (user directive 2026-09-13): the gate ran and recorded its refusal (the activity
+                # wrote the override into the decision file); the run proceeds on the scenarios as requested, and the override
+                # travels with every planning step (`admission.overridden`) and every workflow row (`params_summary`).
+                admission = {**admission, 'overridden': True, 'override': override}
+                p = {**p, 'scenario_ids': list(p.get('scenario_ids') or [])}
+            else:
+                p = {**p, 'scenario_ids': admission.get('scenario_ids', p.get('scenario_ids', []))}
+            self.admission = admission
             if admission.get('evidence_path'):
                 # A Tier D/E request: every later planning step (fresh plan, cached plan page, continue-as-new resume) verifies
                 # this recorded decision against its own request (`plan_trials`); a Tier A–C request carries nothing.
-                p['admission'] = {'evidence_path': admission['evidence_path'], 'identity': admission.get('identity')}
-                self.state = {'stage': 'probing-models', 'admission': p['admission']}
+                p['admission'] = {'evidence_path': admission['evidence_path'], 'identity': admission.get('identity'),
+                                  **({'overridden': True} if admission.get('overridden') else {})}
         self.state = {'stage': 'probing-models'}
         probe = await act('probe_models_activity', p, 5)
         p = {**p, **(probe.get('substitutions') or {}), **(probe.get('resolved') or {})}
@@ -1139,12 +1195,13 @@ async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
             results[sid]['status'] = self.scenarios[sid]['status']
         if children == CHILDREN_PER_RUN and (more_trials or index + 1 < len(sids)):
             await _continue(p, {'scenario_index': index if more_trials else index + 1, 'offset': page['next_offset'] if more_trials else 0,
-                                'plan': prepared if more_trials else None, 'summary': summary, 'previous_checkpoint': resume.get('previous_checkpoint')},
+                                'plan': prepared if more_trials else None, 'summary': summary, 'previous_checkpoint': resume.get('previous_checkpoint'),
+                                'admission': self.admission},
                             {'scenarios': self.scenarios, 'trials': self.trials, 'results': results, 'summary': summary})
     self.state['stage'] = 'complete'
     ok = bool(summary['scenarios']) and not summary['failed_scenarios']
     out = {'status': 'complete' if ok else 'complete-with-failures', 'scenarios': results, 'trials': self.trials, 'summary': summary,
-           'stopped_reason': self.state.get('stopped_reason'), 'spend': self.state.get('spend', {})}
+           'stopped_reason': self.state.get('stopped_reason'), 'spend': self.state.get('spend', {}), 'admission': self.admission}
     out['checkpoint_path'] = await _checkpoint(p, {**out, 'previous_checkpoint': resume.get('previous_checkpoint')})
     self.state['checkpoint_path'] = out['checkpoint_path']
     await index_workflow('completed', {**params_summary(p), 'status': out['status'], 'stopped_reason': out['stopped_reason']})
