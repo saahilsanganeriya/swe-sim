@@ -125,16 +125,20 @@ if N>=6:
         check(any(c.get('discovery',{}).get('repo_only') is True for c in source),'repo-only discovery lineage for '+s.id)
         check(any(r.get('spec_hash')==s.spec_hash and r.get('status')=='completed' and reward_ok(r.get('reward',{})) for r,_ in records),'GitHub task executed: '+s.id)
 if N>=7:
-    from swesim.stages.score import summarize
+    from swesim.stages.score import summarize, load_trial_records
+    from swesim.paths import Workspace
     reg=read('registry.json')
     for spec,validation,sdir in valid:
-        key=f'{spec.id}@{spec.version}'; entry=reg.get('scenarios',{}).get(key,{})
-        check(entry.get('spec_hash')==spec.spec_hash and entry.get('validation_status')=='valid','registry version binding '+key)
+        # Registry contract (register.py): one entry per scenario id carrying the current version and spec hash.
+        key=spec.id; entry=reg.get('scenarios',{}).get(key,{})
+        check(entry.get('spec_hash')==spec.spec_hash and entry.get('version')==spec.version and entry.get('validation_status')=='valid','registry version binding '+key)
         evidence(sdir/'scores.json',lambda p: read(p) or (_ for _ in ()).throw(ValueError('empty score table')),'nonempty scores '+key)
         rs=[r for r,_ in records if r.get('scenario_id')==spec.id]
         scored=read(sdir/'scores.json')
         if scored:
-            k=next(iter(scored.values()))['requested_k']; check(scored==summarize(rs,k),'scores recompute from attempts '+key)
+            # Same loader as `swesim score` (merges the sibling run_config.json/spec.json), so the table is reproducible.
+            k=next(iter(scored.values()))['requested_k']; loaded=load_trial_records(Workspace('workspace'),spec.id)
+            check(scored==summarize(loaded,k),'scores recompute from attempts '+key)
         for condition in ('full','hidden','interactive'):
             check(any(r.get('condition')==condition and r.get('spec_hash')==spec.spec_hash for r in rs),'recorded '+condition+' attempt '+key)
         exports=list(Path('workspace/exports').glob('*.episode.json'))

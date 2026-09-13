@@ -161,7 +161,7 @@ def discover(repo: str, since: str, max_prs: int = 400, min_comments: int = 4, d
             targets = threads.linked_targets(repo, p["number"], threads.closing_text(p))
             issues = targets["issues"]
             c = _candidate(repo, p, _pr_diff(repo, p["number"]))
-            c["linked_prs"], c["linked_missing"] = targets["prs"], targets["missing"]
+            c["linked_prs"], c["linked_missing"], c["link_kind"] = targets["prs"], targets["missing"], targets.get("link_kind")
             if issues:
                 c["issue"] = issues[0]
                 c["thread"] = threads.fetch_pr_thread(repo, p["number"])

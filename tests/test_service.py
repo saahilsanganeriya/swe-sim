@@ -22,6 +22,7 @@ def body(**over):
 def svc(monkeypatch, tmp_path):
     monkeypatch.setattr(service, "STORE", tmp_path)
     monkeypatch.setattr(service, "LOCK", asyncio.Lock())      # an asyncio.Lock binds to the first loop that contends it
+    monkeypatch.setattr(service, "_SESSION_LOCKS", {})
     monkeypatch.setenv("SWESIM_WORKER_SECRET", "s3")
     monkeypatch.setattr(service, "call_llm", lambda system, messages, schema, cfg: {"reply": "ValueError.", "disclosed_fact_ids": ["f01"]})
     return tmp_path
@@ -231,8 +232,61 @@ def test_shims_end_to_end_against_local_service(svc, monkeypatch, tmp_path):
         p = _shim("ask-user", "still there?", env=env); assert p.returncode == 0 and p.stdout.strip() == "Stakeholder session closed."
         p = _shim("ask-user", "x", env={**env, "SWESIM_SESSION_TOKEN": "t1.bad"})
         assert p.returncode == 1 and p.stderr.strip().startswith("Stakeholder rejected the request (HTTP 401)") and "Traceback" not in p.stderr
+        p = _shim("ask-user", "q" * 20_001, env=env)                                              # FastAPI list-shaped detail
+        assert p.returncode == 1 and p.stderr.strip() == "Stakeholder rejected the request (HTTP 422): String should have at most 20000 characters"
     finally:
         server.should_exit = True; th.join(timeout=10)
+
+
+@pytest.mark.skipif(not pathlib.Path("/usr/bin/git").exists(), reason="shim uses /usr/bin/git")
+def test_shim_malformed_server_reply_is_one_line():
+    """A server that answers garbage makes urllib raise http.client.BadStatusLine; the shim prints one line."""
+    srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1); port = srv.getsockname()[1]
+    def serve():
+        conn, _ = srv.accept(); conn.recv(65536); conn.sendall(b"garbage\r\n\r\n"); conn.close()
+    th = threading.Thread(target=serve, daemon=True); th.start()
+    env = {"SWESIM_STAKEHOLDER_URL": f"http://127.0.0.1:{port}", "SWESIM_SESSION_TOKEN": "t1.x", "SWESIM_TRIAL_ID": "t1"}
+    p = _shim("ask-user", "hi", env=env); th.join(timeout=5); srv.close()
+    assert p.returncode == 1 and p.stderr.strip().startswith("Stakeholder transport failed:") and "Traceback" not in p.stderr
+
+
+@pytest.mark.asyncio
+async def test_sessions_do_not_block_each_other(svc, monkeypatch):
+    """Per-session locks: A's slow model call must not delay B's ask, A's transcript read or /health, while A's
+    freeze still waits for A's in-flight reply (exchange and freeze share A's lock)."""
+    def llm(system, messages, schema, cfg):
+        if cfg.model_id.endswith("slow"): time.sleep(0.4)
+        return {"reply": f"answer from {cfg.model_id}", "disclosed_fact_ids": []}
+    monkeypatch.setattr(service, "call_llm", llm)
+    done: dict[str, float] = {}
+    async def timed(name, coro):
+        r = await coro; done[name] = time.monotonic(); return r
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=service.app), base_url="http://svc") as c:
+        w = {"X-Worker-Secret": "s3"}
+        ta = (await c.post("/sessions", headers=w, json=body(trial_id="ta", stakeholder_config={**CFG, "model_id": "openai/slow"}))).json()["token"]
+        tb = (await c.post("/sessions", headers=w, json=body(trial_id="tb", stakeholder_config={**CFG, "model_id": "openai/fast"}))).json()["token"]
+        ha = {"Authorization": f"Bearer {ta}"}; hb = {"Authorization": f"Bearer {tb}"}
+        a_ask = asyncio.create_task(timed("a_ask", c.post("/ask", headers=ha, json={"request_id": "1", "question": "slow?"})))
+        await asyncio.sleep(0.05)                                            # A is now inside its model call
+        tasks = {"b_ask": c.post("/ask", headers=hb, json={"request_id": "1", "question": "fast?"}),
+                 "a_transcript": c.get("/transcript/ta", headers=w), "health": c.get("/health"),
+                 "b_freeze": c.post("/freeze", headers=hb), "a_freeze": c.post("/freeze", headers=ha)}
+        results = dict(zip(tasks, await asyncio.gather(*(timed(k, v) for k, v in tasks.items()))))
+        ra = await a_ask
+        assert ra.status_code == 200 and ra.json()["reply"] == "answer from openai/slow"
+        assert results["b_ask"].status_code == 200 and results["b_ask"].json()["reply"] == "answer from openai/fast"
+        assert results["a_transcript"].status_code == 200 and results["a_transcript"].json()["pending"] == {"request_id": "1", "kind": "ask"}
+        assert results["health"].status_code == 200 and results["b_freeze"].status_code == 200 and results["a_freeze"].status_code == 200
+        # B's ask, B's freeze, A's transcript and /health all finished well before A's slow reply ...
+        for k in ("b_ask", "b_freeze", "a_transcript", "health"): assert done[k] < done["a_ask"] - 0.2, k
+        # ... while A's freeze waited for A's in-flight reply and its hash covers that reply.
+        assert done["a_freeze"] >= done["a_ask"]
+        t = (await c.get("/transcript/ta", headers=w)).json()
+        assert t["frozen"] and t["transcript_hash"] == results["a_freeze"].json()["transcript_hash"] and t["pending"] is None
+        assert [e["request_id"] for e in t["events"] if e["kind"] == "message"] == ["1", "1"]
+        assert t["transcript_hash"] == hashlib.sha256(json.dumps(t["events"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        tb_ = (await c.get("/transcript/tb", headers=w)).json(); assert tb_["frozen"] and tb_["patience_end"] == 1
+        assert set(service._SESSION_LOCKS) == {"ta", "tb"} and not service.LOCK.locked()
 
 
 @pytest.mark.asyncio
