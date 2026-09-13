@@ -1103,7 +1103,7 @@ async def index_live_trial(trial_id: str, status: str, request_path: str | None)
     reported and logged, never raised."""
     payload = {"trial_id": trial_id, "status": status, "request_path": request_path}
     try:
-        return await asyncio.to_thread(_index_live_trial_sync, payload)
+        return await blocking(lambda: _index_live_trial_sync(payload))  # heartbeats while queued behind other stage threads (never a bare to_thread)
     except Exception as e:  # noqa: BLE001 - bookkeeping never decides a stage's outcome
         reason = f"{type(e).__name__}: {str(e)[:200]}"
         log.warning("live trial row not indexed trial=%s status=%s: %s", trial_id, status, reason)
