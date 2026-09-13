@@ -43,7 +43,10 @@ ANONYMOUS = Identity(None, False)
 def _default_verify(token: str, audience: str) -> Mapping:
     from google.auth.transport import requests as g_requests
     from google.oauth2 import id_token
-    return id_token.verify_token(token, g_requests.Request(), audience=audience, certs_url=IAP_CERTS_URL)
+    claims = id_token.verify_token(token, g_requests.Request(), audience=audience, certs_url=IAP_CERTS_URL)
+    if claims.get("iss") != "https://cloud.google.com/iap":
+        raise ValueError("JWT issuer is not IAP")
+    return claims
 
 
 def _audience(settings: Settings) -> str | None:

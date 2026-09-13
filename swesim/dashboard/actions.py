@@ -133,11 +133,14 @@ def check_origin(headers: Mapping[str, str], settings: Settings, request_url: st
         return
     if origin == "null":
         raise OriginError("cross-site request rejected (null origin)")
-    u = urlsplit(origin)
-    if not u.scheme or not u.hostname:
-        raise OriginError("cross-site request rejected (origin is not a URL)")
-    got = _normalise(u.scheme, u.hostname, u.port)
-    want = expected_origin(headers, settings, request_url)
+    try:
+        u = urlsplit(origin)
+        if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password or u.path or u.query or u.fragment:
+            raise ValueError("not an origin")
+        got = _normalise(u.scheme, u.hostname, u.port)
+        want = expected_origin(headers, settings, request_url)
+    except ValueError as e:
+        raise OriginError("cross-site request rejected (origin is not valid)") from e
     if want is None or got != want:
         raise OriginError("cross-site request rejected (origin scheme/host/port does not match the console)")
 

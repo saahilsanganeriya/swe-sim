@@ -41,7 +41,7 @@ TRIAL_FILES: dict[str, tuple[str, str]] = {
 }
 # Evaluator-only artifacts (Codex B-P2-6): raw record/transcript/spec carry facts, redactions and hidden test ids; the
 # audit carries labels; scenario.json/draft carry author-only facts and hidden assets; judge/draft metadata is internal.
-EVALUATOR_TRIAL_FILES = frozenset({"record.json", "transcript.json", "spec.json", "audit.json"})
+EVALUATOR_TRIAL_FILES = frozenset(TRIAL_FILES) - frozenset({"reward.json", "report.json", "status.json", "costs.json", "label.json", "patch.diff"})
 SCENARIO_FILES = ("scenario.json", "scenario.draft.json", "draft.meta.json", "judge.json", "approval.json", "compile.json", "validation.json",
                   "difficulty.json", "audit.json", "scores.json")
 EVALUATOR_SCENARIO_FILES = frozenset({"scenario.json", "scenario.draft.json", "draft.meta.json", "judge.json", "audit.json"})
@@ -195,7 +195,7 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
     live = status.get("status") == "running" and not has_record
     live_error = None
     if live:
-        transcript, live_error = fetch_live_transcript(tid, settings)
+        transcript, live_error = live_transcript_cached(tid, settings)
     else:
         transcript = record.get("transcript") or read_json(d / "transcript.json")
     report = record.get("report") or read_json(d / "report.json")
@@ -277,7 +277,8 @@ def highlight_spans(text: str, excerpts: list[str]) -> list[tuple[str, bool]]:
 
 def scenario_detail(layout, sid: str, evaluator: bool = False, version: int | None = None) -> dict | None:
     """Everything the scenario/review page needs from one scenario directory (or an archived version).
-    ``evaluator=False`` drops author-only facts, hidden test assets and judge/draft metadata entirely."""
+    ``evaluator=False`` drops author-only facts, hidden test assets, judge/draft metadata and the withheld sentences (the
+    natural brief shows a masked placeholder where a span was removed; facts keep their text but not the excerpt)."""
     if not ID_RE.fullmatch(sid):
         return None
     sdir = layout.scenario_dir(sid) if version is None else layout.scenario_archive_dir(sid, version)
@@ -296,6 +297,8 @@ def scenario_detail(layout, sid: str, evaluator: bool = False, version: int | No
     withheld = (briefs.get("withheld") or {}).get("text")
     hidden_author_only = sum(1 for f in ledger if f.get("discovery") == "author-only")
     visible = [f for f in ledger if evaluator or f.get("discovery") != "author-only"]
+    if not evaluator:  # the withheld sentences themselves are evaluator-only (Codex B-P2-6): facts keep their text, not the excerpt
+        visible = [{k: v for k, v in f.items() if k != "source_excerpt"} for f in visible]
     grouped: dict[str, list[dict]] = {}
     for f in visible:
         grouped.setdefault(str(f.get("discovery")), []).append(f)
@@ -330,7 +333,8 @@ def scenario_detail(layout, sid: str, evaluator: bool = False, version: int | No
         "scenario_id": sid, "version": spec.get("version") or approval.get("version"), "frozen": (sdir / "scenario.json").exists(),
         "spec_hash": approval.get("spec_hash") or compiled.get("spec_hash") or validation.get("spec_hash"),
         "source": spec.get("source"), "source_ref": spec.get("source_ref"), "created_at": spec.get("created_at"),
-        "natural_segments": highlight_spans(natural, removed), "withheld": withheld, "removed_excerpts": removed, "operations": ops,
+        "natural_segments": [(seg if evaluator or not is_removed else f"[withheld span · {len(seg)} chars]", is_removed) for seg, is_removed in highlight_spans(natural, removed)],
+        "withheld": withheld, "removed_excerpts": removed if evaluator else [None] * len(removed), "operations": ops,
         "ledger_groups": grouped, "hidden_author_only": 0 if evaluator else hidden_author_only, "evaluator": evaluator,
         "requirements": spec.get("requirements") or [], "groups": spec.get("groups") or [], "checks": spec.get("checks") or [],
         "persona": spec.get("persona") or {}, "environment": spec.get("environment") or {},

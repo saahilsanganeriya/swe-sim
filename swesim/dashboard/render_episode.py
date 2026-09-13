@@ -11,9 +11,11 @@ import re
 from swesim.dashboard.data import REFUSAL_PREFIX, clock, EVALUATOR_TRIAL_FILES
 from swesim.dashboard.render import chip, code_block, dash, evaluator_switch, h, ident, kv, meter, model_chip, outcome_chip, short
 from swesim.stages.score import OUTCOME_NAMES, outcome_code
+from swesim.dashboard.public import project
 
 LABELS = ("unresolved", "no-question", "disclosed-not-used", "simulator-omission", "derived-without-asking")
-AUDIT_META = ("disclosed_fact_ids", "tier", "patience_remaining", "tool_calls", "delivery", "redacted_terms", "regenerated", "audit", "forbidden_terms")
+# Evaluator-only meta (Codex B-P2-6). ``patience_remaining`` stays public: it is the availability signal the design intends (Codex A-P1-3 ruling).
+AUDIT_META = ("disclosed_fact_ids", "tier", "tool_calls", "delivery", "redacted_terms", "regenerated", "audit", "forbidden_terms", "withheld_sentences")
 
 
 def public_rows(rows: list[dict]) -> list[dict]:
@@ -25,7 +27,7 @@ def public_rows(rows: list[dict]) -> list[dict]:
         meta = r.get("meta")
         if isinstance(meta, dict):
             r = {**r, "meta": {k: v for k, v in meta.items() if k not in AUDIT_META}}
-        out.append(r)
+        out.append(project(r))
     return out
 
 

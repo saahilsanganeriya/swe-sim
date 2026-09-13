@@ -1,0 +1,119 @@
+"""Regression coverage for public projections, index-only lists and complete execution history."""
+from __future__ import annotations
+
+import importlib
+import json
+from datetime import UTC, datetime
+
+import pytest
+
+from swesim.dashboard import actions, console, rows as R
+from swesim.settings import get_settings
+from test_dashboard import SENTINELS, reader_of, site  # noqa: F401
+
+routes = importlib.import_module("swesim.dashboard.app")
+
+
+def test_nested_evaluator_metadata_is_removed_from_all_public_json_artifacts(site):
+    tid = site["done"]
+    trial = site["ws"].root / "trials" / tid
+    report = json.loads((trial / "report.json").read_text())
+    report["diagnostics"] = {"redacted_terms": [SENTINELS["redacted_term"]], "safe": "public result"}
+    (trial / "report.json").write_text(json.dumps(report))
+    record = json.loads((trial / "record.json").read_text())
+    record["report"] = report
+    record["transcript"]["events"][0]["extra"] = {"withheld_sentences": [SENTINELS["withheld_excerpt"]]}
+    (trial / "record.json").write_text(json.dumps(record))
+    urls = [f"/api/trial/{tid}/timeline", f"/trial/{tid}/file/report.json", f"/trial/{tid}",
+            f"/artifacts?path=trials/{tid}/report.json", f"/artifacts/download?path=trials/{tid}/report.json"]
+    for url in urls:
+        public = site["client"].get(url)
+        assert public.status_code == 200, url
+        assert SENTINELS["redacted_term"] not in public.text, url
+        assert SENTINELS["withheld_excerpt"] not in public.text, url
+    assert SENTINELS["redacted_term"] in site["client"].get(urls[0], headers=site["eval"]).text
+
+
+def test_database_projects_nested_fields_but_evaluator_can_inspect_them(site):
+    reader = reader_of(site)
+    original = reader.table
+
+    def table(name, f):
+        page = original(name, f)
+        if name == "scenarios":
+            for row in page.items:
+                row["registry_json"] = {"draft_meta": {"note": SENTINELS["draft_meta"]}}
+                row["task_sense"] = {"coherent": True, "reasons": {"note": SENTINELS["audit_reason"]}}
+        return page
+
+    reader.table = table
+    routes.app.dependency_overrides[routes.reader_dep] = lambda: reader
+    try:
+        for url in ("/db/scenarios", "/api/db/scenarios", "/api/db/scenarios.csv"):
+            assert SENTINELS["draft_meta"] not in site["client"].get(url).text
+            assert SENTINELS["audit_reason"] not in site["client"].get(url).text
+            assert SENTINELS["draft_meta"] in site["client"].get(url, headers=site["eval"]).text
+        assert "redacted_terms" in site["client"].get("/api/db/exchanges", headers=site["eval"]).text
+    finally:
+        routes.app.dependency_overrides.clear()
+
+
+def test_artifact_aliases_and_private_families_cannot_bypass_identity(site, tmp_path):
+    root = site["ws"].root
+    sibling = root.parent / (root.name + "-private")
+    sibling.mkdir()
+    (sibling / "private.json").write_text(json.dumps({"secret": SENTINELS["author_only_fact"]}))
+    (root / "escape").symlink_to(sibling, target_is_directory=True)
+    (root / "alias").symlink_to(root / "scenarios" / site["spec"].id / "judge.json")
+    client = site["client"]
+    for path in ("escape/private.json", "alias", "candidates", "jobs", "probes", "calibration", "evidence"):
+        for prefix in ("/api/artifacts?path=", "/artifacts?path=", "/artifacts/download?path="):
+            response = client.get(prefix + path)
+            assert response.status_code == 403, (prefix, path, response.status_code)
+    for headers in ({}, site["eval"]):
+        result = client.get(f"/api/artifacts?path=trials/{site['done']}", headers=headers).json()
+        assert "task" not in {entry["name"] for entry in result["entries"]}
+
+
+def test_workflow_executions_keep_run_identity_and_filters(site):
+    now = datetime.now(UTC)
+    common = dict(parent_workflow_id=None, closed_at=None, task_queue=None, cost_usd=None, search_attributes={})
+    rows = [R.WorkflowRow(workflow_id="repeat", run_id="first", type="CreateTasksWorkflow", status="failed", params_summary={},
+                          failure="first failed", started_at=now, origin="laptop", **common),
+            R.WorkflowRow(workflow_id="repeat", run_id="second", type="CreateTasksWorkflow", status="running", params_summary={},
+                          started_at=now, failure=None, origin="laptop", **common)]
+
+    class Reader:
+        def workflows(self, f):
+            selected = [r for r in rows if not f.status or r.status in f.status]
+            return R.Page(items=selected[f.offset:f.offset + f.limit], total=len(selected), offset=f.offset, limit=f.limit)
+
+    views, total = routes.workflow_views(Reader(), [{**rows[1].model_dump(mode="json"), "summary": "live"}], get_settings(), R.WorkflowFilter())
+    assert total == 2 and {r["run_id"] for r in views} == {"first", "second"}
+    assert all(f"run_id={v['run_id']}" in v["console_url"] for v in views)
+    views, total = routes.workflow_views(Reader(), [rows[1].model_dump(mode="json")], get_settings(), R.WorkflowFilter(status=["failed"]))
+    assert total == 1 and [r["run_id"] for r in views] == ["first"]
+
+
+def test_bad_browser_filters_and_origins_return_client_errors(site):
+    for url in ("/api/trials?status=bogus", "/api/db/trials?order_by=bogus", "/api/db/trials?where.bogus=x"):
+        assert site["client"].get(url).status_code == 400, url
+    for origin in ("http://testserver:bad", "http://testserver/path", "http://user@testserver", "http://[broken"):
+        response = site["client"].post("/api/rebuild/preview", json={}, headers={"Origin": origin})
+        assert response.status_code == 403, origin
+
+
+def test_review_counts_do_not_scan_workspace(site, monkeypatch):
+    monkeypatch.setattr(console, "local_drafts", lambda *args: pytest.fail("list view scanned workspace"))
+    assert site["client"].get("/api/counts").status_code == 200
+    assert site["client"].get("/api/review").status_code == 200
+
+
+def test_model_defaults_follow_current_shared_roles():
+    from swesim import cli
+    from swesim.models import StakeholderConfig
+    defaults = console.defaults()
+    assert defaults["judge_model"] == cli.JUDGE_MODEL_DEFAULT
+    assert defaults["draft_model"] == cli.DRAFT_MODEL_DEFAULT
+    assert defaults["solver_model"] == cli.SOLVER_MODEL_DEFAULT
+    assert defaults["stakeholder_model"] == StakeholderConfig().model_id

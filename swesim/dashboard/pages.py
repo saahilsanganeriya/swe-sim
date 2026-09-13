@@ -13,6 +13,9 @@ from decimal import Decimal
 from pathlib import Path
 
 from swesim.dashboard import charts
+from swesim.dashboard.public import project
+from urllib.parse import urlencode
+from swesim.stages.score import OUTCOME_NAMES
 from swesim.dashboard.render import (
     Column, chip, code_block, dash, difficulty_chip, fmt_usd, h, hero, ident, kv, model_chip, table, tier_of, tile, tiles,
 )
@@ -34,11 +37,13 @@ TRIAL_COLUMNS = (
     Column("confirmations", "confirmed", "num"),
     Column("cost_usd", "cost", "usd"),
     Column("origin", "origin", "text", filterable=True),
+    Column("workflow_id", "workflow", "id", href="/workflows/{workflow_id}", n=16),
     Column("started_at", "started", "time"),
     Column("attempt_index", "#", "num"),
 )
 WORKFLOW_COLUMNS = (
-    Column("workflow_id", "workflow", "id", href="/workflows/{workflow_id}", n=28, filterable=True),
+    Column("workflow_id", "workflow", "id", href="{console_url}", n=28, filterable=True),
+    Column("run_id", "execution", "id", n=12),
     Column("type", "type", "text", filterable=True),
     Column("status", "status", "chip", filterable=True),
     Column("summary", "params", "text"),
@@ -63,20 +68,36 @@ CANDIDATE_COLUMNS = (
 )
 
 
-def trial_view(r, extras: dict | None = None) -> dict:
+def trial_view(r) -> dict:
+    """A TrialRow as the table/JSON row: adds the outcome name (score.OUTCOME_NAMES) and a hover detail."""
     d = r.model_dump(mode="json")
-    ex = extras or {}
-    d["outcome"] = ex.get("outcome") or (None if r.outcome_code is None else str(r.outcome_code))
-    d["outcome_detail"] = (f"error {ex['error_type']} · from {ex.get('source_file')}" if ex.get("error_type") else (f"from {ex['source_file']}" if ex.get("source_file") else None))
+    d["outcome"] = OUTCOME_NAMES.get(r.outcome_code) if r.outcome_code is not None else None
+    d["outcome_detail"] = f"outcome code {r.outcome_code}" if r.outcome_code is not None else None
     if not d["outcome"] and r.status not in ("completed", "running", "launched", "planned"):
         d["outcome"] = "unresolved"
+        d["outcome_detail"] = "ended without a verifier record; never counted in n or pass@k"
     return d
+
+
+def reject_histogram(reader, rows, source_key: str | None) -> dict[str, int]:
+    """Index projection of discovery and candidate rejects; older readers expose candidate gates only."""
+    from collections import Counter
+    read = getattr(reader, "reject_histogram", None)
+    if callable(read):
+        return read(source_key)
+    out: Counter = Counter()
+    for r in rows:
+        if r.status == "rejected" and r.gate and (source_key is None or r.source_key == source_key):
+            out[r.gate] += 1
+    return dict(out.most_common())
 
 
 def workflow_view(w: dict, settings) -> dict:
     d = dict(w)
     d["temporal_url"] = settings.workflow_url(w.get("workflow_id", ""), w.get("run_id")) or ""
     d["temporal"] = "open ↗" if d["temporal_url"] else None
+    d["console_url"] = "/workflows/" + w.get("workflow_id", "") + ("?" + urlencode({"run_id": w["run_id"]}) if w.get("run_id") else "")
+    d["execution_key"] = f"{w.get('workflow_id')}|{w.get('run_id', '')}"
     if isinstance(w.get("params_summary"), dict) and not w.get("summary"):
         d["summary"] = ", ".join(f"{k}={','.join(map(str, v)) if isinstance(v, (list, tuple)) else v}" for k, v in w["params_summary"].items())
     return d
@@ -116,7 +137,7 @@ def _filter_select(name: str, values: list, current: list | None, label: str) ->
     return f"<label>{h(label)}<select name='{h(name)}'><option value=''>all</option>{opts}</select></label>"
 
 
-def trials_body(page, views: list[dict], facets: dict, current: dict, unprojected: list[dict]) -> str:
+def trials_body(page, views: list[dict], facets: dict, current: dict) -> str:
     form = ["<form class='toolbar' method='get' action='/trials'>",
             _filter_select("scenario_id", facets["scenario_id"], current.get("scenario_id"), "scenario"),
             _filter_select("version", facets["version"], current.get("version"), "version"),
@@ -134,11 +155,6 @@ def trials_body(page, views: list[dict], facets: dict, current: dict, unprojecte
             "".join(form),
             table("trials", TRIAL_COLUMNS, views, key="trial_id", total=page.total, offset=page.offset, limit=page.limit,
                   empty="<strong>No trials match.</strong> Reset the filters, or start a run on <a href='/run'>Run</a>.")]
-    if unprojected:
-        items = "".join(f"<li><a class='mono' href='/trial/{h(u['trial_id'])}'>{h(u['trial_id'])}</a> · status {h(u['status'])} · missing {h(', '.join(u['missing']))} · "
-                        f"<a href='/artifacts?path=trials/{h(u['trial_id'])}'>files</a></li>" for u in unprojected)
-        body.append(f"<h2>Attempt directories without lineage</h2><p class='muted small'>{len(unprojected)} directory(ies) exist under <code>trials/</code> but carry no condition/model in any file, "
-                    f"so they cannot be projected into the trials table. They are listed here rather than dropped.</p><ul class='small'>{items}</ul>")
     return "".join(body)
 
 
@@ -171,7 +187,7 @@ def workflows_body(views: list[dict], error: str | None, total: int, settings) -
             "params summary, cost and a deep link to the Temporal UI for the event history. This page never duplicates the history itself.</p>"]
     if error:
         body.append(f"<div class='banner warn' role='status'><strong>Live listing unavailable.</strong> {h(error)} Rows below come from the index only.</div>")
-    body.append(table("workflows", WORKFLOW_COLUMNS, views, key="workflow_id", total=total, source="/api/workflows",
+    body.append(table("workflows", WORKFLOW_COLUMNS, views, key="execution_key", total=total, source="/api/workflows",
                       empty="<strong>No workflows.</strong> Start one on <a href='/create'>Create</a> or <a href='/run'>Run</a>."))
     return "".join(body)
 
@@ -246,6 +262,7 @@ def leaderboard_body(views: list[dict], gate: list[dict], current: dict, matrix_
             + _filter_select("brief_profile", ["natural", "withheld"], current.get("brief_profile"), "brief profile")
             + _filter_select("source", ["github-repo", "swebench-annotated", "authored"], current.get("source"), "scenario source")
             + _filter_select("tier", ["A", "B", "C", "D", "E"], current.get("tier"), "model tier")
+            + _filter_select("difficulty_tier", ["informative", "saturated"], current.get("difficulty_tier"), "difficulty")
             + _filter_select("condition", ["full", "hidden", "interactive"], current.get("condition"), "condition")
             + f"<label class='inline'><input type='checkbox' name='include_saturated' value='1'{' checked' if current.get('include_saturated') else ''}> include saturated scenarios</label>"
             "<button type='submit' class='button'>Apply</button> <a class='button' href='/leaderboard'>Reset</a></form>")
@@ -319,17 +336,35 @@ def is_listable(rel: Path, evaluator: bool) -> tuple[bool, str]:
     if len(parts) >= 3 and parts[0] == "trials" and parts[2] == "task":
         return False, "the per-trial task copy holds the session token and is never listed"
     if not evaluator:
+        if parts and parts[0] in ("candidates", "evidence", "jobs", "probes", "calibration"):
+            return False, "evaluator-only (raw pipeline records and audit evidence)"
         if len(parts) >= 3 and parts[0] == "scenarios" and (parts[2] == "assets" or parts[-1] in ("scenario.json", "scenario.draft.json", "judge.json", "draft.meta.json", "audit.json")):
             return False, "evaluator-only (author-only facts, hidden test assets, judge/draft metadata)"
         if len(parts) >= 5 and parts[0] == "scenarios" and parts[2] == "archive" and (parts[4] == "assets" or parts[-1] in ("scenario.json", "scenario.draft.json", "judge.json", "draft.meta.json", "audit.json")):
             return False, "evaluator-only (archived spec and metadata)"
         if len(parts) >= 3 and parts[0] == "trials" and parts[-1] in ("record.json", "transcript.json", "spec.json", "audit.json"):
             return False, "evaluator-only (raw record, transcript, frozen spec, audit)"
+        if len(parts) >= 3 and parts[0] == "trials" and parts[-1] not in ("reward.json", "report.json", "status.json", "costs.json", "label.json"):
+            return False, "evaluator-only (raw trial configuration or trace)"
         if len(parts) >= 2 and parts[0] == "tasks":
             return False, "evaluator-only (compiled task directories carry hidden tests)"
         if len(parts) >= 2 and parts[0] == "exports":
             return False, "evaluator-only (episode exports carry the frozen spec)"
     return True, ""
+
+
+def artifact_path(root: Path, rel: Path) -> Path:
+    """Resolve a workspace artifact without following any symlink or accepting prefix siblings."""
+    root = root.resolve()
+    target = root / rel
+    if not target.resolve().is_relative_to(root):
+        raise PermissionError("path escapes the workspace")
+    current = root
+    for part in rel.parts:
+        current /= part
+        if current.is_symlink():
+            raise PermissionError("artifact symlinks are not served")
+    return target
 
 
 def sha256_from_manifests(root: Path, rel: Path) -> str | None:
@@ -348,15 +383,17 @@ def sha256_from_manifests(root: Path, rel: Path) -> str | None:
 
 def list_dir(root: Path, rel: Path, evaluator: bool, offset: int = 0) -> dict:
     """One directory level via os.scandir, paged; entries carry size, sha256 (from manifests), listability."""
-    target = (root / rel).resolve()
-    if not str(target).startswith(str(root.resolve())):
-        raise ValueError("path escapes the workspace")
+    target = artifact_path(root, rel)
     entries = []
     try:
         with os.scandir(target) as it:
             for e in it:
                 r = rel / e.name
+                if len(r.parts) >= 3 and r.parts[0] == "trials" and r.parts[2] == "task":
+                    continue
                 ok, why = is_listable(r, evaluator)
+                if e.is_symlink():
+                    ok, why = False, "artifact symlinks are not served"
                 try:
                     st = e.stat(follow_symlinks=False)
                     size = None if e.is_dir(follow_symlinks=False) else st.st_size
@@ -412,21 +449,24 @@ def artifacts_body(root: Path, listing: dict, preview: dict | None, rel: Path) -
     return "".join(body)
 
 
-def preview_file(root: Path, rel: Path, max_bytes: int = 400_000) -> dict | None:
-    p = (root / rel).resolve()
-    if not str(p).startswith(str(root.resolve())) or not p.is_file():
+def preview_file(root: Path, rel: Path, max_bytes: int = 400_000, evaluator: bool = False) -> dict | None:
+    p = artifact_path(root, rel)
+    if not p.is_file():
         return None
     size = p.stat().st_size
     lang = "diff" if p.suffix in (".diff", ".patch") else p.suffix.lstrip(".")
     text = None
     if p.suffix.lower() in TEXT_PREVIEW:
-        data = p.read_bytes()[:max_bytes]
+        with p.open("rb") as stream:
+            data = stream.read(max_bytes)
         text = data.decode("utf-8", errors="replace")
         if p.suffix == ".json":
             try:
-                text = json.dumps(json.loads(text), indent=2, sort_keys=True)
+                parsed = json.loads(text)
+                text = json.dumps(parsed if evaluator else project(parsed), indent=2, sort_keys=True)
             except ValueError:
-                pass
+                if not evaluator:
+                    text = "JSON cannot be projected safely; evaluator access required."
         if size > max_bytes:
             text += f"\n… truncated at {max_bytes} bytes; download for the full file"
     digest = hashlib.sha256(p.read_bytes()).hexdigest() if size <= 50_000_000 else None

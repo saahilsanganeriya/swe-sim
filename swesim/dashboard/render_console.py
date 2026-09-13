@@ -66,6 +66,11 @@ def create_body(d: dict, repos: list[str], spend_cap) -> str:
     return "".join(body)
 
 
+def create_page(d: dict) -> str:
+    """The create form body with no repository list and no cap (the shape older callers and tests/test_workflows.py use)."""
+    return create_body(d, [], None)
+
+
 def run_body(d: dict, scenarios: list, spend_cap) -> str:
     """``scenarios``: ScenarioRows (valid, current) with difficulty labels for the picker."""
     opts = "".join(f"<option value='{h(s.scenario_id)}' data-tier='{h(s.difficulty_tier or 'unlabelled')}' data-source='{h(s.source)}'>"

@@ -21,10 +21,10 @@ from pathlib import Path
 
 from swesim.dashboard.data import ID_RE, read_json
 from swesim.paths import Workspace, atomic_json
-from swesim.settings import Settings
+from swesim.settings import Settings, get_settings
 
 GITHUB_REPO_RE = re.compile(r"^(?:https://github\.com/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
-MODEL_RE = re.compile(r"^[a-z0-9-]+/[A-Za-z0-9._:-]+$")
+MODEL_RE = re.compile(r"^[a-z0-9-]+/[A-Za-z0-9._:-]+(?:/[A-Za-z0-9._:-]+)?$")  # <provider>/<vendor-or-model>[/<model>] (interfaces §6)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+$")
 WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")  # `@` for rebuilt candidates: create:<sid>@v<n>
@@ -84,9 +84,9 @@ def defaults() -> dict:
             "since": "2026-06-01", "max_candidates": 3, "limit": 5, "max_parallel": 1, "k": 3}
 
 
-def stakeholder_url(settings: Settings) -> str:
+def stakeholder_url(settings: Settings | None = None) -> str:
     """Server-side only (``Settings.stakeholder_url``); passed to the workflow, never rendered or echoed."""
-    return settings.stakeholder_url or ""
+    return (settings or get_settings()).stakeholder_url or ""
 
 
 def _lines(value) -> list[str]:
@@ -287,7 +287,7 @@ def _ids(result) -> list[str]:
     return [str(x) for x in result] if isinstance(result, (list, tuple)) else [str(result)]
 
 
-async def start_create(params: dict, settings: Settings) -> dict:
+async def start_create(params: dict, settings: Settings | None = None) -> dict:
     """Prefer CreateTasksWorkflow (one workflow for every source); fall back to one PipelineWorkflow per repository."""
     cli = cli_for_create(params)
     url = stakeholder_url(settings)
@@ -333,7 +333,7 @@ def planner_workspace(root: Path | None):
         activities.WS = previous
 
 
-async def start_run(params: dict, settings: Settings, root: Path | None = None) -> dict:
+async def start_run(params: dict, settings: Settings | None = None, root: Path | None = None) -> dict:
     """Prefer RunTasksWorkflow (one workflow, bounded parallelism); fall back to one serial RunMatrixWorkflow per scenario,
     planned by the worker's own ``plan_trials`` so trial ids and score groups agree with the CLI."""
     cli = cli_for_run(params)
@@ -520,8 +520,20 @@ def _awaiting_from_progress(wid: str, p: dict) -> list[dict]:
     return items
 
 
-async def review_queue(root: Path) -> dict:
+async def review_queue(root: Path, reader=None) -> dict:
     """Candidates awaiting approval from running creation jobs plus local drafts without approval.json."""
+    if reader is not None:
+        from swesim.dashboard.access import all_rows
+        from swesim.dashboard.rows import ScenarioFilter, WorkflowFilter
+        items = []
+        for w in all_rows(reader.workflows, WorkflowFilter(type=list(CREATION_TYPES), status=["running"])):
+            items.extend(_awaiting_from_progress(w.workflow_id, w.params_summary))
+        seen = {i["scenario_id"] for i in items}
+        for s in all_rows(reader.scenarios, ScenarioFilter(validation_status=["drafting"], latest_only=True)):
+            if s.scenario_id not in seen:
+                items.append({"scenario_id": s.scenario_id, "spec_hash": s.spec_hash, "source": s.source,
+                              "workflow_id": s.workflow_id, "drafted_at": s.created_at.isoformat(), "judge_keep": None, "rubric": None})
+        return {"items": items, "errors": []}
     items: list[dict] = []
     errors: list[str] = []
     try:

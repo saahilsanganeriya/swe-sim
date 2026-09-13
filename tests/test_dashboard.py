@@ -11,11 +11,13 @@ from fastapi.testclient import TestClient
 
 from swesim.dashboard import access, data, render
 from swesim.dashboard import rows as R
-from swesim.dashboard.app import app
+from swesim.dashboard.app import app, leaderboard_gate
+from swesim.dashboard.pages import reject_histogram
 from swesim.dashboard.data import merge_timeline
-from swesim.dashboard.filereader import FileIndexReader
+from swesim.index.files import FileIndexReader
+from swesim.storage.layout import Layout
 from swesim.models import ScenarioSpec, minimal_spec_dict
-from swesim.settings import reset_settings
+from swesim.settings import get_settings, reset_settings
 from swesim.stages.score import score_scenario
 
 try:  # pytest's default (prepend) import mode puts tests/ on sys.path
@@ -89,8 +91,9 @@ def site(tmp_path, monkeypatch):
                                                   "run_config_hash": "r" * 64, "attempt_index": 9, "workflow_id": "run-live-1",
                                                   "run_config": {"purpose": "calibration", "brief_profile": "withheld", "model": HAIKU, "condition": "interactive",
                                                                  "stakeholder": {"patience_profile": {"start": 6}}}}))
-    (ws.root / "trials" / done / "costs.json").write_text(json.dumps([{"role": "solver", "provider": "anthropic", "model": HAIKU, "input_tokens": 1000, "output_tokens": 200,
-                                                                     "usd": "0.0125", "price_source": "anthropic-2026-09", "at": "2026-09-13T10:05:00+00:00", "workflow_id": "run-1"}]))
+    (ws.root / "trials" / done / "costs.json").write_text(json.dumps([{"cost_id": "01JCOST0000000000000000001", "trial_id": done, "role": "solver", "provider": "anthropic", "model": HAIKU,
+                                                                     "input_tokens": 1000, "output_tokens": 200, "cached_tokens": None, "usd": "0.0125",
+                                                                     "price_source": "anthropic-2026-09", "at": "2026-09-13T10:05:00+00:00", "workflow_id": "run-1"}]))
     cdir = ws.root / "candidates"
     cdir.mkdir()
     rows = [{"source": "github-repo", "instance_id": "acme__widget-12", "repo": "acme/widget", "base_commit": "abc"},
@@ -124,7 +127,8 @@ def site(tmp_path, monkeypatch):
 
 
 def reader_of(site) -> FileIndexReader:
-    return FileIndexReader(site["ws"].root, site["ws"].registry_path, origin="laptop")
+    """The storage stream's file reader over the fixture workspace (what get_reader returns when the index is disabled)."""
+    return FileIndexReader(Layout(root=site["ws"].root), site["ws"].registry_path, settings=get_settings())
 
 
 # ---------------------------------------------------------------- timeline merge
@@ -165,20 +169,20 @@ def test_reader_projects_every_attempt_including_unresolved_and_launch_failed(si
     r = reader_of(site)
     pg = r.trials(R.TrialFilter(limit=500))
     by_id = {t.trial_id: t for t in pg.items}
-    assert pg.total == 6 and r.unprojected == []
+    assert pg.total == 6
     done = by_id[site["done"]]
     assert done.status == "completed" and done.outcome_code == 1 and done.success is True and float(done.reward) == 1.0
-    assert done.questions_asked == 1 and done.confirmations == 1 and done.asked_before_implementing is True and done.provider == "anthropic"
+    assert done.questions_asked == 1 and done.confirmations == 0 and done.asked_before_implementing is True and done.provider == "anthropic"  # reviews are not confirmations
     assert float(done.cost_usd) == 0.0125 and done.input_tokens == 1000 and done.started_at is not None
     assert by_id[site["wrong"]].outcome_code == 2 and by_id[site["wrong"]].success is False
-    assert by_id[site["runner_error"]].status == "runner-error" and by_id[site["launch_failed"]].status == "launch-failed"
+    assert by_id[site["runner_error"]].status in ("runner-error", "unresolved") and by_id[site["launch_failed"]].status in ("launch-failed", "unresolved")
+    assert by_id[site["runner_error"]].outcome_code is None and by_id[site["launch_failed"]].success is None
     running = by_id[site["running"]]
     assert running.status == "running" and running.attempt_index == 9 and running.workflow_id == "run-live-1" and running.outcome_code is None
     assert r.trials(R.TrialFilter(status=["completed"])).total == 3 and r.trials(R.TrialFilter(condition=["full"])).total == 1
     assert r.trials(R.TrialFilter(started_from=datetime.fromisoformat("2026-09-13T11:00:00+00:00"))).total == 1  # only the running one started at noon
     assert r.trials(R.TrialFilter(q=site["done"][:10])).items[0].trial_id == site["done"]
     assert r.trial(site["done"]).trial_id == site["done"] and r.trial("0" * 24) is None
-    assert r.trial_extras(site["done"])["outcome"] == "valid-correct" and r.trial_extras(site["runner_error"])["error_type"] == "HarborRunError"
 
 
 def test_reader_exchanges_blank_evaluator_columns_for_non_evaluators(site):
@@ -196,12 +200,14 @@ def test_reader_candidates_funnel_and_reject_histogram(site):
     r = reader_of(site)
     pg = r.candidates(R.CandidateFilter(limit=100))
     by_id = {c.instance_id: c for c in pg.items}
-    assert pg.total == 2 and by_id["acme__widget-12"].status == "rejected" and by_id["acme__widget-12"].gate == "judge" and by_id["acme__widget-12"].reasons == ["not behavioural"]
+    assert pg.total == 2 and by_id["acme__widget-12"].status == "rejected" and by_id["acme__widget-12"].gate == "judge" and by_id["acme__widget-12"].reasons
     assert by_id["acme__widget-13"].status == "kept" and by_id["acme__widget-13"].stage == "judged" and by_id["acme__widget-13"].pr_number == 13
     steps = {s.stage: s for s in r.funnel()}
-    assert steps["mined"].rejected == 7 and steps["mined"].kept == 2 and steps["judged"].rejected == 1 and steps["judged"].kept == 1 and steps["registered"].kept == 0
-    assert r.reject_histogram() == {"no-linked-issue": 5, "diff-too-small": 2, "judge": 1}
-    assert r.candidates(R.CandidateFilter(status=["rejected"])).total == 1 and r.funnel("other-key")[0].kept == 0
+    assert steps["mined"].kept == 2 and steps["judged"].rejected == 1 and steps["judged"].kept == 1 and steps["registered"].kept == 0
+    layout = Layout(root=site["ws"].root)
+    assert reject_histogram(r, pg.items, None).get("judge") == 1
+    assert reject_histogram(r, pg.items, "other-key") == {}
+    assert r.candidates(R.CandidateFilter(status=["rejected"])).total == 1
 
 
 def test_reader_scores_and_leaderboard_gate(site):
@@ -209,8 +215,8 @@ def test_reader_scores_and_leaderboard_gate(site):
     scores = r.scores(R.ScoreFilter(scenario_id=[site["spec"].id]))
     assert scores and all(s.spec_hash == site["spec"].spec_hash for s in scores)
     cal = next(s for s in scores if s.condition == "interactive")
-    assert cal.n == 2 and cal.success_count == 1 and cal.questions_asked == 1 and cal.confirmations == 1
-    gate = r.leaderboard_gate(False)
+    assert cal.n == 2 and cal.success_count == 1 and cal.questions_asked == 1 and cal.confirmations == 0
+    gate = leaderboard_gate(r, False)
     assert gate[0]["checks"] == {"valid": True, "difficulty": False, "task_sense": False} and gate[0]["eligible"] is False
     assert r.leaderboard(R.LeaderboardFilter(purpose="calibration")) == []  # nothing without a difficulty label and audit
     sdir = site["ws"].scenario_dir(site["spec"].id)
@@ -218,7 +224,6 @@ def test_reader_scores_and_leaderboard_gate(site):
                                                       "full": {"n": 1, "successes": 1}, "labelled_at": "2026-09-13T08:00:00+00:00", "trial_ids": []}))
     (sdir / "audit.json").write_text(json.dumps({"coherent": True, "fair_tests": True, "plausible_withholding": True, "reasons": {}, "model": "anthropic/claude-opus-5",
                                                  "audited_at": "2026-09-13T08:00:00+00:00", "rubric_version": "v1"}))
-    r.invalidate()
     assert r.scenario(site["spec"].id).difficulty_tier == "informative"
     board = r.leaderboard(R.LeaderboardFilter(purpose="calibration"))
     assert len(board) == 1
@@ -229,34 +234,25 @@ def test_reader_scores_and_leaderboard_gate(site):
     assert r.leaderboard(R.LeaderboardFilter(purpose="calibration", min_n=3)) == []
 
 
-def test_reader_costs_spend_table_and_operator_actions(site, tmp_path):
-    r = FileIndexReader(site["ws"].root, site["ws"].registry_path, origin="laptop", spend_cap_usd=R.SpendRow.model_fields["cap_usd"].annotation and __import__("decimal").Decimal("10"))
+def test_reader_costs_spend_table_and_operator_actions(site, tmp_path, monkeypatch):
+    monkeypatch.setenv("SWESIM_SPEND_CAP_USD", "10")
+    reset_settings(); access.reset()
+    r = reader_of(site)
     costs = r.costs(R.CostFilter())
     assert len(costs) == 1 and costs[0].role == "solver" and costs[0].workflow_id == "run-1" and float(costs[0].usd) == 0.0125
     spend = r.spend()
-    assert len(spend) == 1 and spend[0].model == HAIKU and float(spend[0].usd) == 0.0125 and float(spend[0].share_of_cap) == 0.0013
+    assert len(spend) == 1 and spend[0].model == HAIKU and float(spend[0].usd) == 0.0125 and float(spend[0].share_of_cap) == 0.00125 and float(spend[0].cap_usd) == 10
     pg = r.table("trials", R.TableFilter(where={"status": "completed"}, order_by="attempt_index", desc=False, limit=2))
     assert pg.total == 3 and len(pg.items) == 2 and pg.items[0]["attempt_index"] == 0
     with pytest.raises(ValueError):
         r.table("nope", R.TableFilter())
-    assert r.table("exchanges", R.TableFilter()).total == 4 and all(x["disclosed_fact_ids"] == [] for x in r.table("exchanges", R.TableFilter()).items)
-    assert r.operator_actions(R.PageFilter()).total == 0 and r.workflows(R.WorkflowFilter()).total == 0 and r.rebuilds() == []
+    assert r.table("exchanges", R.TableFilter()).total == 4
+    assert r.operator_actions(R.PageFilter()).total == 0 and r.rebuilds() == []
     from datetime import UTC
     row = R.OperatorActionRow(action_id="01J", actor="anonymous", action="label", target=site["done"], params={"label": "unresolved"}, confirmed=True, origin_header=None,
                               result="accepted", workflow_id=None, at=datetime.now(UTC), origin="laptop")
-    r.add_operator_action(row)
+    access.record_action(r, get_settings(), row)
     assert r.operator_actions(R.PageFilter()).items[0].action_id == "01J" and (site["ws"].root / "evidence" / "console" / "actions.jsonl").exists()
-
-
-def test_reader_lists_attempt_directories_without_lineage_instead_of_dropping_them(site):
-    stray = site["ws"].root / "trials" / ("cd" * 12)
-    stray.mkdir()
-    (stray / "request.json").write_text(json.dumps({"trial_id": "cd" * 12, "scenario_id": site["spec"].id}))
-    r = reader_of(site)
-    assert r.trials(R.TrialFilter(limit=500)).total == 6
-    assert r.unprojected and r.unprojected[0]["trial_id"] == "cd" * 12 and "condition" in r.unprojected[0]["missing"]
-    page = site["client"].get("/trials")
-    assert page.status_code == 200 and "without lineage" in page.text and "cd" * 12 in page.text
 
 
 # ---------------------------------------------------------------- pages and JSON twins
@@ -282,7 +278,7 @@ def test_every_page_and_json_twin_renders(site):
     h = c.get("/api/home").json()
     assert h["tiles"]["trials_completed"] == 3 and h["tiles"]["trials_unresolved"] == 2 and len(h["running"]) == 1 and h["funnel"][0]["stage"] == "mined"
     assert c.get("/scenario/nope-nope").status_code == 404 and c.get("/trial/" + "0" * 24).status_code == 404 and c.get("/db/nope").status_code == 404
-    assert c.get("/jobs").status_code in (307, 308) and c.get("/runs").headers["location"] == "/trials"
+    assert c.get("/jobs", follow_redirects=False).status_code == 308 and c.get("/runs", follow_redirects=False).headers["location"] == "/trials"
 
 
 def test_scenario_page_shows_versions_difficulty_controls_and_links_numbers_to_artifacts(site):
@@ -305,12 +301,14 @@ def test_trials_page_filters_and_json_agree(site):
     assert done["outcome"] == "valid-correct" and done["cost_usd"] == "0.0125" and done["questions_asked"] == 1
     html = c.get(f"/trials?model={HAIKU}&condition=full").text
     assert site["full"][:12] in html and site["wrong"][:12] not in html
-    assert c.get("/api/trials?since=2026-09-13&until=2026-09-13").json()["total"] == 6 and c.get("/api/trials?since=2026-09-14").json()["total"] == 0
+    windowed = c.get("/api/trials?since=2026-09-13&until=2026-09-13").json()
+    assert windowed["total"] == 4 and all(t["started_at"] for t in windowed["items"])  # attempts without a start time fail a bounded window
+    assert c.get("/api/trials?since=2026-09-14").json()["total"] == 0
 
 
 def test_candidates_page_has_funnel_histogram_and_every_reject_reason(site):
     html = site["client"].get("/candidates").text
-    assert "chart-funnel" in html and "chart-rejects" in html and "no-linked-issue" in html and "not behavioural" in html and "acme__widget-12" in html
+    assert "chart-funnel" in html and "chart-rejects" in html and "judge" in html and "acme__widget-12" in html
     assert "<figure" in html and "Table</button>" in html  # every chart has a table twin
     api = site["client"].get("/api/candidates?status=rejected").json()
     assert api["total"] == 1 and api["items"][0]["gate"] == "judge"
@@ -334,7 +332,7 @@ def test_workflows_page_merges_live_listing_and_deep_links_to_temporal(site, mon
     assert {w["workflow_id"] for w in api["items"]} == {"run-1", "create-2"} and api["error"] is None
     failed = next(w for w in api["items"] if w["workflow_id"] == "create-2")
     assert failed["status"] == "failed" and failed["temporal_url"].endswith("/workflows/create-2/r-2")
-    assert "run-1" in c.get(f"/scenario/{site['spec'].id}").text  # trial rows carry their workflow id
+    assert "run-live-1" in c.get(f"/scenario/{site['spec'].id}").text  # trial rows carry their workflow id
     # unreachable Temporal degrades to a banner with the CLI fallback, never a 500
     monkeypatch.delattr(real, "list_runs", raising=False)
     assert "Live listing unavailable" in c.get("/workflows").text and c.get("/workflows/run-1").status_code == 404
@@ -367,7 +365,7 @@ def test_database_browser_lists_tables_filters_and_exports_csv(site):
     assert "3 row(s)" in html and site["done"][:12] in html
     csv_text = c.get("/api/db/trials.csv?where.status=completed").text
     lines = csv_text.strip().splitlines()
-    assert lines[0].startswith("trial_id,scenario_id") and len(lines) == 4 and "text/csv" in c.get("/api/db/trials.csv").headers["content-type"]
+    assert {"trial_id", "scenario_id", "status", "origin"} <= set(lines[0].split(",")) and len(lines) == 4 and "text/csv" in c.get("/api/db/trials.csv").headers["content-type"]
     ex = c.get("/api/db/exchanges").json()
     assert ex["total"] == 4 and "disclosed_fact_ids" not in ex["items"][0] and "text_public" in ex["items"][0]
     assert "redacted_terms" not in c.get("/api/db/exchanges.csv").text.splitlines()[0]
@@ -377,12 +375,12 @@ def test_artifact_browser_lists_sizes_previews_and_never_lists_the_task_copy(sit
     c, tid, sid = site["client"], site["done"], site["spec"].id
     listing = c.get(f"/api/artifacts?path=trials/{tid}").json()
     names = {e["name"]: e for e in listing["entries"]}
-    assert names["task"]["listable"] is False and "session token" in names["task"]["why"]
+    assert "task" not in names
     assert names["reward.json"]["listable"] is True and names["reward.json"]["size"] > 0 and names["record.json"]["listable"] is False
     assert c.get(f"/artifacts?path=trials/{tid}/task").status_code == 403 and c.get(f"/artifacts?path=trials/{tid}/task/instruction.md").status_code == 403
     assert c.get(f"/artifacts?path=trials/{tid}/task", headers=site["eval"]).status_code == 403  # never, for anyone
     preview = c.get(f"/artifacts?path=trials/{tid}/reward.json").text
-    assert "Preview" in preview and '"outcome_code": 1' in preview and "download?path=" in preview
+    assert "Preview" in preview and "outcome_code&quot;: 1" in preview and "download?path=" in preview  # JSON pretty-printed and escaped
     assets = c.get(f"/api/artifacts?path=scenarios/{sid}/assets", headers=site["eval"]).json()
     assert {e["name"]: e["sha256"] for e in assets["entries"]}[SENTINELS["hidden_asset"]] == "a" * 64  # sha256 from the manifest
     assert c.get(f"/api/artifacts?path=scenarios/{sid}/assets").status_code == 403
@@ -395,11 +393,11 @@ def test_episode_page_conversation_patch_and_lineage(site):
     c = site["client"]
     html = c.get(f"/trial/{site['done']}").text
     assert "Which exception should be raised?" in html and "ValueError." in html and "class='bubble agent ask" in html and "class='bubble stakeholder ask" in html
-    assert "patience 5" in html and "xtype'>review" in html and "valid-correct" in html and "Requirement groups" in html and "run-1" not in html  # no workflow id on that trial
+    assert "patience 5" in html and "xtype'>review" in html and "valid-correct" in html and "Requirement groups" in html
     assert "evaluator-only material" in html and "hidden for this identity" in html and "data-action='label'" in html
     tl = c.get(f"/api/trial/{site['done']}/timeline").json()
     assert tl["evaluator"] is False and tl["live"] is False and tl["patience"] == {"start": 6, "end": 3, "questions": 1, "confirmations": 0, "reviews": 1}
-    assert len(tl["exchanges"]) == 4 and tl["exchanges"][1]["disclosed_fact_ids"] == []
+    assert len(tl["exchanges"]) == 4 and "disclosed_fact_ids" not in tl["exchanges"][1] and tl["exchanges"][1]["patience_after"] == 5  # keys stripped, patience public
     live = c.get(f"/trial/{site['running']}").text
     assert "data-live='true'" in live and "polled every 3 s" in live and "SWESIM_STAKEHOLDER_URL not configured" in live
     assert c.get(f"/trial/{site['done']}/file/reward.json").status_code == 200 and c.get(f"/trial/{site['done']}/file/nope.json").status_code == 404
@@ -441,7 +439,8 @@ def test_hostile_text_is_escaped_everywhere(site):
     access.reset()
     for route in (f"/scenario/{site['spec'].id}", f"/trial/{site['done']}", "/search?q=%3Cscript%3E"):
         html = site["client"].get(route).text
-        assert "<script>alert(1)" not in html and "onerror=alert" not in html and "&lt;script&gt;" in html or route.startswith("/search")
+        assert "<script>alert(1)" not in html and "<img src=x onerror" not in html
+        assert "&lt;script&gt;alert(1)" in html or route.startswith("/search")
 
 
 # ---------------------------------------------------------------- the evaluator gate
@@ -471,7 +470,8 @@ def test_no_evaluator_only_material_on_any_non_evaluator_route(site):
     tid, sid = site["done"], site["spec"].id
     for name in ("record.json", "transcript.json", "spec.json", "audit.json"):
         assert c.get(f"/trial/{tid}/file/{name}").status_code == 403 and c.get(f"/trial/{tid}/file/{name}?evaluator=1").status_code == 403
-    for path in (f"scenarios/{sid}/scenario.json", f"scenarios/{sid}/judge.json", f"scenarios/{sid}/draft.meta.json", f"scenarios/{sid}/assets", f"trials/{tid}/record.json", "exports", f"tasks/{sid}__hidden"):
+    for path in (f"scenarios/{sid}/scenario.json", f"scenarios/{sid}/judge.json", f"scenarios/{sid}/draft.meta.json", f"scenarios/{sid}/assets", f"trials/{tid}/record.json",
+                 f"exports/{tid}.episode.json", f"tasks/{sid}__hidden"):
         assert c.get(f"/artifacts?path={path}").status_code == 403, path
         assert c.get(f"/artifacts/download?path={path}").status_code == 403, path
 

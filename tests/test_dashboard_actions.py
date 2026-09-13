@@ -258,6 +258,9 @@ def test_cancel_review_retry_and_rebuild_flows(site, monkeypatch):
     (sdir / "approval.json").unlink()
     (sdir / "scenario.draft.json").write_text((sdir / "scenario.json").read_text())
     (sdir / "scenario.json").unlink()
+    site["ws"].registry_path.write_text(json.dumps({"scenarios": {}}))  # a held draft has not been registered
+    for name in ("validation.json", "compile.json"):
+        (sdir / name).unlink(missing_ok=True)
     access.reset()
     spec_hash = site["spec"].spec_hash
     page = c.get(f"/review/{sid}").text
