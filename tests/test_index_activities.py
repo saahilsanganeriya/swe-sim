@@ -13,6 +13,8 @@ from temporalio.exceptions import ApplicationError
 
 from swesim.index import activities as IA
 from swesim.index import models as M
+from swesim.index.files import FileIndexReader
+from swesim.index.store import IndexStore
 from swesim.settings import QUEUES, Settings, get_settings, reset_settings
 from swesim.workflows import queues as Q
 
@@ -167,6 +169,41 @@ def test_workflow_activity_keeps_started_at_and_closes_terminal_rows(enabled: Se
         run(IA.index_workflow_activity, {**p, "status": "exploded"})
     with pytest.raises(ApplicationError):
         run(IA.index_workflow_activity, {"workflow_id": "w"})
+
+
+def test_workflow_status_precedence_holds_on_the_sql_path(enabled: Settings):
+    """The hosted console (SQL mode) showed `running` for a Create workflow whose bucket snapshots held both a `running` and a
+    `completed` row. The store side is settled here: through `index_workflow` a terminal report closes the row in either
+    order, a late `running` cannot reopen it, the console's list/detail reads agree, and a rebuild from the snapshots agrees."""
+    store = IA.store_for(enabled)
+    base = {"type": "CreateTasksWorkflow", "params_summary": {"sources": ["swebench-annotated:A"]}, "failure": None, "parent_workflow_id": None}
+    wid, rid = "create-49584e8df239448c83673333030e907b", "run-1"
+    assert run(IA.index_workflow_activity, {**base, "workflow_id": wid, "run_id": rid, "status": "running"}) == {"indexed": True, "rows": 1}
+    running = store.workflow(wid)
+    assert running.status == "running" and running.closed_at is None
+    completed_payload = {**base, "workflow_id": wid, "run_id": rid, "status": "completed", "params_summary": {**base["params_summary"], "status": "complete"}}
+    assert run(IA.index_workflow_activity, completed_payload) == {"indexed": True, "rows": 1}
+    row = store.workflow(wid)
+    assert row.status == "completed" and row.closed_at is not None and row.run_id == rid and row.started_at == running.started_at
+    assert row.params_summary["status"] == "complete" and row.lifecycle_source == "workflow"
+    # the reverse order: a late `running` report cannot reopen a closed row (and does not touch its close time)
+    late = "create-late"
+    run(IA.index_workflow_activity, {**base, "workflow_id": late, "run_id": rid, "status": "completed"})
+    closed = store.workflow(late)
+    assert closed.status == "completed" and closed.closed_at is not None
+    run(IA.index_workflow_activity, {**base, "workflow_id": late, "run_id": rid, "status": "running"})
+    row = store.workflow(late)
+    assert row.status == "completed" and row.closed_at == closed.closed_at
+    # the same reads the console makes in SQL mode
+    assert store.workflows(M.WorkflowFilter(status=["running"])).total == 0
+    assert {w.workflow_id for w in store.workflows(M.WorkflowFilter(status=["completed"])).items} == {wid, late}
+    assert store.workflows(M.WorkflowFilter(workflow_id=[wid], run_id=[rid], limit=1)).items[0].status == "completed"
+    # the record's snapshots (what the bucket holds), reprojected by the file reader and by a rebuild, agree
+    layout = Layout(root=enabled.workspace)
+    files = FileIndexReader(layout, settings=enabled)
+    assert files.workflow(wid).status == "completed" and files.workflow(late).status == "completed"
+    rebuilt = IndexStore("sqlite://", settings=enabled); rebuilt.migrate(); rebuilt.rebuild_from_layout(layout, enabled.registry_path)
+    assert rebuilt.workflow(wid).status == "completed" and rebuilt.workflow(late).status == "completed"
 
 
 def test_rebuild_activity_returns_counts_and_a_bounded_skip_list(enabled: Settings, record: Record):
