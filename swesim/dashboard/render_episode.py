@@ -230,8 +230,11 @@ def episode_body(t: dict, row, rows: list[dict], resolve, evaluator: bool, extra
     left.append(f"<section data-tab-panel='timeline' id='panel-timeline' role='tabpanel' aria-labelledby='tab-timeline' class='timeline hidden'>{tl}</section>")
     brief = (f"<details open><summary class='muted small'>instruction.md as the agent saw it</summary><pre class='code'>{h(t['instruction'])}</pre></details>"
              if t["instruction"] else "<p class='empty'>Instruction not materialised yet; it appears when the trial task is prepared.</p>")
-    patch = (f"<details><summary class='muted small'>submitted patch ({len(_files_from_diff(t['patch']))} file(s))</summary>{code_block(t['patch'], 'diff', diff=True, max_lines=600)}</details>"
-             if t.get("patch") else "<p class='muted small'>No patch artifact collected for this trial.</p>")
+    patch_file = t.get("patch_file") or "verifier/patch.diff"
+    legacy = " · <span class='flag small' title='pre-2026-09-13 artifact name; the grader now writes verifier/submission.diff'>legacy patch.diff</span>" if patch_file.endswith("patch.diff") else ""
+    patch = (f"<details><summary class='muted small'>submitted patch ({len(_files_from_diff(t['patch']))} file(s)) · <code>{h(patch_file)}</code>{legacy}</summary>"
+             f"{code_block(t['patch'], 'diff', diff=True, max_lines=600)}</details>"
+             if t.get("patch") else "<p class='muted small'>No patch artifact collected for this trial (no <code>verifier/submission.diff</code>).</p>")
     cost = ""
     costs = t.get("costs") or []
     if isinstance(costs, list) and costs:

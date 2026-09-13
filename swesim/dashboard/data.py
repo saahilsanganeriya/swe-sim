@@ -37,11 +37,14 @@ TRIAL_FILES: dict[str, tuple[str, str]] = {
     "audit.json": ("trial", "audit.json"), "launcher.log": ("trial", "launcher.log"),
     "harbor-result.json": ("harbor", "result.json"), "trajectory.json": ("harbor", "agent/trajectory.json"),
     "verifier-reward.json": ("harbor", "verifier/reward.json"), "verifier-report.json": ("harbor", "verifier/report.json"),
-    "patch.diff": ("harbor", "verifier/patch.diff"),
+    "submission.diff": ("harbor", "verifier/submission.diff"), "patch.diff": ("harbor", "verifier/patch.diff"),
 }
+# The grader writes the submission diff (taken against the untouched base before the hidden-test overlay) as
+# verifier/submission.diff; verifier/patch.diff is the pre-2026-09-13 name kept for the recorded trials that have it.
+PATCH_FILES: tuple[str, ...] = ("submission.diff", "patch.diff")
 # Evaluator-only artifacts (Codex B-P2-6): raw record/transcript/spec carry facts, redactions and hidden test ids; the
 # audit carries labels; scenario.json/draft carry author-only facts and hidden assets; judge/draft metadata is internal.
-EVALUATOR_TRIAL_FILES = frozenset(TRIAL_FILES) - frozenset({"reward.json", "report.json", "status.json", "costs.json", "label.json", "patch.diff"})
+EVALUATOR_TRIAL_FILES = frozenset(TRIAL_FILES) - frozenset({"reward.json", "report.json", "status.json", "costs.json", "label.json", "submission.diff", "patch.diff"})
 SCENARIO_FILES = ("scenario.json", "scenario.draft.json", "draft.meta.json", "judge.json", "approval.json", "compile.json", "validation.json",
                   "difficulty.json", "audit.json", "scores.json")
 EVALUATOR_SCENARIO_FILES = frozenset({"scenario.json", "scenario.draft.json", "draft.meta.json", "judge.json", "audit.json"})
@@ -230,19 +233,21 @@ def load_trial(layout, tid: str, settings: Settings) -> dict | None:
         "stakeholder_model": (rc.get("stakeholder") or {}).get("model_id") or request.get("stakeholder_model"),
         "started_at": status.get("started_at") or record.get("started_at"), "finished_at": status.get("finished_at") or record.get("finished_at"),
     }
-    patch = None
+    patch, patch_file = None, None
     if record.get("trial_dir"):
-        p = Path(record["trial_dir"]) / "verifier" / "patch.diff"
-        if _contained(layout, p) and p.is_file():
-            try:
-                patch = p.read_text(errors="replace")
-            except OSError:
-                patch = None
+        for name in PATCH_FILES:  # the grader's submission.diff first; the legacy patch.diff only when no submission.diff exists
+            p = Path(record["trial_dir"]) / TRIAL_FILES[name][1]
+            if _contained(layout, p) and p.is_file():
+                try:
+                    patch, patch_file = p.read_text(errors="replace"), TRIAL_FILES[name][1]
+                except OSError:
+                    continue
+                break
     return {"trial_id": tid, "dir": d, "status": {**{k: v for k, v in meta.items() if k in ("started_at", "finished_at") and v}, **status},
             "record": record, "request": request, "live": live, "unresolved": unresolved, "live_transcript_error": live_error,
             "transcript": transcript or {}, "report": report or {}, "reward": reward or {}, "trajectory": traj,
             "instruction": ins.read_text() if ins else None, "label": read_json(d / "label.json", default=None) or None, "meta": meta,
-            "patience": patience_of(transcript or {}, rc), "files": list(TRIAL_FILES), "patch": patch,
+            "patience": patience_of(transcript or {}, rc), "files": list(TRIAL_FILES), "patch": patch, "patch_file": patch_file,
             "costs": read_json(d / "costs.json", default=[]), "audit": read_json(d / "audit.json")}
 
 
