@@ -39,6 +39,21 @@
     n.querySelector(".txt").textContent = text;
   }
   let lastUpdate = null;
+  /* One poller per page: the next request is scheduled only after the previous one settles (no overlap), and the
+     interval doubles on each consecutive error (capped at 60 s) until a request succeeds. */
+  function poll(baseMs, fn) {
+    let delay = baseMs, failures = 0, stopped = false;
+    function schedule() { if (!stopped) setTimeout(run, delay); }
+    function run() {
+      if (document.hidden) { schedule(); return; }
+      Promise.resolve().then(fn).then(function () { failures = 0; delay = baseMs; }, function (e) {
+        failures += 1; delay = Math.min(baseMs * Math.pow(2, failures), 60000);
+        liveIndicator("err", "refresh failed (" + failures + "x, retry in " + Math.round(delay / 1000) + "s): " + e);
+      }).then(schedule);
+    }
+    schedule();
+    return { stop: function () { stopped = true; } };
+  }
   function tickAgo() {
     const n = document.getElementById("live");
     if (!n || lastUpdate === null) return;
@@ -126,7 +141,7 @@
     const seen = new Set();
     items.forEach(function (it) {
       const id = it[key]; seen.add(id);
-      let row = tbody.querySelector('tr[data-id="' + id + '"]');
+      let row = tbody.querySelector('tr[data-id="' + (window.CSS && CSS.escape ? CSS.escape(String(id)) : String(id).replace(/["\\]/g, "\\$&")) + '"]');
       if (!row) {
         row = tpl.content.firstElementChild.cloneNode(true);
         row.dataset.id = id;
@@ -143,18 +158,17 @@
     if (table) table.classList.toggle("hidden", items.length === 0);
   }
   function refreshOverview() {
-    fetch("/api/overview", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (ov) {
+    return fetch("/api/overview", { cache: "no-store" }).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }).then(function (ov) {
       patchTable("trials-body", "trial-row", ov.trials || [], "trial_id", fillTrialRow, "/trial/");
       patchTable("scenarios-body", "scenario-row", ov.scenarios || [], "id", fillScenarioRow, "/scenario/");
       const s = ov.summary || {};
       Object.keys(s).forEach(function (k) { const n = document.querySelector('[data-tile="' + k + '"]'); if (n) n.textContent = s[k]; });
       lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
-    }).catch(function (e) { liveIndicator("err", "refresh failed: " + e); });
+    });
   }
   if (page === "overview") {
-    const ms = parseInt(body.dataset.pollMs || "5000", 10);
     lastUpdate = Date.now();
-    setInterval(refreshOverview, ms);
+    poll(parseInt(body.dataset.pollMs || "5000", 10), refreshOverview);
   }
 
   /* ---------------------------------------------------------------- console: forms, jobs, review */
@@ -225,13 +239,13 @@
       setText(row, "summary", j.summary);
     }
     function refreshJobs() {
-      fetch("/api/jobs", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
-        if (!j.ok) { liveIndicator("err", "jobs unavailable: " + (j.error || "")); return; }
+      return fetch("/api/jobs", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
+        if (!j.ok) throw new Error("jobs unavailable: " + (j.error || ""));
         patchTable("jobs-body", "job-row", j.jobs || [], "workflow_id", fillJob, "/jobs/");
         lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago");
-      }).catch(function (e) { liveIndicator("err", "refresh failed: " + e); });
+      });
     }
-    if (document.getElementById("live")) { lastUpdate = Date.now(); setInterval(refreshJobs, parseInt(body.dataset.pollMs || "5000", 10)); }
+    if (document.getElementById("live")) { lastUpdate = Date.now(); poll(parseInt(body.dataset.pollMs || "5000", 10), refreshJobs); }
   }
   if (page === "job") {
     const btn = document.getElementById("cancel-job");
@@ -306,7 +320,7 @@
       const t = el("time", "", r.ts_iso ? r.ts_iso.slice(11, 19) : "no timestamp"); if (r.ts_iso) t.dateTime = r.ts_iso; who.appendChild(t);
       b.appendChild(who);
       b.appendChild(el("div", "text", r.text));
-      if (r.actor === "stakeholder" && (m.disclosed_fact_ids || m.tier !== undefined)) {
+      if (body.dataset.evaluator === "1" && r.actor === "stakeholder" && (m.disclosed_fact_ids || m.tier !== undefined)) {
         b.appendChild(el("div", "audit", "audit (evaluator-only): tier " + (m.tier || "—") + " · patience remaining " + (m.patience_remaining === undefined ? "—" : m.patience_remaining) + " · disclosed fact ids: " + ((m.disclosed_fact_ids || []).join(", ") || "none")));
       }
       return b;
@@ -320,7 +334,8 @@
       m.querySelector(".pq").textContent = "questions " + (p.questions ?? 0) + " · reviews " + (p.reviews ?? 0);
     }
     function refreshEpisode() {
-      fetch("/api/trial/" + encodeURIComponent(tid) + "/timeline", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (data) {
+      const url = "/api/trial/" + encodeURIComponent(tid) + "/timeline" + (body.dataset.evaluator === "1" ? "?evaluator=1" : "");
+      return fetch(url, { cache: "no-store" }).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }).then(function (data) {
         if (data.status && data.status.status !== "running") { location.reload(); return; }
         const chat = document.getElementById("chat");
         if (chat) {
@@ -333,12 +348,11 @@
         }
         updateMeter(data.patience);
         lastUpdate = Date.now(); liveIndicator("ok", "updated 0s ago" + (data.live_transcript_error ? " · transcript unavailable: " + data.live_transcript_error : ""));
-      }).catch(function (e) { liveIndicator("err", "refresh failed: " + e); });
+      });
     }
     if (body.dataset.live === "true") {
-      const ms = parseInt(body.dataset.pollMs || "3000", 10);
       lastUpdate = Date.now();
-      setInterval(refreshEpisode, ms);
+      poll(parseInt(body.dataset.pollMs || "3000", 10), refreshEpisode);
     }
   }
 })();

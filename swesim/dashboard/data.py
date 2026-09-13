@@ -7,10 +7,12 @@ of a running trial (``fetch_live_transcript``), with a short cache for the overv
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,13 +29,16 @@ from swesim.stages.score import (
 
 TRIAL_RE = re.compile(r"[a-f0-9]{24}")
 ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{2,63}")
-LIVE_TIMEOUT = 10.0
-LIVE_CACHE_TTL = 4.0
+LIVE_TIMEOUT = 10.0          # episode page / timeline API: one trial, the reviewer is waiting for it
+LIVE_POLL_TIMEOUT = 2.0      # overview poll: per-trial fetch timeout
+LIVE_BUDGET = 2.0            # overview poll: total wall-clock budget for all live fetches together
+LIVE_CACHE_TTL = 6.0         # >= the 5 s poll so a trial is fetched at most once per poll cycle
 REFUSAL_PREFIX = "I have to step away now"
 STAGES = ("candidate", "judged", "drafted", "approved", "compiled", "validated", "registered")
 SCENARIO_FILES = ("scenario.json", "scenario.draft.json", "draft.meta.json", "judge.json", "approval.json", "compile.json",
                   "validation.json", "scores.json")
 _live_cache: dict[str, tuple[float, dict, str | None]] = {}
+_LIVE_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="swesim-live")
 
 
 # ----------------------------------------------------------------------------- primitives
@@ -86,7 +91,7 @@ def short(x, n: int = 12) -> str:
 
 # ----------------------------------------------------------------------------- live transcript
 
-def fetch_live_transcript(tid: str) -> tuple[dict, str | None]:
+def fetch_live_transcript(tid: str, timeout: float | None = None) -> tuple[dict, str | None]:
     """``GET {SWESIM_STAKEHOLDER_URL}/transcript/{tid}`` with the worker secret. Returns (transcript, error).
     Reads only the two keys it needs from the environment (python-dotenv, SWESIM_ENV_FILE); never logs them."""
     from dotenv import load_dotenv
@@ -98,7 +103,7 @@ def fetch_live_transcript(tid: str) -> tuple[dict, str | None]:
     if not secret:
         return {}, "SWESIM_WORKER_SECRET not configured"
     try:
-        r = httpx.get(f"{base}/transcript/{tid}", headers={"X-Worker-Secret": secret}, timeout=LIVE_TIMEOUT)
+        r = httpx.get(f"{base}/transcript/{tid}", headers={"X-Worker-Secret": secret}, timeout=LIVE_TIMEOUT if timeout is None else timeout)
         r.raise_for_status()
         data = r.json()
         return (data if isinstance(data, dict) else {}), None
@@ -107,13 +112,14 @@ def fetch_live_transcript(tid: str) -> tuple[dict, str | None]:
         return {}, type(e).__name__
 
 
-def live_transcript_cached(tid: str, now: float | None = None) -> tuple[dict, str | None]:
-    """The overview polls every few seconds for every running trial; bound the calls to one per trial per TTL."""
+def live_transcript_cached(tid: str, now: float | None = None, timeout: float | None = None) -> tuple[dict, str | None]:
+    """The overview polls every few seconds for every running trial; bound the calls to one per trial per TTL
+    (errors are cached too, so a dead stakeholder cannot slow every poll)."""
     now = time.time() if now is None else now
     hit = _live_cache.get(tid)
     if hit and now - hit[0] < LIVE_CACHE_TTL:
         return hit[1], hit[2]
-    transcript, error = fetch_live_transcript(tid)
+    transcript, error = fetch_live_transcript(tid, LIVE_POLL_TIMEOUT if timeout is None else timeout)
     _live_cache[tid] = (now, transcript, error)
     return transcript, error
 
@@ -196,13 +202,55 @@ def trial_row(d: Path, now: float | None = None, live: bool = False) -> dict:
         "simulator_validity": report.get("simulator_validity"), "transcript_binding_valid": report.get("transcript_binding_valid"),
         "live_error": live_error, "spec_hash": rec.get("spec_hash") or request.get("spec_hash"),
         "run_config_hash": rec.get("run_config_hash") or request.get("run_config_hash") or u.get("run_config_hash"),
+        "_rc": rc,
     }
+
+
+def apply_live(row: dict, transcript: dict, error: str | None) -> None:
+    """Fold a live transcript (or its error) into a board row produced with live=False."""
+    row["live_error"] = error
+    if transcript:
+        pt = patience_of(transcript, row.get("_rc") or {})
+        row.update(patience_start=pt["start"], patience_end=pt["end"], patience_tier=pt["tier"],
+                   questions=pt["questions"], reviews=pt["reviews"])
 
 
 def trial_board(root: Path, now: float | None = None, live: bool = False) -> list[dict]:
     now = time.time() if now is None else now
     rows = [trial_row(d, now, live) for d in trial_dirs(root)]
     rows.sort(key=lambda r: (r["started_ts"] or 0.0, r["trial_id"]), reverse=True)
+    for r in rows:
+        r.pop("_rc", None)
+    return rows
+
+
+async def trial_board_async(root: Path, now: float | None = None, budget: float | None = None) -> list[dict]:
+    """Board rows with live patience for running trials, fetched concurrently in threads within ``budget`` seconds total.
+    Trials whose fetch did not finish in time keep their file-derived values and say so; the fetch completes in the
+    background and fills the cache for the next poll."""
+    now = time.time() if now is None else now
+    budget = LIVE_BUDGET if budget is None else budget
+    rows = [trial_row(d, now, live=False) for d in trial_dirs(root)]
+    running = [r for r in rows if r["running"]]
+    if running:
+        loop = asyncio.get_running_loop()
+        # A dedicated bounded pool: stakeholder fetches never occupy the default executor, and an event loop that is torn
+        # down after the response (asyncio.run, TestClient) does not wait for stragglers still inside the 2 s timeout.
+        tasks = {r["trial_id"]: asyncio.ensure_future(loop.run_in_executor(_LIVE_POOL, live_transcript_cached, r["trial_id"], now, LIVE_POLL_TIMEOUT))
+                 for r in running}
+        done, _pending = await asyncio.wait(tasks.values(), timeout=budget)
+        for r in running:
+            task = tasks[r["trial_id"]]
+            if task in done and not task.cancelled() and task.exception() is None:
+                transcript, error = task.result()
+                apply_live(r, transcript, error)
+            elif task in done:
+                apply_live(r, {}, type(task.exception()).__name__ if task.exception() else "error")
+            else:
+                apply_live(r, {}, "live fetch budget exceeded")
+    rows.sort(key=lambda r: (r["started_ts"] or 0.0, r["trial_id"]), reverse=True)
+    for r in rows:
+        r.pop("_rc", None)
     return rows
 
 
@@ -368,16 +416,26 @@ def scenario_board(root: Path, registry_path: Path) -> list[dict]:
     return out
 
 
-def overview(root: Path, registry_path: Path, live: bool = False, now: float | None = None) -> dict:
-    now = time.time() if now is None else now
-    scenarios = scenario_board(root, registry_path)
-    trials = trial_board(root, now, live)
-    summary = {"scenarios": len(scenarios), "valid": sum(1 for s in scenarios if s["validation_status"] == "valid"),
+def _summary(scenarios: list[dict], trials: list[dict]) -> dict:
+    return {"scenarios": len(scenarios), "valid": sum(1 for s in scenarios if s["validation_status"] == "valid"),
                "trials": len(trials), "running": sum(1 for t in trials if t["running"]),
                "finished": sum(1 for t in trials if not t["unresolved"]),
                "unresolved": sum(1 for t in trials if t["unresolved"] and not t["running"]),
                "succeeded": sum(1 for t in trials if t["success"] == 1)}
-    return {"generated_at": iso(now), "now": now, "summary": summary, "scenarios": scenarios, "trials": trials}
+
+
+def overview(root: Path, registry_path: Path, live: bool = False, now: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    scenarios = scenario_board(root, registry_path)
+    trials = trial_board(root, now, live)
+    return {"generated_at": iso(now), "now": now, "summary": _summary(scenarios, trials), "scenarios": scenarios, "trials": trials}
+
+
+async def overview_async(root: Path, registry_path: Path, now: float | None = None, budget: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    scenarios = scenario_board(root, registry_path)
+    trials = await trial_board_async(root, now, budget)
+    return {"generated_at": iso(now), "now": now, "summary": _summary(scenarios, trials), "scenarios": scenarios, "trials": trials}
 
 
 # ----------------------------------------------------------------------------- scenario detail

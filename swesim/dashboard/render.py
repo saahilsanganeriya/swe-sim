@@ -17,6 +17,7 @@ from swesim.dashboard.data import REFUSAL_PREFIX, clock, short
 from swesim.stages.score import OUTCOME_NAMES, outcome_code
 
 TEMPORAL_UI = "http://localhost:8233"
+SCENARIO_EVALUATOR_FILES = ("scenario.json", "scenario.draft.json")
 LABELS = ("unresolved", "no-question", "disclosed-not-used", "simulator-omission", "derived-without-asking")
 NAV = (("Overview", "/", "overview"), ("Runs", "/runs", "runs"), ("Scenarios", "/scenarios", "scenarios"),
        ("Jobs", "/jobs", "jobs"), ("Review", "/review", "review"), ("Create", "/create", "create"), ("Run", "/run", "run"))
@@ -257,11 +258,11 @@ def scores_table(groups: list[dict]) -> str:
     for g in groups:
         k = g.get("requested_k")
         n_unres = g.get("attempts_unresolved") or 0
-        by_status = ", ".join(f"{h(s)} {c}" for s, c in sorted((g.get("unresolved_by_status") or {}).items()))
+        by_status = ", ".join(f"{h(s)} {h(c)}" for s, c in sorted((g.get("unresolved_by_status") or {}).items()))
         attempts = (f"{h(g.get('attempts_total'))} (<span class='{'flag' if n_unres else 'muted'}' title='{by_status or 'none'}'>{h(n_unres)}</span>)"
                     if g.get("attempts_total") is not None else "—")
-        outcomes = ", ".join(f"{h(n)} {c}" for n, c in sorted((g.get("outcomes") or {}).items())) or "—"
-        labels = ", ".join(f"{h(n)} {c}" for n, c in sorted((g.get("labels") or {}).items())) or "—"
+        outcomes = ", ".join(f"{h(n)} {h(c)}" for n, c in sorted((g.get("outcomes") or {}).items())) or "—"
+        labels = ", ".join(f"{h(n)} {h(c)}" for n, c in sorted((g.get("labels") or {}).items())) or "—"
         trials = " ".join(f"<a class='trial-link' href='/trial/{h(t)}'>{h(short(t, 8))}</a>" for t in g.get("trial_ids") or [] if t)
         trials += "".join(f" <a class='trial-link flag' title='unresolved attempt: {h(x.get('status'))}' href='/trial/{h(x.get('trial_id'))}'>{h(short(x.get('trial_id'), 8))}</a>"
                           for x in g.get("unresolved") or [] if x.get("trial_id"))
@@ -310,7 +311,9 @@ def _files_from_diff(text: str) -> list[str]:
     return files
 
 
-def chat_bubbles(rows: list[dict], live: bool) -> str:
+def chat_bubbles(rows: list[dict], live: bool, evaluator: bool = False) -> str:
+    """Stakeholder fact annotations, tier/patience internals, tool audit and delivery flags are evaluator-only:
+    they render only when the page was opened with ?evaluator=1 (same gate as author-only facts on the scenario page)."""
     convo = [r for r in rows if r.get("actor") in ("agent", "stakeholder") and r.get("kind") not in ("agent-step", "tool_call")]
     sha_by_request = {(r.get("meta") or {}).get("request_id"): (r.get("meta") or {}).get("reviewed_diff_sha256")
                       for r in rows if r.get("actor") == "stakeholder" and (r.get("meta") or {}).get("reviewed_diff_sha256")}
@@ -335,7 +338,7 @@ def chat_bubbles(rows: list[dict], live: bool) -> str:
                     + (f"<details class='diff'><summary>diff</summary><pre>{h(diff)}</pre></details>" if diff.strip() else ""))
         else:
             body = f"<div class='text'>{h(text)}</div>"
-        if r["actor"] == "stakeholder":
+        if r["actor"] == "stakeholder" and evaluator:
             bits = []
             if m.get("tier") is not None or m.get("patience_remaining") is not None:
                 bits.append(f"tier {h(m.get('tier'))} · patience remaining {h(m.get('patience_remaining'))}")
@@ -366,7 +369,7 @@ def _call_text(call) -> str:
     return args if isinstance(args, str) else json.dumps(args, indent=1)
 
 
-def timeline_row(r: dict) -> str:
+def timeline_row(r: dict, evaluator: bool = False) -> str:
     actor, kind, meta = r["actor"], r["kind"], r.get("meta") or {}
     when = (f"<time datetime='{h(r['ts_iso'])}' title='{h(r['ts_iso'])}'>{h(clock(r['ts']))}</time>" if r["ts"] is not None
             else "<span class='flag' title='This row has no timestamp; its position is not chronological evidence.'>no timestamp</span>")
@@ -387,7 +390,7 @@ def timeline_row(r: dict) -> str:
         body = f"<div class='txt'><strong>{h(r['text'])}</strong></div>"
     else:
         body = f"<div class='txt'>{h(r['text'])}</div>"
-        if actor == "stakeholder":
+        if actor == "stakeholder" and evaluator:
             bits = []
             if meta.get("tier") is not None or meta.get("patience_remaining") is not None:
                 bits.append(f"tier {h(meta.get('tier'))}, patience remaining {h(meta.get('patience_remaining'))}")
@@ -448,19 +451,36 @@ def label_form(t: dict) -> str:
             "<div><button type='submit' class='primary'>Save label</button> <span id='labelresult' class='muted small'></span></div></form>")
 
 
-def files_section(t: dict, resolve) -> str:
+def files_section(t: dict, resolve, evaluator: bool = False) -> str:
     items = []
+    gated = 0
     for name in t["files"]:
         p = resolve(t, name)
-        if p is not None and p.exists():
-            items.append(f"<li><a href='/trial/{h(t['trial_id'])}/file/{h(name)}'>{h(name)}</a> <span class='muted mono small'>{h(p)}</span></li>")
+        if p is None or not p.exists():
+            continue
+        if name in EVALUATOR_FILES and not evaluator:
+            gated += 1
+            continue
+        q = "?evaluator=1" if name in EVALUATOR_FILES else ""
+        items.append(f"<li><a href='/trial/{h(t['trial_id'])}/file/{h(name)}{q}'>{h(name)}</a> <span class='muted mono small'>{h(p)}</span></li>")
+    if gated:
+        items.append(f"<li class='muted'>{gated} evaluator-only file(s) (record, transcript, spec) hidden; turn the evaluator switch on to open them.</li>")
     if t["meta"].get("trial_dir"):
         items.append(f"<li class='muted'>Harbor trial dir <code>{h(t['meta']['trial_dir'])}</code> (inspect with <code>harbor view</code>)</li>")
     return "<ul class='small'>" + "".join(items) + "</ul>" if items else "<p class='empty'>No files yet.</p>"
 
 
-def episode_page(t: dict, rows: list[dict], resolve) -> str:
+EVALUATOR_FILES = ("record.json", "transcript.json", "spec.json")
+
+
+def evaluator_switch(base: str, on: bool, label: str) -> str:
+    return (f"<a class='switch{' on' if on else ''}' href='{h(base)}{'' if on else '?evaluator=1'}' role='switch' aria-checked='{'true' if on else 'false'}'>"
+            f"<i></i>evaluator-only: {h(label)} {'shown' if on else 'hidden'}</a>")
+
+
+def episode_page(t: dict, rows: list[dict], resolve, evaluator: bool = False) -> str:
     m, tid = t["meta"], t["trial_id"]
+    rows = [r for r in rows if evaluator or r.get("kind") != "tool_call"]  # stakeholder tool audit is evaluator-only
     st = t["status"].get("status") or ("finished" if t["record"] else "unknown")
     live = bool(t["live"])
     p = t["patience"]
@@ -473,11 +493,12 @@ def episode_page(t: dict, rows: list[dict], resolve) -> str:
                     f"{' · error ' + h(u['error_type']) if u.get('error_type') else ''} · from {h(u['source_file'])}. "
                     "Not counted in n, success or pass@k; reported as attempts_unresolved. Files that exist are listed on the right.</p>")
     pat = meter(p["end"], p["start"]) if p["start"] is not None else "<span class='muted'>no stakeholder session for this condition</span>"
-    tier = f" · last tier {h(p['tier'])}" if p.get("tier") else ""
+    tier = f" · last tier {h(p['tier'])}" if p.get("tier") and evaluator else ""  # the tier is a stakeholder internal
     left.append(f"<div id='patience' class='card small'><strong>Patience</strong> {pat} "
                 f"<span class='pq muted'>questions {h(p['questions'])} · reviews {h(p['reviews'])}{tier}</span></div>")
-    left.append("<div class='tabs' role='tablist'><button type='button' role='tab' data-tab='chat' aria-selected='true'>Conversation</button>"
-                "<button type='button' role='tab' data-tab='timeline' aria-selected='false'>Timeline</button></div>")
+    left.append(f"<p class='small'>{evaluator_switch(f'/trial/{tid}', evaluator, 'fact annotations, tool audit, raw transcript/spec files')}</p>")
+    left.append("<div class='tabs' role='tablist'><button type='button' role='tab' id='tab-chat' aria-controls='panel-chat' data-tab='chat' aria-selected='true'>Conversation</button>"
+                "<button type='button' role='tab' id='tab-timeline' aria-controls='panel-timeline' data-tab='timeline' aria-selected='false'>Timeline</button></div>")
     if live:
         left.append("<p class='note'>Trial is running: the stakeholder transcript is polled every 3 s. The agent's own tool calls appear in the "
                     "Timeline tab when the trial completes; Harbor writes the trajectory at the end.</p>")
@@ -486,11 +507,11 @@ def episode_page(t: dict, rows: list[dict], resolve) -> str:
     else:
         left.append("<p class='note'>Conversation shows the stakeholder transcript. The agent's tool calls, interleaved by time with the "
                     "conversation and the verifier outcome, are in the Timeline tab.</p>")
-    left.append(f"<section data-tab-panel='chat'>{chat_bubbles(rows, live)}</section>")
-    tl = "".join(timeline_row(r) for r in rows) or "<p class='empty'>No timeline rows yet.</p>"
+    left.append(f"<section data-tab-panel='chat' id='panel-chat' role='tabpanel' aria-labelledby='tab-chat'>{chat_bubbles(rows, live, evaluator)}</section>")
+    tl = "".join(timeline_row(r, evaluator) for r in rows) or "<p class='empty'>No timeline rows yet.</p>"
     if any(r.get("no_timestamp") for r in rows):
         tl += "<p class='muted small'>Rows marked <span class='flag'>no timestamp</span> are listed last; their position is not chronological evidence.</p>"
-    left.append(f"<section data-tab-panel='timeline' class='timeline hidden'>{tl}</section>")
+    left.append(f"<section data-tab-panel='timeline' id='panel-timeline' role='tabpanel' aria-labelledby='tab-timeline' class='timeline hidden'>{tl}</section>")
     brief = (f"<details open><summary class='muted small'>instruction.md as the agent saw it</summary><pre>{h(t['instruction'])}</pre></details>"
              if t["instruction"] else "<p class='empty'>Instruction not materialized yet; it appears when the trial task is prepared.</p>")
     right = ["<div class='panel card'><h2>Brief</h2>", brief, "<h2>Verifier</h2>", verifier_section(t),
@@ -498,9 +519,9 @@ def episode_page(t: dict, rows: list[dict], resolve) -> str:
              f"<dt>spec hash</dt><dd class='mono'>{dash(m.get('spec_hash'))}</dd><dt>run config hash</dt><dd class='mono'>{dash(m.get('run_config_hash'))}</dd>",
              f"<dt>compiled hash</dt><dd class='mono'>{dash(m.get('compiled_hash'))}</dd><dt>image digest</dt><dd class='mono'>{dash(m.get('image_digest'))}</dd>",
              f"<dt>started</dt><dd class='mono'>{dash(m.get('started_at'))}</dd><dt>finished</dt><dd class='mono'>{dash(m.get('finished_at'))}</dd></dl>",
-             "<h2>Reviewer label</h2>", label_form(t), "<h2>Files</h2>", files_section(t, resolve), "</div>"]
+             "<h2>Reviewer label</h2>", label_form(t), "<h2>Files</h2>", files_section(t, resolve, evaluator), "</div>"]
     body = f"<div class='two-col'><div>{''.join(left)}</div>{''.join(right)}</div>"
-    attrs = {"trial": tid, "live": "true" if live else "false", "poll-ms": "3000"}
+    attrs = {"trial": tid, "live": "true" if live else "false", "poll-ms": "3000", "evaluator": "1" if evaluator else "0"}
     return layout(f"Episode {tid}", body, "runs", "episode", attrs, "live" if live else None)
 
 
@@ -516,13 +537,14 @@ def _fact(f: dict) -> str:
             f"{' · tests ' + tests if tests else ''}</span><div>{h(f.get('text'))}</div>{excerpt}</div>")
 
 
-def scenario_page_sections(d: dict) -> dict:
+def scenario_page_sections(d: dict, toggle_base: str | None = None) -> dict:
     """The scenario page pieces (head, briefs, ledger, controls, judge, links) so the review page can reuse them."""
     b = d["board"]
     sid = b["id"]
     judge = d.get("judge") or {}
     source_link = f" · <a href='{h(b['source_url'])}' target='_blank' rel='noopener'>source ↗</a>" if b.get("source_url") else ""
-    repo_link = f" · <a href='{h(b['repo_url'])}' target='_blank' rel='noopener'>repository ↗</a>" if b.get("repo_url") else ""
+    repo_ok = str(b.get("repo_url") or "").startswith(("http://", "https://"))
+    repo_link = f" · <a href='{h(b['repo_url'])}' target='_blank' rel='noopener'>repository ↗</a>" if repo_ok else ""
     draft_flag = "" if d["frozen"] else " · <span class='flag'>draft (not approved yet)</span>"
     head = [f"<h1>{h(sid)} <span class='mono'>v{h(b.get('version'))}</span></h1>",
             f"<p class='lead'>{dash(b.get('source_label'))}{source_link}{repo_link} · spec hash <span class='mono'>{dash(b.get('spec_hash'))}</span>{draft_flag}</p>",
@@ -546,8 +568,8 @@ def scenario_page_sections(d: dict) -> dict:
     order = ("brief", "on-request", "volunteered-at-review", "repo-derivable", "author-only")
     groups = d["ledger_groups"]
     on = d["evaluator"]
-    toggle = (f"<a class='switch{' on' if on else ''}' href='/scenario/{h(sid)}{'' if on else '?evaluator=1'}' aria-pressed='{'true' if on else 'false'}'>"
-              f"<i></i>evaluator-only: author-only facts {'shown' if on else 'hidden (' + str(d['hidden_author_only']) + ')'}</a>")
+    base = toggle_base or f"/scenario/{sid}"
+    toggle = evaluator_switch(base, on, "author-only facts" + ("" if on else f" ({d['hidden_author_only']})"))
     ledger = [f"<h2>Ledger</h2><p class='muted small'>{sum(len(v) for v in groups.values())} fact(s) visible · grouped by discovery. {toggle}</p>"]
     if not groups:
         ledger.append("<p class='empty'>No ledger facts in this spec.</p>")
@@ -594,7 +616,10 @@ def scenario_page_sections(d: dict) -> dict:
              f"<dt>persona</dt><dd>{dash((d.get('persona') or {}).get('summary'))}</dd>"]
     for cond, path in sorted(tdirs.items()):
         links.append(f"<dt>task dir · {h(cond)}</dt><dd class='mono'>{h(path)}</dd>")
-    links.append("</dl><p class='small'>" + " · ".join(f"<a href='/scenario/{h(sid)}/file/{h(n)}'>{h(n)}</a>" for n in b.get("files") or []) + "</p>")
+    links.append("</dl><p class='small'>" + " · ".join(
+        f"<a href='/scenario/{h(sid)}/file/{h(n)}{'?evaluator=1' if n in SCENARIO_EVALUATOR_FILES else ''}'>{h(n)}</a>"
+        + (" <span class='muted'>(evaluator-only)</span>" if n in SCENARIO_EVALUATOR_FILES else "")
+        for n in b.get("files") or [] if on or n not in SCENARIO_EVALUATOR_FILES) + "</p>")
     return {"head": "".join(head), "briefs": briefs, "ledger": "".join(ledger), "controls": "".join(controls), "judge": jud,
             "links": "".join(links), "exists": True}
 

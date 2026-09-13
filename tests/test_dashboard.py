@@ -150,9 +150,151 @@ def test_runs_page_has_filters_chart_and_score_table(site):
     assert '<svg class=' in html and 'aria-label=' in html and 'pass@k' in html and 'pass^k' in html
     assert "<g class='bar s1'" in html or "<g class='bar na'" in html  # one series: bars or n/a markers, no legend box
     assert "class='legend'" not in html
+    assert 'calibration · withheld brief · k=3' in html and 'comparison · natural brief · k=3' in html  # one facet per purpose/profile
+    assert 'groups are never pooled' in html
     for tid in (site['done'], site['wrong'], site['full'], site['running']):
         assert f'data-id=\'{tid}\'' in html and f"href='/trial/{tid}'" in html
     assert 'unknown-config' in html  # the running fixture has a partial run_config: attributable, unresolved, no run config hash
+
+
+def test_chart_draws_every_group_and_labels_k_per_facet():
+    from swesim.dashboard.charts import pass_at_k_svg
+    groups = []
+    for purpose, profile, k in (('calibration', 'withheld', 1), ('comparison', 'withheld', 3), ('comparison', 'natural', 3)):
+        for cond in ('full', 'hidden', 'interactive'):
+            for i, model in enumerate(('a/one', 'b/two')):
+                groups.append({'condition': cond, 'model': model, 'purpose': purpose, 'brief_profile': profile, 'requested_k': k,
+                               'pass_at_k': 0.5 if i else None, 'n_valid': 3, 'n_total': 3, 'run_config_hash': f'{purpose}{profile}{cond}{i}' * 4})
+    svg = pass_at_k_svg(groups)
+    assert svg.count("<g class='bar") == 18 and svg.count('<svg') == 3  # every group drawn, one facet per (purpose, profile)
+    assert 'calibration · withheld brief · k=1' in svg and 'comparison · withheld brief · k=3' in svg and 'comparison · natural brief · k=3' in svg
+    assert 'k in {1, 3}' in svg and '18 of 18 group(s) drawn' in svg and 'never pooled' in svg
+    assert svg.count("class='legend'") == 1 and 'a/one' in svg and 'b/two' in svg  # two series: legend present
+    assert svg.count("class='bar s2'") == 9 and svg.count("class='bar na'") == 9  # b/two has values, a/one is n/a everywhere
+    # two groups sharing a slot inside a facet (a rebuild) stay separate bars and are called out
+    dup = groups[:1] + [{**groups[0], 'run_config_hash': 'z' * 64, 'pass_at_k': 0.9}]
+    svg2 = pass_at_k_svg(dup)
+    assert svg2.count("<g class='bar") == 2 and 'hold more than one group' in svg2 and 'build z' in svg2
+    assert 'No scored groups yet' in pass_at_k_svg([]) and 'role=\'img\'' not in svg  # focusable bars inside an svg: no role=img
+
+
+def test_api_overview_live_fetch_stays_within_budget(site, monkeypatch):
+    import time as _time
+    c, tid = site['client'], site['running']
+    dash.data._live_cache.clear()
+
+    class Slow:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {'events': [], 'patience_start': 6, 'patience_end': 2}
+
+    def slow_get(url, headers=None, timeout=None, **k):
+        _time.sleep(0.6)
+        return Slow()
+
+    monkeypatch.setattr(dash.httpx, 'get', slow_get)
+    monkeypatch.setenv('SWESIM_STAKEHOLDER_URL', 'https://stakeholder.example.test')
+    monkeypatch.setenv('SWESIM_WORKER_SECRET', 's')
+    monkeypatch.setattr(dash.data, 'LIVE_BUDGET', 0.15)
+    t0 = _time.monotonic()
+    ov = c.get('/api/overview').json()
+    assert _time.monotonic() - t0 < 0.5  # the poll returns within the budget even though the stakeholder is slow
+    row = next(t for t in ov['trials'] if t['trial_id'] == tid)
+    assert row['live_error'] == 'live fetch budget exceeded' and row['patience_end'] is None
+    _time.sleep(0.7)  # the background fetch finished and filled the cache: the next poll is served from it
+    row = next(t for t in c.get('/api/overview').json()['trials'] if t['trial_id'] == tid)
+    assert row['patience_end'] == 2 and row['live_error'] is None
+
+
+def test_post_routes_reject_cross_origin_requests(site):
+    c, tid = site['client'], site['wrong']
+    evil = {'Origin': 'http://evil.example'}
+    assert c.post(f'/trial/{tid}/label', json={'label': 'unresolved'}, headers=evil).status_code == 403
+    assert c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b'}, headers=evil).status_code == 403
+    assert c.post('/api/run', json={}, headers=evil).status_code == 403
+    assert c.post('/api/jobs/x/cancel', json={'confirm': True}, headers=evil).status_code == 403
+    assert c.post(f"/api/review/{site['spec'].id}", json={}, headers=evil).status_code == 403
+    assert c.post(f'/trial/{tid}/label', json={'label': 'unresolved'}, headers={'Origin': 'null'}).status_code == 403
+    assert c.post(f'/trial/{tid}/label', json={'label': 'unresolved'}, headers={'Origin': 'http://testserver:8080'}).status_code == 200
+    assert c.post(f'/trial/{tid}/label', json={'label': 'unresolved'}).status_code == 200  # no Origin (curl, scripts): allowed
+    assert 'CSRF posture' in dash.__doc__
+
+
+def test_console_inputs_are_fullmatched_and_cli_strings_quoted(site, monkeypatch):
+    c = site['client']
+    client = _Client()
+    _install_client(monkeypatch, client)
+    bad = c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b', 'since': '2026-01-01\n', 'approval_mode': '<script>x;rm -rf /</script>'})
+    assert bad.status_code == 400
+    errs = bad.json()['errors']
+    assert any('since must be' in e for e in errs) and any('approval_mode' in e for e in errs)
+    assert "'<script>x;rm -rf /</script>'" in bad.json()['cli']  # shell-quoted, never bare, in the CLI equivalent
+    assert c.post('/api/create', json={'source': 'github-repo', 'repos': '../evil'}).status_code == 400
+    assert c.post('/api/create', json={'source': 'github-repo', 'repos': 'https://github.com/../..'}).status_code == 400
+    assert c.get('/jobs/x%0A').status_code == 404 and c.get('/jobs/ok-id').status_code == 200
+    bad = c.post('/api/run', json={'scenario_ids': [site['spec'].id], 'models': ['a/b'], 'conditions': ['interactive'], 'purpose': '$(id)'})
+    assert bad.status_code == 400 and "'$(id)'" in bad.json()['cli']
+    # fallback paths carry every collected field
+    class Legacy:
+        def __init__(self):
+            self.pipeline = []
+            self.matrix = []
+
+        async def start_pipeline(self, params):
+            self.pipeline.append(params)
+            return 'pipeline-1'
+
+        async def start_matrix(self, plan):
+            self.matrix.append(plan)
+            return 'matrix-1'
+
+    legacy = Legacy()
+    _install_client(monkeypatch, legacy)
+    ok = c.post('/api/create', json={'source': 'github-repo', 'repos': 'a/b', 'since': '2026-03-01', 'limit': 7})
+    assert ok.status_code == 200 and legacy.pipeline[0]['since'] == '2026-03-01' and legacy.pipeline[0]['limit'] == 7
+    ok = c.post('/api/run', json={'scenario_ids': [site['spec'].id], 'models': [HAIKU], 'conditions': ['interactive'], 'k': 1,
+                                  'stakeholder_model': 'anthropic/claude-sonnet-5'})
+    assert ok.status_code == 200 and 'stakeholder model from RunConfig defaults' not in ok.json()['via']
+    plan = legacy.matrix[0]
+    assert plan['trials'] and all(t['run_config']['stakeholder']['model_id'] == 'anthropic/claude-sonnet-5' for t in plan['trials'])
+
+
+def test_hostile_spec_and_progress_text_is_escaped(tmp_path, monkeypatch):
+    spec = make_spec(withheld=True)
+    d = json.loads(spec.model_dump_json())
+    d['briefs'][0]['text'] = d['briefs'][0]['text'] + '\n<script>alert(1)</script>'
+    d['ledger'][0]['text'] = '<img src=x onerror=alert(2)> Raise ValueError'
+    d['environment']['repo_url'] = 'javascript:alert(3)'
+    d['persona']['summary'] = '<b>maintainer</b>'
+    ws = make_workspace(tmp_path, spec)
+    (ws.scenario_dir(spec.id) / 'scenario.json').write_text(json.dumps(d))
+    (ws.scenario_dir(spec.id) / 'judge.json').write_text(json.dumps({'keep': True, 'verified_rubric_score': 2, 'rationale': '<script>alert(4)</script>',
+                                                                     'gaps': [{'category': 'behavior', 'text': '<svg onload=alert(5)>'}]}))
+    monkeypatch.setattr(dash, 'ROOT', ws.root)
+    monkeypatch.setattr(dash, 'REGISTRY', ws.registry_path)
+    monkeypatch.setenv('SWESIM_ENV_FILE', str(tmp_path / 'absent.env'))
+    c = TestClient(app)
+    for path in (f'/scenario/{spec.id}', f'/review/{spec.id}'):
+        html = c.get(path).text
+        for raw in ('<script>alert(1)</script>', '<img src=x onerror=alert(2)>', '<script>alert(4)</script>', '<svg onload=alert(5)>', '<b>maintainer</b>'):
+            assert raw not in html, (path, raw)
+        assert "href='javascript:" not in html and 'repository ↗' not in html  # non-http repo_url gets no link
+    client = _Client()
+    client.jobs = [{'workflow_id': 'j1', 'type': 'pipeline', 'status': 'running', 'summary': '<script>alert(6)</script>'}]
+    client.progress_by_id = {'j1': {'stage': '<img src=x onerror=alert(7)>', 'scenario_id': '<b>x</b>', 'needs_human': ['<script>alert(8)</script>'],
+                                    'candidates': [{'instance_id': '<i>evil</i>', 'stage': 'judging', 'detail': 'token=abc123 https://secret.example/x'}]}}
+    _install_client(monkeypatch, client)
+    jobs = c.get('/jobs').text
+    assert '<script>alert(6)</script>' not in jobs
+    job = c.get('/jobs/j1').text
+    for raw in ('<img src=x onerror=alert(7)>', '<b>x</b>', '<script>alert(8)</script>', '<i>evil</i>'):
+        assert raw not in job
+    assert 'https://secret.example/x' not in job and '&lt;url&gt;' in job  # raw progress pane is redacted
+    # review toggle stays on the review page
+    review = c.get(f'/review/{spec.id}').text
+    assert f"href='/review/{spec.id}?evaluator=1'" in review and f"href='/scenario/{spec.id}?evaluator=1'" not in review
 
 
 def test_scenario_page_briefs_ledger_controls_and_evaluator_toggle(tmp_path, monkeypatch):
@@ -176,7 +318,7 @@ def test_scenario_page_briefs_ledger_controls_and_evaluator_toggle(tmp_path, mon
     assert html.count("<mark class='removed' title=") == 1 and 'Import fails\nSteps: run `pkg load`.' in html  # one removed span; withheld brief verbatim
     assert 'withholding' in html and 'Removed category: reproduction' in html
     assert '<h3>on-request' in html and 'withheld-001' in html and 'f01' in html
-    assert 'SECRET-AUTHOR-ONLY-NOTE' not in html and 'author-only facts hidden (1)' in html  # off by default: not even in the DOM
+    assert 'SECRET-AUTHOR-ONLY-NOTE' not in html and 'author-only facts (1) hidden' in html  # off by default: not even in the DOM
     on = c.get(f'/scenario/{spec.id}?evaluator=1').text
     assert 'SECRET-AUTHOR-ONLY-NOTE' in on and '<h3>author-only' in on and 'evaluator-only' in on
     # controls joined with validation results; the fixture validation only ran nop
@@ -403,7 +545,8 @@ def test_jobs_list_progress_and_cancel(site, monkeypatch):
     # without list_runs / progress in the client: banner with the CLI equivalent, page still renders
     _install_client(monkeypatch, object())
     page = c.get('/jobs')
-    assert page.status_code == 200 and 'Temporal is not reachable' in page.text and 'pipeline-progress' in page.text
+    assert page.status_code == 200 and "client does not support that yet" in page.text and 'pipeline-progress' in page.text
+    assert 'Temporal is not reachable' not in page.text  # a missing client function is not an unreachable server
     assert c.get('/api/jobs').status_code == 502 and c.get('/jobs/create-abc').status_code == 200
 
 
@@ -532,16 +675,24 @@ def test_runs_page_lists_scenarios_scores_and_trials(site):
 
 def test_episode_page_renders_conversation_and_outcome(site):
     tid = site['done']
+    c = site['client']
     r = site['client'].get(f'/trial/{tid}')
     assert r.status_code == 200
     html = r.text
     assert f'Episode {tid}' in html and 'It breaks.' in html and 'ask-user' in html  # brief
     assert 'Which exception should be raised?' in html and 'ValueError.' in html and 'Looks right.' in html
-    assert 'read_diff' in html and 'f01' in html and 'evaluator-only' in html
-    assert '3 / 6' in html  # patience end / start
+    # evaluator-only material is gated (default off): no fact annotations, tier/patience internals, tool audit or delivery flags
+    assert 'read_diff' not in html and 'disclosed fact ids' not in html and 'delivery generated' not in html and 'tier full' not in html
+    assert "role='switch' aria-checked='false'" in html and f"href='/trial/{tid}?evaluator=1'" in html
+    on = c.get(f'/trial/{tid}?evaluator=1').text
+    assert 'read_diff' in on and 'f01' in on and 'disclosed fact ids' in on and 'delivery generated' in on and "aria-checked='true'" in on
+    assert 'SECRET-AUTHOR-ONLY-NOTE' not in on  # the trial page never renders the spec's author-only facts
+    assert '3 / 6' in html  # patience end / start (agent-observable availability stays visible)
     assert 'valid-correct' in html and 'g01' in html and 't1' in html and 'interactive' in html and 'withheld' in html
     assert 'unadjudicated' in html and 'diff-only' in html  # reviewed_equals_submitted null is explained, not hidden
     assert f"href='/trial/{tid}/file/trajectory.json'" in html and f"href='/trial/{tid}/file/verifier-report.json'" in html
+    assert f"href='/trial/{tid}/file/transcript.json" not in html and 'evaluator-only file(s)' in html  # raw transcript/record/spec gated
+    assert f"href='/trial/{tid}/file/transcript.json?evaluator=1'" in on
     assert 'name="label"' in html and 'selected' in html and 'first look' in html
     assert 'setInterval' not in html  # finished: no polling
     assert 'SECRET-AUTHOR-ONLY-NOTE' not in html
@@ -592,6 +743,10 @@ def test_timeline_live_transcript_only_when_running(site, monkeypatch):
     assert body['live'] is True and body['status']['status'] == 'running'
     assert [x['text'] for x in body['timeline'] if x['actor'] in ('agent', 'stakeholder')] == ['Live question?', 'Live answer.']
     assert 'worker-secret-value' not in json.dumps(body)
+    assert 'disclosed_fact_ids' not in json.dumps(body) and body['evaluator'] is False  # API strips audit meta unless ?evaluator=1
+    ev = site['client'].get(f'/api/trial/{tid}/timeline?evaluator=1').json()
+    assert ev['evaluator'] is True and any(x.get('meta', {}).get('disclosed_fact_ids') == ['f01'] for x in ev['timeline'])
+    assert 'tier' not in body['patience'] and ev['patience'].get('tier') == 'full'  # stakeholder tier is evaluator-only too
     page = site['client'].get(f'/trial/{tid}')
     assert page.status_code == 200 and "data-live='true'" in page.text and 'running' in page.text and 'Live answer.' in page.text
     assert 'agent is working' in page.text and 'setInterval' not in page.text  # behaviour lives in /static/app.js, never inline
@@ -639,7 +794,12 @@ def test_file_route_serves_whitelisted_trial_files_only(site):
     assert r.status_code == 200 and r.json()['steps'] == TRAJ['steps']
     assert c.get(f'/trial/{tid}/file/verifier-report.json').json()['outcome'] == 'valid-correct'
     assert c.get(f'/trial/{tid}/file/instruction.md').text.startswith('# Task')
-    assert c.get(f'/trial/{tid}/file/record.json').status_code == 200
+    for gated in ('record.json', 'transcript.json', 'spec.json'):  # evaluator-only raw files
+        assert c.get(f'/trial/{tid}/file/{gated}').status_code == 403
+        assert c.get(f'/trial/{tid}/file/{gated}?evaluator=1').status_code == 200
+    assert c.get(f"/scenario/{site['spec'].id}/file/scenario.json").status_code == 403
+    assert c.get(f"/scenario/{site['spec'].id}/file/scenario.json?evaluator=1").status_code == 200
+    assert c.get(f"/scenario/{site['spec'].id}/file/compile.json").status_code == 200
     assert c.get(f'/trial/{tid}/file/passwd').status_code == 404
     assert c.get(f'/trial/{tid}/file/..%2Fspec.json').status_code == 404
     assert c.get(f"/trial/{site['running']}/file/trajectory.json").status_code == 404  # not there yet

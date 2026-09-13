@@ -16,12 +16,20 @@ from swesim.dashboard.render import (
 )
 
 
+def redact_dump(progress: dict) -> str:
+    """Raw progress for the details pane, with URLs and secret-like values masked (the redactor caps at 300 chars per call)."""
+    text = json.dumps(progress, indent=2, default=str)
+    return "\n".join(console.redact(line) for line in text.splitlines()[:400])
+
+
 def banner_slot() -> str:
     return "<div id='banner' class='banner hidden' role='status'></div>"
 
 
-def unavailable_banner(message: str, cli: str) -> str:
-    return (f"<div class='banner error'><strong>Temporal is not reachable from the dashboard.</strong> {h(message)}"
+def unavailable_banner(message: str, cli: str, kind: str = "unreachable") -> str:
+    heading = {"missing": "This worker's client does not support that yet.",
+               "no-query": "No progress query for this workflow type."}.get(kind, "Temporal is not reachable from the dashboard.")
+    return (f"<div class='banner {'warn' if kind in ('missing', 'no-query') else 'error'}'><strong>{h(heading)}</strong> {h(message)}"
             f"<div class='muted small'>Equivalent command:</div><pre>{h(cli)}</pre></div>")
 
 
@@ -104,7 +112,7 @@ def jobs_page(jobs: list[dict] | None, error: console.ConsoleUnavailable | None)
     body = [("<h1>Jobs</h1><p class='lead'>Temporal workflows started from the console or the CLI: creation jobs (PipelineWorkflow) and run "
             "matrices. Refreshes every 5 s. Workflow state lives in Temporal; episodes and outcomes live on the <a href='/runs'>Runs</a> page.</p>")]
     if error is not None:
-        body.append(unavailable_banner(str(error), error.cli))
+        body.append(unavailable_banner(str(error), error.cli, error.kind))
     rows = "".join(job_row(j) for j in jobs or [])
     body.append(f"<div class='table-wrap'><table class='{'hidden' if not jobs else ''}'><thead>{JOB_HEAD}</thead><tbody id='jobs-body'>{rows}</tbody></table></div>")
     empty = ("<p class='empty' id='jobs-body-empty'><strong>No workflows yet.</strong> Start one from <a href='/create'>Create</a> or <a href='/run'>Run</a>, or "
@@ -124,8 +132,9 @@ def _progress_candidates(cands: list[dict]) -> str:
         sid = c.get("scenario_id")
         link = f"<a href='/scenario/{h(sid)}'>{h(sid)}</a>" if sid else "—"
         review = f" <a href='/review/{h(sid)}'>review</a>" if sid and c.get("stage") == "awaiting-approval" else ""
+        detail = c.get("detail") or c.get("reasons")
         rows.append(f"<tr><td class='mono'>{dash(c.get('instance_id') or c.get('candidate'))}</td><td>{link}{review}</td><td>{chips}</td>"
-                    f"<td class='small muted'>{dash(c.get('detail') or c.get('reasons'))}</td></tr>")
+                    f"<td class='small muted'>{dash(console.redact(str(detail))) if detail else '—'}</td></tr>")
     return ("<h2>Candidates</h2><div class='table-wrap'><table><thead><tr><th>candidate</th><th>scenario</th><th>stage</th><th>detail</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>")
 
@@ -150,7 +159,7 @@ def job_page(wid: str, progress: dict | None, error: console.ConsoleUnavailable 
         body.append(f"<p class='lead'>{dash(job.get('type'))} {chip(job.get('status'), status_kind(job.get('status')))} started {dash(job.get('started_at'))}</p>")
     body.append(banner_slot())
     if error is not None:
-        body.append(unavailable_banner(str(error), error.cli))
+        body.append(unavailable_banner(str(error), error.cli, error.kind))
     if progress:
         stage = progress.get("stage") or progress.get("status")
         body.append(f"<p>Stage {chip(stage, 'warn pulse' if stage in ('awaiting-approval', 'trial', 'validating', 'compiling', 'mining', 'judging') else 'info')}"
@@ -173,7 +182,7 @@ def job_page(wid: str, progress: dict | None, error: console.ConsoleUnavailable 
         counts = {k: progress[k] for k in ("tried", "completed", "rejected", "invalid") if k in progress}
         if counts:
             body.append("<p class='muted small'>" + " · ".join(f"{k} {h(v)}" for k, v in counts.items()) + "</p>")
-        body.append(f"<details><summary>raw progress</summary><pre>{h(json.dumps(progress, indent=2, default=str))}</pre></details>")
+        body.append(f"<details><summary>raw progress</summary><pre>{h(console.redact(json.dumps(progress, indent=2, default=str))[:300] if False else redact_dump(progress))}</pre></details>")
     elif error is None:
         body.append("<p class='empty'>No progress yet; the workflow has not reported a stage.</p>")
     body.append(f"<div class='card'><strong>Cancel</strong> <span class='muted small'>Stops the workflow; running Harbor units are not killed by this button.</span>"
@@ -206,7 +215,7 @@ def review_queue_page(queue: dict) -> str:
     return layout("swesim · review", "".join(body), "review", "review")
 
 
-def review_page(d: dict, spec_hash: str | None, workflow_id: str | None, approval: dict, review: dict) -> str:
+def review_page(d: dict, spec_hash: str | None, workflow_id: str | None, approval: dict, review: dict, evaluator: bool = False) -> str:
     sid = d["board"]["id"]
     read_only = bool(approval) or review.get("decision") == "reject"
     head = [f"<h1>Review <span class='mono'>{h(sid)}</span></h1>", banner_slot()]
@@ -222,7 +231,7 @@ def review_page(d: dict, spec_hash: str | None, workflow_id: str | None, approva
                     + (f" · held by job <a class='mono' href='/jobs/{h(workflow_id)}'>{h(workflow_id)}</a>" if workflow_id else " · local draft") + "</p>")
     if not spec_hash and not approval:
         head.append("<p class='flag'>The draft on disk does not validate against the current schema; approval is disabled.</p>")
-    sections = scenario_page_sections(d)
+    sections = scenario_page_sections(d, toggle_base=f"/review/{sid}")
     assets = d["spec"].get("assets") or {}
     asset_rows = "".join(f"<tr><td class='mono'>{h(name)}</td><td class='mono small'>{h(a.get('path'))}</td><td class='num'>{h(a.get('bytes'))}</td>"
                          f"<td class='mono small'>{h(str(a.get('sha256') or '')[:16])}…</td></tr>" for name, a in sorted(assets.items()) if isinstance(a, dict))

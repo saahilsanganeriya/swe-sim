@@ -7,8 +7,13 @@ JSON: ``/api/overview``, ``/api/trial/{id}/timeline``. Writes: only ``POST /tria
 
 Honesty rules baked in: rows without timestamps are flagged and never ordered as facts; stakeholder fact annotations and
 tool audit are marked evaluator-only; null metrics (n < k) read "n/a"; ``reviewed_equals_submitted`` null is explained as
-the diff-only pilot; author-only facts are rendered only with ``?evaluator=1``. Reviewer tool: reached over an SSH forward,
-never exposed to agents. Secrets are read from the server environment only and never rendered.
+the diff-only pilot; author-only facts, stakeholder fact annotations, tool audit and the raw record/transcript/spec files are
+rendered only with ``?evaluator=1``. Reviewer tool: reached over an SSH forward, never exposed to agents. Secrets are read
+from the server environment only and never rendered.
+
+CSRF posture: every mutating route takes a JSON body only (an HTML form cannot produce one cross-site without a CORS
+preflight, and no CORS middleware is installed) and additionally rejects a request whose ``Origin`` host differs from
+its ``Host`` (``same_origin``). Residual: DNS rebinding against the SSH-forwarded localhost port, accepted for this tool.
 """
 from __future__ import annotations
 
@@ -17,7 +22,7 @@ import os
 from pathlib import Path
 
 import httpx  # noqa: F401 - re-exported so tests can monkeypatch ``app.httpx.get`` (the module object is shared with data.py)
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from swesim.dashboard import console, data, render, render_console
@@ -60,6 +65,36 @@ def trial_path(tid: str) -> Path:
     if not TRIAL_RE.fullmatch(tid):
         raise HTTPException(404)
     return ROOT / "trials" / tid
+
+
+def same_origin(request: Request) -> None:
+    """POST guard: when the browser sends an Origin, its host must be our Host (scheme/port aside). No Origin (curl, tests) passes."""
+    origin = request.headers.get("origin")
+    if not origin or origin == "null":
+        if origin == "null":
+            raise HTTPException(403, detail="cross-site request rejected (null origin)")
+        return
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    origin_host = origin.split("://", 1)[-1].split("/", 1)[0].split(":")[0].lower()
+    if not host or origin_host != host:
+        raise HTTPException(403, detail="cross-site request rejected (origin does not match host)")
+
+
+EVALUATOR_TRIAL_FILES = set(render.EVALUATOR_FILES)
+EVALUATOR_SCENARIO_FILES = set(render.SCENARIO_EVALUATOR_FILES)
+AUDIT_META = ("disclosed_fact_ids", "tier", "patience_remaining", "tool_calls", "delivery")
+
+
+def _public_rows(rows: list[dict]) -> list[dict]:
+    """Timeline rows without evaluator-only material: no stakeholder tool-call rows, no audit fields in stakeholder meta."""
+    out = []
+    for r in rows:
+        if r.get("kind") == "tool_call":
+            continue
+        if r.get("actor") == "stakeholder" and isinstance(r.get("meta"), dict):
+            r = {**r, "meta": {k: v for k, v in r["meta"].items() if k not in AUDIT_META}}
+        out.append(r)
+    return out
 
 
 # ----------------------------------------------------------------------------- timeline
@@ -206,19 +241,21 @@ def scenario(sid: str, evaluator: int = 0) -> HTMLResponse:
 
 
 @app.get("/scenario/{sid}/file/{name}")
-def scenario_file(sid: str, name: str) -> PlainTextResponse:
+def scenario_file(sid: str, name: str, evaluator: int = 0) -> PlainTextResponse:
     if name not in SCENARIO_FILES or not data.ID_RE.fullmatch(sid):
         raise HTTPException(404)
     p = ROOT / "scenarios" / sid / name
     if not p.is_file():
         raise HTTPException(404)
+    if name in EVALUATOR_SCENARIO_FILES and not evaluator:
+        raise HTTPException(403, detail="evaluator-only file: add ?evaluator=1")
     return PlainTextResponse(p.read_text(), media_type="application/json")
 
 
 @app.get("/trial/{tid}", response_class=HTMLResponse)
-def episode(tid: str) -> HTMLResponse:
+def episode(tid: str, evaluator: int = 0) -> HTMLResponse:
     t = load_trial(tid)
-    return HTMLResponse(render.episode_page(t, _timeline_rows(t), _resolve_file))
+    return HTMLResponse(render.episode_page(t, _timeline_rows(t), _resolve_file, evaluator=bool(evaluator)))
 
 
 @app.get("/static/{name}")
@@ -231,19 +268,23 @@ def static(name: str) -> Response:
 # ----------------------------------------------------------------------------- routes: JSON
 
 @app.get("/api/overview")
-def api_overview() -> dict:
-    return data.overview(ROOT, REGISTRY, live=True)
+async def api_overview() -> dict:
+    # Live patience for running trials is fetched concurrently within a fixed budget; the poll never waits on a hung stakeholder.
+    return await data.overview_async(ROOT, REGISTRY)
 
 
 @app.get("/api/trial/{tid}/timeline")
-def timeline(tid: str) -> dict:
+def timeline(tid: str, evaluator: int = 0) -> dict:
     t = load_trial(tid)
+    rows = _timeline_rows(t)
+    patience = t["patience"] if evaluator else {k: v for k, v in t["patience"].items() if k != "tier"}  # tier is a stakeholder internal
     return {"trial_id": tid, "status": t["status"], "live": t["live"], "live_transcript_error": t["live_transcript_error"],
-            "unresolved": t["unresolved"], "timeline": _timeline_rows(t), "report": t["report"], "reward": t["reward"],
-            "label": t["label"], "patience": t["patience"], "meta": t["meta"]}
+            "unresolved": t["unresolved"], "evaluator": bool(evaluator),
+            "timeline": rows if evaluator else _public_rows(rows), "report": t["report"], "reward": t["reward"],
+            "label": t["label"], "patience": patience, "meta": t["meta"]}
 
 
-@app.post("/trial/{tid}/label")
+@app.post("/trial/{tid}/label", dependencies=[Depends(same_origin)])
 def label(tid: str, body: dict) -> dict:
     d = trial_path(tid)
     if not d.is_dir():
@@ -255,10 +296,12 @@ def label(tid: str, body: dict) -> dict:
 
 
 @app.get("/trial/{tid}/file/{name}")
-def trial_file(tid: str, name: str) -> PlainTextResponse:
+def trial_file(tid: str, name: str, evaluator: int = 0) -> PlainTextResponse:
     if name not in TRIAL_FILES:
         raise HTTPException(404)
-    t = load_trial(tid)
+    t = load_trial(tid)  # 404 for unknown trials before the evaluator gate
+    if name in EVALUATOR_TRIAL_FILES and not evaluator:
+        raise HTTPException(403, detail="evaluator-only file: add ?evaluator=1")
     p = _resolve_file(t, name)
     if p is None or not p.is_file():
         raise HTTPException(404)
@@ -281,7 +324,7 @@ def create_form() -> HTMLResponse:
     return HTMLResponse(render_console.create_page(console.defaults()))
 
 
-@app.post("/api/create")
+@app.post("/api/create", dependencies=[Depends(same_origin)])
 async def api_create(body: dict) -> JSONResponse:
     params, errors = console.validate_create(body)
     if errors:
@@ -298,13 +341,13 @@ def run_form() -> HTMLResponse:
     return HTMLResponse(render_console.run_page(console.defaults(), console.valid_registered(REGISTRY)))
 
 
-@app.post("/api/run")
+@app.post("/api/run", dependencies=[Depends(same_origin)])
 async def api_run(body: dict) -> JSONResponse:
     params, errors = console.validate_run(body, REGISTRY)
     if errors:
         return _json_error(400, {"ok": False, "errors": errors, "cli": console.cli_for_run(params)})
     try:
-        started = await console.start_run(params)
+        started = await console.start_run(params, ROOT)
     except console.ConsoleUnavailable as e:
         return _unavailable(e)
     return JSONResponse({"ok": True, **started, "params": params, "cli": console.cli_for_run(params)})
@@ -328,7 +371,7 @@ async def api_jobs() -> JSONResponse:
 
 
 def _workflow_id(wid: str) -> str:
-    if not console.WORKFLOW_ID_RE.match(wid):
+    if not console.WORKFLOW_ID_RE.fullmatch(wid):
         raise HTTPException(404)
     return wid
 
@@ -357,7 +400,7 @@ async def api_job(wid: str) -> JSONResponse:
         return _unavailable(e)
 
 
-@app.post("/api/jobs/{wid}/cancel")
+@app.post("/api/jobs/{wid}/cancel", dependencies=[Depends(same_origin)])
 async def api_cancel(wid: str, body: dict) -> JSONResponse:
     wid = _workflow_id(wid)
     if not isinstance(body, dict) or body.get("confirm") is not True:
@@ -384,7 +427,7 @@ async def review_item(sid: str, evaluator: int = 0, workflow_id: str = "") -> HT
     if d is None or not d["exists"]:
         raise HTTPException(404)
     sdir = ROOT / "scenarios" / sid
-    wid = workflow_id if workflow_id and console.WORKFLOW_ID_RE.match(workflow_id) else ""
+    wid = workflow_id if workflow_id and console.WORKFLOW_ID_RE.fullmatch(workflow_id) else ""
     if not wid:
         try:  # is this draft held by a running creation job? then decisions go through the signal
             wid = next((i["workflow_id"] for i in (await console.review_queue(ROOT))["items"]
@@ -392,10 +435,10 @@ async def review_item(sid: str, evaluator: int = 0, workflow_id: str = "") -> HT
         except Exception:  # noqa: BLE001 - the queue is a convenience; the page still renders
             wid = ""
     return HTMLResponse(render_console.review_page(d, console.draft_hash(sdir), wid or None, read_json(sdir / "approval.json"),
-                                                   read_json(sdir / "review.json")))
+                                                   read_json(sdir / "review.json"), evaluator=bool(evaluator)))
 
 
-@app.post("/api/review/{sid}")
+@app.post("/api/review/{sid}", dependencies=[Depends(same_origin)])
 async def api_review(sid: str, body: dict) -> JSONResponse:
     if not data.ID_RE.fullmatch(sid):
         raise HTTPException(404)

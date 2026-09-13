@@ -7,8 +7,9 @@
   --r-1: 4px; --r-2: 8px; --r-3: 14px;
   --measure: 72ch;
   --surface: #fcfcfb; --panel: #ffffff; --panel-2: #f3f2ee; --line: #e2e1dc; --line-2: #cfceca;
-  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8984;
+  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #6f6e69; /* ink-3 >= 4.5:1 on the light surface at 12-13px */
   --accent: #2a78d6; --accent-ink: #1c5cab; --focus: #2a78d6;
+  --badge-agent: #1c5cab; --badge-stakeholder: #b8471a; --badge-verifier: #0b7a56; /* white text >= 4.5:1 */
   --good: #0ca30c; --good-ink: #0a7a0a; --warn: #fab219; --warn-ink: #7a5300; --critical: #d03b3b; --critical-ink: #a32b2b;
   --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
   --agent: var(--series-1); --stakeholder: var(--series-2); --verifier: var(--series-3); --harness: #8a8984;
@@ -18,8 +19,9 @@
 @media (prefers-color-scheme: dark) {
   :root {
     --surface: #1a1a19; --panel: #232322; --panel-2: #2c2c2a; --line: #383835; --line-2: #4a4a46;
-    --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8f8e86;
+    --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #9d9c93;
     --accent: #3987e5; --accent-ink: #86b6ef; --focus: #86b6ef;
+    --badge-agent: #1c5cab; --badge-stakeholder: #b8471a; --badge-verifier: #0b7a56;
     --good: #0ca30c; --good-ink: #5ed35e; --warn: #fab219; --warn-ink: #f2c65a; --critical: #d03b3b; --critical-ink: #ef8a8a;
     --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
     --agent-wash: #1d2a3b; --stakeholder-wash: #3a2519; --audit-wash: #33281a; --mark-wash: #4a2a15;
@@ -75,7 +77,7 @@ pre { background: var(--panel); border: 1px solid var(--line); border-radius: va
 .stages { display: flex; flex-wrap: wrap; gap: var(--s-1); }
 .stages .chip { height: 20px; font-weight: 500; }
 .badge { display: inline-block; padding: 0 var(--s-2); border-radius: var(--r-1); font-size: var(--fs-0); font-weight: 700; color: #fff; background: var(--harness); letter-spacing: 0.02em; }
-.badge.agent { background: var(--agent); } .badge.stakeholder { background: var(--stakeholder); } .badge.verifier { background: var(--verifier); }
+.badge.agent { background: var(--badge-agent); } .badge.stakeholder { background: var(--badge-stakeholder); } .badge.verifier { background: var(--badge-verifier); }
 
 /* tables and cards */
 table { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-2); overflow: hidden; }
@@ -98,7 +100,7 @@ dl.meta dt { color: var(--ink-2); font-weight: 600; font-size: var(--fs-1); } dl
 .toolbar { display: flex; flex-wrap: wrap; gap: var(--s-3); align-items: end; margin: var(--s-3) 0 var(--s-4); }
 .toolbar label { display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-0); color: var(--ink-2); }
 select, textarea, input, button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-1); padding: var(--s-1) var(--s-2); }
-button.primary { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
+button.primary { background: var(--badge-agent); color: #fff; border-color: var(--badge-agent); cursor: pointer; }
 button { cursor: pointer; }
 details > summary { cursor: pointer; color: var(--ink-2); }
 .row-actions a { margin-right: var(--s-2); }
@@ -168,7 +170,10 @@ form.console .row label { margin: 0; }
 button.danger { background: var(--critical); color: #fff; border-color: var(--critical); }
 button[disabled] { opacity: 0.5; cursor: not-allowed; }
 .button { display: inline-block; padding: var(--s-1) var(--s-3); border: 1px solid var(--line-2); border-radius: var(--r-1); text-decoration: none; color: var(--ink); background: var(--panel); }
-.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.button.primary { background: var(--accent-ink); border-color: var(--accent-ink); color: #fff; }
+.facet { display: inline-block; vertical-align: top; margin: 0 var(--s-4) var(--s-3) 0; }
+.facet h4 { margin: 0 0 var(--s-1); font-size: var(--fs-0); color: var(--ink-2); font-weight: 600; }
+figcaption { margin-top: var(--s-1); }
 .banner { border-radius: var(--r-2); padding: var(--s-3) var(--s-4); margin: var(--s-3) 0; border: 1px solid var(--line); background: var(--panel); max-width: none; }
 .banner.ok { border-color: color-mix(in srgb, var(--good) 50%, var(--line)); }
 .banner.warn { border-color: color-mix(in srgb, var(--warn) 60%, var(--line)); background: var(--audit-wash); }
