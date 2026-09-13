@@ -29,8 +29,10 @@ only the merged tests or patch pin it (resolution_excerpt = the test excerpt), o
 agent could settle the question by reading the repository at the base commit. Never judge the issue as a whole. Also score
 the issue's underspecification 0-3 with the SWE-bench Verified annotator rubric (0: well specified; 1: minor blanks a
 reasonable solver fills; 2: multiple valid solutions, the tests accept one; 3: nearly impossible without more information).
+Phrase each gap's `text` and `question` as user-visible behaviour a maintainer could state to a developer (what the software
+must do), never as how the test is constructed: no assert/pytest wording, fixture names, private calls or test file paths.
 Be strict and concrete."""
-SCHEMA = """{"gaps": [{"id": "g1", "text": "...", "source": "test-literal|test-exception|patch-public-name|proposed",
+SCHEMA = """{"gaps": [{"id": "g1", "text": "the decision as user-visible behaviour a maintainer could state (never how a test is built)", "source": "test-literal|test-exception|patch-public-name|proposed",
   "evidence": "verbatim excerpt of test_patch or patch that pins this decision", "question": "what a developer would have to ask",
   "derivable_from_repo": true|false, "consequential": true|false,
   "resolved_by": "thread|tests|none", "resolution_excerpt": "verbatim thread statement when resolved_by=thread, else the test excerpt",

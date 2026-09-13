@@ -491,7 +491,7 @@ def test_tests_for_excerpt_and_synthesized_authored_facts():
     assert tests_resolved_facts(row, j) == []
     j = _judged(); j["gaps"][1]["derivable_from_repo"] = True
     assert tests_resolved_facts(row, j) == []
-    j = _judged(); j["gaps"][1]["evidence"] = "def test_new(): pass"                                                # in a test function -> linked to it, not to every F2P test
+    j = _judged(); j["gaps"][1]["evidence"] = "def test_new(): pass"; j["gaps"][1]["text"] = "Expected error for a missing dim"   # in a test function -> linked to it, not to every F2P test
     assert tests_resolved_facts(row, j) == [] if F2P.startswith("xarray/tests/test_weighted.py::test_new") else tests_resolved_facts(_row(fail_to_pass=f2p), j)[0]["tests"] == ["xarray/tests/test_weighted.py::test_new"]
     assert tests_resolved_facts(_row(thread={}), _judged())[0]["source_url"] == "https://github.com/pydata/xarray/pull/5362"   # PR url fallback from the instance id
 
@@ -537,7 +537,7 @@ def test_grounding_excerpt_may_span_adjacent_added_lines():
     row = _row(repo="sphinx-doc/sphinx", test_patch=SPHINX_TEST_PATCH, fail_to_pass=f2p, thread=_thread("sphinx-doc/sphinx", 9467))
     excerpt = "assert len(content.splitlines()) == 11 assert len(rows) == 11"
     d = _draft_llm(repo="sphinx-doc/sphinx", pr=9467)
-    d["ledger"] = [{"id": "f01", "text": "The rendered table has eleven rows", "kind": "behavior", "provenance": "authored", "source_excerpt": excerpt,
+    d["ledger"] = [{"id": "f01", "text": "The rendered table has eleven entries", "kind": "behavior", "provenance": "authored", "source_excerpt": excerpt,
                     "source_url": "https://github.com/sphinx-doc/sphinx/pull/9467", "authored_rationale": "only the tests pin the count", "discovery": "on-request", "tests": f2p}]
     assert ledger_violations(d, row) == []
     d["ledger"][0]["source_excerpt"] = "assert len(rows) == 11 assert old_value == 7"     # removed (`-`) lines are not evidence of the merged state
@@ -872,7 +872,8 @@ def _thread(repo, pr):
     url = f"https://github.com/{repo}/pull/{pr}"
     return {"pr_url": url, "number": pr, "pr_title": "Raise on missing weights dim", "pr_body": "Adds a _check_dim helper before reducing.",
             "author": "dev", "merged_at": "2021-06-01T00:00:00Z", "gold_commit": "b" * 40, "pr_created_at": "2021-05-20T00:00:00Z",
-            "reviews": [{"user": "rev", "created_at": "2021-05-21T00:00:00Z", "body": "Please raise a  ValueError\nwhen the dim is missing.", "url": url + "#pullrequestreview-1", "path": None}],
+            "reviews": [{"user": "rev", "created_at": "2021-05-21T00:00:00Z", "body": "Please raise a  ValueError\nwhen the dim is missing.\nThe message should say the dimension was not found.",
+                         "url": url + "#pullrequestreview-1", "path": None}],
             "pr_comments": [], "review_comments": [], "linked_prs": [],
             "linked_issues": [{"issue_url": f"https://github.com/{repo}/issues/5360", "number": 5360, "title": "t", "body": "b", "created_at": "2021-05-01T00:00:00Z", "comments": []}],
             "issue_url": f"https://github.com/{repo}/issues/5360", "issue_comments": []}
@@ -1232,6 +1233,104 @@ def test_fallback_inversion_respects_strings_comments_and_prefers_statements():
     draft_spec._code_mask('doc = """open', state); assert state["quote"] == '"""'
     assert draft_spec._code_of("still inside", draft_spec._code_mask("still inside", state)) == "" and state["quote"] == '"""'
     assert draft_spec._code_of('end""" + tail', draft_spec._code_mask('end""" + tail', state)) == "+ tail" and state["quote"] is None
+
+
+SEABORN_ISSUE = ("Boolean color data fails on a continuous scale\n"
+                 "Passing boolean values as color data with a continuous color scale raises a TypeError.\n"
+                 "Expected: True maps to 1 and False to 0 on the scale, and plotting boolean color data must not raise.\n"
+                 "Seen with seaborn 0.13 on Linux.\n"
+                 "A small reproducer is attached below.")
+SEABORN_TP = ("diff --git a/tests/_core/test_scales.py b/tests/_core/test_scales.py\n--- a/tests/_core/test_scales.py\n+++ b/tests/_core/test_scales.py\n"
+              "@@ -1 +1,7 @@\n x\n+class TestContinuous:\n+    def test_boolean_series(self):\n+        s = pd.Series([True, False, False])\n"
+              "+        p = IntervalProperty()\n+        mapped = Continuous()._setup(s, p)(s)\n+        assert mapped == [1, 0, 0]\n")
+SEABORN_F2P = "tests/_core/test_scales.py::TestContinuous::test_boolean_series"
+
+
+def _seaborn_row():
+    return _row(problem_statement=SEABORN_ISSUE, test_patch=SEABORN_TP, fail_to_pass=[SEABORN_F2P], pass_to_pass=["tests/_core/test_scales.py::TestContinuous::test_other"])
+
+
+def test_fact_text_never_describes_test_construction():
+    """seaborn-3190 f05: the stakeholder told the agent exactly how the hidden test is built."""
+    from swesim.stages import draft_spec
+    row = _seaborn_row()
+    leak = ("The regression test constructs a pandas Series of booleans and passes it directly to Continuous()._setup with IntervalProperty(), "
+            "expecting mapped output [1, 0, 0].")
+    reasons = draft_spec.unsafe_fact_text(leak, row)
+    assert any("private attribute '._setup'" in r for r in reasons) and any("'intervalproperty' exists only in the tests" in r for r in reasons)
+    assert draft_spec.unsafe_fact_text("Plotting with boolean color data must not raise", row) == []             # Python keywords are not identifiers
+    gold_names_setup = _seaborn_row(); gold_names_setup["patch"] = gold_names_setup["patch"].replace("+y\n", "+    def _setup(self, data, prop):\n")
+    assert draft_spec.unsafe_fact_text("Continuous()._setup(data, prop) upcasts booleans", gold_names_setup) == ["private attribute '._setup('"]   # gold patch naming it does not make it observable
+    assert draft_spec.unsafe_fact_text("Boolean values on a continuous color scale map True to 1 and False to 0, and plotting boolean color data must not raise", row) == []
+    assert draft_spec.unsafe_fact_text("assert the scale maps booleans", row) == ["test vocabulary 'assert'"]
+    assert draft_spec.unsafe_fact_text("see test_boolean_series and pytest", row) == ["test vocabulary 'pytest'", "test vocabulary 'test_boolean_series'"]
+    assert draft_spec.unsafe_fact_text("covered by tests/_core/test_scales.py", row) and draft_spec.unsafe_fact_text("uses obj.__dict__ internally", row)
+    assert draft_spec.unsafe_fact_text("ValueError when the dim is missing", _row()) == []          # words from the issue/thread are always allowed
+    # a model fact naming _setup( or assert is a violation in the correction round and is demoted to author-only leniently
+    fact = {"id": "f09", "text": "The test asserts Continuous()._setup(series, IntervalProperty()) returns [1, 0, 0]", "kind": "behavior", "provenance": "pr-review",
+            "source_excerpt": "raise a ValueError when the dim is missing", "source_url": "https://github.com/pydata/xarray/pull/5362#r1", "discovery": "on-request", "tests": [SEABORN_F2P]}
+    d = {"ledger": [fact], "requirements": [{"id": "r01", "text": "r", "fact_id": "f09", "tests": [SEABORN_F2P]}]}
+    bad = draft_spec.ledger_violations(d, row)
+    assert any("f09: fact text would tell the agent how the hidden tests are built" in v and "_setup(" in v for v in bad)
+    log = []
+    bad = draft_spec.ledger_violations(d, row, demote_unsafe=True, filter_log=log)
+    assert fact["discovery"] == "author-only" and fact["tests"] == [] and d["requirements"][0]["fact_id"] is None
+    assert log[0]["fact_id"] == "f09" and log[0]["action"] == "demoted-author-only" and any(_is_gate(v) for v in bad)
+    # synthesized facts: rewritten to observable behaviour when the judge phrased it so, demoted to author-only otherwise
+    evidence = "mapped = Continuous()._setup(s, p)(s)"
+    good = {"id": "g2", "source": "proposed", "text": "Boolean values on a continuous color scale map True to 1 and False to 0", "evidence": evidence,
+            "question": "What do boolean values map to on a continuous scale?", "derivable_from_repo": False, "consequential": True, "resolved_by": "tests", "category": "behavior"}
+    log = []
+    facts = draft_spec.tests_resolved_facts(row, {"gaps": [good]}, log)
+    assert facts[0]["discovery"] == "on-request" and facts[0]["tests"] == [SEABORN_F2P] and facts[0]["text"] == good["text"] and log[0]["action"] == "kept"
+    leaky_gap = {**good, "text": leak, "question": "Does Continuous()._setup( map a pandas Series of booleans?"}
+    log = []
+    facts = draft_spec.tests_resolved_facts(row, {"gaps": [leaky_gap]}, log)
+    assert facts[0]["discovery"] == "author-only" and facts[0]["tests"] == [] and facts[0]["text"] == evidence and "evaluator-only" in facts[0]["authored_rationale"]
+    assert log[0]["action"] == "demoted-author-only" and set(log[0]["candidates_rejected"]) == {leak, leaky_gap["question"]}
+    question_only = {**good, "text": leak}
+    facts = draft_spec.tests_resolved_facts(row, {"gaps": [question_only]}, [])
+    assert facts[0]["discovery"] == "on-request" and facts[0]["text"] == good["question"]
+
+
+def _is_gate(v):
+    return v.startswith("no on-request fact links")
+
+
+def test_demoted_synthesized_fact_is_rescued_by_a_thread_statement_or_the_candidate_is_rejected(monkeypatch, tmp_path):
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    leaky = {"id": "g2", "source": "proposed", "text": "assert the match string", "evidence": "match=\"dimension 'z' not found\"", "question": "pytest match?",
+             "derivable_from_repo": False, "consequential": True, "resolved_by": "tests", "category": "behavior"}
+    judged = {**_judged(), "gaps": [_judged()["gaps"][0], leaky]}                                    # g1: thread-resolved, resolution excerpt in the review
+    d = _draft_llm(); d["ledger"][0]["discovery"] = "repo-derivable"; d["ledger"] = [f for f in d["ledger"] if f["id"] != "f04"]   # no visible on-request F2P fact left
+    d["requirements"] = []
+    calls = _patch_llm(monkeypatch, d, _withhold_llm())
+    p = draft_spec.draft(_row(), judged, "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    by = {f.id: f for f in spec.ledger}
+    assert by["tests-001"].discovery == "author-only" and by["tests-001"].tests == []
+    assert by["thread-001"].discovery == "on-request" and by["thread-001"].tests == [F2P] and by["thread-001"].provenance == "pr-review"
+    assert by["thread-001"].text == "raise a ValueError when the dim is missing" and by["thread-001"].source_url.endswith("/pull/5362")
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert meta["rescue_facts"] == ["thread-001"]
+    actions = {(x["fact_id"], x["action"]) for x in meta["fact_filter"]}
+    assert ("tests-001", "demoted-author-only") in actions and ("thread-001", "added-rescue") in actions and ("withheld-001", "kept") in actions
+    assert len([c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]) == 2                   # the model got one round to add a visible fact first
+    # without any thread-resolved statement the candidate is rejected with the recorded reason
+    _patch_llm(monkeypatch, d, _withhold_llm())
+    with pytest.raises(ValueError, match="no-stakeholder-safe-fact"):
+        draft_spec.draft(_row(), {**_judged(), "gaps": [leaky]}, "fake/model", tmp_path / "s2")
+    assert not (tmp_path / "s2" / "scenario.draft.json").exists()
+    # a model on-request fact that describes the test is demoted leniently and the requirement that depended on it is unlinked
+    d2 = _draft_llm(); d2["ledger"][0]["text"] = "The test asserts pytest.raises(ValueError) with the match string 'z' not found"
+    _patch_llm(monkeypatch, d2, _withhold_llm())
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s3")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    by = {f.id: f for f in spec.ledger}
+    assert by["f01"].discovery == "author-only" and by["f01"].tests == [] and spec.requirements[0].fact_id is None
+    meta = json.loads((tmp_path / "s3" / "draft.meta.json").read_text())
+    assert ("f01", "demoted-author-only") in {(x["fact_id"], x["action"]) for x in meta["fact_filter"]} and meta["rescue_facts"] == []   # tests-001 still carries the gate
 
 
 def test_draft_with_zero_removals_keeps_only_the_natural_brief(monkeypatch, tmp_path):
