@@ -111,7 +111,10 @@ def run_trial(ws: Workspace, spec: ScenarioSpec, rc: RunConfig, attempt_index: i
 
     status = "completed"; trial_dir: Path | None = None; reward: dict = {}; report: dict = {}; transcript: dict = {}
     try:
-        trial_dir = harbor_cli.run_task(task, rc.agent, ws.jobs_dir / "runs", tid, model=rc.model, timeout_sec=rc.solver_timeout_sec + 7200)
+        # Pin the pre-baked agent version so Harbor's offline `uv tool install` request matches the baked receipt.
+        agent_kwargs = {"version": rc.agent_version} if rc.agent == "mini-swe-agent" and rc.agent_version else None
+        trial_dir = harbor_cli.run_task(task, rc.agent, ws.jobs_dir / "runs", tid, model=rc.model, agent_kwargs=agent_kwargs,
+                                        timeout_sec=rc.solver_timeout_sec + 7200)
         reward = harbor_cli.read_reward(trial_dir); report = harbor_cli.read_report(trial_dir)
         raw = json.loads((trial_dir / "result.json").read_text()); report["harbor_exception"] = raw.get("exception_info")
         if raw.get("exception_info"):
