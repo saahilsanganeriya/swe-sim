@@ -39,6 +39,7 @@ EXTRA_ENV_FILES ?=
 MODAL_TOML ?= $(HOME)/.modal.toml
 EVIDENCE_DIR ?= workspace/evidence/cloud
 TF_ARGS ?=
+OVERRIDE_OPEN_EXECUTIONS ?= 0
 export SWESIM_ENV_FILE
 
 UV := uv run --frozen
@@ -48,7 +49,7 @@ STATE_BUCKET := $(PROJECT)-swesim-tfstate
 ENV_FILE_FLAGS := --env-file $(SWESIM_ENV_FILE) $(foreach f,$(EXTRA_ENV_FILES),--env-file $(f))
 
 .PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build pin-image \
-        deploy verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
+        deploy open-executions verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
 
 check:
 	uv sync --extra dev --frozen
@@ -104,7 +105,20 @@ pin-image: require-project
 	printf '{"image": "%s"}\n' "$$digest" > infra/image.auto.tfvars.json; \
 	echo "pinned $$digest"
 
-deploy: require-project pin-image
+open-executions:
+	mkdir -p $(EVIDENCE_DIR)
+	@report=$(EVIDENCE_DIR)/open-types-$$(date -u +%Y%m%dT%H%M%SZ).txt; \
+	$(UV) swesim workflows open-types > "$$report"; \
+	if [ -s "$$report" ]; then \
+	  cat "$$report"; \
+	  if [ "$(OVERRIDE_OPEN_EXECUTIONS)" = 1 ]; then \
+	    printf '# Explicit operator override: OVERRIDE_OPEN_EXECUTIONS=1\n' >> "$$report"; \
+	  else echo "open workflows exist; deployment stopped before build" >&2; exit 1; fi; \
+	else printf '# No open workflows\n' >> "$$report"; fi
+
+deploy: require-project
+	$(MAKE) open-executions
+	$(MAKE) pin-image
 	$(MAKE) apply
 	$(MAKE) migrate
 	$(MAKE) verify-cloud

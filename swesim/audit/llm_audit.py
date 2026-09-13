@@ -8,9 +8,9 @@ Contract
   stakeholder-visible facts (author-only facts listed separately, marked), the requirements with their fact grounding, the
   hidden test source, the oracle diff (scenario) or the transcript (trial). Large fields are clipped at ``MAX_FIELD_CHARS``.
   The deny-list (``forbidden_terms``) is worker material and never enters a prompt.
-- ``Judge`` calls ``swesim.llm.chat_json`` on ``AUDIT_MODEL`` and falls back to ``AUDIT_FALLBACK_MODEL`` on ``LLMError``;
+- ``Judge`` calls ``swesim.llm.chat_json_with_usage`` on the configured model and follows the role fallback chain on ``LLMError``;
   when both fail it raises ``AuditLLMError`` (retryable). Every call is recorded in ``Judge.calls`` for the usage report;
-  token counts are estimated from characters because ``chat_json`` returns no usage.
+  provider usage is retained and priced through the shared price table. Character estimates are labelled for older injected clients.
 - Model output is coerced, never trusted: labels become booleans or ``None`` (unknown), ids become string lists, reasons
   become strings; a structurally unusable answer raises ``AuditOutputError``.
 """
@@ -21,7 +21,8 @@ from dataclasses import dataclass, field
 
 from swesim.audit.record import ScenarioBundle, TrialBundle, strip_confirm_prefix
 from swesim.audit.rubric import rubric_text
-from swesim.llm import LLMError, chat_json
+from swesim.costs import Usage, usd_for
+from swesim.llm import ChatResult, LLMError, chat_json_with_usage
 
 AUDIT_MODEL = "anthropic/claude-opus-5"
 AUDIT_FALLBACK_MODEL = "openai/gpt-5.6-sol"
@@ -204,14 +205,14 @@ def coerce_trial(out) -> tuple[dict[int, dict], dict[int, dict]]:
 
 @dataclass
 class Judge:
-    """Model chain plus a call ledger. ``chat`` defaults to ``swesim.llm.chat_json`` (looked up at call time)."""
+    """Model chain plus provider usage; injected legacy clients remain explicitly estimated."""
     chat: object | None = None
     models: tuple[str, ...] = (AUDIT_MODEL, AUDIT_FALLBACK_MODEL)
     calls: list[dict] = field(default_factory=list)
 
     def _ask(self, purpose: str, system: str, payload: dict, schema: str) -> tuple[dict, str]:
         content = json.dumps(payload, ensure_ascii=False, indent=1, default=str)
-        fn = self.chat or chat_json
+        fn = self.chat or chat_json_with_usage
         failures = []
         for model in self.models:
             entry = {"purpose": purpose, "model": model, "input_chars": len(system) + len(schema) + len(content), "output_chars": 0, "ok": False}
@@ -222,6 +223,9 @@ class Judge:
                 self.calls.append(entry)
                 failures.append(f"{model}: {str(e)[:200]}")
                 continue
+            if isinstance(out, ChatResult):
+                entry["usage"] = out.usage.model_dump(mode="json")
+                out = out.data
             entry.update(ok=True, output_chars=len(json.dumps(out, default=str)))
             self.calls.append(entry)
             return out, model
@@ -237,7 +241,7 @@ class Judge:
         return {"questions": questions, "replies": replies}, model
 
     def usage(self) -> dict:
-        """Calls, estimated tokens and estimated USD per model (estimates: chat_json returns no usage)."""
+        """Provider token/cost totals when complete, alongside labelled estimates for older injected clients."""
         by_model: dict[str, dict] = {}
         for c in self.calls:
             if not c["ok"]:
@@ -250,8 +254,34 @@ class Judge:
             pin, pout = PRICES_USD_PER_MTOK.get(model, (0.0, 0.0))
             m["estimated_cost_usd"] = round(m["estimated_input_tokens"] / 1e6 * pin + m["estimated_output_tokens"] / 1e6 * pout, 4)
         ok = sum(m["calls"] for m in by_model.values())
+        measured = self.measured_usage()
+        complete = all(c.get("usage") is not None for c in self.calls)
+        priced = [usd_for(model, usage)[0] for model, usage in measured.items()]
+        actual_cost = float(sum(priced)) if complete and all(p is not None for p in priced) else None
         return {"calls": ok, "failed_calls": len(self.calls) - ok, "by_model": by_model,
                 "estimated_input_tokens": sum(m["estimated_input_tokens"] for m in by_model.values()),
                 "estimated_output_tokens": sum(m["estimated_output_tokens"] for m in by_model.values()),
                 "estimated_cost_usd": round(sum(m["estimated_cost_usd"] for m in by_model.values()), 4),
-                "estimate": True, "chars_per_token": CHARS_PER_TOKEN, "price_source": PRICE_SOURCE}
+                "estimate": not complete, "chars_per_token": CHARS_PER_TOKEN, "price_source": PRICE_SOURCE,
+                "usage_complete": complete,
+                "input_tokens": sum(u.input_tokens for u in measured.values()) if complete else None,
+                "output_tokens": sum(u.output_tokens for u in measured.values()) if complete else None,
+                "cost_usd": actual_cost}
+
+    def measured_usage(self) -> dict[str, Usage]:
+        """Usage grouped by the model actually called, excluding calls whose provider returned no usage."""
+        totals: dict[str, Usage] = {}
+        for call in self.calls:
+            if call.get("usage") is None:
+                continue
+            usage = Usage.model_validate(call["usage"])
+            if call["model"] not in totals:
+                totals[call["model"]] = usage
+                continue
+            prior = totals[call["model"]]
+            totals[call["model"]] = Usage(input_tokens=prior.input_tokens + usage.input_tokens,
+                                         output_tokens=prior.output_tokens + usage.output_tokens,
+                                         cached_tokens=(prior.cached_tokens + usage.cached_tokens
+                                                        if prior.cached_tokens is not None and usage.cached_tokens is not None else None),
+                                         calls=prior.calls + usage.calls)
+        return totals

@@ -137,6 +137,16 @@ class Layout(Strict):
             raise LayoutError(f"invalid candidate stage: {stage!r}")
         return self.candidates_dir() / (_segment(source_key, "source key") + _CANDIDATE_SUFFIX[stage])
 
+    def discovery_dir(self, source_key: str | None = None) -> Path:
+        """Immutable discovery observations, including runs that produced no candidate rows."""
+        root = self.candidates_dir() / "discovery"
+        return root / _segment(source_key, "source key") if source_key is not None else root
+
+    def discovery_snapshot(self, source_key: str, discovery_id: str) -> Path:
+        if not isinstance(discovery_id, str) or not re.fullmatch(r"[0-9a-f]{64}", discovery_id):
+            raise LayoutError(f"invalid discovery id: {discovery_id!r}")
+        return self.discovery_dir(source_key) / (discovery_id + ".json")
+
     def probe_dir(self, instance_id: str) -> Path:
         return self.root / "probes" / _segment(instance_id, "instance id")
 
@@ -176,6 +186,17 @@ class Layout(Strict):
         return self.root / "dataset.json"
 
     # ------------------------------------------------------------------ object names
+    def resolve_artifact(self, reference: Path | str) -> Path:
+        """An absolute or relative artifact reference confined to this workspace, including through symlinks."""
+        path = Path(reference)
+        if not path.is_absolute():
+            path = self.root / path
+        try:
+            relative = path.resolve().relative_to(self.root.resolve())
+        except ValueError as exc:
+            raise LayoutError("artifact reference is outside the workspace") from exc
+        return self.root / relative
+
     def relative(self, path: Path) -> str:
         """Bucket object name (POSIX, relative to root) for a path under the root."""
         try:

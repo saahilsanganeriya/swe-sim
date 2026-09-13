@@ -34,6 +34,7 @@ RANGES: dict[str, tuple[str, str]] = {"started_from": ("started_at", ">="), "sta
 TEXT_FIELDS: dict[str, tuple[str, ...]] = {
     "scenarios": ("scenario_id", "source", "source_ref", "spec_hash", "compiled_hash"),
     "candidates": ("instance_id", "repo", "scenario_id", "gate", "source_key"),
+    "discoveries": ("source_key", "discovery_id", "source", "repo", "band", "identity_kind", "workflow_id", "run_id"),
     "trials": ("trial_id", "scenario_id", "model", "spec_hash", "run_config_hash", "job_name", "workflow_id"),
     "scores": ("scenario_id", "model", "spec_hash", "run_config_hash"),
     "workflows": ("workflow_id", "run_id", "type", "failure", "parent_workflow_id"),
@@ -44,7 +45,7 @@ TEXT_FIELDS: dict[str, tuple[str, ...]] = {
 }
 DEFAULT_ORDER: dict[str, str] = {"scenarios": "scenario_id", "candidates": "instance_id", "trials": "started_at", "scores": "scenario_id",
                                  "workflows": "started_at", "costs": "at", "operator_actions": "at", "index_rebuilds": "started_at",
-                                 "exchanges": "seq"}
+                                 "exchanges": "seq", "discoveries": "discovered_at"}
 
 
 def matches(row: BaseModel, f: BaseModel, text_fields: tuple[str, ...]) -> bool:
@@ -133,6 +134,15 @@ class FileIndexReader:
                 log.warning("candidates %s not projected: %s", key, e)
         return rows
 
+    def _discovery_rows(self, source_key: str | None = None) -> list[M.DiscoveryRow]:
+        rows: list[M.DiscoveryRow] = []
+        for key in [source_key] if source_key is not None else P.discovery_source_keys(self.layout):
+            try:
+                rows.extend(P.project_discoveries(self.layout, key, origin=self.settings.origin))
+            except ValueError as exc:
+                log.warning("discovery %s not projected: %s", key, exc)
+        return rows
+
     def _trials(self) -> list[tuple[M.TrialRow, list[M.ExchangeRow], list[M.CostRow]]]:
         out = []
         for tid in P.trial_ids(self.layout):
@@ -213,6 +223,9 @@ class FileIndexReader:
     def funnel(self, source_key: str | None = None) -> list[M.FunnelStep]:
         return R.funnel_steps(self._candidate_rows(source_key))
 
+    def reject_histogram(self, source_key: str | None = None) -> dict[str, int]:
+        return R.reject_histogram(self._discovery_rows(source_key), self._candidate_rows(source_key))
+
     def trials(self, f: M.TrialFilter) -> M.Page[M.TrialRow]:
         rows = [t for t, _ex, _c in self._trials()]
         return page([r for r in rows if matches(r, f, TEXT_FIELDS["trials"])], f, DEFAULT_ORDER["trials"])
@@ -275,6 +288,8 @@ class FileIndexReader:
             return list(self._scenario_rows())
         if name == "candidates":
             return list(self._candidate_rows())
+        if name == "discoveries":
+            return list(self._discovery_rows())
         if name == "trials":
             return [t for t, _ex, _c in self._trials()]
         if name == "exchanges":

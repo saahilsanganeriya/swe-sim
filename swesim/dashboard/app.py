@@ -80,10 +80,14 @@ def identity_dep(request: Request, settings: Settings = Depends(settings_dep)) -
     return identity_from_headers(request.headers, settings, verify=app.state.verify_jwt)
 
 
-def origin_dep(request: Request, settings: Settings = Depends(settings_dep)) -> None:
+def origin_dep(request: Request, settings: Settings = Depends(settings_dep), reader=Depends(reader_dep), identity: Identity = Depends(identity_dep)) -> None:
     try:
         actions.check_origin(request.headers, settings, str(request.url))
     except actions.OriginError as e:
+        action = request.path_params.get("action")
+        if action in actions.ACTIONS:
+            access.record_action(reader, settings, actions.audit_row(identity=identity, action=action, target=None, params={}, confirmed=False,
+                                                                     origin_header=request.headers.get("origin"), result="rejected", workflow_id=None, settings=settings))
         raise HTTPException(403, detail=str(e)) from e
 
 
@@ -492,6 +496,7 @@ def board_views(reader, rows: list, eligible: set[str], f: R.LeaderboardFilter) 
         flags = [t.asked_before_implementing for t in trials if t.model == r.model and t.condition == r.condition and t.brief_profile == r.brief_profile and t.asked_before_implementing is not None]
         d["asked_first_rate"] = f"{sum(1 for x in flags if x) / len(flags):.3f}" if flags else None
         ci = _wilson(r.success_count, r.n)
+        d["confidence"] = f"{ci[0]:.2f}–{ci[1]:.2f}" if ci else None
         d["confidence_note"] = (f"n={r.n} valid attempt(s) over {r.scenarios} scenario(s); pass rate {r.success_count}/{r.n}" + (f", Wilson 95% CI {ci[0]:.2f}–{ci[1]:.2f} (attempt independence approximation)" if ci else "")
                                 + ("; pass@k is the mean of matching per-spec/config scores (k as scored)" if pk else "; pass@k unavailable: insufficient attempts or no matching score"))
         d["key"] = f"{r.model}|{r.condition}|{r.brief_profile}"
@@ -519,18 +524,23 @@ def leaderboard(request: Request, reader=Depends(reader_dep), identity: Identity
         if want:
             trials = [t for t in trials if getattr(t, key) in want]
     models = sorted({t.model for t in trials}, key=lambda m: (render.family_of(m)[2] or 99, m))
-    by_cell: dict[tuple[str, str], list] = {}
+    by_cell: dict[tuple[str, str, str, str], list] = {}
     for t in trials:
-        by_cell.setdefault((t.scenario_id, t.model), []).append(t)
+        by_cell.setdefault((t.scenario_id, t.model, t.condition, t.brief_profile), []).append(t)
 
-    def cell(sid, model):
-        ts = [t for t in by_cell.get((sid, model), []) if t.outcome_code in (1, 2, 3, 4)]
+    def cell(sid, model, condition, profile):
+        ts = by_cell.get((sid, model, condition, profile), [])
         if not ts:
             return None, 0, f"{sid} · {model}: no valid attempts"
         return sum(1 for t in ts if t.success) / len(ts), len(ts), f"{sid} · {model}: {sum(1 for t in ts if t.success)}/{len(ts)} valid attempts succeeded"
 
-    matrix_html = pages.charts.matrix(sorted(eligible), models, cell, chart_id="chart-matrix", title="pass rate per scenario × model",
-                                      col_label=lambda m: m.split("/")[-1][:18]) if eligible and models else "<p class='empty'>No eligible scenario has completed trials for this purpose.</p>"
+    matrices = []
+    for condition, profile in sorted({(t.condition, t.brief_profile) for t in trials}):
+        matrices.append(f"<h3>{render.h(condition)} · {render.h(profile)}</h3>" + pages.charts.matrix(
+            sorted(eligible), models, lambda sid, model, c=condition, p=profile: cell(sid, model, c, p),
+            chart_id=f"chart-matrix-{condition}-{profile}", title=f"{condition} / {profile}: pass rate per scenario × model",
+            col_label=lambda m: m.split("/")[-1][:18]))
+    matrix_html = "".join(matrices) or "<p class='empty'>No eligible scenario has completed trials for this purpose.</p>"
     chart_rows = [{"model": r.model, "condition": r.condition, "pass_rate": float(r.pass_rate) if r.pass_rate is not None else None, "n": r.n} for r in rows]
     chart_html = pages.charts.grouped_bars(chart_rows, metric="pass_rate", chart_id="chart-lb", title="pass rate per model per condition")
     p = render.Page("Leaderboard", "leaderboard", "leaderboard", crumbs=(("Leaderboard", None),))
@@ -637,10 +647,11 @@ async def review_item(sid: str, workflow_id: str = "", reader=Depends(reader_dep
 # ----------------------------------------------------------------------------- create / run / spend / search
 
 @app.get("/create", response_class=HTMLResponse)
-def create_form(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+def create_form(request: Request, reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
     repos = sorted({r.source_ref for r in reader.scenarios(R.ScenarioFilter(source=["github-repo"], latest_only=True, limit=500)).items if str(r.source_ref).startswith("http")})
     p = render.Page("Create tasks", "create", "create", crumbs=(("Create", None),))
-    return page(p, render_console.create_body(console.defaults(), repos, settings.spend_cap_usd), reader, identity, settings)
+    defaults = {**console.defaults(), "rebuild": request.query_params.get("rebuild") == "1"}
+    return page(p, render_console.create_body(defaults, repos, settings.spend_cap_usd), reader, identity, settings)
 
 
 @app.get("/run", response_class=HTMLResponse)
@@ -848,6 +859,12 @@ def _describe(action: str, params: dict, reader, settings: Settings) -> tuple[di
             errs.append("decision must be approve or reject")
         p = {"scenario_id": sid, "decision": decision, "spec_hash": str(params.get("spec_hash") or ""), "workflow_id": str(params.get("workflow_id") or ""),
              "reason": str(params.get("reason") or params.get("note") or "")[:2000]}
+        if not p["reason"].strip():
+            errs.append("a reason is required for approval or rejection")
+        if decision == "approve" and not p["workflow_id"]:
+            errs.append("approval requires the holding workflow id; task creation is executed through Temporal")
+        if p["workflow_id"] and not console.WORKFLOW_ID_RE.fullmatch(p["workflow_id"]):
+            errs.append("invalid holding workflow id")
         cli = (f"uv run swesim workflows approve {console._q(p['workflow_id'])} {console._q(sid)} {console._q(p['spec_hash'])} --decision {decision}" if p["workflow_id"]
                else (f"uv run swesim approve {console._q(sid)}   # supervised approval of the local draft" if decision == "approve" else f"# reject: writes scenarios/{sid}/review.json with decision=reject"))
         return p, errs, cli, f"{decision.capitalize()} the held draft {sid} (spec hash {p['spec_hash'][:12]}…).", sid
@@ -915,8 +932,10 @@ async def api_preview(action: str, request: Request, reader=Depends(reader_dep),
     if action not in actions.ACTIONS:
         raise HTTPException(404)
     body = await _body(request)
-    p, errs, cli, what, _target = _describe(action, body, reader, settings)
+    p, errs, cli, what, target = _describe(action, body, reader, settings)
     if errs:
+        access.record_action(reader, settings, actions.audit_row(identity=identity, action=action, target=target, params=p, confirmed=False,
+                                                                 origin_header=request.headers.get("origin"), result="rejected", workflow_id=None, settings=settings))
         return _json(400, {"ok": False, "errors": errs, "cli": cli})
     token, exp = actions.issue_token(action, p, identity, settings)
     _key, shared = actions.signing_key(settings)
@@ -950,6 +969,9 @@ async def api_action(action: str, request: Request, reader=Depends(reader_dep), 
     except console.ConsoleUnavailable as e:
         audit("failed", None, True)
         return _json(502, {"ok": False, "error": str(e), "cli": e.cli, "kind": e.kind})
+    except (OSError, RuntimeError) as e:
+        audit("failed", None, True)
+        return _json(500, {"ok": False, "error": f"Action failed: {type(e).__name__}", "cli": cli})
     wids = payload.get("workflow_ids") or ([payload["workflow_id"]] if payload.get("workflow_id") else [])
     audit("accepted" if status < 400 and payload.get("ok", True) else ("failed" if status >= 500 else "rejected"), wids[0] if wids else None, True)
     payload.setdefault("cli", cli)

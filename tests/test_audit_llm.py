@@ -160,6 +160,20 @@ def test_usage_counts_calls_and_estimates_cost_from_prompt_size():
     assert u["price_source"] == L.PRICE_SOURCE and u["estimate"] is True
 
 
+def test_production_audit_keeps_provider_usage_and_prices_fallback(monkeypatch):
+    from swesim.costs import Usage, usd_for
+    from swesim.llm import ChatResult
+    usage = Usage(input_tokens=1234, output_tokens=56, cached_tokens=100, calls=1)
+    payload = FakeChat()(L.AUDIT_FALLBACK_MODEL, "system", [], "schema")
+    monkeypatch.setattr(L, "chat_json_with_usage", lambda *a, **kw: ChatResult(payload, usage))
+    judge = L.Judge(models=(L.AUDIT_FALLBACK_MODEL,))
+    judge.judge_scenario(scenario_bundle())
+    result = judge.usage()
+    assert result["input_tokens"] == 1234 and result["output_tokens"] == 56
+    assert result["usage_complete"] is True and result["estimate"] is False
+    assert result["cost_usd"] == float(usd_for(L.AUDIT_FALLBACK_MODEL, usage)[0]) > 0
+
+
 # ---------------------------------------------------------------- coercion of model output
 
 def test_coerce_scenario_accepts_strings_and_fills_unknowns():

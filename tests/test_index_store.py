@@ -70,7 +70,7 @@ def test_ensure_migrated_is_the_workers_startup_step(tmp_path, caplog):
         assert ensure_migrated(enabled) is True
         assert ensure_migrated(enabled) is True  # idempotent: nothing to do the second time
     lines = [r.getMessage() for r in caplog.records if r.name == "swesim.index.store"]
-    assert len(lines) == 2 and all("0001_index_v1" in line for line in lines) and "migrated from empty" in lines[0] and "migrated" not in lines[1]
+    assert len(lines) == 2 and all("0002_discoveries" in line for line in lines) and "migrated from empty" in lines[0] and "migrated" not in lines[1]
     assert not any(url in line or "index.db" in line for line in lines)
     assert IndexStore(url).trials(M.TrialFilter()).total == 0  # the tables exist
 

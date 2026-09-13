@@ -122,7 +122,7 @@ def home_body(data: dict, settings) -> str:
     body.append("<h2>Running now</h2>")
     body.append(table("running", TRIAL_COLUMNS, data["running"], key="trial_id",
                       empty="<strong>Nothing is running.</strong> Start a run on <a href='/run'>Run</a>; rows appear here within 5 s of launch.", export=False))
-    body.append("<div class='side-by-side'><div><h2>Recent workflows</h2>" + table("workflows", WORKFLOW_COLUMNS[:7], data["workflows"], key="workflow_id",
+    body.append("<div class='side-by-side'><div><h2>Recent workflows</h2>" + table("workflows", tuple(c for c in WORKFLOW_COLUMNS if c.key in ("workflow_id", "status", "temporal")), data["workflows"], key="execution_key",
                                                                                   empty="<strong>No workflows listed.</strong> " + h(data.get("workflow_error") or "Start one on Create or Run."), export=False)
                 + "</div><div><h2>Creation funnel</h2>" + charts.funnel(data["funnel"], "chart-home-funnel") + "</div></div>")
     body.append("<h2>Recently finished</h2>")
@@ -153,7 +153,7 @@ def trials_body(page, views: list[dict], facets: dict, current: dict) -> str:
             "<button type='submit' class='button'>Filter</button> <a class='button' href='/trials'>Reset</a></form>"]
     body = ["<h1>Trials</h1><p class='lead'>Every trial record and every planned, launched, unresolved or launch-failed attempt. Unresolved attempts never enter n or pass@k.</p>",
             "".join(form),
-            table("trials", TRIAL_COLUMNS, views, key="trial_id", total=page.total, offset=page.offset, limit=page.limit,
+            table("trials", TRIAL_COLUMNS, views, key="trial_id", total=page.total, offset=page.offset, limit=page.limit, source="/api/trials",
                   empty="<strong>No trials match.</strong> Reset the filters, or start a run on <a href='/run'>Run</a>.")]
     return "".join(body)
 
@@ -169,7 +169,7 @@ def candidates_body(page, views: list[dict], funnel_steps: list[dict], hist: dic
             "<div class='side-by-side'><div>", charts.funnel(funnel_steps, "chart-funnel"), "</div><div>",
             charts.hbars(list(hist.items()), "chart-rejects", "rejects by gate"), "</div></div>",
             "<h2>Every candidate</h2>",
-            table("candidates", CANDIDATE_COLUMNS, views, key="instance_id", total=page.total, offset=page.offset, limit=page.limit,
+            table("candidates", CANDIDATE_COLUMNS, views, key="instance_id", total=page.total, offset=page.offset, limit=page.limit, source="/api/candidates",
                   empty="<strong>No candidate rows.</strong> A creation job's mining step writes <code>candidates/&lt;key&gt;.jsonl</code>; judged and probed rows follow.")]
     return "".join(body)
 
@@ -220,7 +220,7 @@ def workflow_body(wid: str, row, job: dict | None, progress: dict | None, error:
             body.append("<p class='muted small'>" + " · ".join(f"{h(k)} {h(v)}" for k, v in counts.items()) + "</p>")
         body.append(f"<details><summary>raw progress (redacted)</summary><pre class='code'>{h(redact(json.dumps(progress, indent=2, default=str))[:20000])}</pre></details>")
     if children:
-        body.append("<h2>Children</h2>" + table("children", WORKFLOW_COLUMNS[:7], children, key="workflow_id", empty="none", export=False))
+        body.append("<h2>Children</h2>" + table("children", WORKFLOW_COLUMNS, children, key="execution_key", empty="none", export=False))
     if trials:
         body.append("<h2>Trials launched by this workflow</h2>" + table("wf-trials", TRIAL_COLUMNS, trials, key="trial_id", empty="none", export=False))
     if st in ("running", "open", "unknown", "continued_as_new"):
@@ -247,7 +247,7 @@ LB_COLUMNS = (
     Column("questions_asked", "questions", "num"),
     Column("confirmations", "confirmations", "num"),
     Column("asked_first_rate", "asked-first rate", "metric"),
-    Column("confidence_note", "confidence", "text"),
+    Column("confidence", "95% CI", "mono", title="confidence_note"),
 )
 
 
@@ -365,15 +365,23 @@ def is_listable(rel: Path, evaluator: bool) -> tuple[bool, str]:
     if len(parts) >= 3 and parts[0] == "trials" and parts[2] == "task":
         return False, "the per-trial task copy holds the session token and is never listed"
     if not evaluator:
+        if parts and parts[0] not in TOP_LEVEL:
+            return False, "evaluator-only (not a public record family)"
         if parts and parts[0] in ("candidates", "evidence", "jobs", "probes", "calibration"):
             return False, "evaluator-only (raw pipeline records and audit evidence)"
+        if len(parts) >= 3 and parts[0] == "scenarios":
+            tail = parts[2:]
+            if tail[0] == "archive":
+                tail = tail[2:] if len(tail) >= 2 else ()
+            if tail and (len(tail) != 1 or tail[0] not in ("approval.json", "compile.json", "validation.json", "difficulty.json", "scores.json")):
+                return False, "evaluator-only (scenario source, assets or metadata)"
         if len(parts) >= 3 and parts[0] == "scenarios" and (parts[2] == "assets" or parts[-1] in ("scenario.json", "scenario.draft.json", "judge.json", "draft.meta.json", "audit.json")):
             return False, "evaluator-only (author-only facts, hidden test assets, judge/draft metadata)"
         if len(parts) >= 5 and parts[0] == "scenarios" and parts[2] == "archive" and (parts[4] == "assets" or parts[-1] in ("scenario.json", "scenario.draft.json", "judge.json", "draft.meta.json", "audit.json")):
             return False, "evaluator-only (archived spec and metadata)"
         if len(parts) >= 3 and parts[0] == "trials" and parts[-1] in ("record.json", "transcript.json", "spec.json", "audit.json"):
             return False, "evaluator-only (raw record, transcript, frozen spec, audit)"
-        if len(parts) >= 3 and parts[0] == "trials" and parts[-1] not in ("reward.json", "report.json", "status.json", "costs.json", "label.json"):
+        if len(parts) >= 3 and parts[0] == "trials" and (len(parts) != 3 or parts[-1] not in ("reward.json", "report.json", "status.json", "costs.json", "label.json")):
             return False, "evaluator-only (raw trial configuration or trace)"
         if len(parts) >= 2 and parts[0] == "tasks":
             return False, "evaluator-only (compiled task directories carry hidden tests)"
