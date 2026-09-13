@@ -5,9 +5,9 @@ Spec is read-only during this plan review. A box is checked only after
 `bash scripts/verify.sh N` succeeds. Checks are cumulative and offline; the
 cloud execution required to produce evidence is an explicit implementation step.
 
-- [ ] **M1 Models** — Task 1: dependencies installed; strict model, asset, group and hash round-trip tests pass.
-- [ ] **M2 Grader** — Tasks 2–3: safe extraction, source import, exact-ID/exit cross-checks, genuine base outcomes and content hashes pass tests.
-- [ ] **M3 Compiler** — Tasks 4–5: three task variants render, assets are verified, root collector is packaged, PatchAgent implements Harbor's abstract API. This milestone alone claims no cloud run.
+- [x] **M1 Models** — Task 1: dependencies installed; strict model, asset, group and hash round-trip tests pass.
+- [x] **M2 Grader** — Tasks 2–3: safe extraction, source import, exact-ID/exit cross-checks, genuine base outcomes and content hashes pass tests.
+- [x] **M3 Compiler** — Tasks 4–5: three task variants render, assets are verified, root collector is packaged, PatchAgent implements Harbor's abstract API. This milestone alone claims no cloud run.
 - [ ] **M4 Authored SWE-bench task** — Tasks 6–7: mine/judge/draft; unattended approval by code-owned gates (recorded as auto-validators, review_needed=true) bound to spec hash; executed Modal nop/oracle/wrong/tamper controls with complete base/gold test evidence; valid validation file.
 - [ ] **M5 Interaction** — Tasks 8–9: durable stakeholder sessions, serialized freeze, bounded replies; a real mini-swe-agent interactive episode with a paired question/reply, trajectory and transcript hash matching collection.
 - [ ] **M6 Repo URL** — Task 10: mine a GitHub repository URL without a PR override; retain filter/build rejections; automatically select a feature candidate, auto-approve it through the gates, validate and run it. A failed search is recorded honestly and leaves M6 incomplete.
