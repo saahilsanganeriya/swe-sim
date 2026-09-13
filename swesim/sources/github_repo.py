@@ -133,23 +133,18 @@ def _candidate(repo: str, p: dict, patch: str) -> dict:
             "test_files": _DIFF_HEADER.findall(tst), "issue": None, "issue_body": None, "thread": None, "linked_prs": [], "linked_missing": []}
 
 
-class DiscoveryUnavailable(RuntimeError):
-    """`gh api` could not answer (rate limit after threads' own waits, 5xx, network, timeout, auth): an infrastructure
-    failure of this attempt, never a PR decision. It propagates out of `discover` so the Temporal activity fails and is
-    retried; the message names the kind and the PR, never `gh` stderr."""
-
-    def __init__(self, kind: str, repo: str, where: str, error_class: str):
-        self.kind, self.repo, self.where, self.error_class = kind, repo, where, error_class
-        super().__init__(f"gh api unavailable ({kind}, {error_class}) while scanning {repo} {where}")
-
-
-unavailable_kind = threads.unavailable_kind  # gh unavailability classifier lives with the gh wrapper
+# gh unavailability is classified where gh is called; both names are part of this module's contract.
+DiscoveryUnavailable, RateLimited, unavailable_kind = threads.DiscoveryUnavailable, threads.RateLimited, threads.unavailable_kind
 
 
 def _fetch(repo: str, where: str, call):
-    """One gh call: unavailability propagates as `DiscoveryUnavailable`; every other failure is the caller's to classify."""
+    """One gh call: unavailability propagates as `DiscoveryUnavailable` (a rate limit as `RateLimited`, located at this
+    PR or page); every other failure is the caller's to classify."""
     try:
         return call()
+    except RateLimited as limited:
+        log.warning("github-repo %s %s: GitHub rate limit (resets in %.0fs); the scan resumes here after the reset", repo, where, limited.wait_seconds())
+        raise limited.located(repo, where) from limited
     except subprocess.SubprocessError as error:
         kind = unavailable_kind(error)
         if kind is not None:

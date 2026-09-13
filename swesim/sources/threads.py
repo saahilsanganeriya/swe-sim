@@ -1,8 +1,10 @@
 """GitHub issue / pull-request threads via the authenticated `gh api` CLI.
 
 Every call returns one JSON document (never `--paginate`, whose output is several concatenated documents).
-Paging is explicit and bounded; rate-limit errors back off (primary limit: sleep until the reported reset,
-secondary limit: exponential) a bounded number of times, then propagate.
+Paging is explicit and bounded. Nothing here sleeps through GitHub's rate limit: a refused call raises `RateLimited`
+(a `DiscoveryUnavailable`) carrying the reset time read from the response headers (`gh api -i` output) or from one
+uncounted `gh api rate_limit` call, and the owner of the clock (the discovery activity, which heartbeats while it
+waits) decides how to wait and resume. `rate_limit_status()` exposes that quota, cached for 30 s.
 """
 from __future__ import annotations
 
@@ -15,11 +17,14 @@ import time
 from urllib.parse import quote, urlencode
 
 log = logging.getLogger(__name__)
-RATE_LIMIT_RETRIES = 6
-MAX_RATE_LIMIT_SLEEP = 3600.0
-SECONDARY_LIMIT_MIN_SLEEP = 60.0  # GitHub asks for at least a minute after a secondary (burst) limit
+RATE_LIMIT_STATUS_TTL = 30.0
+SECONDARY_LIMIT_WAIT = 60.0  # GitHub asks for at least a minute after a secondary (burst) limit; also the horizon when the quota cannot be read
 _RATE_LIMIT = re.compile(r"rate limit|HTTP 429|abuse detection", re.I)
 _SECONDARY = re.compile(r"secondary|abuse detection", re.I)
+_HEADER_REMAINING = re.compile(r"^x-ratelimit-remaining:\s*(\d+)\s*$", re.I | re.M)
+_HEADER_RESET = re.compile(r"^x-ratelimit-reset:\s*(\d+)\s*$", re.I | re.M)
+_HEADER_RETRY_AFTER = re.compile(r"^retry-after:\s*(\d+)\s*$", re.I | re.M)
+_HTTP_STATUS = re.compile(r"HTTP(?:/[\d.]+)? (\d{3})\b")
 _SERVER_ERROR = re.compile(r"HTTP 5\d\d", re.I)
 _AUTH_ERROR = re.compile(r"HTTP 40[13]\b|bad credentials|authentication|not logged in|gh auth login", re.I)
 _NOT_FOUND = re.compile(r"HTTP 404\b|Not Found", re.I)
@@ -31,38 +36,120 @@ _LINK = re.compile(r"(?:[Ff]ix(?:es|ed)?|[Cc]los(?:es|ed)?|[Rr]esolves?)\s*:?\s*
 _MENTION = re.compile(r"(?:(?<![\w/])#|GH-|/issues/)(\d+)")
 
 
-def _rate_limit_wait(attempt: int, stderr: str = "") -> float:
-    """Seconds to sleep after a rate-limit error: until the primary reset when exhausted, >= 60 s for a secondary
-    (burst) limit, else bounded exponential."""
+def _now() -> float:
+    """Wall clock (epoch seconds); a module seam so tests run these paths against a fake clock."""
+    return time.time()
+
+
+class DiscoveryUnavailable(RuntimeError):
+    """`gh api` could not answer (rate limit, 5xx, network, timeout, auth): an infrastructure failure of this attempt,
+    never a PR decision. It propagates out of a scan so the Temporal activity fails and is retried (or, for a rate
+    limit, waits); the message names the kind and, once `github_repo._fetch` has located it, the PR, never `gh` stderr."""
+
+    def __init__(self, kind: str, repo: str, where: str, error_class: str):
+        self.kind, self.repo, self.where, self.error_class = kind, repo, where, error_class
+        located = f" while scanning {repo} {where}" if repo or where else ""
+        super().__init__(f"gh api unavailable ({kind}, {error_class}){located}")
+
+
+class RateLimited(DiscoveryUnavailable):
+    """GitHub refused the call under its rate limit. `reset_at` is the epoch second the quota (or the burst window)
+    resets; `remaining` the core calls left when the quota was read (None when it could not be read); `secondary`
+    marks a burst limit (quota left, GitHub asks for a minute's pause)."""
+
+    def __init__(self, reset_at: float, remaining: int | None, *, secondary: bool = False, repo: str = "", where: str = "",
+                 error_class: str = "CalledProcessError"):
+        self.reset_at, self.remaining, self.secondary = float(reset_at), remaining, secondary
+        super().__init__("rate-limit", repo, where, error_class)
+        self.args = (f"{self.args[0]}; {'secondary limit' if secondary else 'quota exhausted'}, resets at epoch {int(self.reset_at)}",)
+
+    def located(self, repo: str, where: str) -> "RateLimited":
+        return RateLimited(self.reset_at, self.remaining, secondary=self.secondary, repo=repo, where=where, error_class=self.error_class)
+
+    def wait_seconds(self, now: float | None = None) -> float:
+        return max(0.0, self.reset_at - (_now() if now is None else now))
+
+
+_status_cache: tuple[float, tuple[int, int, float]] | None = None
+
+
+def rate_limit_status(*, fresh: bool = False) -> tuple[int, int, float]:
+    """(remaining, limit, reset_at) of the core REST quota from one `gh api rate_limit` call (GitHub does not count it),
+    cached for `RATE_LIMIT_STATUS_TTL` seconds unless `fresh`. gh failures and malformed payloads propagate."""
+    global _status_cache
+    now = _now()
+    if not fresh and _status_cache is not None and 0 <= now - _status_cache[0] < RATE_LIMIT_STATUS_TTL:
+        return _status_cache[1]
+    proc = subprocess.run(["gh", "api", "rate_limit"], capture_output=True, text=True, check=True, timeout=60)
+    core = json.loads(proc.stdout)["resources"]["core"]
+    status = (int(core["remaining"]), int(core["limit"]), float(core["reset"]))
+    _status_cache = (now, status)
+    return status
+
+
+def _error_text(error: subprocess.CalledProcessError) -> str:
+    return f"{error.stderr or ''}\n{error.output or ''}"
+
+
+def rate_limit_headers(text: str) -> tuple[int, float] | None:
+    """(remaining, reset_at) from `x-ratelimit-*` response headers in `text` (`gh api -i` output); None when absent."""
+    remaining, reset = _HEADER_REMAINING.search(text), _HEADER_RESET.search(text)
+    return (int(remaining.group(1)), float(reset.group(1))) if remaining and reset else None
+
+
+def is_rate_limit_error(error: BaseException) -> bool:
+    """A `gh api` failure GitHub attributes to its rate limit: the stderr text ("API rate limit exceeded", HTTP 429,
+    secondary/abuse limit) or a 403/429 whose headers show `x-ratelimit-remaining: 0`."""
+    if not isinstance(error, subprocess.CalledProcessError):
+        return False
+    text = _error_text(error)
+    if _RATE_LIMIT.search(text):
+        return True
+    headers = rate_limit_headers(text)
+    status = _HTTP_STATUS.search(text)
+    return headers is not None and headers[0] == 0 and status is not None and int(status.group(1)) in (403, 429)
+
+
+def rate_limited(error: BaseException) -> RateLimited | None:
+    """`error` as GitHub's rate limit with its reset time, or None when it is not a rate-limit failure. The reset comes
+    from the response headers when the call printed them (`retry-after`, or `x-ratelimit-reset` with the quota at 0),
+    else from one `rate_limit_status(fresh=True)` call; an unreadable quota gets the secondary-limit horizon."""
+    if not is_rate_limit_error(error):
+        return None
+    text = _error_text(error)
+    headers = rate_limit_headers(text)
+    retry_after = _HEADER_RETRY_AFTER.search(text)
+    if retry_after:
+        return RateLimited(_now() + int(retry_after.group(1)), headers[0] if headers else None, secondary=True)
+    if headers is not None and headers[0] == 0:
+        return RateLimited(headers[1], 0)
     try:
-        proc = subprocess.run(["gh", "api", "rate_limit"], capture_output=True, text=True, check=True, timeout=60)
-        core = json.loads(proc.stdout)["resources"]["core"]
-        if int(core.get("remaining", 1)) == 0:
-            return max(1.0, min(MAX_RATE_LIMIT_SLEEP, float(core["reset"]) - time.time() + 2.0))
+        remaining, _limit, reset_at = rate_limit_status(fresh=True)
     except (subprocess.SubprocessError, ValueError, KeyError, TypeError):
-        pass
-    backoff = min(2.0 ** (attempt + 1), 120.0)
-    return max(backoff, SECONDARY_LIMIT_MIN_SLEEP) if _SECONDARY.search(stderr or "") else backoff
+        return RateLimited(_now() + SECONDARY_LIMIT_WAIT, None, secondary=bool(_SECONDARY.search(text)))
+    if remaining == 0:
+        return RateLimited(reset_at, 0)
+    return RateLimited(_now() + SECONDARY_LIMIT_WAIT, remaining, secondary=True)
 
 
 def _gh_text(path: str, accept: str | None = None) -> str:
     cmd = ["gh", "api", path] + (["-H", f"Accept: {accept}"] if accept else [])
-    for attempt in range(RATE_LIMIT_RETRIES + 1):
-        try:
-            return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120).stdout
-        except subprocess.CalledProcessError as e:
-            if attempt < RATE_LIMIT_RETRIES and _RATE_LIMIT.search(e.stderr or ""):
-                wait = _rate_limit_wait(attempt, e.stderr or "")
-                log.warning("gh api %s: rate limited (%s); retry %d/%d in %.0fs", path, (e.stderr or "").strip()[-120:], attempt + 1, RATE_LIMIT_RETRIES, wait)
-                time.sleep(wait)
-                continue
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120).stdout
+    except subprocess.CalledProcessError as e:
+        limited = rate_limited(e)
+        if limited is None:
             raise
-    raise RuntimeError("unreachable")
+        log.warning("gh api %s: rate limited (%s, remaining=%s); quota resets in %.0fs", path, "secondary" if limited.secondary else "primary",
+                    limited.remaining, limited.wait_seconds())
+        raise limited from e
 
 
 def unavailable_kind(error: BaseException) -> str | None:
-    """Why `gh api` could not answer (rate-limit after the waits above, server-error, network, timeout, auth), or None when
-    the failure is an answer about the resource (404, 422, malformed payload) or an unknown gh failure."""
+    """Why `gh api` could not answer (rate-limit, server-error, network, timeout, auth), or None when the failure is an
+    answer about the resource (404, 422, malformed payload) or an unknown gh failure."""
+    if isinstance(error, DiscoveryUnavailable):
+        return error.kind
     if isinstance(error, subprocess.TimeoutExpired):
         return "timeout"
     if not isinstance(error, subprocess.CalledProcessError):
@@ -203,10 +290,12 @@ def linked_numbers(repo: str, pr: int, body: str) -> list[int]:
     return linked_targets(repo, pr, body)["issues"]
 
 
-def fetch_pr_thread(repo: str, pr: int) -> dict:
-    p = _gh(f"repos/{repo}/pulls/{pr}")
+def fetch_pr_thread(repo: str, pr: int, detail: dict | None = None, targets: dict | None = None) -> dict:
+    """PR title/body/reviews/comments plus its linked issue threads. `detail` (a `repos/{repo}/pulls/{pr}` payload) and
+    `targets` (its `linked_targets`) may be prefetched by a scan that already paid for them."""
+    p = detail if detail is not None else _gh(f"repos/{repo}/pulls/{pr}")
     body = p.get("body") or ""
-    targets = linked_targets(repo, pr, closing_text(p))
+    targets = targets if targets is not None else linked_targets(repo, pr, closing_text(p))
     out = {"pr_url": p["html_url"], "number": p.get("number", pr), "pr_title": p["title"], "pr_body": body, "author": _login(p),
            "merged_at": p.get("merged_at"), "gold_commit": p.get("merge_commit_sha"), "pr_created_at": p["created_at"],
            "reviews": [_strip(c) for c in pages(f"repos/{repo}/pulls/{pr}/reviews")],
