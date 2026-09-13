@@ -15,7 +15,7 @@ integrator during Phase 3. Nothing below claims a cloud result until the placeho
 | Stakeholder service | Modal web endpoint | deployed from the laptop (`scripts/deploy_stakeholder.sh`); URL in the env file as `SWESIM_STAKEHOLDER_URL` | |
 | Laptop | thin client | `scripts/vm/create.sh`, `scripts/vm/tunnel.sh`, `swesim pipeline|approve-signal|matrix` through the tunnel, browsers | |
 
-Files on the VM: `/opt/swesim` (git checkout at the deployed commit), `/opt/swesim/workspace/{candidates,scenarios,tasks,trials,jobs,exports,evidence}`, `/opt/swesim/registry.json`, `/var/lib/swesim/temporal.db`, `/etc/swesim/env` (dotenv, 0600, copied from the laptop; never from the repo), `~/.modal.toml` (0600). All service ports bind to 127.0.0.1; nothing is exposed on the VM's public address.
+Files on the VM: `/opt/swesim` (git checkout at the deployed commit), `/opt/swesim/workspace/{candidates,scenarios,tasks,trials,jobs,exports,evidence}`, `/opt/swesim/registry.json`, `/var/lib/swesim/temporal.db`, `/etc/swesim/env` (0600; rendered by `render_worker_env` from the laptop's dotenv file and holding only `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SWESIM_WORKER_SECRET`, `SWESIM_STAKEHOLDER_URL`, `GH_TOKEN` as `KEY='value'` lines; read by systemd `EnvironmentFile=` for the worker and dashboard and by python-dotenv in trial units via `SWESIM_ENV_FILE`; never from the repo), `~/.modal.toml` (0600). All service ports bind to 127.0.0.1; nothing is exposed on the VM's public address.
 
 Why per-trial units: `systemd-run` places the Harbor process in its own unit under the user manager (lingering enabled), so `systemctl --user restart swesim-worker` cannot kill it. The worker records `launch.json` (intent, then acknowledgement) before and after the single `systemd-run`; every later poll reads that file and the unit state and never launches again (`swesim/workflows/activities.py: decide_launch`).
 
@@ -81,7 +81,15 @@ WORKFLOW_ID=pipeline-...
 
 Approval is unattended by default (`approval_mode=auto`): `auto_approve_activity` runs the code-owned gates and the
 pipeline continues; `approval.json` records `approved_by: auto-validators, review_needed: true`. On a withholding leak the
-workflow re-drafts once, then moves to the next judged candidate (bounded by `max_candidates_tried`, default 3).
+workflow re-drafts once, then moves to the next judged candidate (bounded by `max_candidates_tried`, default 3). The leak
+trigger is structured: a rejection with `gate: "withholding-leak"`, or, as a fallback on the reason text, any reason that
+starts with `withholding` or contains `leak` or `withheld` (the approve stage's `withheld brief still contains excerpt of
+<fact>`). Every other rejection reason (judge, load-bearing fact, controls, assets) goes straight to the next candidate.
+
+The workflow result carries `tried`, `completed`, `rejected`, `invalid` counts. Top-level status is `complete` when at least
+one scenario completed, `complete-with-failures` when none did, `no-valid-candidate` when the judge kept nothing, and
+`awaiting-approval-timeout` in signal mode. A scenario whose solver model failed the probe is registered but launches no
+trial (`complete-no-trials`, with `solver_unavailable` and `needs_human`); the solver is never substituted silently.
 
 Supervised mode (`--approval-mode signal`, not used overnight): the workflow parks at stage `awaiting-approval` for up to
 24 h. Find the pending scenario id from the `progress` query, approve on the VM, then send the signal with the frozen hash:
@@ -127,7 +135,7 @@ record = Path(f"workspace/trials/{tid}/record.json"); export = Path(f"workspace/
 journal = Path(f"workspace/evidence/swesim-trial-{tid}.journal.txt"); launch = json.loads(Path(f"workspace/trials/{tid}/launch.json").read_text())
 assert json.loads(record.read_text())["status"] == "completed" and export.is_file() and journal.stat().st_size > 0
 assert launch["phase"] == "acknowledged" and launch["returncode"] == 0
-launch_count = journal.read_text().count("Started swesim trial")
+launch_count = journal.read_text().count("Started swesim-trial-")   # systemd >= 250 logs "Started <unit>.service - <description>."
 ops = {"provider": "gce",
        "laptop_off": {"passed": True, "workflow_id": wid, "history_path": "workspace/evidence/pipeline-history.json", "record_path": str(record), "export_path": str(export)},
        "worker_restart": {"passed": launch_count == 1, "trial_id": tid, "unit": f"swesim-trial-{tid}", "journal_path": str(journal), "launch_count": launch_count, "record_path": str(record)}}
@@ -164,7 +172,7 @@ After the trial finishes:
 ```bash
 UNIT=swesim-trial-$TRIAL_ID
 journalctl --user -u "$UNIT" --no-pager > workspace/evidence/$UNIT.journal.txt
-grep -c 'Started swesim trial' workspace/evidence/$UNIT.journal.txt                    # must be 1
+grep -c 'Started swesim-trial-' workspace/evidence/$UNIT.journal.txt                   # must be 1 (systemd >= 250: "Started swesim-trial-<id>.service - swesim trial ...")
 cat workspace/trials/$TRIAL_ID/launch.json                                             # phase acknowledged, returncode 0, one file
 temporal --address 127.0.0.1:7233 workflow show --workflow-id "$TRIAL_ID" --output json \
   | python3 -c 'import json,sys; ev=json.load(sys.stdin)["events"]; print(sum(1 for e in ev if e.get("activityTaskScheduledEventAttributes",{}).get("activityType",{}).get("name")=="launch_trial_activity"))'   # must be 1
@@ -209,7 +217,10 @@ Design residuals (present before any cloud run):
   still consumes that attempt index; the retry is a new attempt index (see below), so Temporal history keeps the lineage.
 - `systemd-run` requires the worker to run inside the user's systemd manager (the user unit does; lingering keeps the manager
   alive). Running the worker from a plain SSH shell without `XDG_RUNTIME_DIR` fails at launch with `launch-failed`, recorded in
-  `launch.json`.
+  `launch.json`. A `systemctl` that cannot reach the bus is never read as "unit gone": `systemd_unit_state` raises
+  `UnitStateUnavailable` (retryable, so the poll retries) and only an explicit `LoadState=not-found` means the unit is absent.
+- A terminal `status.json` without `record.json` is returned as that status (with `reward: {}`) once the unit is no longer
+  running; while the unit runs the poll continues so a record written moments later is still ingested.
 - `temporalio`'s time-skipping test server is downloaded on first use by `tests/test_workflows.py`; offline, those tests fall
   back to the `temporal` CLI on PATH (`start_local`) and otherwise skip with an explicit reason (the pure decision tests still run).
 - `gh repo clone` over HTTPS with `GH_TOKEN` and `gh auth setup-git` are the token path for the VM checkout; this is

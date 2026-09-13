@@ -2,10 +2,11 @@
 # Create the swesim GCE VM and bootstrap it (laptop side). Re-runnable: an existing instance is reused.
 #
 # Inputs (never printed, never evaluated as shell):
-#   SWESIM_ENV_FILE  dotenv file, default ~/Documents/.env. Read with a line parser for GCP_PROJECT and
-#                    GCP_ZONE when they are not already in the environment. The whole file is copied to the
-#                    VM as /etc/swesim/env (mode 0600) for the worker: ANTHROPIC_API_KEY, OPENAI_API_KEY,
-#                    SWESIM_WORKER_SECRET, SWESIM_STAKEHOLDER_URL and a read-only GH_TOKEN for mining/clone.
+#   SWESIM_ENV_FILE  dotenv file, default ~/Documents/.env. Read with a line parser (env_get) for GCP_PROJECT and
+#                    GCP_ZONE when they are not already in the environment. The laptop file itself is NOT shipped:
+#                    render_worker_env writes a mode-0600 temp file holding only the worker's keys
+#                    (ANTHROPIC_API_KEY, OPENAI_API_KEY, SWESIM_WORKER_SECRET, SWESIM_STAKEHOLDER_URL, read-only GH_TOKEN)
+#                    and that rendered file becomes /etc/swesim/env on the VM (systemd EnvironmentFile= and python-dotenv).
 #   MODAL_TOML       Modal token file, default ~/.modal.toml, copied to the VM (mode 0600).
 #   VM_NAME          default swesim-worker.   SWESIM_REPO_URL  default: the https form of `git remote origin`.
 # The VM clones the repo at the current HEAD commit, so push before running this.
@@ -33,14 +34,39 @@ env_get() {
   printf '%s' "$line"
 }
 
+# render_worker_env SRC DST: write only the worker's keys from SRC into DST (mode 0600), one `KEY='value'` per line so
+# systemd EnvironmentFile= and python-dotenv both read the value literally. Values are never printed.
+render_worker_env() {
+  local src=$1 dst=$2 key value
+  local keys=(ANTHROPIC_API_KEY OPENAI_API_KEY SWESIM_WORKER_SECRET SWESIM_STAKEHOLDER_URL GH_TOKEN)
+  local missing=()
+  : > "$dst"
+  chmod 600 "$dst"
+  for key in "${keys[@]}"; do
+    if value=$(env_get "$src" "$key"); then
+      case $value in
+        *\'*|*$'\n'*) echo "$key: values containing a single quote or newline are not supported" >&2; return 1 ;;
+      esac
+      printf "%s='%s'\n" "$key" "$value" >> "$dst"
+    else
+      missing+=("$key")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then echo "warning: not set in $src: ${missing[*]}" >&2; fi
+}
+
 test -f "$ENV_FILE" || { echo "env file $ENV_FILE missing" >&2; exit 1; }
 test -f "$MODAL_TOML" || { echo "Modal token file $MODAL_TOML missing" >&2; exit 1; }
 GCP_PROJECT=${GCP_PROJECT:-$(env_get "$ENV_FILE" GCP_PROJECT || true)}
 GCP_ZONE=${GCP_ZONE:-$(env_get "$ENV_FILE" GCP_ZONE || true)}
 : "${GCP_PROJECT:?GCP_PROJECT missing (environment or $ENV_FILE)}" "${GCP_ZONE:?GCP_ZONE missing (environment or $ENV_FILE)}"
-for key in ANTHROPIC_API_KEY SWESIM_WORKER_SECRET SWESIM_STAKEHOLDER_URL GH_TOKEN; do
-  env_get "$ENV_FILE" "$key" >/dev/null || echo "warning: $key is not set in $ENV_FILE" >&2
+for key in ANTHROPIC_API_KEY SWESIM_WORKER_SECRET GH_TOKEN; do
+  env_get "$ENV_FILE" "$key" >/dev/null || { echo "$key is required in $ENV_FILE" >&2; exit 1; }
 done
+
+WORKER_ENV=$(mktemp "${TMPDIR:-/tmp}/swesim-worker-env.XXXXXX")
+trap 'rm -f "$WORKER_ENV"' EXIT
+render_worker_env "$ENV_FILE" "$WORKER_ENV"
 
 REPO_URL=${SWESIM_REPO_URL:-$(git remote get-url origin)}
 case $REPO_URL in git@github.com:*) REPO_URL="https://github.com/${REPO_URL#git@github.com:}" ;; esac
@@ -67,7 +93,7 @@ SSH=("${GC[@]}" compute ssh "$VM_NAME" --zone "$GCP_ZONE" --command)
 SCP=("${GC[@]}" compute scp --zone "$GCP_ZONE")
 
 "${SSH[@]}" 'mkdir -p ~/swesim-bootstrap && chmod 700 ~/swesim-bootstrap'
-"${SCP[@]}" "$ENV_FILE" "$VM_NAME":~/swesim-bootstrap/env
+"${SCP[@]}" "$WORKER_ENV" "$VM_NAME":~/swesim-bootstrap/env
 "${SCP[@]}" "$MODAL_TOML" "$VM_NAME":~/swesim-bootstrap/modal.toml
 "${SCP[@]}" scripts/vm/setup.sh "$VM_NAME":~/swesim-bootstrap/setup.sh
 "${SSH[@]}" "chmod 600 ~/swesim-bootstrap/env ~/swesim-bootstrap/modal.toml && bash ~/swesim-bootstrap/setup.sh '$REPO_URL' '$COMMIT'"

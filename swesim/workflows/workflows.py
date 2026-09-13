@@ -16,6 +16,19 @@ ONE = RetryPolicy(maximum_attempts=1)
 READ = RetryPolicy(maximum_attempts=3)
 APPROVAL_TIMEOUT = timedelta(hours=24)
 APPROVAL_MODES = {"auto", "signal", "human"}  # "human" is the brief's older spelling of "signal"
+# Re-draft-once trigger. Structured: approve_scenario may return {"gate": "withholding-leak"}. Fallback on reason text:
+# a reason starting with "withholding", or containing "leak" or "withheld" (the approve stage's "withheld brief still
+# contains excerpt of <fact>"). Anything else (judge, load-bearing, controls, assets) moves to the next candidate.
+LEAK_GATE = "withholding-leak"
+
+
+def _is_leak_reason(reason) -> bool:
+    r = str(reason).strip().lower()
+    return r.startswith("withholding") or "leak" in r or "withheld" in r
+
+
+def _leak_rejection(approved: dict) -> bool:
+    return approved.get("gate") == LEAK_GATE or any(_is_leak_reason(r) for r in approved.get("reasons", []) or [])
 
 
 async def act(name: str, p: dict, minutes: int = 10):
@@ -91,25 +104,28 @@ class PipelineWorkflow:
         self.state = {"stage": "judging", **mined}
         judged = await act("judge_activity", {**p, **mined}, 60)
         out: list[dict] = []
+        counts = {"tried": 0, "completed": 0, "rejected": 0, "invalid": 0}
         if not judged["instance_ids"]:
-            self.state = {"stage": "no-valid-candidate"}
-            return {"status": "no-valid-candidate", "scenarios": []}
-        max_scenarios = p.get("max_scenarios", 1); max_tried = p.get("max_candidates_tried", 3); tried = 0; completed = 0
+            self.state = {"stage": "no-valid-candidate", **counts}
+            return {"status": "no-valid-candidate", "scenarios": [], **counts}
+        max_scenarios = p.get("max_scenarios", 1); max_tried = p.get("max_candidates_tried", 3)
+        solver_unavailable = list(probe.get("solver_unavailable") or [])
         for iid in judged["instance_ids"]:
-            if completed >= max_scenarios or tried >= max_tried:
+            if counts["completed"] >= max_scenarios or counts["tried"] >= max_tried:
                 break
-            tried += 1
+            counts["tried"] += 1
             draft = await act("draft_activity", {**p, **judged, "instance_id": iid}, 30); sid = draft["scenario_id"]
             if _auto(p):
                 self.state = {"stage": "auto-approving", **draft}
                 approved = await act("auto_approve_activity", {"scenario_id": sid})  # code-owned gates; approval.json says auto-validators
-                if not approved["approved"] and p.get("redraft_on_leak", True) and any("withheld" in r for r in approved.get("reasons", [])):
+                if not approved["approved"] and p.get("redraft_on_leak", True) and _leak_rejection(approved):
                     # Withholding leak: re-draft once with the violating reasons, never hand-edit the draft.
                     self.state = {"stage": "re-drafting", **draft, "reasons": approved.get("reasons", [])}
                     draft = await act("draft_activity", {**p, **judged, "instance_id": iid, "force": True, "reject_reasons": approved.get("reasons", [])}, 30)
                     approved = await act("auto_approve_activity", {"scenario_id": sid})
                 if not approved["approved"]:
                     out.append({"scenario_id": sid, "status": "auto-approval-rejected", "reasons": approved.get("reasons", [])})
+                    counts["rejected"] += 1
                     continue
                 self.approvals[sid] = approved["spec_hash"]
             else:
@@ -118,7 +134,7 @@ class PipelineWorkflow:
                     # No Boolean is read from wait_condition: the signal payload and approval.json carry the truth.
                     await workflow.wait_condition(lambda sid=sid: sid in self.approvals, timeout=APPROVAL_TIMEOUT)
                 except TimeoutError:
-                    return {"status": "awaiting-approval-timeout", "scenarios": out, "pending": draft}
+                    return {"status": "awaiting-approval-timeout", "scenarios": out, "pending": draft, **counts}
             accepted = await act("verify_approval_activity", {"scenario_id": sid, "spec_hash": self.approvals[sid]})
             step = {**p, **accepted}
             self.state = {"stage": "compiling", **accepted}
@@ -127,9 +143,16 @@ class PipelineWorkflow:
             validation = await act("validate_activity", step, 180)
             if validation["status"] != "valid":
                 out.append({"scenario_id": sid, **validation})
+                counts["invalid"] += 1
                 continue
             self.state = {"stage": "registering", **accepted}
             await act("register_activity", step)
+            if solver_unavailable:
+                # The probe found the solver unavailable and nothing may substitute it silently: registered, no trial launched.
+                out.append({"scenario_id": sid, "status": "complete-no-trials", "solver_unavailable": solver_unavailable,
+                            "needs_human": probe.get("needs_human") or []})
+                counts["completed"] += 1
+                continue
             trials = await act("plan_trials_activity", step); results = []
             for trial in trials["trials"]:
                 self.state = {"stage": "trial", **accepted, "trial_id": trial["trial_id"]}
@@ -142,6 +165,8 @@ class PipelineWorkflow:
             self.state = {"stage": "scoring", **accepted}
             await act("score_activity", step)
             await act("export_activity", step)
-            out.append({"scenario_id": sid, "status": "complete", "trials": results}); completed += 1
-        self.state = {"stage": "complete"}
-        return {"status": "complete", "scenarios": out}
+            out.append({"scenario_id": sid, "status": "complete", "trials": results})
+            counts["completed"] += 1
+        status = "complete" if counts["completed"] else "complete-with-failures"
+        self.state = {"stage": status, **counts}
+        return {"status": status, "scenarios": out, **counts}

@@ -43,7 +43,6 @@ POLL_SECONDS = float(os.environ.get("SWESIM_TRIAL_POLL_SEC", "10"))
 AWAIT_DEADLINE_SEC = 3 * 3600
 LAUNCH_GRACE_POLLS = 6  # polls without any launch evidence before await reports launch-failed
 FALLBACK_MODEL = "anthropic/claude-sonnet-5"
-TERMINAL_STATUSES = {"completed", "launch-failed", "failed", "error", "runner-error"}
 RUNNING_STATES = {"active", "activating", "reloading", "deactivating"}
 SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
 LAUNCH_SLOTS = asyncio.Semaphore(1)  # pilot trials launch serially per worker
@@ -56,6 +55,10 @@ class TrialBindingConflict(ValueError):
 
 class LaunchFailed(RuntimeError):
     """The launcher did not create the unit. Never retried automatically; reconcile first."""
+
+
+class UnitStateUnavailable(RuntimeError):
+    """systemctl could not report the unit (no bus, missing XDG_RUNTIME_DIR, killed). Retryable; never read as 'unit gone'."""
 
 
 def RUN(argv: list[str]) -> subprocess.CompletedProcess:  # injectable process runner (tests substitute a fake)
@@ -88,6 +91,14 @@ def _read_json(path: Path) -> dict:
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
+
+
+def _redact(text: str) -> str:
+    """Replace the values of secret-looking environment variables inside error text before it is stored."""
+    for k, v in os.environ.items():
+        if len(v) >= 8 and any(m in k.upper() for m in SECRET_MARKERS) and v in text:
+            text = text.replace(v, f"[redacted:{k}]")
+    return text
 
 
 def _accepted_kwargs(fn, candidates: dict) -> dict:
@@ -128,22 +139,24 @@ def probe_models(p: dict) -> dict:
                               '{"ok": true}', max_tokens=20)
                 results[model_id] = {"ok": True, "error": None}
             except Exception as e:  # provider/auth/network failures are the point of the probe
-                results[model_id] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+                results[model_id] = {"ok": False, "error": _redact(f"{type(e).__name__}: {str(e)[:200]}")}
         return results[model_id]["ok"]
 
     substitutions: dict[str, str] = {}
     needs_human: list[str] = []
+    solver_unavailable: list[str] = []
     for model_id, model_roles in roles.items():
         if probe(model_id):
             continue
         for role in sorted(model_roles):
             if role == "solver":
+                solver_unavailable.append(model_id)
                 needs_human.append(f"solver model {model_id} unavailable; no silent substitution")
             elif probe(FALLBACK_MODEL):
                 substitutions[role] = FALLBACK_MODEL
             else:
                 needs_human.append(f"{role} {model_id} and fallback {FALLBACK_MODEL} both unavailable")
-    out = {"models": results, "substitutions": substitutions, "needs_human": needs_human, "probed_at": time.time()}
+    out = {"models": results, "substitutions": substitutions, "needs_human": needs_human, "solver_unavailable": solver_unavailable, "probed_at": time.time()}
     atomic_json(WS.root / "evidence" / "model-probe.json", out)
     return out
 
@@ -186,7 +199,9 @@ async def judge_activity(p: dict) -> dict:
             row = json.loads(line)
             row["judge"] = await blocking(lambda row=row: judge_candidate(row, p["judge_model"]))
             rows.append(row)
-        out.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        tmp = out.with_name(out.name + ".tmp")  # write-then-rename: a crash never leaves a truncated file that a rerun would trust
+        tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        os.replace(tmp, out)
     return {"judged_path": str(out), "instance_ids": [r["instance_id"] for r in rows if r.get("judge", {}).get("keep")]}
 
 
@@ -250,7 +265,9 @@ async def validate_activity(p: dict) -> dict:
 async def register_activity(p: dict) -> dict:
     from swesim.stages.register import register_scenario
 
-    return {"registry_entry": await blocking(lambda: register_scenario(WS, _spec(p["scenario_id"])))}
+    r = await blocking(lambda: register_scenario(WS, _spec(p["scenario_id"])))
+    # Coerce to plain JSON (Path, datetime, models -> str) so the activity result never fails to serialize after the registry write.
+    return {"registry_entry": json.loads(json.dumps(r, default=str))}
 
 
 def plan_trials(p: dict) -> dict:
@@ -333,9 +350,13 @@ def decide_launch(ev: TrialEvidence) -> str:
 
 
 def systemd_unit_state(unit: str) -> dict:
+    """Only an explicit `LoadState=not-found` means the unit is gone; a failing systemctl raises (retryable)."""
     cp = RUN(["systemctl", "--user", "show", unit, "--property=LoadState,ActiveState,SubState,Result"])
-    props = dict(line.split("=", 1) for line in cp.stdout.splitlines() if "=" in line)
-    return {"load_state": props.get("LoadState", "not-found"), "active_state": props.get("ActiveState", "inactive"),
+    props = dict(line.split("=", 1) for line in (cp.stdout or "").splitlines() if "=" in line)
+    load = props.get("LoadState")
+    if load is None or (cp.returncode != 0 and load != "not-found"):
+        raise UnitStateUnavailable(f"systemctl --user show {unit} failed (rc={cp.returncode}): {((cp.stderr or '') + (cp.stdout or ''))[-300:]}")
+    return {"load_state": load, "active_state": props.get("ActiveState", "inactive"),
             "sub_state": props.get("SubState", "dead"), "result": props.get("Result", "")}
 
 
@@ -404,17 +425,22 @@ def _boot_id() -> str | None:
         return None
 
 
+def _unit_env() -> dict[str, str]:
+    """The only variables a trial unit receives: paths and PATH. Secrets come from the env file via python-dotenv."""
+    return {"SWESIM_WORKSPACE": str(WS.root),
+            "SWESIM_ENV_FILE": os.environ.get("SWESIM_ENV_FILE", str(Path.home() / "Documents" / ".env")),
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "PYTHONUNBUFFERED": "1"}
+
+
 def _launch_systemd(unit: str, command: list[str]) -> tuple[int, str, str]:
-    env = {"SWESIM_WORKSPACE": str(WS.root),
-           "SWESIM_ENV_FILE": os.environ.get("SWESIM_ENV_FILE", str(Path.home() / "Documents" / ".env")),  # a path; the runner loads it with python-dotenv
-           "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "PYTHONUNBUFFERED": "1"}
-    cp = RUN(build_systemd_run_argv(unit, command, REPO_ROOT, env))
+    cp = RUN(build_systemd_run_argv(unit, command, REPO_ROOT, _unit_env()))
     return cp.returncode, cp.stdout or "", cp.stderr or ""
 
 
 def _launch_subprocess(command: list[str], d: Path, intent: dict) -> tuple[int, str, str]:
     log = open(d / "launcher.log", "ab")  # noqa: SIM115 - inherited by the detached child
-    env = {**os.environ, "SWESIM_WORKSPACE": str(WS.root), "PYTHONUNBUFFERED": "1"}
+    env = {k: os.environ[k] for k in ("HOME", "USER", "LANG", "TMPDIR") if k in os.environ}  # same shape as the systemd path
+    env.update(_unit_env())
     proc = subprocess.Popen(command, cwd=str(REPO_ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
     log.close(); _CHILDREN[proc.pid] = proc; intent["pid"] = proc.pid
     return 0, "", f"detached pid {proc.pid} via subprocess launcher (NOT production)"
@@ -477,6 +503,10 @@ async def await_trial_activity(p: dict) -> dict:
                     "reason": "launch evidence exists but the unit is gone without a terminal record (VM loss or manual cleanup); inspect the unit journal and Harbor job; never relaunch"}
         if decision == "launch" and polls >= LAUNCH_GRACE_POLLS:
             return {"trial_id": tid, "status": "launch-failed", "unit": unit, "reason": "no launch evidence for this trial; the launch activity did not reach the launcher"}
+        if decision == "ingest" and not (ev.active_state in RUNNING_STATES and ev.sub_state != "exited"):
+            # Terminal status.json without record.json and the unit is not running: nothing more will appear.
+            return {"trial_id": tid, "status": ev.status or "unknown", "unit": unit, "reward": {},
+                    "reason": "status.json is terminal but record.json is absent; read the unit journal; never relaunch"}
         if decision == "reconcile":
             if ev.active_state == "failed":
                 return {"trial_id": tid, "status": "unit-failed", "unit": unit, "reason": "unit failed without a terminal record; read its journal; never relaunch"}
@@ -514,7 +544,7 @@ def execute_trial_request(request_path: Path) -> dict:
         rec = run_trial(ws, spec, rc, p["attempt_index"], p["stakeholder_url"], secret)
         return {"trial_id": rec.trial_id, "status": rec.status, "reward": rec.reward}
     except Exception as e:
-        atomic_json(d / "runner-error.json", {"trial_id": p["trial_id"], "error": repr(e), "type": type(e).__name__, "at": time.time()})
+        atomic_json(d / "runner-error.json", {"trial_id": p["trial_id"], "error": _redact(repr(e)), "type": type(e).__name__, "at": time.time()})
         raise
 
 

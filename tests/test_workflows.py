@@ -11,6 +11,7 @@ import asyncio
 import configparser
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -142,6 +143,71 @@ def test_auto_rejection_for_withholding_leak_redrafts_once_then_moves_on(monkeyp
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("reasons,gate,redraft", [
+    (["withheld brief still contains excerpt of f01"], None, True),      # the approve stage's actual wording
+    (["withholding: removed excerpt visible"], None, True),
+    (["Brief leak detected in profile withheld"], None, True),
+    (["judge did not accept (no non-derivable gap)"], None, False),
+    (["controls incomplete"], None, False),
+    (["controls incomplete"], "withholding-leak", True),                 # structured gate wins over the text
+])
+def test_redraft_trigger_is_structured(monkeypatch, reasons, gate, redraft):
+    # Fix round 1, Minor 7.
+    async def scenario():
+        w = W.PipelineWorkflow(); calls = []
+        async def act(name, p, minutes=10):
+            calls.append(name)
+            if name == "auto_approve_activity":
+                out = {"approved": False, "spec_hash": "h", "reasons": reasons}
+                if gate: out["gate"] = gate
+                return out
+            return dict(BIG)
+        monkeypatch.setattr(W, "act", act)
+        await w.run({"max_candidates_tried": 1})
+        assert calls.count("draft_activity") == (2 if redraft else 1)
+    asyncio.run(scenario())
+    assert W._is_leak_reason("Withholding leak") and not W._is_leak_reason("judge rejected")
+
+
+def test_pipeline_result_counts_and_failure_status(monkeypatch):
+    # Fix round 1, Minor 8.
+    async def scenario():
+        async def act(name, p, minutes=10):
+            if name == "judge_activity": return {"judged_path": "j", "instance_ids": ["a", "b", "c"]}
+            if name == "draft_activity": return {"scenario_id": p["instance_id"], "draft_path": "d"}
+            if name == "auto_approve_activity": return {"approved": p["scenario_id"] != "a", "spec_hash": "h", "reasons": ["judge did not accept"]}
+            if name == "verify_approval_activity": return {"scenario_id": p["scenario_id"], "spec_hash": p["spec_hash"]}
+            if name == "validate_activity": return {"status": "invalid" if p["scenario_id"] == "b" else "valid", "failures": ["oracle earned 0"]}
+            return dict(BIG)
+        monkeypatch.setattr(W, "act", act)
+        r = await W.PipelineWorkflow().run({"max_scenarios": 1, "max_candidates_tried": 3})
+        assert (r["tried"], r["completed"], r["rejected"], r["invalid"]) == (3, 1, 1, 1) and r["status"] == "complete"
+        assert [s["status"] for s in r["scenarios"]] == ["auto-approval-rejected", "invalid", "complete"]
+        r2 = await W.PipelineWorkflow().run({"max_scenarios": 1, "max_candidates_tried": 1})
+        assert r2["status"] == "complete-with-failures" and (r2["tried"], r2["completed"], r2["rejected"]) == (1, 0, 1)
+    asyncio.run(scenario())
+
+
+def test_solver_unavailable_registers_but_launches_nothing(monkeypatch):
+    # Fix round 1, Minor 9.
+    async def scenario():
+        w = W.PipelineWorkflow(); calls = []
+        async def act(name, p, minutes=10):
+            calls.append(name)
+            if name == "probe_models_activity":
+                return {"substitutions": {}, "solver_unavailable": ["openai/gpt-5.5"], "needs_human": ["solver model openai/gpt-5.5 unavailable; no silent substitution"]}
+            if name == "auto_approve_activity": return {"approved": True, "spec_hash": "h", "reasons": []}
+            return dict(BIG)
+        async def child(*a, **k): raise AssertionError("no trial may launch with an unavailable solver")
+        monkeypatch.setattr(W, "act", act); monkeypatch.setattr(W.workflow, "execute_child_workflow", child)
+        r = await w.run({"models": ["openai/gpt-5.5"]})
+        s = r["scenarios"][0]
+        assert s["status"] == "complete-no-trials" and s["solver_unavailable"] == ["openai/gpt-5.5"] and s["needs_human"]
+        assert "register_activity" in calls and "plan_trials_activity" not in calls and "score_activity" not in calls
+        assert r["completed"] == 1 and r["status"] == "complete"
+    asyncio.run(scenario())
+
+
 def test_probe_substitutions_flow_into_later_activities(monkeypatch):
     async def scenario():
         w = W.PipelineWorkflow(); seen = {}
@@ -199,12 +265,15 @@ class FakeSystemd:
     """Fake `systemctl --user show` and `systemd-run --user`. Units live in .units."""
     def __init__(self, run_returncode=0):
         self.units: dict[str, dict] = {}; self.calls: list[list[str]] = []; self.run_returncode = run_returncode
+        self.systemctl_failure = None; self.systemctl_rc = 0; self.systemctl_stdout_override = None
     def __call__(self, argv):
         self.calls.append(list(argv))
         if argv[0] == "systemctl":
+            if self.systemctl_failure: return subprocess.CompletedProcess(argv, 1, "", self.systemctl_failure)
             unit = next(a for a in argv[3:] if not a.startswith("--"))
             st = self.units.get(unit, {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "Result": "success"})
-            return subprocess.CompletedProcess(argv, 0, "".join(f"{k}={v}\n" for k, v in st.items()), "")
+            stdout = self.systemctl_stdout_override if self.systemctl_stdout_override is not None else "".join(f"{k}={v}\n" for k, v in st.items())
+            return subprocess.CompletedProcess(argv, self.systemctl_rc, stdout, "")
         if argv[0] == "systemd-run":
             unit = next(a for a in argv if a.startswith("--unit=")).split("=", 1)[1]
             if self.run_returncode: return subprocess.CompletedProcess(argv, self.run_returncode, "", "Failed to start transient service unit")
@@ -392,6 +461,53 @@ def test_await_unit_failed_without_record_is_unit_failed(ws, systemd):
     assert r["status"] == "unit-failed" and r["unit"] == unit
 
 
+def test_await_terminal_status_without_record_returns_status_unless_unit_still_running(ws, systemd):
+    # Fix round 1, Important 1: a terminal status.json with no record.json must not poll to the 3 h deadline.
+    spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]; unit = "swesim-trial-" + p["trial_id"]
+    atomic_json(d / "launch.json", {"trial_id": p["trial_id"], "unit": unit, "phase": "acknowledged", "returncode": 0, "launcher": "systemd"})
+    atomic_json(d / "status.json", {"status": "launch-failed", "trial_id": p["trial_id"]})
+    r = asyncio.run(A.await_trial_activity(p))                       # unit gone: the terminal status is the answer, now
+    assert r["status"] == "launch-failed" and r["reward"] == {} and "record.json" in r["reason"]
+    atomic_json(d / "status.json", {"status": "completed", "trial_id": p["trial_id"]})
+    systemd.units[unit] = {"LoadState": "loaded", "ActiveState": "active", "SubState": "running", "Result": "success"}
+    polls = {"n": 0}; real_read = A.read_evidence
+    def read_evidence(tid):                                           # unit still running: keep polling until the record lands
+        polls["n"] += 1
+        if polls["n"] == 3: atomic_json(d / "record.json", {"trial_id": tid, "status": "completed", "reward": {"reward": 1.0, "success": 1}})
+        return real_read(tid)
+    A.read_evidence = read_evidence
+    try: r = asyncio.run(A.await_trial_activity(p))
+    finally: A.read_evidence = real_read
+    assert r["status"] == "completed" and r["reward"]["success"] == 1 and polls["n"] == 3
+    assert not hasattr(A, "TERMINAL_STATUSES")
+
+
+def test_systemctl_failure_is_retryable_error_not_unit_gone(ws, systemd):
+    # Fix round 1, Important 2: a failing systemctl must never read as "unit not found".
+    spec = frozen_scenario(ws); p = trial_request(ws, spec); d = ws.root / "trials" / p["trial_id"]; unit = "swesim-trial-" + p["trial_id"]
+    atomic_json(d / "launch.json", {"trial_id": p["trial_id"], "unit": unit, "phase": "acknowledged", "returncode": 0, "launcher": "systemd"})
+    systemd.systemctl_failure = "Failed to connect to bus: No medium found"
+    with pytest.raises(A.UnitStateUnavailable, match="Failed to connect to bus"): A.read_evidence(p["trial_id"])
+    with pytest.raises(A.UnitStateUnavailable): asyncio.run(A.await_trial_activity(p))
+    with pytest.raises(A.UnitStateUnavailable): A.launch_once(p)      # launch never guesses either
+    assert not [c for c in systemd.calls if c[0] == "systemd-run"]
+    systemd.systemctl_failure = None
+    systemd.systemctl_rc = 1                                          # nonzero exit but an explicit not-found is trusted
+    assert A.systemd_unit_state(unit)["load_state"] == "not-found"
+    systemd.systemctl_rc = 0; systemd.systemctl_stdout_override = "Result=success\n"
+    with pytest.raises(A.UnitStateUnavailable): A.systemd_unit_state(unit)   # LoadState missing from the output
+
+
+def test_register_activity_result_is_json_serializable(ws, monkeypatch):
+    # Fix round 1, Important 5.
+    spec = frozen_scenario(ws)
+    def register_scenario(ws_, spec_): return {"id": spec_.id, "validation_path": Path("/x/validation.json"), "runs": [], "nested": {"p": Path("/y")}}
+    monkeypatch.setitem(sys.modules, "swesim.stages.register", fake_module("swesim.stages.register", register_scenario=register_scenario))
+    r = asyncio.run(A.register_activity({"scenario_id": spec.id}))
+    assert r == {"registry_entry": {"id": spec.id, "validation_path": "/x/validation.json", "runs": [], "nested": {"p": "/y"}}}
+    json.dumps(r)
+
+
 # ---------------------------------------------------------------- subprocess launcher (non-production local smoke)
 
 def test_subprocess_launcher_end_to_end_and_reconcile(ws, monkeypatch):
@@ -483,14 +599,18 @@ def test_mine_activity_adapts_to_either_mine_signature(ws, monkeypatch):
 
 
 def test_probe_models_substitutes_judge_and_draft_but_never_solver(ws, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key-value-1234")
     def chat_json(model_id, system, messages, schema_hint, temperature=0.0, max_tokens=4000):
-        if model_id.startswith("openai/"): raise RuntimeError("401 unauthorized")
+        if model_id.startswith("openai/"): raise RuntimeError("401 unauthorized for key fake-openai-key-value-1234")
         return {"ok": True}
     monkeypatch.setattr("swesim.llm.chat_json", chat_json)
     r = A.probe_models({"judge_model": "openai/gpt-5.5", "draft_model": "anthropic/claude-sonnet-5", "models": ["openai/gpt-5.5", "anthropic/claude-haiku-4-5-20251001"]})
     assert r["substitutions"] == {"judge_model": A.FALLBACK_MODEL}
     assert r["models"]["openai/gpt-5.5"]["ok"] is False and r["models"]["anthropic/claude-sonnet-5"]["ok"] is True
     assert r["needs_human"] == ["solver model openai/gpt-5.5 unavailable; no silent substitution"]
+    assert r["solver_unavailable"] == ["openai/gpt-5.5"]
+    err = r["models"]["openai/gpt-5.5"]["error"]
+    assert "fake-openai-key-value-1234" not in err and "[redacted:OPENAI_API_KEY]" in err   # provider error text is redacted
     assert json.loads((ws.root / "evidence" / "model-probe.json").read_text())["substitutions"] == {"judge_model": A.FALLBACK_MODEL}
 
 
@@ -705,3 +825,42 @@ def test_ops_doc_has_required_sections():
     for section in ("## Topology", "## Deploy (VM)", "## Laptop-off acceptance test", "## Worker restart test", "## Model probe and fallbacks", "## Known failures and residuals", "## Manual retry lineage"):
         assert section in text, section
     assert "workspace/evidence/ops.json" in text and "systemctl --user restart swesim-worker" in text and "swesim-trial-" in text
+    # Fix round 1, Important 4: the launch-count evidence must match systemd >= 250's "Started <unit>.service - <description>." line.
+    assert text.count("Started swesim-trial-") >= 2 and "Started swesim trial'" not in text and 'count("Started swesim trial")' not in text
+    assert "complete-with-failures" in text and "complete-no-trials" in text and "withholding-leak" in text
+
+
+def _bash_functions(text, names):
+    parts = []
+    for name in names:
+        m = re.search(rf"^{re.escape(name)}\(\) \{{$.*?^\}}$", text, re.S | re.M)
+        assert m, name
+        parts.append(m.group(0))
+    return "\n".join(parts)
+
+
+def test_worker_env_is_rendered_with_only_the_five_keys(tmp_path):
+    # Fix round 1, Important 3: the laptop dotenv file is never shipped; a filtered KEY='value' file becomes /etc/swesim/env.
+    from dotenv import dotenv_values
+    src = tmp_path / "laptop.env"
+    src.write_text("# laptop env\nexport ANTHROPIC_API_KEY=\"fake-anthropic-123\"\nOPENAI_API_KEY=fake-openai-456 \n"
+                   "SWESIM_WORKER_SECRET='fake-worker-secret'\nSWESIM_STAKEHOLDER_URL=https://stake.example\nGH_TOKEN=fake-gh-token\n"
+                   "GCP_PROJECT=my-proj\nGCP_ZONE=us-central1-a\nAWS_SECRET_ACCESS_KEY=must-not-ship\nHF_TOKEN=must-not-ship-either\n")
+    create = (ROOT / "scripts/vm/create.sh").read_text(); setup = (ROOT / "scripts/vm/setup.sh").read_text()
+    funcs = _bash_functions(create, ["env_get", "render_worker_env"])
+    assert funcs == _bash_functions(setup, ["env_get", "render_worker_env"])          # identical copies in both scripts
+    dst = tmp_path / "worker.env"
+    subprocess.run(["bash", "-c", funcs + '\nrender_worker_env "$1" "$2"', "bash", str(src), str(dst)], check=True, capture_output=True, text=True)
+    assert oct(dst.stat().st_mode & 0o777) == "0o600"
+    text = dst.read_text()
+    assert "GCP_" not in text and "AWS_" not in text and "HF_TOKEN" not in text and "export" not in text and "#" not in text
+    assert all(re.fullmatch(r"[A-Z_]+='[^'\n]*'", line) for line in text.splitlines())   # systemd EnvironmentFile= safe
+    assert dotenv_values(dst) == {"ANTHROPIC_API_KEY": "fake-anthropic-123", "OPENAI_API_KEY": "fake-openai-456 ", "SWESIM_WORKER_SECRET": "fake-worker-secret",
+                                  "SWESIM_STAKEHOLDER_URL": "https://stake.example", "GH_TOKEN": "fake-gh-token"}
+    # create.sh ships the rendered temp file, and setup.sh renders again into /etc/swesim/env
+    assert '"${SCP[@]}" "$WORKER_ENV" "$VM_NAME":~/swesim-bootstrap/env' in create and 'render_worker_env "$ENV_FILE" "$WORKER_ENV"' in create
+    assert 'render_worker_env "$BOOT/env" /etc/swesim/env' in setup and 'install -m 600 "$BOOT/env"' not in setup
+    # a value with a single quote is refused rather than written malformed
+    bad = tmp_path / "bad.env"; bad.write_text("ANTHROPIC_API_KEY=it's-bad\nSWESIM_WORKER_SECRET=x\nGH_TOKEN=y\n")
+    cp = subprocess.run(["bash", "-c", funcs + '\nrender_worker_env "$1" "$2"', "bash", str(bad), str(tmp_path / "bad.out")], capture_output=True, text=True)
+    assert cp.returncode != 0 and "single quote" in cp.stderr

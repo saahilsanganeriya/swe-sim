@@ -31,6 +31,27 @@ env_get() {
   printf '%s' "$line"
 }
 
+# render_worker_env SRC DST: write only the worker's keys from SRC into DST (mode 0600), one `KEY='value'` per line so
+# systemd EnvironmentFile= and python-dotenv both read the value literally. Values are never printed.
+render_worker_env() {
+  local src=$1 dst=$2 key value
+  local keys=(ANTHROPIC_API_KEY OPENAI_API_KEY SWESIM_WORKER_SECRET SWESIM_STAKEHOLDER_URL GH_TOKEN)
+  local missing=()
+  : > "$dst"
+  chmod 600 "$dst"
+  for key in "${keys[@]}"; do
+    if value=$(env_get "$src" "$key"); then
+      case $value in
+        *\'*|*$'\n'*) echo "$key: values containing a single quote or newline are not supported" >&2; return 1 ;;
+      esac
+      printf "%s='%s'\n" "$key" "$value" >> "$dst"
+    else
+      missing+=("$key")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then echo "warning: not set in $src: ${missing[*]}" >&2; fi
+}
+
 echo "== packages"
 sudo apt-get update -y
 sudo apt-get install -y --no-install-recommends git curl ca-certificates gnupg file
@@ -66,10 +87,10 @@ sudo chown "$SWESIM_USER:$SWESIM_USER" /opt/swesim /var/lib/swesim /etc/swesim
 chmod 750 /var/lib/swesim
 chmod 700 /etc/swesim
 
-echo "== secrets (copied files only; never from the repo)"
-test -f "$BOOT/env" || { echo "$BOOT/env missing; create.sh copies it from SWESIM_ENV_FILE" >&2; exit 1; }
+echo "== secrets (rendered from the copied file: only the worker's keys reach /etc/swesim/env; never from the repo)"
+test -f "$BOOT/env" || { echo "$BOOT/env missing; create.sh renders it from SWESIM_ENV_FILE" >&2; exit 1; }
 test -f "$BOOT/modal.toml" || { echo "$BOOT/modal.toml missing; create.sh copies it from ~/.modal.toml" >&2; exit 1; }
-install -m 600 "$BOOT/env" /etc/swesim/env
+render_worker_env "$BOOT/env" /etc/swesim/env
 install -m 600 "$BOOT/modal.toml" "$HOME/.modal.toml"
 chmod 600 /etc/swesim/env "$HOME/.modal.toml"
 
