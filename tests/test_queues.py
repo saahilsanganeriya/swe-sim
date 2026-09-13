@@ -155,3 +155,37 @@ def test_blocking_without_drain_releases_immediately_on_cancel_and_slot_wait_hea
         finally:
             A._heartbeat = orig
     asyncio.run(scenario())
+
+
+def test_blocking_heartbeats_once_per_call_even_when_the_call_is_short():
+    """A stage made of many short calls (discovery decides ten PRs per batch, most rejected in seconds) must still heartbeat:
+    measured 2026-09-13, three scans in a row timed out at the 180 s heartbeat timeout although the worker was healthy."""
+    import asyncio
+    from swesim.workflows import activities as A
+
+    async def scenario():
+        beats = []
+        orig = A._heartbeat
+        A._heartbeat = lambda *d: beats.append(d)
+        try:
+            for _ in range(3):
+                assert await A.blocking(lambda: "quick", every=5.0) == "quick"
+        finally:
+            A._heartbeat = orig
+        assert len(beats) >= 3, beats
+    asyncio.run(scenario())
+
+
+def test_draft_refuses_a_stale_judged_row_read_as_a_retryable_failure():
+    """The probe (BUILD pool) rewrites the judged row; draft (AUTHORING pool) may read the previous object generation through its
+    own mount's metadata cache for up to a minute. The workflow hands draft the probe's measured_at: a mismatch is a retry, not
+    the non-retryable 'probe did not record the grading identity' refusal (measured 2026-09-13, sklearn-13584 v3)."""
+    from swesim.workflows import activities as A
+    fresh = {"instance_id": "x", "probe_workflow": {"measured_at": 1789335902.34}}
+    stale = {"instance_id": "x", "probe": {"statuses": {"a": "failed"}}}
+    assert A.judged_row_stale(fresh, 1789335902.34) is None
+    assert A.judged_row_stale(fresh, None) is None, "pre-patch workflows pass nothing and keep the old behaviour"
+    reason = A.judged_row_stale(stale, 1789335902.34)
+    assert reason and "stale" in reason and "1789335902.34" in reason
+    err = A.retries.transient(reason, kind="StaleRead")
+    assert err.non_retryable is False and err.type == "StaleRead"

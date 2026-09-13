@@ -434,3 +434,17 @@ def test_fact_scope_flags_identifiers_that_exist_only_in_a_pass_to_pass_body():
     assert out["f2"].offending_tests == ["tests/test_x.py::test_reads_legacy_header"] and "legacy_header_offset" in out["f2"].reason
     # plain words shared with a PASS_TO_PASS-only body are evidence for the reading pass, never a mechanical verdict
     assert out["f3"].within_contract is None and "test_reads_legacy_header" in out["f3"].reason and out["f3"].offending_tests == []
+
+
+def test_fact_scope_one_word_parametrisation_marker_needs_the_exact_word():
+    """pypdf-3826 v3 (2026-09-13): f09 said the recovery "emits the warning ..." and the prefix rule read the plain word `warning`
+    as naming `warning_msgs0`, a parametrisation of the unrelated PASS_TO_PASS test test_get_images_raw. A marker made of one
+    non-generic word is named only by that exact word; multi-word markers keep the prefix rule (f05 above)."""
+    f2p = ["tests/test_reader.py::test_startxref_corrupt_trailing_pointer"]
+    p2p = ["tests/test_reader.py::test_get_images_raw[True-False--1-False-warning_msgs0]"]
+    facts = [{"id": "f09", "text": "Successful non-strict recovery emits the warning `found startxref pointing to a previous revision`.",
+              "discovery": "on-request"},
+             {"id": "f10", "text": "The warning_msgs0 case must keep passing.", "discovery": "on-request"}]
+    out = {fs.fact_id: fs for fs in R.fact_scope_mechanical(facts, f2p, p2p, {})}
+    assert out["f09"].within_contract is None and out["f09"].offending_tests == []
+    assert out["f10"].within_contract is False and out["f10"].markers == ["True-False--1-False-warning_msgs0"]

@@ -382,7 +382,10 @@ def test_run_discovery_waits_out_refusals_and_resumes_within_the_attempt(activit
     asyncio.run(A.run_discovery(scan))
     assert scan.done and scan.runs == 3
     assert sum(activity_clock["sleeps"]) == (120 + 5) + (240 + 5)  # first refusal 120 s, the consecutive one 240 s, each plus the grace
-    assert {h["waiting_for"] for h in activity_clock["heartbeats"]} == {"github-rate-limit"} and all(h["secondary"] for h in activity_clock["heartbeats"])
+    waits = [h for h in activity_clock["heartbeats"] if h and "waiting_for" in h]
+    assert {h["waiting_for"] for h in waits} == {"github-rate-limit"} and all(h["secondary"] for h in waits)
+    # every stage call and every finished batch heartbeats too (a run of short batches must not fall silent; 2026-09-13)
+    assert None in activity_clock["heartbeats"] and any(h and "decided" in h for h in activity_clock["heartbeats"])
 
 
 def test_run_discovery_resets_the_backoff_after_a_successful_batch(activity_clock, monkeypatch):
@@ -406,7 +409,8 @@ def test_run_discovery_waits_for_the_quota_when_below_the_margin(activity_clock,
     monkeypatch.setattr(A, "_github_quota", lambda: (A.GH_RATE_MARGIN - 1, 5000, NOW + 50))
     scan = FakeScan()
     asyncio.run(A.run_discovery(scan))
-    assert scan.done and activity_clock["sleeps"] == [30, 25] and activity_clock["heartbeats"][0]["remaining"] == A.GH_RATE_MARGIN - 1
+    waits = [h for h in activity_clock["heartbeats"] if h and "waiting_for" in h]
+    assert scan.done and activity_clock["sleeps"] == [30, 25] and waits[0]["remaining"] == A.GH_RATE_MARGIN - 1
     monkeypatch.setattr(A, "_github_quota", lambda: None)  # gh cannot answer: the scan itself classifies the outage
     activity_clock["sleeps"].clear()
     asyncio.run(A.run_discovery(FakeScan()))

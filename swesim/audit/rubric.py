@@ -780,7 +780,10 @@ def fact_scope_mechanical(facts: list[dict], fail_to_pass: list[str], pass_to_pa
         offending: list[str] = []
         markers: list[str] = []
         for r, toks in param_markers:
-            if all(_names(tokens, t) for t in toks):
+            # A one-word marker must be named exactly: prefix tolerance let the plain word "warning" in a fact about the
+            # FAIL_TO_PASS behaviour name `warning_msgs0`, a parametrisation of an unrelated PASS_TO_PASS test (pypdf-3826
+            # v3, 2026-09-13). Multi-word markers keep the prefix rule: naming all of them is not a coincidence.
+            if all(_names(tokens, t) for t in toks) and (len(toks) >= 2 or toks <= tokens):
                 reasons.append(f"names parametrisation '{r.param}' of PASS_TO_PASS-only test {r.test_id}, which no FAIL_TO_PASS test "
                                f"carries (FAIL_TO_PASS parametrisations: {', '.join(sorted(f2p_params)) or 'none'})")
                 offending.append(r.test_id)

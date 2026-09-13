@@ -671,7 +671,8 @@ class CandidateWorkflow:
                 done = self._done(sid, "not-reproducible-offline", [probed.get("reason") or "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold"], None)
                 await self._receipt("probe", "probed", "rejected", "probe", done["reasons"])
                 return await self._finish(done)
-            judged = {**judged, "judged_path": probed["judged_path"]}  # the probed row (measured lists) is what draft reads
+            # The probed row (measured lists) is what draft reads; its measured_at lets draft detect a stale mount read.
+            judged = {**judged, "judged_path": probed["judged_path"], "probe_measured_at": probed.get("measured_at")}
             if p.get("rebuild") and p.get("previous_version"):
                 # Rebuild as version p["version"]: the previous version's spec/compile/validation/approval/judge/draft-meta files
                 # move to archive/v<previous>/ so draft (with version=next), approve, compile, validate and register run afresh.
@@ -712,6 +713,7 @@ class CandidateWorkflow:
 def _mine_params(src: dict) -> dict:
     if src.get("kind") == "github-repo":
         out = {"source": "github-repo", "repo": src["repo"], "since": src.get("since"), "max_candidates": src.get("max_candidates"), "pr": src.get("pr"),
+               "max_prs": src.get("max_prs"),  # listing depth (closed PRs, newest activity first); begin_scan's 400 when absent
                "kind": src.get("pr_kind")}  # discovery band; github_repo.discover defaults to "feature" when absent
     else:
         out = {"source": "swebench-annotated", "pool": src.get("pool", "A"), "instance_ids": src.get("instance_ids"), "limit": src.get("limit")}

@@ -140,6 +140,11 @@ async def blocking(fn, every: float | None = None, *, drain_on_cancel: bool = Tr
     if _cancelled():
         raise asyncio.CancelledError("activity cancelled before the next stage")
     task = asyncio.ensure_future(asyncio.to_thread(fn))
+    # One heartbeat per stage call, not only per `every` seconds inside a long call: a run of short calls (discovery
+    # decides 10 PRs per batch, most rejected in a second or two) otherwise never heartbeats and the server times the
+    # attempt out at its heartbeat timeout (measured 2026-09-13: three scans in a row, 185 s each, on a healthy worker).
+    # The SDK throttles heartbeats to HEARTBEAT_THROTTLE, so a burst of quick calls costs one request.
+    _heartbeat()
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=every or HEARTBEAT_SECONDS)
@@ -276,6 +281,7 @@ async def run_discovery(scan) -> None:
             consecutive += 1
             continue
         consecutive = 0
+        _heartbeat({"repo": getattr(scan, "repo", None), "decided": getattr(scan, "cursor", None), "listed": len(getattr(scan, "summaries", ()))})
         if not scan.done:
             await await_github_quota()
 
@@ -628,7 +634,8 @@ async def probe_candidate_activity(p: dict) -> dict:
                                         "measured FAIL_TO_PASS is empty: no test fails on base and passes on gold in the offline probe")
     return {"judged_path": str(judged_path), "instance_id": iid, "scenario_id": sid, "fail_to_pass": f2p if reproducible else [], "pass_to_pass": p2p,
             "probe_dir": probe.get("probe_dir") or row.get("probe_dir"), "reproducible": reproducible, "reason": reason,
-            "dropped": (row.get("probe_workflow") or {}).get("dropped") or probe.get("dropped") or {}}
+            "dropped": (row.get("probe_workflow") or {}).get("dropped") or probe.get("dropped") or {},
+            "measured_at": (row.get("probe_workflow") or {}).get("measured_at")}  # draft_activity checks it read this measurement
 
 
 def _probe_measured(row: dict) -> bool:
@@ -739,12 +746,29 @@ async def human_approve_activity(p: dict) -> dict:
     return {"approved": True, "scenario_id": sid, "spec_hash": spec.spec_hash, "approved_by": "human-command"}
 
 
+def judged_row_stale(row: dict, expected_measured_at) -> str | None:
+    """Why `row` is not the measurement the workflow just recorded, or None. The probe (BUILD pool) rewrites the judged file and
+    draft (AUTHORING pool) reads it seconds later through another instance's bucket mount, whose metadata cache may still
+    serve the previous object generation (measured 2026-09-13: a re-probed sklearn row read back without its grading identity
+    16 s after the rewrite). The workflow passes the probe's `measured_at`; a mismatch is a retryable read, never a draft refusal."""
+    if not expected_measured_at:
+        return None
+    seen = (row.get("probe_workflow") or {}).get("measured_at")
+    if seen == expected_measured_at:
+        return None
+    return (f"judged row for {row.get('instance_id')!r} read stale: probe measured_at {seen!r}, the workflow recorded {expected_measured_at!r} "
+            f"(bucket metadata cache); retrying the read")
+
+
 @swesim_activity
 async def draft_activity(p: dict) -> dict:
     from swesim.stages.draft_spec import draft
 
     rows = [json.loads(line) for line in Path(p["judged_path"]).read_text().splitlines() if line.strip()]
     row = next(r for r in rows if r["instance_id"] == p["instance_id"])
+    stale = judged_row_stale(row, p.get("probe_measured_at"))
+    if stale:
+        raise retries.transient(stale, kind="StaleRead")
     sid = scenario_id_for(p["instance_id"]); sdir = WS.scenario_dir(sid); path = sdir / "scenario.draft.json"
     if p.get("force") and path.exists():
         n = 1

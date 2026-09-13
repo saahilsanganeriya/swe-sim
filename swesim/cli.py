@@ -435,6 +435,8 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
            candidate_id: str | None = typer.Option(None), source_key: str | None = typer.Option(None),
            pr: int | None = typer.Option(None, help="Exact PR number; requires one GitHub source"),
            since: str = typer.Option("2026-06-01"), max_candidates: int = typer.Option(20), max_parallel: int = typer.Option(8),
+           max_prs: int = typer.Option(400, help="Closed PRs listed per GitHub repository (newest activity first) before the band filters and --since "
+                                       "apply; a far --since needs a deeper listing (2000 = twenty list calls)"),
            approval_mode: str = typer.Option("auto", help="auto | hold (review queue; approve with `swesim workflows approve`)"),
            pr_kind: str = typer.Option("bugfix", help="GitHub source band: bugfix (diff 20-600 lines, >=4 comments; the band that produced pypdf-3826) | feature (200-1500 lines, >=8 comments, feature label)"),
            rebuild: bool = typer.Option(False, "--rebuild", help="Re-create scenarios that already exist as a new version: archive the previous "
@@ -451,7 +453,8 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
             _, pool, *ids = s.split(":", 2)
             sources.append({"kind": "swebench-annotated", "pool": pool or "A", "limit": max_candidates, **({"instance_ids": ids[0].split(",")} if ids else {})})
         else:
-            sources.append({"kind": "github-repo", "repo": s, "since": since, "max_candidates": max_candidates, "pr_kind": pr_kind, **({"pr": pr} if pr else {})})
+            sources.append({"kind": "github-repo", "repo": s, "since": since, "max_candidates": max_candidates, "max_prs": max_prs, "pr_kind": pr_kind,
+                            **({"pr": pr} if pr else {})})
     if any((candidate_snapshot, candidate_id, source_key)):
         if not all((candidate_snapshot, candidate_id, source_key)):
             raise typer.BadParameter("frozen retry requires --candidate-snapshot, --candidate-id and --source-key")
