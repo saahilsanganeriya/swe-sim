@@ -472,6 +472,8 @@ def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenar
 
 workflows_app = typer.Typer(help="Inspect and steer Temporal workflows.")
 app.add_typer(workflows_app, name="workflows")
+from swesim.index.cli import index_app  # noqa: E402  (mounted after the root app exists)
+app.add_typer(index_app, name="index")
 
 @workflows_app.command("list")
 def workflows_list(kind: str = typer.Argument("all", help="create | candidate | run | pipeline | matrix | trial | all"), limit: int = typer.Option(50)) -> None:
