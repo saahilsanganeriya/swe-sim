@@ -436,8 +436,9 @@ async def judge_one_activity(p: dict) -> dict:
 
 @swesim_activity
 async def probe_candidate_activity(p: dict) -> dict:
-    """Measure FAIL_TO_PASS / PASS_TO_PASS on base and gold for one judged row (Harbor on Modal; one attempt, and
-    harbor_cli reconciles an existing job dir instead of relaunching). The probed row replaces the row in the
+    """Measure FAIL_TO_PASS / PASS_TO_PASS on base and gold for one judged row (Harbor on Modal; harbor_cli reuses a job dir
+    with a terminal result and gives an abandoned one, left by a worker-pool roll, a bounded fresh attempt with recorded
+    lineage; the 4th abandonment is a HarborRunError). The probed row replaces the row in the
     per-candidate judged file, so draft_activity reads the measured lists. Retained: a row with probe.measured is reused."""
     judged_path = Path(p["judged_path"]); iid = p["instance_id"]; sid = p.get("scenario_id") or scenario_id_for(iid)
     rows = [json.loads(line) for line in judged_path.read_text().splitlines() if line.strip()]
@@ -635,9 +636,9 @@ def _compile_info(sid: str) -> dict:
 
 @swesim_activity
 async def validate_control_activity(p: dict) -> dict:
-    """One control run of the validation (BUILD): Harbor on Modal through harbor_cli, which reconciles an existing job dir instead
-    of relaunching. `HarborRunError` propagates and the BUILD class retries this one control; the result carries paths and the
-    small reward summary, never report bodies."""
+    """One control run of the validation (BUILD): Harbor on Modal through harbor_cli, which reuses a job dir with a terminal result
+    and gives an abandoned one a bounded fresh attempt with recorded lineage (validation.run_control). `HarborRunError` propagates
+    and the BUILD class retries this one control; the result carries paths and the small reward summary, never report bodies."""
     spec = _spec(p["scenario_id"]); comp = _compile_info(spec.id)
     if p.get("compiled_hash") and p["compiled_hash"] != comp["compiled_hash"]:
         raise ValueError("compiled build changed after control planning")

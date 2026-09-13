@@ -596,7 +596,9 @@ def probe_tests(row: dict, ws) -> dict:
     (tests / "probe.py").write_text(PROBE_SCRIPT)
     (root / "instruction.md").write_text("Environment authoring probe; no solver work.")
     (root / "task.toml").write_text(PROBE_TASK_TOML)
-    td = harbor_cli.run_task(root, "nop", ws.jobs_dir / "probe", job_name, timeout_sec=9000)
+    # An abandoned job dir (a worker-pool roll or the wrapper deadline killed the launch before result.json) gets a bounded fresh
+    # attempt beside it with its lineage in <job_name>.attempts.json; a dir with a terminal result is reused (harbor_cli, P2-17).
+    td = harbor_cli.run_task(root, "nop", ws.jobs_dir / "probe", job_name, timeout_sec=9000, max_fresh_attempts=harbor_cli.MAX_FRESH_ATTEMPTS)
     data = json.loads((td / "verifier" / "probe.json").read_text())
     res = _probe_record(row, data, kind=kind, digest=digest, repo_dir=repo_dir, interpreter=interpreter, files=files, command=command,
                         job_dir=str(td), probed_at=datetime.now(timezone.utc).isoformat())
