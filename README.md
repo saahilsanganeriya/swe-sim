@@ -19,10 +19,10 @@ validate (nop, oracle, plausible-wrong, tamper, reachability; all on Modal) -> r
 
 ## Prerequisites
 
-- `uv`; it installs Python 3.12 from `.python-version`. Harbor 0.23.0, Modal 1.5.5 and Temporal's SDK are project dependencies, not tools on PATH. No Docker: every build, sandbox and verifier runs on Modal.
+- `uv`; it installs Python 3.12 from `.python-version`. Harbor 0.23.0, Modal 1.5.5 and the Temporal SDK are project dependencies. No Docker: every build, sandbox and verifier runs on Modal.
 - A Modal token in `~/.modal.toml` (`uv run modal setup`).
 - `gh auth login`: mining reads issue and PR threads through the GitHub API.
-- A git-ignored dotenv file, mode 0600, at `~/Documents/.env` or the path in `SWESIM_ENV_FILE`, read with python-dotenv (never shell-sourced). Keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SWESIM_WORKER_SECRET` (a long random string shared with the stakeholder deployment), `SWESIM_STAKEHOLDER_URL` (filled after deploying), and for the VM path `GH_TOKEN` (a read-only token from `gh auth token`), `GCP_PROJECT`, `GCP_ZONE`.
+- A git-ignored dotenv file, mode 0600, at `~/Documents/.env` or the path in `SWESIM_ENV_FILE`, read with python-dotenv (never shell-sourced). Keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SWESIM_WORKER_SECRET` (a long random string shared with the stakeholder deployment), `SWESIM_STAKEHOLDER_URL` (filled after deploying), and for the VM path `GH_TOKEN` (read-only, from `gh auth token`), `GCP_PROJECT`, `GCP_ZONE`.
 - `gcloud` authenticated for that project (VM path only).
 
 ## Quick start on a laptop
@@ -89,13 +89,13 @@ uv run swesim workflows cancel <workflow_id>
 
 ## Authoring a new simulation
 
-The pipeline authors automatically. Code extracts the issue-to-contract delta and a judge model classifies each gap; code measures the contract offline. A second model (never the judge's) drafts the fact ledger, persona, requirements, checks, requirement groups and a plausible-wrong patch; code writes the natural brief, computes the withheld brief from model-selected spans (removing reproduction code, tracebacks, literal outputs, file references, version pins and fix proposals, never summarizing), generates the oracle and test assets and the tamper controls, and checks that every non-authored fact quotes a verbatim span of the text its provenance names. One correction round, then the draft fails honestly.
+The pipeline authors automatically. Code extracts the issue-to-contract delta and a judge model classifies each gap; code measures the contract offline. A second model (never the judge's) drafts the fact ledger, persona, requirements, checks, groups and a plausible-wrong patch; code writes the natural brief, computes the withheld brief from model-selected spans (removing reproduction code, tracebacks, literal outputs, file references, version pins and fix proposals, never summarizing), generates the oracle, test and tamper assets, and checks that every non-authored fact quotes a verbatim span of the text its provenance names. One correction round, then the draft fails honestly.
 
-A human reviews `workspace/scenarios/<id>/scenario.draft.json` or the `/review/<id>` page: the two briefs and what was removed; each ledger fact's text, kind, provenance, `source_excerpt`, `source_url`, discovery (`given`, `on-request`, `author-only`) and linked tests; the persona; requirements and group weights; the contract's test ids and protected paths; each control's rationale. `approve --auto` checks six gates: strict schema, assets present with declared bytes and sha256 inside the scenario directory, judge acceptance, at least one on-request fact linked to a FAIL_TO_PASS test (otherwise asking is not load-bearing), no withheld excerpt surviving in the withheld brief (title retained), and controls present (a plausible-wrong patch and an incorrect-exploit tamper; structural tests also need an alternative-correct patch). `compile` refuses an unpinned image digest, a non-HTTPS stakeholder URL or an unpinned agent version.
+A human reviews `workspace/scenarios/<id>/scenario.draft.json` or `/review/<id>`: both briefs and what was removed; each fact's text, kind, provenance, `source_excerpt`, `source_url`, discovery (`given`, `on-request`, `author-only`) and linked tests; persona; requirements and group weights; test ids and protected paths; each control's rationale. `approve --auto` checks six gates: strict schema; assets with declared bytes and sha256 inside the scenario directory; judge acceptance; an on-request fact linked to a FAIL_TO_PASS test (otherwise asking is not load-bearing); no withheld excerpt surviving in the withheld brief; controls present (a plausible-wrong patch and an incorrect-exploit tamper; structural tests also need an alternative-correct patch). `compile` refuses an unpinned image digest, a non-HTTPS stakeholder URL or an unpinned agent version.
 
-To reject: in hold mode send `--decision reject --note`; locally the queue writes `review.json` and the draft leaves the queue. To re-draft, run `swesim draft` again or take the next candidate. Drafts are never hand-edited to pass a gate.
+To reject, send `--decision reject --note` in hold mode; locally the queue writes `review.json`. To re-draft, run `swesim draft` again or take the next candidate. Drafts are never hand-edited to pass a gate.
 
-Controls are what make a task exist. `validate` applies each on Modal: `nop` must earn 0 with every FAIL_TO_PASS failing and every PASS_TO_PASS passing on base; `oracle` must earn `reward 1, success 1`; `plausible-wrong` must fail with reward at or below its declared maximum; `alternative-correct` must pass; each `incorrect-exploit` tamper (root conftest no-op, skip marker, sitecustomize) must earn exactly 0; the reachability probe must find no gold lines in the image. An infrastructure outcome is never a passing control.
+Controls decide whether a task exists. `validate` applies each on Modal: `nop` must earn 0 with FAIL_TO_PASS failing and PASS_TO_PASS passing on base; `oracle` must earn `reward 1, success 1`; `plausible-wrong` must fail below its declared reward ceiling; `alternative-correct` must pass; each `incorrect-exploit` tamper (root conftest no-op, skip marker, sitecustomize) must earn exactly 0; the reachability probe must find no gold lines. An infrastructure outcome is never a passing control.
 
 ## Running on the VM
 
@@ -105,39 +105,40 @@ bash scripts/vm/tunnel.sh     # forward 8233 (Temporal UI), 7233 (gRPC), 8080 (d
 bash scripts/vm/update.sh     # fast-forward /opt/swesim to origin/main, uv sync, restart worker and dashboard only
 ```
 
-`create.sh` copies only `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SWESIM_WORKER_SECRET`, `SWESIM_STAKEHOLDER_URL` and `GH_TOKEN` into `/etc/swesim/env` (0600); the laptop file itself never leaves. `update.sh` refuses while HEAD has commits `origin/main` lacks and never restarts the Temporal server or a running trial. User units with lingering: `swesim-temporal` (dev server, SQLite at `/var/lib/swesim/temporal.db`, loopback only), `swesim-worker` (queue `swesim`), `swesim-dashboard`, plus one transient `swesim-trial-<trial_id>` per trial created once by `systemd-run`; a worker restart cannot kill a trial and never relaunches one. Evidence lands under `/opt/swesim/workspace/` (`trials/<trial_id>/`, `exports/`, `evidence/` including `model-probe.json` and `ops.json`) and in `journalctl --user -u swesim-trial-<trial_id>`. Retries are new attempt indices; see `docs/ops.md` for the reconciliation rules.
+`create.sh` copies only `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SWESIM_WORKER_SECRET`, `SWESIM_STAKEHOLDER_URL` and `GH_TOKEN` into `/etc/swesim/env` (0600). `update.sh` refuses while HEAD has commits `origin/main` lacks and never restarts the Temporal server or a trial. User units with lingering: `swesim-temporal` (dev server, SQLite, loopback only), `swesim-worker` (queue `swesim`), `swesim-dashboard`, plus one transient `swesim-trial-<trial_id>` per trial created once by `systemd-run`; a worker restart cannot kill a trial and never relaunches one. Evidence lands under `/opt/swesim/workspace/` (`trials/`, `exports/`, `evidence/` with `model-probe.json` and `ops.json`) and in `journalctl --user -u swesim-trial-<trial_id>`. Retries are new attempt indices; `docs/ops.md` has the reconciliation rules.
 
 ## Layout
 
 ```
-swesim/             cli.py, models.py (ScenarioSpec, RunConfig), stages/, sources/, verifier/, stakeholder/, workflows/, dashboard/, templates/
-scripts/            verify.sh, deploy_stakeholder.sh, vm/{create,setup,update,tunnel}.sh and the three unit files
-data/annotations/   SWE-bench Verified human annotations (pool A is underspecified >= 2, valid tests)
-references/         DeepSWE task example, Harbor swebench adapter template, the early Modal smoke task
-docs/               architecture.md, grading.md, ops.md, superpowers/specs (design), superpowers/plans, notes/
-workspace/          ignored: candidates/ (.jsonl, .judged, .probed, .rejects.json, .status), scenarios/<id>/ (scenario.draft.json,
-                    draft.meta.json, judge.json, assets/, scenario.json, approval.json, compile.json, validation.json, scores.json),
-                    tasks/<id>__{full,hidden,interactive}/, probes/, jobs/, trials/<trial_id>/, exports/, evidence/, judge_calibration.json
-registry.json       tracked at the root once a scenario validates: one entry per scenario id with version, spec hash, validation status
-examples/           tracked snapshot of the first valid scenario: manifest.json with file digests, the three task dirs, a sanitized run
+swesim/            cli.py, models.py, stages/, sources/, verifier/, stakeholder/, workflows/, dashboard/, templates/
+scripts/           verify.sh, deploy_stakeholder.sh, vm/ (create, setup, update, tunnel, three unit files)
+data/annotations/  SWE-bench Verified human annotations (pool A: underspecified >= 2, valid tests)
+references/        DeepSWE task example, Harbor swebench adapter template, early Modal smoke task
+docs/              architecture.md, grading.md, ops.md, superpowers/specs, superpowers/plans, notes/
+workspace/         ignored: candidates/ (.jsonl, .judged, .probed, .rejects.json), scenarios/<id>/ (scenario.draft.json, judge.json,
+                   assets/, scenario.json, approval.json, compile.json, validation.json, scores.json), tasks/<id>__<condition>/,
+                   probes/, jobs/, trials/<trial_id>/, exports/, evidence/, judge_calibration.json
+registry.json      tracked at the root once a scenario validates: per scenario id, version, spec hash, validation status
+examples/          tracked snapshot of the first valid scenario: manifest.json with digests, three task dirs, a sanitized run
 ```
 
-`registry.json` and `examples/` are written by `register` and by the delivery step and do not exist yet, because no scenario has passed validation.
+`registry.json` was first written by `register` on 2026-09-12 with one scenario and is not yet committed; `examples/` does not exist yet.
 
 ## Docs
 
-`docs/architecture.md` (components, data flow, conditions, stakeholder, trust boundaries, Temporal), `docs/grading.md` (reward contract, outcome codes, pass@k and pass^k, evidence reconciliation, protected paths, the control sweep, measured results), `docs/ops.md` (VM topology, deploy, laptop-off and restart procedures, retry lineage). `PLAN.md` lists milestones.
+`docs/architecture.md` (components, data flow, conditions, stakeholder, trust boundaries, Temporal), `docs/grading.md` (reward contract, outcome codes, pass@k and pass^k, evidence reconciliation, protected paths, control sweep, measured results), `docs/ops.md` (VM topology, deploy, laptop-off and restart procedures, retry lineage). `PLAN.md` lists milestones.
 
 ## Status and honesty
 
 Measured so far, from the ledger and artifacts on disk (2026-09-12):
 
 - Judge calibration (`workspace/judge_calibration.json`, prompt `judge-v3`, `openai/gpt-5.5`, 145 of 150 sampled instances judged, 5 oversize errors): agreement 0.655, precision 0.644, recall 0.460 against the human `underspecified >= 2` labels (tp 29, fp 16, tn 66, fn 34). Over the 45 pytest-eligible pool A rows the judge kept 24.
-- `psf--requests-1944` passed the judge and all six gates, then validation returned invalid: the oracle passed 0 of 5 FAIL_TO_PASS and base failed 47 of 120 PASS_TO_PASS because the requests suite needs a network test server and the verifier is offline by contract. All three tamper controls earned 0. psf/requests is excluded from the pool. This sweep is also the first evidence that the hardened root collector reaches the separate verifier on Modal.
-- `sphinx-doc--sphinx-9467` passed the gates and compiled, then the `nop` control passed all four published FAIL_TO_PASS ids on base: SWE-bench's lists were computed with network access and do not reproduce offline. This produced the `probe` stage, which now runs before every draft.
+- `psf--requests-1944` passed the judge and all six gates; validation was invalid: the oracle passed 0 of 5 FAIL_TO_PASS and base failed 47 of 120 PASS_TO_PASS, because the requests suite needs a network test server and the verifier is offline by contract. All three tamper controls earned 0. psf/requests is excluded from the pool. This sweep is the first evidence that the hardened root collector reaches the separate verifier on Modal.
+- `sphinx-doc--sphinx-9467` passed the gates and compiled; the `nop` control then passed all four published FAIL_TO_PASS ids on base: SWE-bench's lists were computed with network access and do not reproduce offline. This produced the `probe` stage, which now runs before every draft.
 - `scikit-learn--scikit-learn-13584`, the first offline-probed candidate to complete a sweep: oracle `reward 1.0, success 1` (the first gold pass offline) and all five controls earned 0 (plausible-wrong, three tampers, nop). It was invalid only because one PASS_TO_PASS test failed on base when the runner listed FAIL_TO_PASS ids first (test-order pollution). The runner now emits ids in definition order and the probe runs the exact grading command; the re-draft is in flight.
-- `pytest-dev--pytest-7283`'s first validation was stopped when the oracle came back `agent-invalid-submission`: the drafter had protected the gold patch's source file. Protected paths are now code-owned (test files only).
-- Repository-URL discovery on py-pdf/pypdf: the feature band found no valid candidate (no linked issue 119, linked target is a PR 11, diff too small 36, no test changes 16, feature label missing 2); the bugfix band probed two candidates on Modal (PR 3826: 2 FAIL_TO_PASS, 95 PASS_TO_PASS; PR 4032: 1 and 188), the judge kept 3826, and `py-pdf--pypdf-3826` is drafted and auto-approved but not validated.
-- The stakeholder service is deployed on Modal with `/health` passing; the GCE VM exists with all three units active and has been updated through `update.sh`; the configured judge, draft, solver and fallback model ids answered a probe; 490 offline tests pass and `verify.sh 3` is green.
+- `mwaskom--seaborn-3190` is the first valid scenario (`workspace/scenarios/mwaskom--seaborn-3190/validation.json`, Modal, 85 contract ids): oracle `reward 1.0, success 1`; nop 0; plausible-wrong 0 with `success 0`; the three incorrect-exploit tampers 0 each with one `protected-path-edit` signal each; gold commit unreachable and no gold-line hits. It is registered in `registry.json` and `workspace/dataset.json`; its first trials were launching as this was written and have no records yet.
+- `pytest-dev--pytest-7283` (after a first attempt was stopped because the drafter had protected the gold patch's source file; protected paths are now code-owned) and the repository-URL scenario `py-pdf--pypdf-3826` both reached oracle `1.0, 1`, nop 0 and tampers 0, and are invalid only because their plausible-wrong control agent failed before a clean submission, which counts as infrastructure, never as a passing control.
+- Repository-URL discovery on py-pdf/pypdf: the feature band found no valid candidate (no linked issue 119, linked target is a PR 11, diff too small 36, no test changes 16, feature label missing 2); the bugfix band probed two candidates on Modal (PR 3826: 2 FAIL_TO_PASS, 95 PASS_TO_PASS; PR 4032: 1 and 188) and the judge kept 3826.
+- The stakeholder service is deployed on Modal with `/health` passing; the VM exists with all three units active and has been updated through `update.sh`; the configured judge, draft, solver and fallback model ids answered a probe; 490 offline tests pass and `verify.sh 3` is green.
 
-Not measured: no scenario is registered; no trial in any condition has run; no interactive episode, transcript binding, pass@k, export, laptop-off run or worker-restart check has been observed; hold-mode review has not been exercised against a live workflow. Any capability described above that is not in the measured list is implemented and unit-tested but unmeasured on Modal.
+Not measured: no trial in any condition has a record; no interactive episode, transcript binding, pass@k, export, laptop-off run or worker-restart check has been observed; no GitHub-source scenario is valid; hold-mode review has not been exercised against a live workflow. Anything described above and absent from the measured list is implemented and unit-tested but unmeasured on Modal.

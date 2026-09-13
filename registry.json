@@ -1,0 +1,24 @@
+{
+  "scenarios": {
+    "mwaskom--seaborn-3190": {
+      "calibration_runs": [],
+      "comparison_runs": [],
+      "compiled_hash": "befc959d526b0f68b8b20530eed51cd40d81283ff475df15037e22349f366d9b",
+      "conditions": [
+        "full",
+        "hidden",
+        "interactive"
+      ],
+      "demonstration_runs": [],
+      "id": "mwaskom--seaborn-3190",
+      "image_digest": "sha256:5ce876a52439385a2638f21617febf25a333c24b0db555cb9e37230b4db2cdcc",
+      "source": "swebench-annotated",
+      "source_ref": "mwaskom__seaborn-3190",
+      "spec_hash": "6915ece64b0b0d61f823e88e885c65f86ba9dcf3b55f76b1b9b75603a7caff6b",
+      "unresolved_runs": [],
+      "validation_path": "/path/to/swesim/workspace/scenarios/mwaskom--seaborn-3190/validation.json",
+      "validation_status": "valid",
+      "version": 1
+    }
+  }
+}
