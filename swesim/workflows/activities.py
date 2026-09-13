@@ -572,6 +572,8 @@ async def draft_activity(p: dict) -> dict:
             wanted["reject_reasons"] = p["reject_reasons"]
         if p.get("version"):
             wanted["version"] = int(p["version"])  # rebuilds draft the next version; draft writes spec["version"] and draft.meta.json["version"]
+        wanted["layout"] = WS.layout
+        wanted["workflow_id"] = activity.info().workflow_id if activity.in_activity() else "direct"
         kwargs = _accepted_kwargs(draft, wanted)
         await blocking(lambda: draft(row, row.get("judge", {}), p["draft_model"], sdir, **kwargs))
     return {"scenario_id": sid, "draft_path": str(path), "version": int(p.get("version") or 1)}
@@ -942,7 +944,10 @@ def _solver_usage(costs, record: dict, d: Path):
         if usage is not None:
             return usage
     trajectory = _read_json(d / "trajectory.json")
-    return costs.solver_usage_from_trajectory(trajectory) if trajectory else None
+    try:
+        return costs.solver_usage_from_trajectory(trajectory) if trajectory else None
+    except getattr(costs, "MissingUsage", ()):  # old injected cost modules do not expose this classification
+        return None
 
 
 @swesim_activity

@@ -646,7 +646,8 @@ def _cost_row(item: Any, path: Path, i: int, *, origin: str, now: datetime, tria
         raise ProjectionError(f"{path}[{i}]: {e.error_count()} invalid field(s): {[err['loc'] for err in e.errors()]}") from e
 
 
-def project_workflow_costs(layout: Layout, *, origin: str | None = None, now: datetime | None = None) -> list[M.CostRow]:
+def project_workflow_costs(layout: Layout, *, origin: str | None = None, now: datetime | None = None,
+                           workflow_id: str | None = None) -> list[M.CostRow]:
     """Cost records of workflows without a trial (`Layout.workflow_costs_path`, written by `swesim.costs.record_cost`).
     A file that is not a list of records raises `ProjectionError`."""
     origin = _default_origin(origin)
@@ -655,7 +656,10 @@ def project_workflow_costs(layout: Layout, *, origin: str | None = None, now: da
     if not cdir.is_dir():
         return []
     rows: list[M.CostRow] = []
-    for path in sorted(cdir.glob("*.json")):
+    paths = [layout.workflow_costs_path(workflow_id)] if workflow_id is not None else sorted(cdir.glob("*.json"))
+    for path in paths:
+        if not path.exists():
+            continue
         workflow_id = path.name[: -len(".json")]
         data = read_json(path)
         if not isinstance(data, list):

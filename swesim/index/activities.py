@@ -158,6 +158,8 @@ def index_trial(p: dict, settings: Settings | None = None) -> dict:
         return dict(DISABLED)
     (tid,) = _require(p, "trial_id")
     try:
+        from swesim.costs import repair_stakeholder_costs
+        repair_stakeholder_costs(_layout(s), tid)
         row, exchanges, costs = P.project_trial(_layout(s), tid, origin=s.origin)
     except ValueError as e:
         raise _projection_error(f"trial {tid}: {e}") from e
