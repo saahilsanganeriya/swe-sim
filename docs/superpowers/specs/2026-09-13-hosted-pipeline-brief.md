@@ -391,6 +391,20 @@ provider respecting rate limits (OpenRouter 20 concurrent per key is a safe star
 
 ## 5. Difficulty: measured, tiered, reported
 
+> **Superseded 2026-09-13 14:50 PDT** (user ruling; ledger `.superpowers/sdd/2026-09-13-hosted-pipeline/progress.md`, 14:50 line; the
+> 13:35 directive precedes it). Difficulty is model-dependent: on `pytest-dev--pytest-7283` the screen model (`deepseek-v3.2`,
+> hidden 1/2, full 0/1) labelled the scenario `broken` while `deepseek-v4.1-flash` and `glm-5.3` solved every condition and
+> `gpt-5-mini` and `deepseek-v3.2` solved interactive but not full (`docs/grading.md`, "First hosted results";
+> `workspace/evidence/sweep/pytest-7283-comparison-2026-09-13.json`) — the label described one model, not the task. The
+> single-model screen described below is retired as a gate; its label remains an informational chip recording what the screen
+> run measured. The leaderboard admits every scenario that is `valid` and passes the task-sense audit (coherent ∧ fair_tests),
+> whatever its label. Difficulty is read on `/trends` as the capability gradient (`swesim/dashboard/gradient.py`): accuracy by
+> solver tier A→E per condition, with per-scenario chips — `suspicious` when a Tier A/B model beats the best Tier D/E model,
+> `saturated` when every model with n ≥ 2 is at 100%. The frontier admission gate (`swesim/stages/frontier.py`) still exists,
+> but the operator can proceed past a refusal with a recorded reason (`swesim run-tasks --frontier-override "<reason>"`); its
+> "15 informative scenarios" clause is no longer how frontier runs are decided. Cost if wrong: an easy task inflates every
+> model's score until the gradient chips flag it. The original text is kept below as written.
+
 The user's requirement: the trajectories we see and the tasks we create must be difficult enough, and the creation process must
 find the right kind of tasks. Difficulty is a property we measure on every scenario and report per model tier; it is never
 asserted from diff size (CLAUDE.md) and never manufactured by editing a task after a gate.

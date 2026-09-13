@@ -128,6 +128,7 @@ LLM_AUDIT = "swesim/audit/llm_audit.py"
 WORKFLOWS = "swesim/workflows/workflows.py"
 CLOUDRUN = "swesim/workflows/launchers/cloudrun.py"
 LAYOUT = "swesim/storage/layout.py"
+GRADIENT = "swesim/dashboard/gradient.py"
 LEDGER = Source(".superpowers/sdd/2026-09-13-hosted-pipeline/progress.md", "Ruling lines (operator ledger, not tracked in git)", tracked=False)
 
 
@@ -198,7 +199,7 @@ SECTION_1 = Section("measures", "What swesim measures", (
          "50 trial records, 19 of them on the current registered version-2 specs, all laptop/VM-era. No treatment effect or hosted model comparison is "
          "claimed from them: no cell has three attempts, and one scenario's hidden test was audited as unfair.",
          (S(GRADING, "Preserved inventory — 2026-09-13"), S(ARCH, "Acceptance boundary"), S(OPS, "deferred checks")),
-         Console("/leaderboard", "the 'Gate' table at the bottom: every scenario with its validation, difficulty and task-sense checks and why it is on or off the board")),
+         Console("/leaderboard", "the 'Gate' table at the bottom: every scenario with its validation and task-sense checks, its informational screen label, and why it is on or off the board")),
 ))
 
 # ----------------------------------------------------------------------------- 2. hosted architecture
@@ -378,7 +379,7 @@ SECTION_3 = Section("creation", "Creating a task from a repository URL", (
                    "A benchmark that only re-labels SWE-bench measures nothing new; a repository funnel scales and tells you where PRs are lost.",
                    "Fewer tasks by morning than mining a curated pool would give.", "2026-09-13 08:20 UTC", S(BRIEF, "§1 Primary objective")),
           Decision("Diff size and thread size are discovery filters, never measured difficulty.",
-                   "Line counts select for a kind of change; whether a task is hard is decided later by the screen on a real model.",
+                   "Line counts select for a kind of change; whether a task is hard is measured later, per model, as the capability gradient across real solvers.",
                    "Some hard small fixes are never listed; the band is tuned from the reject histogram.", "2026-09-13", S(CLAUDE_MD, "Diff size is a filter")))),
     Card("From candidate to registered scenario",
          "Each retained PR runs one CandidateWorkflow: the judge decides whether a real question is hidden in it (§7), the probe measures the test contract on "
@@ -731,20 +732,25 @@ SECTION_7 = Section("judge", "The judge", (
 # ----------------------------------------------------------------------------- 8. difficulty and task sense
 
 SCREEN = """
- after validation: purpose screen, model openrouter/deepseek/deepseek-v3.2, hidden k=2, full k=1
- three attributable, consistent results, distinct trial ids; infrastructure cannot label a task
-        │
-        ▼
- full 0/1 ?  ── yes ──▶  BROKEN       brief plus every fact still fails: suspect the task
-        │ no
-        ▼
- hidden 2/2 ? ─ yes ──▶  SATURATED    too easy for the screen model: off the board by default
-        │ no
-        ▼
-                         INFORMATIVE  hidden ≤ 1/2: the task discriminates
+ screen: purpose screen · openrouter/deepseek/deepseek-v3.2 · hidden k=2 · full k=1 · never pooled
+   full 0/1 → BROKEN      hidden 2/2 ∧ full 1/1 → SATURATED      otherwise → INFORMATIVE
+   the label records what one model did on one run: an informational chip since 2026-09-13 14:50 PDT
 
- leaderboard  =  validation valid  ∧  difficulty informative  ∧  task-sense coherent ∧ fair_tests
-                 (saturated only with the toggle; broken and unaudited never)
+ pytest-dev--pytest-7283, the case that demoted it (docs/grading.md, First hosted results)
+   screen model deepseek-v3.2       hidden 1/2 · full 0/1                → labelled BROKEN
+   deepseek-v4.1-flash · glm-5.3    every condition solved (7/7, 6/6)    → saturated for them
+   gpt-5-mini · deepseek-v3.2       interactive 2/2 · full 0/2, 0/3      → informative for them
+   one label, three verdicts: difficulty is a property of task × model, not of the task
+
+ difficulty = the capability gradient (/trends): accuracy by solver tier A → E, per arm
+   scenario chip   holds         best accuracy per tier is non-decreasing A → E
+                   suspicious    a Tier A/B model beats the best Tier D/E model by over one trial
+                   saturated     every model with n ≥ 2 is at 100%: easy for everyone measured
+                   not-monotone  a dip that is not the A/B-over-D/E kind
+   chips are informational; they gate nothing
+
+ leaderboard  =  validation valid  ∧  task-sense coherent ∧ fair_tests        whatever the label
+                 (unaudited never; the screen label is a filter the operator may apply)
 """
 
 TASK_SENSE = """
@@ -758,18 +764,32 @@ TASK_SENSE = """
 """
 
 SECTION_8 = Section("difficulty", "Difficulty screen and task-sense audit", (
-    "Hard enough is measured, never asserted from diff size: a cheap screen model labels every valid scenario, and a reading pass asks whether the task "
-    "makes sense, whether the hidden tests are fair, and whether the conversation disclosed the right things at the right time."), (
-    Card("The difficulty screen",
-         "After validation the screen runs the withheld brief twice without a stakeholder and the full brief once, on one frozen model and build, as purpose "
-         "screen so the attempts never pool with comparisons. Full failing wins over hidden saturation. Labels live in difficulty.json and on the scenario row; "
-         "the leaderboard shows every valid, audited scenario whatever its label (the label is a chip and a filter, not an exclusion), and the Trends page reads difficulty as a capability gradient across solver tiers instead.",
-         (S(DIFFICULTY, "label(), SCREEN_MODEL, SCREEN_COUNTS"), S(BRIEF, "§5 Difficulty"), S(INTERFACES, "§9.1 difficulty.json and the leaderboard gate")),
-         Console("/trends", "the capability gradient (accuracy by tier A→E, per-scenario gradient chips) and 'Screen labels' with one link per label; /scenario/<id> 'Difficulty' shows the three screen trials"),
+    "Hard enough is measured, never asserted from diff size — and it is measured per model: the capability gradient across solver tiers is the "
+    "difficulty evidence, the cheap screen's label is provenance of one run, and a reading pass asks whether the task makes sense, whether the "
+    "hidden tests are fair, and whether the conversation disclosed the right things at the right time."), (
+    Card("Difficulty is model-dependent: the gradient, not the screen",
+         "Difficulty belongs to a task and a model together, not to the task alone. On pytest-dev--pytest-7283 the screen model (deepseek-v3.2, hidden 1/2, "
+         "full 0/1) labelled the scenario broken while deepseek-v4.1-flash and glm-5.3 solved every condition and gpt-5-mini and v3.2 solved interactive but "
+         "not full: the label described one model, not the task. By the ruling of 2026-09-13 14:50 PDT the single-model screen (purpose screen, hidden k=2, "
+         "full k=1, never pooled with comparisons) is retired as a gate; its label stays in difficulty.json and on the scenario row as an informational chip "
+         "recording what that run measured, and as a filter. Difficulty is read on Trends as the capability gradient: accuracy by solver tier A→E per "
+         "condition, with a per-scenario chip that is suspicious when a Tier A/B model beats the best Tier D/E model and saturated when every model with "
+         "n ≥ 2 is at 100%. The leaderboard admits every scenario that is valid and passes the task-sense audit (coherent and fair_tests), whatever its label. "
+         "The frontier admission gate still exists, but the operator can proceed past a refusal with a recorded reason (§9).",
+         (S(GRADING, "Metrics and grouping: difficulty; First hosted results (2026-09-13)"), S(GRADIENT, "module docstring, gradient_state()"),
+          S(DIFFICULTY, "label(), SCREEN_MODEL, SCREEN_COUNTS"), S(BRIEF, "§5 Difficulty: Superseded 2026-09-13 14:50 PDT"),
+          S(INTERFACES, "§9.1 difficulty.json and the leaderboard gate"), LEDGER),
+         Console("/trends", "the capability gradient (accuracy by tier A→E per arm, per-scenario chips holds · suspicious · saturated · not-monotone) and "
+                 "'Screen labels' with one link per label; /leaderboard 'Gate' table shows valid and task-sense checks with the label as a chip; "
+                 "/scenario/<id> 'Difficulty' shows the three screen trials"),
          SCREEN,
          (Decision("Difficulty comes from selection and measurement; a scenario is never edited after a gate to make it harder.",
                    "Hand-tuned tests would measure the tuner, not the model, and would break the provenance of every fact and requirement.",
-                   "Some easy tasks are registered and then excluded as saturated instead of being fixed.", "2026-09-13", S(BRIEF, "§5 Difficulty: Not done")),)),
+                   "Some easy tasks are registered and stay on the board with a saturated gradient chip instead of being fixed.", "2026-09-13", S(BRIEF, "§5 Difficulty: Not done")),
+          Decision("2026-09-13 14:50: screen label demoted to informational; capability gradient replaces it.",
+                   "Difficulty is model-dependent: pytest-7283's broken label described the screen model (deepseek-v3.2 full 0/1) while two other models "
+                   "saturated the task and two more solved interactive but not full; a one-model label cannot gate a many-model board.",
+                   "An easy task inflates every model's score until the gradient chips flag it.", "2026-09-13 14:50 PDT", LEDGER))),
     Card("The task-sense audit",
          "Mechanical labels are computed from the frozen transcript and trajectory (was the question asked before the first edit, does the brief already answer "
          "it, did the reply use a term the filter would catch). The labels that need reading are made by claude-opus-5 from evaluator-only inputs: both briefs, "
@@ -805,19 +825,27 @@ FRONTIER_GATE = """
         ▼                                           ▼
    decision written to evidence/sweep/          refused, every failing reason listed;
    frontier-<identity>.json (identity = hash    nothing launched, no model substituted
-   of the policy request); plan_trials re-reads
-   and verifies it against its own request
+   of the policy request); plan_trials re-reads     │ unless --frontier-override "<reason>"
+   and verifies it against its own request          ▼
+                                                {actor, reason} recorded in the same decision file;
+                                                the run proceeds as requested (admission.overridden)
+                                                ruling 2026-09-13 14:50 PDT: the operator decides
 """
 
 SECTION_9 = Section("frontier", "Frontier admission gate", (
     "Frontier models are expensive and their trajectories are the ones people will read, so they run only once the cheap tiers prove the tasks separate "
-    "models and the spend forecast fits. The rule of brief §3.2, as implemented."), (
+    "models and the spend forecast fits. The rule of brief §3.2, as implemented — and, since the ruling of 2026-09-13 14:50 PDT, advisory: the operator "
+    "can proceed past a refusal with a recorded reason, because difficulty is model-dependent and a count of informative screens cannot decide when frontier models run."), (
     Card("The rule as code",
          "Tier A–C requests pass through. A request naming a Tier D or E model is evaluated from frozen evidence: fifteen current, audited, screened scenarios "
          "with two comparison outcomes per arm for each of the six core baselines, the full-over-hidden ordering on a majority of them, eligible targets, "
          "k=1 first for Tier E, a positive cap, complete spend accounting and a forecast under the remaining cap. The decision is written to the evidence "
-         "directory and every later planning step verifies the recorded decision against its own request instead of trusting a flag.",
-         (S(FRONTIER, "module docstring, evaluate(), verify_admission()"), S(BRIEF, "§3.2 Evaluated agents: gating rule"), S(GRADING, "Deferred experimental evidence")),
+         "directory and every later planning step verifies the recorded decision against its own request instead of trusting a flag. A refusal is not the end: "
+         "swesim run-tasks --frontier-override \"<reason>\" records the actor and reason in that decision file, the workflow proceeds on the scenarios as "
+         "requested and every planning step and workflow row carries admission.overridden; an override without a reason is never recorded. The gate's "
+         "fifteen-informative-scenarios clause therefore no longer decides the operator's frontier runs.",
+         (S(FRONTIER, "module docstring, evaluate(), verify_admission()"), S(WORKFLOWS, "_run_batched: PATCH_OVERRIDE, frontier_override_of()"),
+          S(BRIEF, "§3.2 Evaluated agents: gating rule"), S(GRADING, "Deferred experimental evidence")),
          Console("/workflows/<id>", "a refused frontier run fails at plan_trials with every reason in the failure text; /run lists Tier D and E as gated; "
                  "the recorded decision is browsable under /artifacts?path=evidence/sweep", "/workflows"),
          FRONTIER_GATE,
@@ -829,7 +857,10 @@ SECTION_9 = Section("frontier", "Frontier admission gate", (
                    "One extra file read per plan.", "2026-09-13", S(FRONTIER, "verify_admission()")),
           Decision("Frontier tiers only after the path is proven on cheap models; spend tracked per run and capped.",
                    "About $1,500 is acceptable, but a leaderboard on a bad task is worthless and frontier trials cannot be re-run cheaply.",
-                   "A smaller leaderboard by the deadline.", "2026-09-13", S(BRIEF, "§1 Spend; §1 Evaluated agents")))),
+                   "A smaller leaderboard by the deadline.", "2026-09-13", S(BRIEF, "§1 Spend; §1 Evaluated agents")),
+          Decision("The frontier gate stays, but the operator can proceed past a refusal with a recorded reason.",
+                   "Difficulty is model-dependent, so a count of informative screens cannot decide when frontier models run; the operator decides and the record says who and why.",
+                   "A frontier run, at frontier prices, on a task the cheap tiers had not proven.", "2026-09-13 14:50 PDT", LEDGER))),
 ))
 
 # ----------------------------------------------------------------------------- 10. decisions log
@@ -892,6 +923,9 @@ DECISIONS: tuple[Decision, ...] = (
     Decision("Tasks must be hard enough: difficulty is measured on every scenario by the screen, never asserted from diff size.",
              "Diff size is a filter; a saturated toy task is not evidence of model separation.",
              "Some registered tasks are excluded from the board as saturated.", "2026-09-13", S(BRIEF, "§1 Tasks; §5")),
+    Decision("2026-09-13 14:50: screen label demoted to informational; capability gradient replaces it. The leaderboard admits every valid, audited scenario whatever its label.",
+             "Difficulty is model-dependent: pytest-7283's broken label described the screen model (deepseek-v3.2 full 0/1) while deepseek-v4.1-flash and glm-5.3 solved every condition and gpt-5-mini and v3.2 solved interactive but not full.",
+             "An easy task inflates every model's score until the gradient chips flag it.", "2026-09-13 14:50 PDT", LEDGER),
     Decision("Creating tasks from new repositories given as links is the main goal; pool A is the calibration set, not the product.",
              "Re-labelling SWE-bench measures nothing new.",
              "Fewer tasks by morning than mining a curated pool.", "2026-09-13 08:20 UTC", S(BRIEF, "§1 Primary objective")),

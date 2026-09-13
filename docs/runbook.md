@@ -59,7 +59,7 @@ uv run --frozen swesim workflows cancel WORKFLOW_ID
 
 Use the console's spend view and cost rows for recorded provider usage. Unknown usage or price remains unknown, not zero. `SWESIM_SPEND_CAP_USD` stops planning new trials once recorded spend crosses the cap; it is not an external billing limit and does not retroactively cancel work already in flight. A run's own `spend_cap_usd` lowers the cap for that run only.
 
-Keep `purpose=screen`, `comparison`, `calibration` and `demonstration` separate. A screen checks hidden/full success before a larger comparison. Frontier tiers require the brief's gate; no requested model is silently substituted.
+Keep `purpose=screen`, `comparison`, `calibration` and `demonstration` separate. A screen records one model's hidden/full label, which is informational only since the ruling of 2026-09-13 14:50 PDT (difficulty is model-dependent and is read as the capability gradient on Trends; the leaderboard admits every valid, audited scenario whatever the label). Frontier tiers require the brief's gate to run and record its decision, but the operator may proceed past a refusal with a recorded reason (below); no requested model is silently substituted.
 
 ### Frontier gate (Tier D/E solvers)
 
@@ -72,6 +72,8 @@ A `RunTasksWorkflow` that names a Tier D or E model (`swesim/roles.py` `TIERS`) 
 - "A positive spend cap is required for frontier runs." / "Spend accounting is incomplete; unknown usage cannot be treated as zero." / "A forecast requires measured baseline token usage." / "No verified price for <model>." / "Projected spend exceeds the remaining cap." — the forecast (largest observed baseline token counts × 1.25 × trials) plus known spend must fit under the lower of the run's `spend_cap_usd` and `SWESIM_SPEND_CAP_USD`; `admission.forecast_usd` and `forecast_basis` show the arithmetic.
 
 Saturated scenarios are excluded unless the request carries `include_saturated: true`; the decision binds that flag, so a decision made without it never admits a plan that includes a saturated scenario. Neither `swesim run-tasks` nor the console's Run form exposes the flag yet (deferred list); until they do, the only way to include a saturated scenario is to start the workflow with `include_saturated` in its request through `swesim.workflows.client.start_run`, which still runs the gate. Tier A–C requests carry no admission and are never gated. The gate never launches a trial and never substitutes a model.
+
+**Operator override (user ruling 2026-09-13 14:50 PDT).** Difficulty is model-dependent, so the evidence clause above — 15 audited scenarios with an informative or saturated screen — is no longer how the operator decides frontier runs. `swesim run-tasks --frontier-override "<reason>"` sends `{actor, reason}` with the request (the actor defaults to the CLI login name; an empty reason is refused before anything starts). When the gate refuses, `frontier_gate_activity` writes the override into the same `evidence/sweep/frontier-<identity>.json` (`override_recorded`), the workflow proceeds on the scenarios as requested, and `admission.overridden` travels with every planning step and the workflow row. Without the flag a refused run still returns `status: blocked` as above. The gate itself is unchanged: it evaluates and records its reasons either way, so the record shows both the refusal and who overrode it and why.
 
 ## Diagnose a missing or stuck trial
 
