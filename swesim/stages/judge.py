@@ -78,6 +78,12 @@ def norm_text(text: str | None) -> str:
 # test patch are the essentials, so exhausting every ladder means the candidate genuinely does not fit.
 TRIM_LADDER = {"problem_statement": [20000, 6000], "hints_text": [20000, 4000], "patch": [30000, 8000], "test_patch": [40000, 15000],
                "pass_to_pass": [10, 0], "thread": [20, 5, 0]}
+# Row fields that are pipeline bookkeeping or evaluator-only, never evidence for the judge or the drafter. The offline probe
+# block (per-test statuses for every id) is 63 kB on pypdf-3826 and 123 kB on pypdf-4032; copied into the view it pushed both
+# past the 120 kB authoring budget on the first Temporal rebuild although the evidence itself is under 30 kB. `annotation`
+# holds the human underspecification notes (calibration independence); `judge` is passed to the drafter separately.
+NON_AUTHORING_FIELDS = frozenset({"probe", "statuses", "dropped", "probe_dir", "repo_dir", "image", "dockerfile", "install_command",
+                                  "test_command", "test_python", "annotation", "judge"})
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -121,7 +127,7 @@ def llm_view(row: dict, budget: int | None = None, extra_chars: int = 0) -> dict
     `extra_chars` must fit: the largest trimmable field is cut one ladder notch at a time (`TRIM_LADDER`), the cuts are
     recorded under `trimmed`, and ValueError is raised only when every ladder is exhausted and the essentials (issue text
     head, FAIL_TO_PASS ids, test patch head) still do not fit. The spec itself always keeps the full row."""
-    view = dict(row)
+    view = {k: v for k, v in row.items() if k not in NON_AUTHORING_FIELDS}
     p2p = row.get("pass_to_pass") or []
     if len(p2p) > P2P_SAMPLE:
         view.update(pass_to_pass=p2p[:P2P_SAMPLE], pass_to_pass_count=len(p2p), pass_to_pass_truncated=True)

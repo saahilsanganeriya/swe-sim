@@ -1687,3 +1687,21 @@ def test_withhold_nudges_once_when_nothing_selected_but_issue_has_a_code_block(m
     calls.clear(); monkeypatch.setattr(draft_spec, "chat_json", lambda m, s, msgs, sch, **k: (calls.append(1), {"removed": []})[1])
     res = draft_spec.withhold(plain, "fake/model")
     assert len(calls) == 1 and res["stats"]["attempts"] == 1 and res["stats"]["reason"] == "model selected no spans"
+
+
+def test_llm_view_drops_probe_bookkeeping_and_human_notes_before_budgeting():
+    """The mined row carries the offline probe block and per-test statuses (over 100 kB on pypdf); they are not evidence and
+    must not consume the authoring budget (both pypdf candidates failed judging on the first Temporal rebuild). Annotator
+    notes never reach the judge or the drafter."""
+    from swesim.stages.judge import NON_AUTHORING_FIELDS, llm_view
+    row = {"instance_id": "x__y-1", "repo": "x/y", "problem_statement": "p" * 1000, "hints_text": "h" * 200, "test_patch": "t" * 1000,
+           "patch": "d" * 500, "fail_to_pass": ["a::b"], "pass_to_pass": ["c"] * 5, "thread": {"linked_issues": []},
+           "probe": {"statuses": {f"tests/t_{i}.py::test_{i}": "passed" for i in range(3000)}, "binding": "b" * 64},
+           "statuses": {f"tests/t_{i}.py::test_{i}": "failed" for i in range(3000)}, "dropped": ["x" * 20] * 100,
+           "annotation": {"underspecified": "2.0", "underspecified_notes": "secret human note"}, "dockerfile": "FROM x", "test_command": "pytest",
+           "judge": {"accept": True}}
+    assert len(json.dumps(row)) > 120000
+    view = llm_view(row, budget=120000)
+    assert not (set(view) & NON_AUTHORING_FIELDS) and "trimmed" not in view and "secret human note" not in json.dumps(view)
+    assert view["problem_statement"] == row["problem_statement"] and view["fail_to_pass"] == ["a::b"] and view["test_patch"] == row["test_patch"]
+    assert "probe" not in llm_view(row)   # unbudgeted view too
