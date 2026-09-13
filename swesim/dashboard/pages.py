@@ -153,7 +153,7 @@ def trials_body(page, views: list[dict], facets: dict, current: dict) -> str:
             "<button type='submit' class='button'>Filter</button> <a class='button' href='/trials'>Reset</a></form>"]
     body = ["<h1>Trials</h1><p class='lead'>Every trial record and every planned, launched, unresolved or launch-failed attempt. Unresolved attempts never enter n or pass@k.</p>",
             "".join(form),
-            table("trials", TRIAL_COLUMNS, views, key="trial_id", total=page.total, offset=page.offset, limit=page.limit,
+            table("trials", TRIAL_COLUMNS, views, key="trial_id", total=page.total, offset=page.offset, limit=page.limit, source="/api/trials",
                   empty="<strong>No trials match.</strong> Reset the filters, or start a run on <a href='/run'>Run</a>.")]
     return "".join(body)
 
@@ -169,7 +169,7 @@ def candidates_body(page, views: list[dict], funnel_steps: list[dict], hist: dic
             "<div class='side-by-side'><div>", charts.funnel(funnel_steps, "chart-funnel"), "</div><div>",
             charts.hbars(list(hist.items()), "chart-rejects", "rejects by gate"), "</div></div>",
             "<h2>Every candidate</h2>",
-            table("candidates", CANDIDATE_COLUMNS, views, key="instance_id", total=page.total, offset=page.offset, limit=page.limit,
+            table("candidates", CANDIDATE_COLUMNS, views, key="instance_id", total=page.total, offset=page.offset, limit=page.limit, source="/api/candidates",
                   empty="<strong>No candidate rows.</strong> A creation job's mining step writes <code>candidates/&lt;key&gt;.jsonl</code>; judged and probed rows follow.")]
     return "".join(body)
 
