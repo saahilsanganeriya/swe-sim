@@ -31,12 +31,15 @@ def build_probe_command(repo_dir: str, gold_lines: list[str], gold_sha: str = ""
 
 
 def parse_probe_output(text: str) -> dict:
+    """Markers are matched as whole lines so a file named like `HITS_END_fixture.py` cannot truncate the block;
+    `hits_block_found` is False when the probe output is incomplete."""
     refs = re.search(r"^REFS=\s*(\d+)", text, re.M)
     reflog = re.search(r"^REFLOG=\s*(\d+)", text, re.M)
-    block = re.search(r"HITS_BEGIN\n(.*?)HITS_END", text, re.S)
+    block = re.search(r"^HITS_BEGIN$\n(.*?)^HITS_END$", text, re.M | re.S)
     hits = [line.strip() for line in block.group(1).splitlines() if line.strip()] if block else []
     return {"reflog_entries": int(reflog.group(1)) if reflog else None, "all_refs": int(refs.group(1)) if refs else None,
-            "gold_line_hits": hits, "gold_object_reachable": any(h.startswith("GOLD_OBJECT_REACHABLE") for h in hits)}
+            "gold_line_hits": hits, "gold_object_reachable": any(h.startswith("GOLD_OBJECT_REACHABLE") for h in hits),
+            "hits_block_found": block is not None}
 
 
 class PatchAgent(BaseAgent):

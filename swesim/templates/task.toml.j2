@@ -29,7 +29,7 @@ build_timeout_sec = 1800.0
 
 [[verifier.collect]]
 user = "root"
-timeout_sec = 300.0
+timeout_sec = {{ collect_timeout }}
 command = {{ collect_command | tojson }}
 
 [agent]

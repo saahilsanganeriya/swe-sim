@@ -43,6 +43,14 @@ def test_expectations_edge_cases():
     nonnum = json.loads(json.dumps(good)); nonnum["oracle"]["reward"] = "1"
     ok, failures = evaluate_controls(nonnum, controls)
     assert not ok and any("numeric" in f for f in failures)
+    partial_alt = json.loads(json.dumps(good)); partial_alt["alt-correct:alt"]["reward"] = 0.5
+    ok, failures = evaluate_controls(partial_alt, controls)
+    assert not ok and failures == ["alt-correct:alt: reward 0.5 != 1"]  # an alternative correct fix must earn full credit
+    declared = json.loads(json.dumps(controls)); declared["tamper"][1]["expected_reward"] = 1.0; declared["plausible_wrong"][0]["expected_reward"] = 0.0
+    assert evaluate_controls(good, declared) == (True, [])
+    off = json.loads(json.dumps(good)); off["tamper:benign"]["reward"] = 0.5; off["plausible-wrong:k"]["reward"] = 0.0
+    ok, failures = evaluate_controls(off, declared)
+    assert not ok and failures == ["tamper:benign: reward 0.5 != expected 1.0"]
 
 
 def test_gold_lines_picks_long_added_lines():
@@ -118,12 +126,13 @@ def test_validate_scenario_invalid_reasons(tmp_path, monkeypatch):
     ws, spec = _spec_ws(tmp_path)
     monkeypatch.setattr(validate, "compile_scenario", _fake_compile(tmp_path, spec))
     bad = json.loads(json.dumps(GOOD)); bad["nop"]["per_test"] = [{"id": "t1", "observed": "passed"}, {"id": "t0", "observed": "passed"}]
-    run_task, _ = _fake_harbor(ws.jobs_dir, bad, "REFS=1\nREFLOG=1\nGOLD_SHA_CHECKED=none\nHITS_BEGIN\n./pkg/mod.py\nHITS_END\n", exception_for={"tamper-root-conftest"})
+    run_task, _ = _fake_harbor(ws.jobs_dir, bad, "REFS=1\nREFLOG=1\nGOLD_SHA_CHECKED=abc\nHITS_BEGIN\nGOLD_OBJECT_REACHABLE:abc\n./pkg/mod.py\nHITS_END\n", exception_for={"tamper-root-conftest"})
     monkeypatch.setattr(harbor_cli, "run_task", run_task)
     out = validate.validate_scenario(ws, spec, RunConfig.default("full"), "https://x.modal.run")
     assert out["status"] == "invalid"
     assert any("base must execute" in f for f in out["failures"])
-    assert any("gold patch lines reachable" in f for f in out["failures"])
+    assert any("gold patch lines reachable" in f and "./pkg/mod.py" in f and "GOLD_OBJECT" not in f for f in out["failures"])
+    assert any("gold commit object reachable" in f for f in out["failures"]) and out["probe"]["gold_object_reachable"] is True
     assert any(f.startswith("tamper:root-conftest") and "control agent failed" in f for f in out["failures"])
     assert json.loads((ws.scenario_dir(spec.id) / "validation.json").read_text())["status"] == "invalid"
 
@@ -215,6 +224,18 @@ def test_run_task_reconciles_and_refuses_ambiguity(tmp_path, monkeypatch):
     monkeypatch.setattr(harbor_cli.subprocess, "run", timeout)
     with pytest.raises(harbor_cli.HarborRunError, match="deadline"):
         harbor_cli.run_task(tmp_path / "task", "nop", jobs, "slow")
+
+
+def test_run_task_malformed_result_is_a_harbor_error(tmp_path, monkeypatch):
+    jobs = tmp_path / "jobs"; monkeypatch.setattr(harbor_cli, "harbor_executable", lambda: "/bin/harbor")
+    def fake_run(cmd, capture_output, text, timeout, env):
+        job = jobs / cmd[cmd.index("--job-name") + 1]; (job / "t").mkdir(parents=True); (job / "t" / "result.json").write_text("{not json")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    monkeypatch.setattr(harbor_cli.subprocess, "run", fake_run)
+    with pytest.raises(harbor_cli.HarborRunError, match="malformed"):
+        harbor_cli.run_task(tmp_path / "task", "nop", jobs, "bad")
+    with pytest.raises(harbor_cli.HarborRunError, match="malformed"):  # reconciling an existing job reads the same file
+        harbor_cli.run_task(tmp_path / "task", "nop", jobs, "bad")
 
 
 def test_read_reward_and_report(tmp_path):

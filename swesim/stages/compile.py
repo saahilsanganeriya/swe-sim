@@ -33,6 +33,8 @@ AGENT_PYTHON = "3.12"  # Harbor's mini-swe-agent adapter pin (_MINI_SWE_AGENT_PY
 CONDITIONS = ("full", "hidden", "interactive")
 VERIFIER_TIMEOUT_SEC = 1800.0
 TEST_TIMEOUT_SEC = 600  # per pytest invocation inside the grader; the verifier budget above covers the reruns
+# [[verifier.collect]] hook budget: two 240 s freeze attempts (collect.py FREEZE_*) plus killing and archiving the tree.
+COLLECT_TIMEOUT_SEC = 600.0
 ARTIFACTS_DIR = "/var/swesim-collect"
 # Always protected, in addition to the contract's declared paths and its test files (global constraints).
 DEFAULT_PROTECTED = ["**/conftest.py", "**/sitecustomize.py", "**/usercustomize.py", "**/*.pth", "pytest.ini", "tox.ini",
@@ -120,9 +122,11 @@ def _digest_tree(paths) -> dict[str, str]:
     return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(paths) if p.is_file()}
 
 
-def compiled_hash(spec: ScenarioSpec, image_digest: str | None) -> str:
-    """Content hash of everything that shapes the graded environment: spec, base image, templates, verifier, shims."""
+def compiled_hash(spec: ScenarioSpec, image_digest: str | None, agent_version: str | None) -> str:
+    """Content hash of everything that shapes the graded environment: spec, base image, pre-baked agent toolchain,
+    templates, verifier, shims. Two task trees with the same hash build the same images."""
     inputs = {"spec_hash": spec.spec_hash, "image_digest": image_digest,
+              "agent_version": agent_version, "agent_python": AGENT_PYTHON,
               "templates": _digest_tree(TEMPLATES.iterdir()),
               "verifier": _digest_tree(VERIFIER_SRC / f for f in VERIFIER_FILES),
               "shims": _digest_tree(SHIMS / f for f in SHIM_FILES)}
@@ -164,7 +168,7 @@ def compile_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, s
     base_stage, digest = _base_stage(spec, sdir, resolve_digest)
     hosts = _hosts(run_config, stakeholder_url)
     natural, selected = _select_briefs(spec, run_config)
-    chash = compiled_hash(spec, digest)
+    chash = compiled_hash(spec, digest, run_config.agent_version)
     env = Environment(loader=FileSystemLoader(str(TEMPLATES)), keep_trailing_newline=True, trim_blocks=True, lstrip_blocks=True, undefined=StrictUndefined)
     repo_dir = spec.environment.repo_dir
     out: dict[str, Path] = {}
@@ -174,6 +178,7 @@ def compile_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, s
         ctx = dict(spec=spec, run_config=run_config, condition=condition, task_name=f"{spec.id}--{condition}", image_digest=digest,
                    agent_hosts=hosts, stakeholder_url=stakeholder_url, session_token=session_token if condition == "interactive" else "",
                    trial_id=trial_id, collect_command=_collect_command(spec, stakeholder_url), verifier_timeout=VERIFIER_TIMEOUT_SEC,
+                   collect_timeout=COLLECT_TIMEOUT_SEC,
                    repo_dir=repo_dir, repo_dir_q=shlex.quote(repo_dir), base_commit=spec.environment.base_commit, base_stage=base_stage,
                    agent_python=AGENT_PYTHON, agent_version=run_config.agent_version, compiled_hash=chash,
                    brief=natural.text if condition == "full" else selected.text, brief_profile="natural" if condition == "full" else selected.profile,

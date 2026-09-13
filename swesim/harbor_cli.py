@@ -30,6 +30,13 @@ def _terminal_trials(job_dir: Path) -> list[Path]:
     return sorted(p.parent for p in job_dir.glob("*/result.json"))
 
 
+def _read_result(trial_dir: Path):
+    try:
+        return json.loads((trial_dir / "result.json").read_text() or "null")
+    except (OSError, ValueError) as e:
+        raise HarborRunError(f"malformed result.json in {trial_dir}: {e}") from e
+
+
 def run_task(task_dir: Path, agent: str, jobs_dir: Path, job_name: str, model: str | None = None, agent_kwargs: dict | None = None,
              env_provider: str = "modal", timeout_sec: int = 10800) -> Path:
     """Launch one Harbor job and return its trial directory. Agent-error trials are returned too (attribution needs
@@ -37,7 +44,8 @@ def run_task(task_dir: Path, agent: str, jobs_dir: Path, job_name: str, model: s
     jobs_dir = Path(jobs_dir); job_dir = jobs_dir / job_name
     if job_dir.exists():
         matches = _terminal_trials(job_dir)
-        if len(matches) == 1: return matches[0]
+        if len(matches) == 1:
+            _read_result(matches[0]); return matches[0]
         raise HarborRunError(f"job {job_dir} exists without a unique terminal result; reconcile, do not relaunch")
     cmd = [harbor_executable(), "run", "--max-retries", "0", "-p", str(task_dir), "--agent", agent, "-e", env_provider,
            "--jobs-dir", str(jobs_dir), "--job-name", job_name, "--yes"]
@@ -54,7 +62,7 @@ def run_task(task_dir: Path, agent: str, jobs_dir: Path, job_name: str, model: s
     trials = _terminal_trials(job_dir)
     if len(trials) > 1: raise HarborRunError("ambiguous job; never pick a random last trial")
     if not trials: raise HarborRunError(f"no trial dir; harbor rc={proc.returncode} stdout tail: {proc.stdout[-1500:]} stderr: {proc.stderr[-1500:]}")
-    result = json.loads((trials[0] / "result.json").read_text() or "null")
+    result = _read_result(trials[0])
     if proc.returncode and not result: raise HarborRunError("Harbor failed without result")
     return trials[0]
 

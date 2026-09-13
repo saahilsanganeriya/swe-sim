@@ -38,11 +38,20 @@ def evaluate_controls(results: dict[str, dict], controls: dict) -> tuple[bool, l
         if c.get("expected_reward_max") is not None and isinstance(r.get("reward"), (int, float)) and r["reward"] > c["expected_reward_max"] + 1e-9:
             failures.append(f"plausible-wrong:{c['name']}: reward {r.get('reward')} > max {c['expected_reward_max']}")
     for c in controls["alternative_correct"]:
-        if results[f"alt-correct:{c['name']}"].get("success") != 1: failures.append(f"alt-correct:{c['name']}: success != 1")
+        r = results[f"alt-correct:{c['name']}"]
+        if r.get("success") != 1: failures.append(f"alt-correct:{c['name']}: success != 1")
+        elif r.get("reward") != 1: failures.append(f"alt-correct:{c['name']}: reward {r.get('reward')} != 1")
     for c in controls["tamper"]:
         r = results[f"tamper:{c['name']}"]
         if c.get("cls") == "incorrect-exploit" and r.get("reward", 1) != 0: failures.append(f"tamper:{c['name']}: exploit earned reward {r.get('reward')}")
         if c.get("cls") == "benign-edit" and r.get("success") != 1: failures.append(f"tamper:{c['name']}: benign edit failed")
+    # A declared exact reward is checked for every control category (in addition to the class rules above).
+    for prefix, key in (("plausible-wrong", "plausible_wrong"), ("alt-correct", "alternative_correct"), ("tamper", "tamper")):
+        for c in controls[key]:
+            r = results[f"{prefix}:{c['name']}"]
+            if c.get("expected_reward") is not None and isinstance(r.get("reward"), (int, float)) and abs(r["reward"] - c["expected_reward"]) > 1e-9:
+                msg = f"{prefix}:{c['name']}: reward {r['reward']} != expected {c['expected_reward']}"
+                if msg not in failures and not any(f.startswith(f"{prefix}:{c['name']}: ") and "reward" in f for f in failures): failures.append(msg)
     return (not failures), failures
 
 
@@ -82,7 +91,7 @@ def validate_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, 
             failures.append(f"{name}: launch failed: {e}"); launch_failed = True; break  # systemic; do not burn the remaining launches
         trial_dirs[name] = str(td); results[name] = dict(harbor_cli.read_reward(td)); results[name]["report"] = harbor_cli.read_report(td)
         if _exception_info(td): failures.append(f"{name}: control agent failed before a clean submission")
-    probe = {"raw": "", "gold_hits": [], "all_refs": None, "reflog_entries": None, "gold_object_reachable": False}; probe_txt = ""
+    probe = {"raw": "", "gold_hits": [], "all_refs": None, "reflog_entries": None, "gold_object_reachable": False, "hits_block_found": False}; probe_txt = ""
     if not launch_failed:
         try:
             probe_dir = harbor_cli.run_task(task, PATCH_AGENT, jobs, f"{spec.id}--probe",
@@ -95,7 +104,8 @@ def validate_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, 
             probe_txt = p.read_text() if p.exists() else ""
             parsed = parse_probe_output(probe_txt)
             probe = {"raw": probe_txt[-2000:], "gold_hits": parsed["gold_line_hits"], "all_refs": parsed["all_refs"],
-                     "reflog_entries": parsed["reflog_entries"], "gold_object_reachable": parsed["gold_object_reachable"]}
+                     "reflog_entries": parsed["reflog_entries"], "gold_object_reachable": parsed["gold_object_reachable"],
+                     "hits_block_found": parsed["hits_block_found"]}
     ok, control_failures = evaluate_controls(results, spec.controls.model_dump()); failures.extend(control_failures)
     base = {t["id"]: t["observed"] for t in results.get("nop", {}).get("report", {}).get("per_test", [])}
     gold = {t["id"]: t["observed"] for t in results.get("oracle", {}).get("report", {}).get("per_test", [])}
@@ -103,8 +113,10 @@ def validate_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, 
     if set(base) != wanted or any(base.get(t) not in {"failed", "error"} for t in spec.contract.fail_to_pass) or any(base.get(t) != "passed" for t in spec.contract.pass_to_pass):
         failures.append("base must execute every target as failed/error and every regression as passed")
     if set(gold) != wanted or any(gold[t] != "passed" for t in wanted): failures.append("gold exact-id manifest failed")
-    if not probe_txt or "HITS_BEGIN" not in probe_txt or "HITS_END" not in probe_txt: failures.append("missing reachability evidence")
-    if probe["gold_hits"]: failures.append(f"gold patch lines reachable in agent image: {probe['gold_hits'][:3]}")
+    if not probe["hits_block_found"]: failures.append("missing reachability evidence")
+    line_hits = [h for h in probe["gold_hits"] if not h.startswith("GOLD_OBJECT_REACHABLE")]
+    if probe["gold_object_reachable"]: failures.append("gold commit object reachable in agent image (history not stripped)")
+    if line_hits: failures.append(f"gold patch lines reachable in agent image: {line_hits[:3]}")
     controls_out = {k: {**{kk: vv for kk, vv in v.items() if kk != "report"}, "outcome": OUTCOME_NAMES.get(v.get("outcome_code")), "expected": expected.get(k, {})}
                     for k, v in results.items()}
     out = {"status": "valid" if not failures else "invalid", "failures": failures, "expected_base": base, "expected_gold": gold,

@@ -23,10 +23,18 @@ def test_probe_command_greps_gold_lines():
 
 def test_parse_probe_output_separates_counts_from_hits():
     out = "REFS=1\nREFLOG=1\nGOLD_SHA_CHECKED=none\nHITS_BEGIN\nHITS_END\n"
-    assert parse_probe_output(out) == {"reflog_entries": 1, "all_refs": 1, "gold_line_hits": [], "gold_object_reachable": False}
+    assert parse_probe_output(out) == {"reflog_entries": 1, "all_refs": 1, "gold_line_hits": [], "gold_object_reachable": False, "hits_block_found": True}
     out = "REFS=3\nREFLOG=7\nGOLD_SHA_CHECKED=abc\nHITS_BEGIN\nGOLD_OBJECT_REACHABLE:abc\n./pkg/mod.py\nHITS_END\n"
     p = parse_probe_output(out)
     assert p["all_refs"] == 3 and p["reflog_entries"] == 7 and p["gold_object_reachable"] and p["gold_line_hits"] == ["GOLD_OBJECT_REACHABLE:abc", "./pkg/mod.py"]
+
+
+def test_parse_probe_output_markers_are_line_anchored():
+    out = "REFS=1\nREFLOG=0\nGOLD_SHA_CHECKED=none\nHITS_BEGIN\n./tests/HITS_END_fixture.py\n./HITS_BEGIN.txt\nHITS_END\n"
+    p = parse_probe_output(out)
+    assert p["gold_line_hits"] == ["./tests/HITS_END_fixture.py", "./HITS_BEGIN.txt"] and p["hits_block_found"] is True
+    truncated = parse_probe_output("REFS=1\nREFLOG=0\nHITS_BEGIN\n./x.py\n")
+    assert truncated["hits_block_found"] is False and truncated["gold_line_hits"] == []
 
 
 def test_agent_identity_and_kwargs(tmp_path):
@@ -75,7 +83,7 @@ def test_run_probe_writes_txt_and_json(tmp_path):
     assert len(probe_calls) == 1 and probe_calls[0][1] == "agent" and "new_helper" in probe_calls[0][0]
     assert "HITS_BEGIN" in (logs / "probe.txt").read_text()
     j = json.loads((logs / "probe.json").read_text())
-    assert j == {"reflog_entries": 1, "all_refs": 1, "gold_line_hits": ["./pkg/mod.py"], "gold_object_reachable": False}
+    assert j == {"reflog_entries": 1, "all_refs": 1, "gold_line_hits": ["./pkg/mod.py"], "gold_object_reachable": False, "hits_block_found": True}
     assert not env.uploads
 
 

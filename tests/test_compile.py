@@ -101,6 +101,7 @@ def test_task_toml_validates_against_harbor_schema(tmp_path):
         assert cfg.verifier.network_mode.value == "no-network" and cfg.verifier.environment_mode.value == "separate"
         assert cfg.verifier.environment.network_mode.value == "no-network"  # baseline of the separate verifier image, not only the phase
         assert cfg.verifier.collect[0].user == "root" and cfg.verifier.collect[0].command.startswith("/usr/bin/env -i ")
+        assert cfg.verifier.collect[0].timeout_sec == comp.COLLECT_TIMEOUT_SEC >= 2 * 240 + 60  # covers two long freeze attempts plus the archive
         assert "SWESIM_SESSION_TOKEN=\"$SWESIM_SESSION_TOKEN\"" in cfg.verifier.collect[0].command
         assert cfg.artifacts == ["/var/swesim-collect/app.tar", "/var/swesim-collect/collect.status"]
         assert cfg.environment.env["UV_OFFLINE"] == "1" and cfg.environment.env["UV_NO_PROGRESS"] == "1" and cfg.environment.env["UV_CACHE_DIR"] == "/tmp/uv-cache"
@@ -188,6 +189,10 @@ def test_compile_json_and_compiled_hash(tmp_path, neighbours):
     assert a == b and set(a) >= {"compiled_hash", "spec_hash", "run_config_hash", "image_digest", "brief_profile", "task_dirs"}
     assert a["spec_hash"] == spec.spec_hash and a["run_config_hash"] == rc.run_config_hash and a["image_digest"] is None
     assert a["brief_profile"] == "natural"  # withheld requested, absent from spec: fall back and record it
+    bumped = RunConfig.model_validate({"condition": "full", "agent_version": "2.4.7"})
+    v = json.loads(comp.compile_scenario(ws, spec, bumped, URL, resolve_digest=False).compile_json.read_text())
+    assert v["compiled_hash"] != a["compiled_hash"]  # a different pre-baked agent is a different environment
+    assert comp.compiled_hash(spec, None, "2.4.6") == a["compiled_hash"] and comp.compiled_hash(spec, None, "2.4.7") == v["compiled_hash"]
     (neighbours[0] / "grader.py").write_text("# changed\n")
     c = json.loads(comp.compile_scenario(ws, spec, rc, URL, resolve_digest=False).compile_json.read_text())
     assert c["compiled_hash"] != a["compiled_hash"]
@@ -327,12 +332,13 @@ def test_collector_oversized_and_member_caps_still_freeze(tmp_path):
         def read(self): return json.dumps({"frozen": True, "transcript_hash": "f" * 64}).encode()
 
     def opener(req, timeout=None):
-        calls.append((req.full_url, req.get_header("Authorization"), req.data)); return _Resp()
+        calls.append((req.full_url, req.get_header("Authorization"), req.data, timeout)); return _Resp()
 
     r = c.collect(repo, out, stakeholder_url="https://s.modal.run", token="tok", kill=lambda: None, opener=opener, limit_bytes=25)
     assert r["status"] == "oversized" and r["sha256"] is None and not (out / "app.tar").exists()
-    assert r["freeze_status"] == "ok" and r["transcript_hash"] == "f" * 64
-    assert calls == [("https://s.modal.run/freeze", "Bearer tok", b"{}")]
+    assert r["freeze_status"] == "ok" and r["transcript_hash"] == "f" * 64 and r["freeze_elapsed_sec"] >= 0
+    assert c.FREEZE_TIMEOUT_SEC >= 240 and c.FREEZE_ATTEMPTS == 2  # the stakeholder may hold its lock through a model call
+    assert calls == [("https://s.modal.run/freeze", "Bearer tok", b"{}", c.FREEZE_TIMEOUT_SEC)]
     r = c.collect(repo, out, stakeholder_url="https://s.modal.run", token="tok", kill=lambda: None, opener=opener, limit_members=3)
     assert r["status"] == "oversized" and len(calls) == 2
     assert json.loads((out / "collect.status").read_text())["status"] == "oversized"
@@ -352,22 +358,44 @@ def test_collector_invalid_tree_and_failures(tmp_path):
     r = c.collect(_tree(tmp_path / "app"), out, "https://s.modal.run", "tok", kill=boom, opener=opener)
     assert r["status"] == "collection-failure" and r["rc"] == 1 and "pkill failed" in r["error"]
     assert frozen and r["freeze_status"] == "failed" and r["transcript_hash"] is None  # freeze attempted in finally, twice
-    assert len(frozen) == 2
+    assert len(frozen) == 2 and r["freeze_elapsed_sec"] >= 0
+    assert "2 attempts" in r["freeze_error"] and "OSError" in r["freeze_error"] and "stakeholder down" in r["freeze_error"]
 
 
-def test_collector_kill_loop(monkeypatch):
+class _P:
+    def __init__(self, rc): self.returncode = rc
+
+
+def _fake_proc(root: Path, procs: dict[str, tuple[int, str]]) -> Path:
+    """A /proc look-alike: <pid>/status with Uid (real, effective, saved, fs) and State lines."""
+    for pid, (uid, state) in procs.items():
+        d = root / pid; d.mkdir(parents=True)
+        (d / "status").write_text(f"Name:\tx\nState:\t{state}\nPid:\t{pid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    (root / "self").mkdir(); (root / "999").mkdir()  # non-pid entry; pid that exited between listing and read
+    return root
+
+
+def test_collector_kill_loop(tmp_path, monkeypatch):
     c = _collector(); rcs = iter([0, 0, 1]); seen = []
-
-    class P:
-        def __init__(self, rc): self.returncode = rc
-    def fake_run(cmd, **kw): seen.append(cmd); return P(next(rcs))
+    def fake_run(cmd, **kw): seen.append(cmd); return _P(next(rcs))
     monkeypatch.setattr(c.subprocess, "run", fake_run)
-    c.kill_agent_processes()
+    c.kill_agent_processes(proc_root=tmp_path / "unused-proc", uid=1001)
     assert seen and all(cmd[:1] == ["/usr/bin/pkill"] and "-u" in cmd and "agent" in cmd for cmd in seen) and len(seen) == 3
-    monkeypatch.setattr(c.subprocess, "run", lambda cmd, **kw: P(0))
-    with pytest.raises(RuntimeError, match="remain"): c.kill_agent_processes(attempts=3)
-    monkeypatch.setattr(c.subprocess, "run", lambda cmd, **kw: P(2))
-    with pytest.raises(RuntimeError, match="pkill"): c.kill_agent_processes()
+    monkeypatch.setattr(c.subprocess, "run", lambda cmd, **kw: _P(2))
+    with pytest.raises(RuntimeError, match="pkill"): c.kill_agent_processes(proc_root=tmp_path / "unused-proc", uid=1001)
+
+
+def test_collector_zombies_are_not_survivors(tmp_path, monkeypatch):
+    c = _collector()
+    proc = _fake_proc(tmp_path / "proc", {"1": (0, "S (sleeping)"), "42": (1001, "Z (zombie)"), "43": (1001, "S (sleeping)"), "44": (1001, "X (dead)")})
+    assert c.live_processes(1001, proc) == [43]
+    monkeypatch.setattr(c.subprocess, "run", lambda cmd, **kw: _P(0))  # pkill keeps matching: procps does not filter zombies
+    with pytest.raises(RuntimeError, match=r"remain.*43"): c.kill_agent_processes(attempts=2, proc_root=proc, uid=1001)
+    import shutil; shutil.rmtree(proc / "43")
+    c.kill_agent_processes(attempts=2, proc_root=proc, uid=1001)  # only an unreaped zombie is left: not a collection failure
+    (proc / "45").mkdir(); (proc / "45" / "status").write_text("State:\tR (running)\nUid:\t0\t1001\t1001\t1001\n")
+    assert c.live_processes(1001, proc) == [45]  # effective uid counts (pkill -u semantics)
+    with pytest.raises(RuntimeError, match="not found"): c.kill_agent_processes(user="no-such-user-swesim", attempts=1, proc_root=proc)
 
 
 def test_collector_main_reads_cleared_env(tmp_path, monkeypatch):
