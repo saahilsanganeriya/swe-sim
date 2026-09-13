@@ -79,3 +79,82 @@ def test_operator_action_is_durable_before_sql(context, monkeypatch):
     row = action()
     with pytest.raises(RuntimeError): store.add_operator_action(row)
     assert history.read_rows(layout, "operator_actions") == [row]
+
+
+# ----------------------------------------------------------------------------- candidate decision receipts (P1-7)
+
+def _event(**over) -> dict:
+    return {"source_key": "swebench-annotated", "instance_id": "example-scenario", "candidates_path": "/plans/create-1/0.candidates.jsonl",
+            "scenario_id": "example-scenario", "version": 2, "phase": "auto-approval", "stage": "approved", "status": "rejected",
+            "gate": "auto-approval", "reasons": ["withheld brief lost the natural title line"], "terminal": True,
+            "occurred_at": "2026-09-13T12:00:00+00:00", "workflow_id": "create:example-scenario", "run_id": "run-9", "type": "CandidateWorkflow",
+            "parent_workflow_id": "create-1", **over}
+
+
+def test_candidate_receipt_is_durable_first_and_makes_a_rejected_candidate_never_show_as_kept(tmp_path, monkeypatch):
+    from swesim.index import activities as IA
+    from swesim.index import project as P
+    from swesim.index.files import FileIndexReader
+
+    try:
+        from test_index_project import SID, build_record
+    except ImportError:  # pragma: no cover
+        from tests.test_index_project import SID, build_record
+    record = build_record(tmp_path / "record")
+    settings = Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env"), "SWESIM_WORKSPACE": str(record.layout.root),
+                                  "SWESIM_REGISTRY": str(record.registry_path), "SWESIM_ORIGIN": "cloudrun",
+                                  "SWESIM_DATABASE_URL": f"sqlite:///{tmp_path / 'index.db'}", "SWESIM_WORKER_IMAGE_DIGEST": "sha256:" + "3" * 64})
+    IA.reset_store()
+    store = IA.store_for(settings); store.migrate()
+    # Before any receipt the files say the scenario is registered, so the candidate reads as kept.
+    assert IA.index_candidate({"source_key": "swebench-annotated", "instance_id": SID}, settings)["rows"] == 1
+    assert store.candidates(M.CandidateFilter(instance_id=[SID])).items[0].status == "kept"
+    # The workflow's auto-approval rejection: the receipt lands in the record even when SQL is down ...
+    original = store.upsert_candidate_event
+    monkeypatch.setattr(store, "upsert_candidate_event", lambda row: (_ for _ in ()).throw(RuntimeError("database down")))
+    with pytest.raises(RuntimeError, match="database down"):
+        IA.index_candidate_event(_event(), settings)
+    assert len(history.read_rows(record.layout, "candidate_events", settings)) == 1
+    monkeypatch.setattr(store, "upsert_candidate_event", original)
+    # ... and a retry is idempotent (same id, same snapshot), then the candidate row says rejected at the approval gate.
+    out = IA.index_candidate_event(_event(), settings)
+    assert out["indexed"] is True and out["rows"] == 2 and out["status"] == "rejected"
+    assert IA.index_candidate_event(_event(), settings)["event_id"] == out["event_id"]
+    assert len(history.read_rows(record.layout, "candidate_events", settings)) == 1 and store.table("candidate_events", M.TableFilter()).total == 1
+    row = store.candidates(M.CandidateFilter(instance_id=[SID])).items[0]
+    assert (row.stage, row.status, row.gate) == ("approved", "rejected", "auto-approval") and row.reasons == ["withheld brief lost the natural title line"]
+    assert (row.workflow_id, row.run_id, row.candidates_path) == ("create:example-scenario", "run-9", "/plans/create-1/0.candidates.jsonl")
+    event = store.table("candidate_events", M.TableFilter()).items[0]
+    assert event["origin"] == "cloudrun" and event["worker_image_digest"] == "sha256:" + "3" * 64 and event["terminal"] is True
+    # A later decision (another run registers it) is a new receipt and the files' registered/kept view returns.
+    later = _event(phase="register", stage="registered", status="kept", gate=None, reasons=[], run_id="run-10", occurred_at="2026-09-13T13:00:00+00:00")
+    assert IA.index_candidate_event(later, settings)["event_id"] != out["event_id"]
+    row = store.candidates(M.CandidateFilter(instance_id=[SID])).items[0]
+    assert (row.stage, row.status, row.run_id) == ("registered", "kept", "run-10")
+    # An approval timeout on another candidate whose draft exists reads as rejected at the approval gate, never as drafted/kept.
+    timeout = _event(instance_id="second__scenario-1", scenario_id="second-scenario", version=1, phase="hold", gate="approval-timeout",
+                     reasons=["no reviewer decision within the hold window"], run_id="run-11")
+    IA.index_candidate_event(timeout, settings)
+    # Rebuild into a fresh database and read the same record with the file reader: both agree with the live rows.
+    fresh = IndexStore(f"sqlite:///{tmp_path / 'fresh.db'}", settings=settings); fresh.migrate()
+    fresh.rebuild_from_layout(record.layout, settings.registry_path)
+    assert fresh.table("candidate_events", M.TableFilter()).total == 3 == store.table("candidate_events", M.TableFilter()).total
+    assert fresh.candidates(M.CandidateFilter(instance_id=[SID])).items[0].status == "kept"
+    files = FileIndexReader(record.layout, settings.registry_path, settings=settings)
+    assert files.table("candidate_events", M.TableFilter()).total == 3
+    assert files.candidates(M.CandidateFilter(instance_id=[SID])).items[0].run_id == "run-10"
+    events = P.candidate_events_by_identity(record.layout, settings)
+    assert {k[1] for k in events} == {SID, "second__scenario-1"}
+    with pytest.raises(Exception, match="payload lacks"):
+        IA.index_candidate_event({"source_key": "swebench-annotated", "instance_id": SID}, settings)
+    IA.reset_store()
+
+
+def test_candidate_receipt_without_the_index_still_lands_in_the_record(tmp_path):
+    from swesim.index import activities as IA
+    layout = Layout(root=tmp_path / "record")
+    settings = Settings.from_env({"SWESIM_ENV_FILE": str(tmp_path / "none.env"), "SWESIM_WORKSPACE": str(layout.root)})
+    out = IA.index_candidate_event(_event(), settings)
+    assert out["indexed"] is False and out["reason"] == "index disabled" and len(out["event_id"]) == 64
+    [row] = history.read_rows(layout, "candidate_events")
+    assert row.event_id == out["event_id"] and row.gate == "auto-approval" and row.origin == "laptop"

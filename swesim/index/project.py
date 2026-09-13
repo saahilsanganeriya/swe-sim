@@ -391,12 +391,27 @@ def _jsonl_rows(path: Path) -> dict[str, dict]:
     return rows
 
 
+CandidateEvents = dict[tuple[str, str], list[M.CandidateEventRow]]
+
+
+def candidate_events_by_identity(layout: Layout, settings=None) -> CandidateEvents:
+    """Every candidate receipt (`swesim.index.history.candidate_events`) keyed by (source_key, instance_id), oldest first.
+    Read once per listing/rebuild and passed to `project_candidates`; a corrupt receipt directory is a `ValueError`."""
+    from swesim.index.history import candidate_events
+    out: CandidateEvents = {}
+    for event in candidate_events(layout, settings):
+        out.setdefault((event.source_key, event.instance_id), []).append(event)
+    return out
+
+
 def project_candidates(layout: Layout, source_key: str, *, registry: dict[str, dict] | None = None, origin: str | None = None,
-                       now: datetime | None = None) -> list[M.CandidateRow]:
-    """Every instance of one source key with the furthest stage it reached and the outcome at that stage."""
+                       now: datetime | None = None, events: CandidateEvents | None = None) -> list[M.CandidateRow]:
+    """Every instance of one source key with the furthest stage it reached and the outcome at that stage. `events` are the
+    candidates' decision receipts (`candidate_events_by_identity`); read here when not given."""
     registry = project_registry(layout) if registry is None else registry
     origin = _default_origin(origin)
     now = now or M.utcnow()
+    events = candidate_events_by_identity(layout) if events is None else events
     mined_path = layout.candidates_file(source_key, "mined")
     judged_path = layout.candidates_file(source_key, "judged")
     probed_path = layout.candidates_file(source_key, "probed")
@@ -413,12 +428,17 @@ def project_candidates(layout: Layout, source_key: str, *, registry: dict[str, d
                 if per:
                     row.update(per)
                     judged_at = mtime(judged_dir / f"{sid}{suffix}") or judged_at
-        rows.append(_candidate_row(layout, source_key, iid, sid, row, judged_at, registry, origin, now))
+        rows.append(_candidate_row(layout, source_key, iid, sid, row, judged_at, registry, origin, now, events.get((source_key, iid), [])))
     return rows
 
 
+def _further(a: str, b: str) -> bool:
+    """Funnel stage `a` is later than `b`."""
+    return a in M.FUNNEL_ORDER and b in M.FUNNEL_ORDER and M.FUNNEL_ORDER.index(a) > M.FUNNEL_ORDER.index(b)
+
+
 def _candidate_row(layout: Layout, source_key: str, iid: str, sid: str | None, row: dict, judged_at: datetime | None,
-                   registry: dict[str, dict], origin: str, now: datetime) -> M.CandidateRow:
+                   registry: dict[str, dict], origin: str, now: datetime, events: list[M.CandidateEventRow] = ()) -> M.CandidateRow:
     judge = row.get("judge") if isinstance(row.get("judge"), dict) else None
     probe = row.get("probe") if isinstance(row.get("probe"), dict) else None
     error_file = _dict(read_json(layout.candidates_dir() / f"{iid}.error.json")) if SEGMENT_RE.fullmatch(iid) else {}
@@ -460,14 +480,27 @@ def _candidate_row(layout: Layout, source_key: str, iid: str, sid: str | None, r
                 reasons = [str(f) for f in (files["validation.json"].get("failures") or [])][:10] or ["validation not valid"]
         if entry is not None and status == "kept":
             stage = "registered"
+    scenario_id = sid if (present or entry is not None) else None
+    version = scenario_version_of(files) if files else (_int((entry or {}).get("version")) if entry else None)
+    workflow_id = run_id = candidates_path = None
+    latest = max(events, key=lambda e: (e.occurred_at, e.event_id), default=None)
+    if latest is not None:
+        # The workflow's own receipt of its last decision: a terminal rejection/error is the truth about this candidate even
+        # when its scenario directory holds files from a later stage (an auto-approval reject leaves approval-stage files;
+        # a human reject or approval timeout leaves a draft). A kept receipt never lowers what the files show.
+        workflow_id, run_id, candidates_path = latest.workflow_id, latest.run_id, latest.candidates_path
+        scenario_id, version = latest.scenario_id or scenario_id, latest.version or version
+        if latest.terminal and latest.status in ("rejected", "error"):
+            stage, status, gate, reasons = latest.stage, latest.status, latest.gate, list(latest.reasons)
+        elif status == "kept" and _further(latest.stage, stage):
+            stage = latest.stage
     source = _str(row.get("source")) or ("swebench-annotated" if "swebench" in source_key else source_key.split("--", 1)[0])
     discovery = _dict(row.get("discovery"))
     return M.CandidateRow(
         instance_id=iid, source_key=source_key, source=source, repo=_str(row.get("repo")), pr_number=pr_number_of(iid),
         pr_kind=_str(discovery.get("kind")), stage=stage, status=status, gate=gate, reasons=reasons, judged_at=judged_at,
-        scenario_id=sid if (present or entry is not None) else None,
-        version=scenario_version_of(files) if files else (_int((entry or {}).get("version")) if entry else None),
-        created_at=now, updated_at=now, origin=origin)
+        scenario_id=scenario_id, version=version, candidates_path=candidates_path,
+        created_at=now, updated_at=now, workflow_id=workflow_id, run_id=run_id, origin=origin)
 
 
 # ----------------------------------------------------------------------------- trials
@@ -767,5 +800,5 @@ def project_workflows_from_jobs(layout: Layout, *, origin: str | None = None, no
 __all__ = ["ProjectionError", "aware", "dec", "mtime", "provider_of", "scenario_id_for", "pr_number_of", "read_json",
            "project_registry", "scenario_ids", "scenario_version_of", "validation_status_of", "project_scenario", "project_scenario_versions",
            "source_keys", "discovery_source_keys", "project_discovery", "project_discoveries", "read_discovery_snapshot",
-           "project_candidates", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_workflow_costs",
+           "project_candidates", "candidate_events_by_identity", "trial_ids", "project_trial", "project_exchanges", "project_costs", "project_workflow_costs",
            "project_scores", "project_workflows_from_jobs"]

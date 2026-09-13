@@ -1,9 +1,13 @@
 """Index activities (interfaces §2): Temporal activities on the `swesim-control` queue that keep the index current.
 
 Contract
-- Seven activities, names exact (`swesim.workflows.queues.QUEUE_OF` routes them to CONTROL): `index_scenario_activity`,
+- Eight activities, names exact (`swesim.workflows.queues.QUEUE_OF` routes them to CONTROL): `index_scenario_activity`,
   `index_candidate_activity`, `index_trial_activity`, `index_score_activity`, `index_workflow_activity`,
-  `index_rebuild_activity`, `index_discovery_activity`. `ALL` lists them for the worker.
+  `index_rebuild_activity`, `index_discovery_activity`, `index_candidate_event_activity`. `ALL` lists them for the worker.
+- `index_candidate_event_activity` is the candidate's decision receipt (P1-7): the workflow reports the gate it stopped
+  or passed at (`phase`, `stage`, `status`, `gate`, `reasons`, `terminal`, ids); the receipt is published as an immutable
+  snapshot in the record *before* SQL, even when the index is disabled, and the candidate row is reprojected from files
+  plus receipts so a rejected candidate is never shown as kept. Its id is content-derived: a retry is idempotent.
 - Each reads the files through `Layout`, projects rows with `swesim.index.project`, upserts them, and returns
   `{"indexed": True, "rows": n}`. Idempotent: the same payload twice leaves the same rows.
 - When the index is disabled (`Settings.database_url` unset), index-only activities return
@@ -104,13 +108,55 @@ def index_candidate(p: dict, settings: Settings | None = None) -> dict:
     source_key, instance_id = _require(p, "source_key", "instance_id")
     layout = _layout(s)
     try:
-        rows = [r for r in P.project_candidates(layout, source_key, registry=P.project_registry(layout, s.registry_path), origin=s.origin)
+        events = P.candidate_events_by_identity(layout, s)
+        rows = [r for r in P.project_candidates(layout, source_key, registry=P.project_registry(layout, s.registry_path), origin=s.origin, events=events)
                 if r.instance_id == instance_id]
     except ValueError as e:
         raise _projection_error(f"candidates {source_key}: {e}") from e
     if not rows:
         raise _projection_error(f"candidate {instance_id} is not in the {source_key} files")
     return {"indexed": True, "rows": store.upsert_candidates(rows)}
+
+
+CANDIDATE_EVENT_PAYLOAD: tuple[str, ...] = ("candidates_path", "scenario_id", "spec_hash", "result_status", "gate")
+
+
+def candidate_event_row(p: dict, settings: Settings) -> M.CandidateEventRow:
+    """The receipt a workflow's payload describes; `occurred_at` defaults to now (workflows pass `workflow.now()`)."""
+    source_key, instance_id, phase, stage, status, workflow_id, run_id = _require(p, "source_key", "instance_id", "phase", "stage", "status",
+                                                                                 "workflow_id", "run_id")
+    reasons = [str(r) for r in (p.get("reasons") or []) if r is not None] if isinstance(p.get("reasons"), list) else []
+    fields = {"source_key": str(source_key), "instance_id": str(instance_id), "phase": str(phase), "stage": stage, "status": status,
+              "reasons": reasons, "terminal": bool(p.get("terminal", True)), "workflow_id": str(workflow_id), "run_id": str(run_id),
+              "version": P._int(p.get("version")), **{k: P._str(p.get(k)) for k in CANDIDATE_EVENT_PAYLOAD}}
+    occurred = P.aware(p.get("occurred_at")) or M.utcnow()
+    try:
+        return M.CandidateEventRow(event_id=M.candidate_event_identity(fields), occurred_at=occurred, created_at=occurred, updated_at=occurred,
+                                   worker_image_digest=settings.worker_image_digest, origin=settings.origin, **fields)
+    except ValueError as e:
+        raise _projection_error(f"candidate event {source_key}/{instance_id}: {e}") from e
+
+
+def index_candidate_event(p: dict, settings: Settings | None = None) -> dict:
+    """Publish one candidate decision receipt (record first, SQL second) and reproject the candidate's row."""
+    from swesim.storage.history import persist_row
+    s = settings or get_settings()
+    row = candidate_event_row(p, s)
+    layout = _layout(s)
+    persist_row(layout, row, s)
+    store = store_for(s)
+    if store is None:
+        return {**DISABLED, "event_id": row.event_id}
+    store.upsert_candidate_event(row)
+    rows = 1
+    try:
+        events = P.candidate_events_by_identity(layout, s)
+        candidates = [r for r in P.project_candidates(layout, row.source_key, registry=P.project_registry(layout, s.registry_path), origin=s.origin, events=events)
+                      if r.instance_id == row.instance_id]
+    except ValueError:  # the candidate's source files are not (yet) in this copy of the record: the receipt alone is indexed
+        candidates = []
+    rows += store.upsert_candidates(candidates)
+    return {"indexed": True, "rows": rows, "event_id": row.event_id, "stage": row.stage, "status": row.status}
 
 
 def index_discovery(p: dict, settings: Settings | None = None) -> dict:
@@ -270,5 +316,10 @@ async def index_discovery_activity(p: dict) -> dict:
     return await asyncio.to_thread(index_discovery, p)
 
 
+@activity.defn
+async def index_candidate_event_activity(p: dict) -> dict:
+    return await asyncio.to_thread(index_candidate_event, p)
+
+
 ALL = [index_scenario_activity, index_candidate_activity, index_trial_activity, index_score_activity, index_workflow_activity,
-       index_rebuild_activity, index_discovery_activity]
+       index_rebuild_activity, index_discovery_activity, index_candidate_event_activity]

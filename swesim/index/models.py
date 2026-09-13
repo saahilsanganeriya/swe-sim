@@ -96,8 +96,25 @@ class CandidateRow(Provenance):
     candidates_path: str | None = None
 
 
+CANDIDATE_EVENT_IDENTITY: tuple[str, ...] = ("source_key", "instance_id", "workflow_id", "run_id", "phase", "stage", "status", "gate",
+                                             "reasons", "result_status", "terminal", "scenario_id", "version", "spec_hash")
+
+
+def candidate_event_identity(fields: dict) -> str:
+    """The receipt's id: SHA256 of its decision content and workflow/run, so an activity retry lands on the same row and a
+    genuinely different decision (another run, other reasons) is another receipt. `occurred_at` is deliberately excluded."""
+    data = {key: fields.get(key) for key in CANDIDATE_EVENT_IDENTITY}
+    return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
 class CandidateEventRow(Provenance):
-    """Durable stage/terminal receipt, table candidate_events, pk event_id."""
+    """One immutable stage/decision receipt of a candidate (P1-7); table candidate_events, pk event_id.
+
+    Written by `index_candidate_event_activity` at every gate the workflows decide at (judge, probe, precheck,
+    auto-approval, human review, approval timeout, validation, registration, an infrastructure error). `terminal` says
+    the workflow stopped working on the candidate there; `project_candidates` lets the latest terminal negative receipt
+    (status rejected | error) decide the candidate's row, so a rejected candidate is never shown as kept because its
+    scenario files reached a later stage."""
 
     event_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_key: str

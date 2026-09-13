@@ -130,9 +130,14 @@ class FileIndexReader:
     def _candidate_rows(self, source_key: str | None = None) -> list[M.CandidateRow]:
         registry = self._registry()
         rows: list[M.CandidateRow] = []
+        try:
+            events = P.candidate_events_by_identity(self.layout, self._settings)
+        except ValueError as e:
+            log.warning("candidate receipts not projected: %s", e)
+            events = {}
         for key in ([source_key] if source_key else P.source_keys(self.layout)):
             try:
-                rows.extend(P.project_candidates(self.layout, key, registry=registry, origin=self.settings.origin))
+                rows.extend(P.project_candidates(self.layout, key, registry=registry, origin=self.settings.origin, events=events))
             except ValueError as e:
                 log.warning("candidates %s not projected: %s", key, e)
         return rows

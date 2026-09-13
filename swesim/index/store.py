@@ -307,9 +307,14 @@ class IndexStore:
             except ValueError as e:
                 skipped["scores"].append({"id": sid, "reason": str(e)[:300]})
         candidate_rows: list[M.CandidateRow] = []
+        try:
+            events = P.candidate_events_by_identity(layout, settings)
+        except ValueError as e:  # a corrupt receipt: the candidates are projected from their files alone and the skip is recorded
+            events = {}
+            skipped["candidate_events"] = [{"id": layout.relative(layout.history_dir("candidate_events")), "reason": str(e)[:300]}]
         for key in P.source_keys(layout):
             try:
-                candidate_rows.extend(P.project_candidates(layout, key, registry=registry, origin=origin, now=started))
+                candidate_rows.extend(P.project_candidates(layout, key, registry=registry, origin=origin, now=started, events=events))
             except ValueError as e:
                 skipped["candidates"].append({"id": key, "reason": str(e)[:300]})
         discovery_rows: list[M.DiscoveryRow] = []
@@ -342,7 +347,7 @@ class IndexStore:
                 history_rows[name] = list(project(layout, settings))
             except ValueError as e:
                 history_rows[name] = []
-                skipped[name] = [{"id": layout.relative(layout.history_dir(name)), "reason": str(e)[:300]}]
+                skipped.setdefault(name, []).append({"id": layout.relative(layout.history_dir(name)), "reason": str(e)[:300]})
         projected = {"scenarios": len(scenario_rows), "candidates": len(candidate_rows), "trials": len(trial_rows), "exchanges": len(exchange_rows),
                      "scores": len(score_rows), "costs": len(cost_rows), "discoveries": len(discovery_rows),
                      **{name: len(rows) for name, rows in history_rows.items()}}

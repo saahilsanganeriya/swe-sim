@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
     from tests.test_index_project import SID, Record, build_record
 
 NAMES = ["index_scenario_activity", "index_candidate_activity", "index_trial_activity", "index_score_activity", "index_workflow_activity",
-         "index_rebuild_activity", "index_discovery_activity"]
+         "index_rebuild_activity", "index_discovery_activity", "index_candidate_event_activity"]
 
 
 @pytest.fixture(scope="module")
@@ -73,8 +73,8 @@ def test_names_are_exact_and_routed_to_the_control_queue():
 
 def test_disabled_index_never_raises(disabled: Settings):
     for fn in IA.ALL:
-        if fn is IA.index_discovery_activity:
-            continue  # discovery also preserves the file-backed history and requires its source payload
+        if fn in (IA.index_discovery_activity, IA.index_candidate_event_activity):
+            continue  # these two also preserve file-backed history and require their identifying payload
         assert run(fn, {}) == {"indexed": False, "reason": "index disabled"}
         assert run(fn, {"trial_id": "nope", "scenario_id": 7}) == {"indexed": False, "reason": "index disabled"}
     assert IA.store_for(disabled) is None
