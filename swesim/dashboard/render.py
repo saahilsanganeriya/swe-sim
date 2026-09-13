@@ -367,7 +367,7 @@ class NavItem:
 
 
 NAV: tuple[tuple[str, tuple[NavItem, ...]], ...] = (
-    ("", (NavItem("Home", "/", "home"),)),
+    ("", (NavItem("Home", "/", "home"), NavItem("Explainer", "/explainer", "explainer"))),
     ("Record", (NavItem("Scenarios", "/scenarios", "scenarios", "scenarios_valid"), NavItem("Trials", "/trials", "trials", "trials_running"),
                 NavItem("Candidates", "/candidates", "candidates", "candidates_pending"), NavItem("Workflows", "/workflows", "workflows", "workflows_running"),
                 NavItem("Leaderboard", "/leaderboard", "leaderboard"), NavItem("Trends", "/trends", "trends"))),

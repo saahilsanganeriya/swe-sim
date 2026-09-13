@@ -34,7 +34,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 
 from swesim.dashboard import access, actions, console, data, pages, render, render_console, render_episode, render_scenario
-from swesim.dashboard import health as health_cache, render_trends, trends
+from swesim.dashboard import health as health_cache, render_explainer, render_trends, trends
 from swesim.dashboard import rows as R
 from swesim.dashboard.data import merge_timeline  # noqa: F401 - contract re-export (tests/test_contracts.py)
 from swesim.dashboard.identity import Identity, identity_from_headers
@@ -683,6 +683,13 @@ def trend_evidence(request: Request, reader=Depends(reader_dep), identity: Ident
             + render.table("trend-evidence", pages.TRIAL_COLUMNS, [pages.trial_view(t) for t in selected[offset:offset + limit]], key="trial_id",
                            total=len(selected), offset=offset, limit=limit, empty="No admitted trials match this measurement."))
     return page(render.Page("Trend evidence", "trends", "trend-evidence", crumbs=(("Trends", "/trends"), ("Evidence", None))), body, reader, identity, settings)
+
+
+@app.get("/explainer", response_class=HTMLResponse)
+def explainer_page(reader=Depends(reader_dep), identity: Identity = Depends(identity_dep), settings: Settings = Depends(settings_dep)) -> HTMLResponse:
+    """The system explained from structured data (render_explainer.SECTIONS); static, identical for every identity."""
+    p = render.Page("Explainer", "explainer", "explainer", crumbs=(("Explainer", None),))
+    return page(p, render_explainer.body(), reader, identity, settings)
 
 
 @app.get("/health", response_class=HTMLResponse)
