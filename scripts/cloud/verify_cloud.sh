@@ -41,17 +41,11 @@ run_checks() {
   echo "image (terraform): $IMAGE"
 
   # 1 Temporal
-  if desc=$(uv run --frozen python - <<'PY' 2>&1
-import asyncio
-from swesim.workflows.client import connect, describe_connection
-async def main():
-    client = await asyncio.wait_for(connect(), 45)
-    async for _ in client.list_workflows(limit=1):
-        break
-    print(describe_connection())
-asyncio.run(main())
-PY
-  ); then pass "temporal: $desc"; else failed "temporal: $(echo "$desc" | tail -n 3 | tr '\n' ' ')"; fi
+  if desc=$(uv run --frozen python scripts/cloud/verify_runtime.py); then
+    pass "temporal: $desc"
+  else
+    failed "temporal: $desc"
+  fi
 
   # 2 IAP redirect
   if curl -sS -o /dev/null -D "$HEADERS" --max-time 30 "$CONSOLE_URL"; then
