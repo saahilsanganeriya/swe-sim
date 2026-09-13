@@ -55,18 +55,31 @@ async def workers(env, workflows, activities):
         pytest.skip('Temporal test server cannot register the required search attributes')
     # Keep the established stage fakes; adapt their in-memory outputs to the new immutable-plan activity boundaries.
     mapping = {activity._Definition.from_callable(a).name: a for a in activities}; plans = {}
-    extra = []
+    extra = []; paged = False
     if W.RunTasksWorkflow in workflows and 'probe_models_activity' not in mapping:
         @activity.defn(name='probe_models_activity')
         async def probe_for_run(p): return {'resolved': {}, 'solver_unavailable': []}
         extra.append(probe_for_run)
+    if W.RunTasksWorkflow in workflows and 'frontier_gate_activity' not in mapping:
+        # The gate's policy is tested in test_frontier_gate.py and through A.plan_trials; this stand-in admits Tier A–C requests
+        # only, so an env test that names a frontier model without a real decision is blocked, never waved through.
+        from swesim.stages.frontier import frontier_requested
+        @activity.defn(name='frontier_gate_activity')
+        async def gate_for_run(p):
+            if frontier_requested(p): return {'allowed': False, 'scenario_ids': [], 'reasons': ['no frontier evidence in this test environment']}
+            return {'allowed': True, 'scenario_ids': list(p.get('scenario_ids') or []), 'reasons': []}
+        extra.append(gate_for_run)
+    if W.RunTasksWorkflow in workflows and 'spend_check_activity' not in mapping:
+        @activity.defn(name='spend_check_activity')
+        async def spend_for_run(p): return {'spend_usd': 0.0, 'cap_usd': p.get('cap_usd'), 'exceeded': False, 'spend_complete': True}
+        extra.append(spend_for_run)
     if 'plan_trials_activity' in mapping and 'prepare_trial_plan_activity' not in mapping:
         @activity.defn(name='prepare_trial_plan_activity')
         async def prepare_trials(p):
             result = await mapping['plan_trials_activity'](p)
             path = p['scenario_id']; plans[path] = result['trials']
             return {'plan_path': path, 'total': len(plans[path])}
-        extra.append(prepare_trials)
+        extra.append(prepare_trials); paged = True
     if 'list_candidates_activity' in mapping and 'prepare_candidate_plan_activity' not in mapping:
         @activity.defn(name='prepare_candidate_plan_activity')
         async def prepare_candidates(p):
@@ -80,8 +93,8 @@ async def workers(env, workflows, activities):
                     seen.add(c['scenario_id']); items.append({**source, **c})
             plans['candidates'] = items
             return {'plan_path': 'candidates', 'total': len(items), 'duplicates': duplicates}
-        extra.append(prepare_candidates)
-    if extra:
+        extra.append(prepare_candidates); paged = True
+    if paged and 'read_plan_page_activity' not in mapping:
         @activity.defn(name='read_plan_page_activity')
         async def read_page(p):
             items = plans[p['plan_path']]; offset = p.get('offset', 0)
@@ -366,6 +379,8 @@ def test_run_tasks_stops_planning_when_the_spend_cap_is_exceeded(monkeypatch):
         calls = []; state = {"exceeded": False}
         async def act(name, p, minutes=10, **kw):
             calls.append(name)
+            if name == "frontier_gate_activity":
+                return {"allowed": True, "scenario_ids": p["scenario_ids"], "reasons": []}       # Tier A–C: no evidence needed
             if name == "spend_check_activity":
                 state["exceeded"] = state["exceeded"] or len([c for c in calls if c == "prepare_trial_plan_activity"]) >= 1
                 return {"spend_usd": 1600.0 if state["exceeded"] else 10.0, "cap_usd": p.get("cap_usd") or 1500.0, "exceeded": state["exceeded"]}
@@ -396,6 +411,96 @@ def test_run_tasks_stops_planning_when_the_spend_cap_is_exceeded(monkeypatch):
         assert w.progress()["stopped_reason"] == "spend-cap" and w.progress()["scenarios"]["s2"]["status"] == "skipped"
         # once exceeded, later checks are not even asked (the run has stopped planning)
         assert calls.count("spend_check_activity") == 3   # at start, before s1, before s2 (exceeded); s3 short-circuits
+    asyncio.run(scenario())
+
+
+def test_run_tasks_frontier_gate_blocks_or_binds_every_planning_step(monkeypatch):
+    async def scenario():
+        calls = []
+        decision = {"allowed": True, "scenario_ids": ["s2"], "reasons": [], "evidence_path": "/ws/evidence/sweep/frontier-abc.json", "identity": "abc",
+                    "excluded_scenarios": {"s1": "Saturated scenarios are excluded by default."}}
+        async def act(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "frontier_gate_activity": return dict(decision)
+            if name == "probe_models_activity": return {"resolved": {}, "solver_unavailable": []}
+            if name == "spend_check_activity": return {"spend_usd": 1.0, "cap_usd": 100.0, "exceeded": False}
+            if name == "prepare_trial_plan_activity": return {"plan_path": p["scenario_id"], "total": 1}
+            if name == "read_plan_page_activity":
+                return {"items": [{"trial_id": p["plan_path"] + "-t0", "scenario_id": p["plan_path"], "model": "openai/gpt-5.5", "condition": "hidden", "attempt_index": 0}], "total": 1, "next_offset": 1}
+            if name == "checkpoint_workflow_activity": return {"checkpoint_path": "/checkpoint/test"}
+            return {}
+        async def child(fn, arg, **kw): return {"trial_id": arg["trial_id"], "status": "completed"}
+        monkeypatch.setattr(W, "act", act); monkeypatch.setattr(W.workflow, "execute_child_workflow", child)
+        params = {"scenario_ids": ["s1", "s2"], "models": ["openai/gpt-5.5"], "conditions": ["hidden"], "k": 1, "stakeholder_url": "https://s"}
+        r = await W.RunTasksWorkflow().run(params)
+        prepared = [p for n, p in calls if n == "prepare_trial_plan_activity"]
+        assert [p["scenario_id"] for p in prepared] == ["s2"]                                             # the excluded scenario is never planned
+        assert all(p["admission"] == {"evidence_path": decision["evidence_path"], "identity": "abc"} for p in prepared)   # plan_trials verifies this file
+        assert r["status"] == "complete" and set(r["scenarios"]) == {"s2"}
+        # a refused gate blocks before any probe or plan
+        decision.update(allowed=False, scenario_ids=[], reasons=["Requires 15 current audited scenarios with at least two outcomes per arm on every core Tier A–C baseline."]); calls.clear()
+        w = W.RunTasksWorkflow(); r2 = await w.run(params)
+        assert r2["status"] == "blocked" and r2["stopped_reason"] == "frontier-gate" and r2["admission"]["reasons"] == decision["reasons"]
+        assert not [n for n, _ in calls if n in ("probe_models_activity", "prepare_trial_plan_activity")] and w.progress()["stopped_reason"] == "frontier-gate"
+        # a Tier A–C request passes the gate without a decision file and carries no admission reference
+        decision.update(allowed=True, scenario_ids=["s1", "s2"], reasons=[]); decision.pop("evidence_path"); decision.pop("identity"); calls.clear()
+        r3 = await W.RunTasksWorkflow().run({**params, "models": ["openrouter/deepseek/deepseek-v3.2"]})
+        assert r3["status"] == "complete" and all("admission" not in p for n, p in calls if n == "prepare_trial_plan_activity")
+    asyncio.run(scenario())
+
+
+def test_operator_workflows_write_running_first_and_a_terminal_row_on_every_exit(monkeypatch):
+    """P1-6: the running row precedes any probe/gate; failure, cancellation and invalid input end as recorded rows with the reason;
+    continue-as-new is not a failure (its `continued_as_new` row is written by `_continue`)."""
+    from types import SimpleNamespace
+    async def scenario():
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="run-1", run_id="r1", workflow_type="RunTasksWorkflow"))
+        calls = []
+        def fake(raise_on_gate):
+            async def act(name, p, minutes=10, **kw):
+                calls.append((name, p))
+                if name == "frontier_gate_activity": raise raise_on_gate
+                return {}
+            return act
+        params = {"scenario_ids": ["s1"], "models": ["m"], "stakeholder_url": "https://s"}
+        monkeypatch.setattr(W, "act", fake(RuntimeError("control pool down")))
+        with pytest.raises(RuntimeError): await W.RunTasksWorkflow().run(params)
+        names = [n for n, _ in calls]
+        assert names.index("index_workflow_activity") < names.index("frontier_gate_activity")          # running before the gate/probe
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert [r["status"] for r in rows] == ["running", "failed"] and rows[-1]["workflow_id"] == "run-1" and rows[-1]["run_id"] == "r1"
+        assert "RuntimeError: control pool down" in rows[-1]["failure"] and rows[0]["failure"] is None and rows[0]["params_summary"]["models"] == ["m"]
+        # cancellation: a cancelled row (no failure text), then the cancellation propagates
+        calls.clear(); monkeypatch.setattr(W, "act", fake(asyncio.CancelledError()))
+        with pytest.raises(asyncio.CancelledError): await W.RunTasksWorkflow().run(params)
+        assert [(p["status"], p["failure"]) for n, p in calls if n == "index_workflow_activity"] == [("running", None), ("cancelled", None)]
+        # continue-as-new passes through: no failed row from the wrapper
+        class _CAN(W.workflow.ContinueAsNewError): pass
+        calls.clear(); monkeypatch.setattr(W, "act", fake(_CAN()))
+        with pytest.raises(_CAN): await W.RunTasksWorkflow().run(params)
+        assert [p["status"] for n, p in calls if n == "index_workflow_activity"] == ["running"]
+        # CreateTasksWorkflow: invalid input is a recorded failed execution, not one that never appears
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="create-1", run_id="r1", workflow_type="CreateTasksWorkflow"))
+        calls.clear(); monkeypatch.setattr(W, "act", fake(RuntimeError("unused")))
+        with pytest.raises(W.ApplicationError, match="sources is empty"): await W.CreateTasksWorkflow().run({"sources": []})
+        rows = [p for n, p in calls if n == "index_workflow_activity"]
+        assert [r["status"] for r in rows] == ["running", "failed"] and "sources is empty" in rows[-1]["failure"] and rows[-1]["workflow_id"] == "create-1"
+        # ... and a probe outage on a valid request
+        calls.clear()
+        async def probe_down(name, p, minutes=10, **kw):
+            calls.append((name, p))
+            if name == "probe_models_activity": raise RuntimeError("provider probe timed out")
+            return {}
+        monkeypatch.setattr(W, "act", probe_down)
+        with pytest.raises(RuntimeError): await W.CreateTasksWorkflow().run({"sources": [{"kind": "swebench-annotated", "pool": "A"}], "judge_model": "j", "draft_model": "d"})
+        names = [n for n, _ in calls]
+        assert names.index("index_workflow_activity") < names.index("probe_models_activity")
+        assert [p["status"] for n, p in calls if n == "index_workflow_activity"] == ["running", "failed"]
+        # executions started before the patch replay without the wrapper's rows
+        monkeypatch.setattr(W, "_patched", lambda name: name != W.PATCH_LIFECYCLE)
+        calls.clear(); monkeypatch.setattr(W, "act", fake(RuntimeError("control pool down")))
+        with pytest.raises(RuntimeError): await W.RunTasksWorkflow().run(params)
+        assert not [n for n, _ in calls if n == "index_workflow_activity"]
     asyncio.run(scenario())
 
 
@@ -720,10 +825,21 @@ def test_register_activity_result_is_json_serializable(ws, monkeypatch):
 
 # ---------------------------------------------------------------- plan_trials, verify_approval, judge, probe
 
+def admit(ws, p: dict, *, allowed: bool = True, scenario_ids=None) -> dict:
+    """A recorded frontier decision for `p` (tests only): the same file `frontier_gate_activity` writes, so `plan_trials` verifies
+    it exactly as it verifies a workflow's. Returns the `admission` reference a RunTasksWorkflow would carry."""
+    from swesim.stages import frontier as F
+    request = F.request_of(p); path = F.decision_path(ws, F.identity_of(request))
+    atomic_json(path, {"request": request, "decision": {"allowed": allowed, "reasons": [] if allowed else ["test refusal"],
+                                                         "scenario_ids": request["scenario_ids"] if scenario_ids is None else scenario_ids}})
+    return {"evidence_path": str(path)}
+
+
 def test_plan_trials_distinct_ids_per_model_and_profile_rule(ws):
     spec = frozen_scenario(ws)
-    out = A.plan_trials({"scenario_id": spec.id, "models": ["anthropic/claude-haiku-4-5-20251001", "openai/gpt-5.5"], "conditions": ["full", "hidden"],
-                         "k": 2, "purpose": "comparison", "brief_profile": "withheld", "stakeholder_url": "https://s"})
+    request = {"scenario_id": spec.id, "models": ["anthropic/claude-haiku-4-5-20251001", "openai/gpt-5.5"], "conditions": ["full", "hidden"],
+               "k": 2, "purpose": "comparison", "brief_profile": "withheld", "stakeholder_url": "https://s"}
+    out = A.plan_trials({**request, "admission": admit(ws, request)})    # gpt-5.5 is Tier E: planned only under a recorded admission
     trials = out["trials"]; assert len(trials) == 8 and len({t["trial_id"] for t in trials}) == 8
     for t in trials:
         rc = RunConfig.model_validate(t["run_config"])
@@ -736,6 +852,40 @@ def test_plan_trials_distinct_ids_per_model_and_profile_rule(ws):
     # A manual retry is a new attempt index (new trial id), never a Temporal retry of the old one.
     more = A.plan_trials({"scenario_id": spec.id, "models": ["m"], "conditions": ["hidden"], "k": 2, "attempt_offset": 3, "stakeholder_url": "https://s"})["trials"]
     assert [t["attempt_index"] for t in more] == [3, 4] and not {t["trial_id"] for t in more} & {t["trial_id"] for t in trials}
+
+
+def test_plan_trials_enforces_frontier_admission(ws):
+    """Brief §3.2: a Tier D/E request is planned only under a frontier admission; a recorded decision admits exactly the request it
+    was made for; Tier A–C requests are untouched."""
+    spec = frozen_scenario(ws)
+    base = {"scenario_id": spec.id, "models": ["openai/gpt-5.5"], "conditions": ["hidden"], "k": 1, "purpose": "comparison", "stakeholder_url": "https://s"}
+    # no evidence: the fresh evaluation refuses and records why, durably, under evidence/sweep
+    with pytest.raises(ValueError, match="frontier admission rejected"): A.plan_trials(base)
+    written = list(ws.layout.evidence_dir("sweep").glob("frontier-*.json")); assert len(written) == 1
+    decision = json.loads(written[0].read_text())["decision"]
+    assert decision["allowed"] is False and any("15 current audited scenarios" in r for r in decision["reasons"])
+    # a recorded decision binds its request: other k, another scenario, a refusal, or a file outside evidence/sweep do not admit
+    with pytest.raises(ValueError, match="different request"): A.plan_trials({**base, "admission": admit(ws, {**base, "k": 3})})
+    with pytest.raises(ValueError, match="not admitted"): A.plan_trials({**base, "admission": admit(ws, {**base, "scenario_id": "other-scenario"})})
+    with pytest.raises(ValueError, match="frontier admission rejected"): A.plan_trials({**base, "admission": admit(ws, base, allowed=False)})
+    with pytest.raises(ValueError, match="under evidence/sweep"): A.plan_trials({**base, "admission": {"evidence_path": str(ws.root / "frontier-x.json")}})
+    with pytest.raises(ValueError, match="lacks evidence_path"): A.plan_trials({**base, "admission": {"allowed": True}})
+    # a decision that admits the request but excludes this scenario (saturated) refuses the scenario with its reason
+    with pytest.raises(ValueError, match="not admitted"): A.plan_trials({**base, "admission": admit(ws, base, scenario_ids=[])})
+    # the matching decision plans, and its identity travels with the plan
+    out = A.plan_trials({**base, "admission": admit(ws, base)})
+    assert len(out["trials"]) == 1 and out["admission"]["evidence_path"].startswith(str(ws.layout.evidence_dir("sweep")))
+    # cached plan pages are under the same check: the frontier request's plan is not returned without an admission
+    A.WS = ws
+    async def go():
+        prepared = await A.prepare_trial_plan_activity({**base, "workflow_id": "run-x", "admission": admit(ws, base)})
+        assert prepared["total"] == 1
+        with pytest.raises(Exception, match="frontier admission rejected"):
+            await A.prepare_trial_plan_activity({**base, "workflow_id": "run-x"})
+        assert (await A.prepare_trial_plan_activity({**base, "workflow_id": "run-x", "admission": admit(ws, base)}))["total"] == 1
+    asyncio.run(go())
+    # Tier A–C requests need no admission and carry none
+    assert "admission" not in A.plan_trials({**base, "models": ["openrouter/deepseek/deepseek-v3.2"]})
 
 
 def test_verify_approval_matches_frozen_spec_hash(ws):
@@ -1629,7 +1779,7 @@ def test_env_run_tasks_two_scenarios_bounded_and_progress():
             # index_score_activity is not registered on these workers (the storage stream's module): recorded as indexed False, never a failure
             assert prog["scenarios"] == {"s1": {"status": "complete", "trials": 2, "indexed": False}, "s2": {"status": "complete", "trials": 2, "indexed": False},
                                          "bad": {"status": "error", "error": prog["scenarios"]["bad"]["error"], "trials": 0}}
-            assert prog["spend"]["indexed"] is False and "not registered" in prog["spend"]["reason"] and prog["stopped_reason"] is None
+            assert prog["spend"]["exceeded"] is False and prog["stopped_reason"] is None
             done = await env.client.get_workflow_handle("s1-t0").query(W.TrialWorkflow.progress)
             assert done["status"] == "completed" and done["indexed"] is False
             # running the same selection again cannot relaunch: every trial id is already used
@@ -1717,26 +1867,35 @@ def test_update_script_contract():
     # the helper emits the token from the environment only (no token appears in any git argument)
     cp = subprocess.run(["bash", "-c", "f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f"], capture_output=True, text=True, env={**os.environ, "GH_TOKEN": "fake-token-value"})
     assert cp.stdout == "username=x-access-token\npassword=fake-token-value\n"
-    # the refusal really triggers on an "ahead" status line (function-level check of the guard logic)
-    doc = (ROOT / "docs/ops.md").read_text()
-    # Cloud era: the VM path is the documented historical fallback; the runbook names the script and the deploy path
+    # The deploy procedure the VM script implemented is documented in the cloud runbook: guarded by open executions, pinned to a
+    # commit, and the VM backend stays a labelled fallback rather than the documented path.
     runbook = (ROOT / "docs/runbook.md").read_text()
-    assert "## Historical VM fallback" in runbook and "scripts/vm/update.sh" in runbook and "git pull --ff-only" in runbook
-    assert "## Deploy a commit" in runbook and "make deploy" in runbook
+    assert "## Deploy a commit" in runbook and "swesim workflows open-types" in runbook and "make deploy" in runbook and "SHA=COMMIT_SHA" in runbook
+    assert "OVERRIDE_OPEN_EXECUTIONS" in runbook and "workflow.patched" in runbook
+    assert "## Historical VM fallback" in runbook and "scripts/vm/" in runbook and "origin=vm-systemd" in runbook
 
 
-def test_ops_doc_has_required_sections():
-    """Cloud era: ops.md is the evidence ledger; the runbook is the procedure. Both keep the sections operators rely on and
-    the historical VM evidence stays labelled as such (brief §10: VM-era records are never pooled with hosted ones)."""
-    text = (ROOT / "docs/ops.md").read_text(); runbook = (ROOT / "docs/runbook.md").read_text()
-    for section in ("## Preserved record inventory", "## Outstanding hosted acceptance", "## Historical VM evidence",
-                    "## Historical failures and resulting fixes", "## Retry and evidence rules"):
-        assert section in text, section
-    for section in ("## Deploy a commit", "## Diagnose a missing or stuck trial", "## Change capacity and test restart recovery",
-                    "## Import and rebuild the record", "## Historical VM fallback", "## Acceptance checklist"):
+def test_cloud_docs_have_required_sections():
+    """setup/runbook/ops replaced the VM-era ops.md (f53c3c5). What the old check protected, in cloud terms: a complete operator
+    path (setup 1-7), a runbook with deploy / inspect / stuck-trial / capacity+restart / rotation / import / restore / access /
+    fallback / acceptance, an evidence ledger with model availability, restart and failure history, and the literals operators
+    grep for: the trial runtime named by trial id, evidence paths, the never-relaunch rule, the spend cap and the frontier gate."""
+    setup = (ROOT / "docs/setup.md").read_text(); runbook = (ROOT / "docs/runbook.md").read_text(); ops = (ROOT / "docs/ops.md").read_text()
+    for section in ("## 1. Accounts and tools", "## 2. Clone and configure", "## 3. Check the checkout", "## 4. Configure Modal",
+                    "## 5. Provision and deploy GCP", "## 6. First use", "## 7. Teardown"):
+        assert section in setup, section
+    for section in ("## Deploy a commit", "## Inspect work and spend", "## Diagnose a missing or stuck trial", "## Change capacity and test restart recovery",
+                    "## Rotate credentials", "## Import and rebuild the record", "## Restore from bucket versions", "## Revoke or grant console access",
+                    "## Historical VM fallback", "## Acceptance checklist"):
         assert section in runbook, section
-    assert "26f3304d9caedfe10cd75ebf" in text and "systemd unit per trial" in text            # the measured VM restart proof, labelled historical
-    assert "swesim-trial-TRIAL_ID" in runbook and "origin=vm-systemd" in runbook               # one Job per trial; VM records keep their origin
+    for section in ("## Hosted takeover", "### Model availability", "## Preserved record inventory", "## Outstanding hosted acceptance",
+                    "## Historical VM evidence", "### Worker restart", "## Historical failures and resulting fixes", "## Retry and evidence rules"):
+        assert section in ops, section
+    assert "swesim-trial-TRIAL_ID" in runbook and "Do not issue another execute call" in runbook and "workspace/evidence/cloudrun/" in runbook
+    assert "SWESIM_SPEND_CAP_USD" in runbook and "Frontier tiers require the brief's gate" in runbook and "no requested model is silently substituted" in runbook
+    assert "workspace/evidence/" in ops and "swesim-trial-" in ops and "never" in ops.lower()
+    # hosted evidence is dated and labelled; a VM demonstration is never presented as Cloud Run acceptance
+    assert "Historical VM demonstrations remain separate from Cloud Run acceptance" in ops
 
 
 def _bash_functions(text, names):

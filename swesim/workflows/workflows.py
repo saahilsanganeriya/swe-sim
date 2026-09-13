@@ -41,8 +41,10 @@ PATCH_BATCH = "20260913-bounded-batches"
 PATCH_SEARCH = "20260913-search-attributes"
 PATCH_DIFFICULTY = "20260913-difficulty-screen"
 PATCH_AUDIT = "20260913-automatic-audits"
+PATCH_FRONTIER = "20260913-frontier-admission"
 PATCH_SCORE_K = "20260913-requested-score-k"
 PATCH_FROZEN_RETRY = "20260913-frozen-candidate-retry"
+PATCH_LIFECYCLE = "20260913-lifecycle-bookkeeping"  # operator workflows: running row before any probe/gate; failed/cancelled rows on exit
 CHILDREN_PER_RUN = 100
 HOOK_MINUTES = 2
 CONTROL_MINUTES = 60                           # one Harbor control run on Modal (validate_scenario's whole set had 180)
@@ -147,6 +149,22 @@ async def index_workflow(status: str, summary: dict, failure: str | None = None)
 
 def _indexed(*results: dict) -> bool:
     return all(bool(r.get("indexed", True)) for r in results)
+
+
+async def _lifecycle(p: dict, body):
+    """Terminal bookkeeping for an operator workflow (Create/Run): the `running` row is written before any probe, gate or plan,
+    and the execution's end is recorded even when the body never reached its own completion hook: `failed` with the failure
+    text, `cancelled` on cancellation. A completed body writes its own `completed` row (it carries the outcome); continue-as-new
+    is recorded by `_continue` and passes through untouched. Bookkeeping never changes the outcome: the exception is re-raised."""
+    if not _patched(PATCH_LIFECYCLE):
+        return await body()
+    await index_workflow("running", params_summary(p))
+    try:
+        return await body()
+    except (asyncio.CancelledError, Exception) as e:  # noqa: BLE001 - recorded, then re-raised unchanged
+        cancelled = isinstance(e, asyncio.CancelledError) or is_cancelled_exception(e)
+        await asyncio.shield(index_workflow("cancelled" if cancelled else "failed", params_summary(p), None if cancelled else _err(e)))
+        raise
 
 
 def _auto(p: dict) -> bool:
@@ -369,7 +387,7 @@ class RunTasksWorkflow:
     async def run(self, p: dict) -> dict:
         p = dict(p or {})
         if _patched(PATCH_BATCH):
-            return await _run_batched(self, p)
+            return await _lifecycle(p, lambda: _run_batched(self, p))
         sem = asyncio.Semaphore(max(1, int(p.get("max_parallel_trials", 1))))
         plan_keys = ("models", "conditions", "k", "purpose", "brief_profile", "stakeholder_model", "attempt_offset", "stakeholder_url")
         plan_p = {k: p[k] for k in plan_keys if p.get(k) is not None}
@@ -605,6 +623,21 @@ def _source_key(src: dict, *, include_band: bool = False) -> str:
     return f"{kind}:{str(src.get('pool', 'A')).strip().casefold()}"
 
 
+def _validate_create(p: dict) -> str:
+    """CreateTasksWorkflow's input rules (non-retryable): a known approval mode, at least one source, no duplicate source keys
+    (mine outputs are one file per pool/repo, so two sources with the same key in one batch would race on that file)."""
+    mode = p.get("approval_mode", "auto")
+    if mode not in CREATE_APPROVAL_MODES:
+        raise ApplicationError(f"approval_mode must be one of {sorted(CREATE_APPROVAL_MODES)}", non_retryable=True)
+    keys = [_source_key(src, include_band=_patched(PATCH_BATCH)) for src in p.get("sources", [])]
+    dups = sorted({k for k in keys if keys.count(k) > 1})
+    if dups:
+        raise ApplicationError(f"duplicate sources in one batch: {dups}; merge them into one source or run separate batches", non_retryable=True)
+    if not keys:
+        raise ApplicationError("sources is empty", non_retryable=True)
+    return mode
+
+
 @workflow.defn
 class CreateTasksWorkflow:
     """Mine each source, then one CandidateWorkflow per candidate (id create:<scenario_id>), at most `max_parallel` at a time."""
@@ -639,19 +672,13 @@ class CreateTasksWorkflow:
     @workflow.run
     async def run(self, p: dict) -> dict:
         p = dict(p or {})
-        mode = p.get("approval_mode", "auto")
-        if mode not in CREATE_APPROVAL_MODES:
-            raise ApplicationError(f"approval_mode must be one of {sorted(CREATE_APPROVAL_MODES)}", non_retryable=True)
-        # Mine outputs are one file per pool/repo, so two sources with the same key in one batch would race on that
-        # file while mining concurrently. Guard: duplicate keys are rejected before any activity runs.
-        keys = [_source_key(src, include_band=_patched(PATCH_BATCH)) for src in p.get("sources", [])]
-        dups = sorted({k for k in keys if keys.count(k) > 1})
-        if dups:
-            raise ApplicationError(f"duplicate sources in one batch: {dups}; merge them into one source or run separate batches", non_retryable=True)
-        if not keys:
-            raise ApplicationError("sources is empty", non_retryable=True)
         if _patched(PATCH_BATCH):
-            return await _create_batched(self, p)
+            # Validation runs inside the lifecycle so invalid input is a recorded `failed` execution, not one that never appears.
+            async def body():
+                _validate_create(p)
+                return await _create_batched(self, p)
+            return await _lifecycle(p, body)
+        mode = _validate_create(p)
         sem = asyncio.Semaphore(max(1, int(p.get("max_parallel", 8))))
         rebuild = bool(p.get("rebuild"))
         self.state = {"stage": "probing-models", "sources": {}, "probe": {}, "rebuild": rebuild}
@@ -889,7 +916,8 @@ async def _create_batched(self: CreateTasksWorkflow, p: dict) -> dict:
     sem = asyncio.Semaphore(max(1, int(p.get('max_parallel', 8))))
     self.state = {'stage': 'starting', 'sources': resume.get('sources', {}), 'probe': resume.get('probe', {}), 'rebuild': rebuild,
                   'checkpoint_path': resume.get('previous_checkpoint')}
-    await index_workflow('running', params_summary(p))
+    if not _patched(PATCH_LIFECYCLE):
+        await index_workflow('running', params_summary(p))  # newer executions wrote it in `_lifecycle`, before this point
     if resume:
         self.counts = dict(resume['counts']); prepared = resume['plan']
     else:
@@ -947,6 +975,18 @@ async def _create_batched(self: CreateTasksWorkflow, p: dict) -> dict:
 async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
     resume = p.get('_continuation') or {}
     if not resume:
+        if _patched(PATCH_FRONTIER):
+            admission = await act('frontier_gate_activity', p, 5, retry=retries.READ)
+            if not admission.get('allowed'):
+                self.state = {'stage': 'complete', 'stopped_reason': 'frontier-gate', 'admission': admission}
+                await index_workflow('completed', {**params_summary(p), 'stopped_reason': 'frontier-gate'})
+                return {'status': 'blocked', 'scenarios': {}, 'trials': {}, 'admission': admission, 'stopped_reason': 'frontier-gate'}
+            p = {**p, 'scenario_ids': admission.get('scenario_ids', p.get('scenario_ids', []))}
+            if admission.get('evidence_path'):
+                # A Tier D/E request: every later planning step (fresh plan, cached plan page, continue-as-new resume) verifies
+                # this recorded decision against its own request (`plan_trials`); a Tier A–C request carries nothing.
+                p['admission'] = {'evidence_path': admission['evidence_path'], 'identity': admission.get('identity')}
+                self.state = {'stage': 'probing-models', 'admission': p['admission']}
         self.state = {'stage': 'probing-models'}
         probe = await act('probe_models_activity', p, 5)
         p = {**p, **(probe.get('substitutions') or {}), **(probe.get('resolved') or {})}
@@ -955,11 +995,13 @@ async def _run_batched(self: RunTasksWorkflow, p: dict) -> dict:
             await index_workflow('completed', {**params_summary(p), 'stopped_reason': 'model-unavailable'})
             return {'status': 'complete-with-failures', 'scenarios': {}, 'trials': {}, 'stopped_reason': 'model-unavailable', 'probe': probe}
     sem = asyncio.Semaphore(max(1, int(p.get('max_parallel_trials', 1))))
-    keys = ('models', 'conditions', 'k', 'purpose', 'brief_profile', 'stakeholder_model', 'audit_model', 'attempt_offset', 'stakeholder_url')
+    keys = ('models', 'conditions', 'k', 'purpose', 'brief_profile', 'stakeholder_model', 'audit_model', 'attempt_offset', 'stakeholder_url',
+            'include_saturated', 'admission')
     plan_p = {k: p[k] for k in keys if p.get(k) is not None}
     results = {}; children = 0; summary = dict(resume.get('summary') or {'children': 0, 'scenarios': 0, 'failed_scenarios': 0})
     self.state = {'stage': 'running', 'summary': summary, 'checkpoint_path': resume.get('previous_checkpoint')}
-    await index_workflow('running', params_summary(p))
+    if not _patched(PATCH_LIFECYCLE):
+        await index_workflow('running', params_summary(p))  # newer executions wrote it in `_lifecycle`, before the gate and the probe
     await self._spend_exceeded(p)
     async def set_status(trial, status):
         self.trials[trial['trial_id']] = {**self.trials.get(trial['trial_id'], {}), 'status': status}

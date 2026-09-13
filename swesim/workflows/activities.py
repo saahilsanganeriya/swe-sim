@@ -662,7 +662,10 @@ async def register_activity(p: dict) -> dict:
 
 
 def plan_trials(p: dict) -> dict:
-    """Precompute trial requests with the actual per-model RunConfig; trial ids are the workflow ids."""
+    """Precompute trial requests with the actual per-model RunConfig; trial ids are the workflow ids. A Tier D/E request is
+    planned only under a frontier admission (brief §3.2): the recorded decision the workflow carries, verified against this
+    request, or a fresh evaluation for a direct caller; the scenario must be among the admitted ids."""
+    admission = _frontier_admission(p)
     spec = _spec(p["scenario_id"]); comp = json.loads((WS.scenario_dir(spec.id) / "compile.json").read_text()); trials = []
     offset = int(p.get("attempt_offset", 0))  # manual retries use fresh attempt indices, never the same trial id
     if p.get("purpose") == "screen":
@@ -697,7 +700,35 @@ def plan_trials(p: dict) -> dict:
     if p.get("audit_model"):
         for trial in trials:
             trial["audit_model"] = p["audit_model"]
-    return {"scenario_id": spec.id, "trials": trials}
+    provenance = {k: admission[k] for k in ("identity", "evidence_path") if admission.get(k)}  # the decision these trials were planned under
+    return {"scenario_id": spec.id, "trials": trials, **({"admission": provenance} if provenance else {})}
+
+
+def _frontier_preflight(p: dict) -> dict:
+    """Fresh evaluation from frozen evidence; writes the durable decision (RunTasksWorkflow's gate)."""
+    from swesim.stages.frontier import preflight
+    return preflight(WS, SETTINGS, p)
+
+
+def _frontier_admission(p: dict) -> dict:
+    """The admission `plan_trials` enforces (`frontier.admission_for_plan`); refuses with a ValueError (non-retryable) unless the
+    request is admitted and the planned scenario is among the admitted ids."""
+    from swesim.stages.frontier import admission_for_plan, frontier_requested
+    admission = admission_for_plan(WS, SETTINGS, p)
+    if not admission.get("allowed"):
+        raise ValueError("frontier admission rejected: " + "; ".join(admission.get("reasons") or ["no admission"]))
+    if frontier_requested(p) and p.get("scenario_id") not in (admission.get("scenario_ids") or []):
+        reason = (admission.get("excluded_scenarios") or {}).get(p.get("scenario_id")) or "not among the admitted scenario ids"
+        raise ValueError(f"frontier admission excludes scenario {p.get('scenario_id')}: {reason}")
+    return admission
+
+
+@swesim_activity
+async def frontier_gate_activity(p: dict) -> dict:
+    """RunTasksWorkflow's admission gate (CONTROL): the durable decision for the whole request. Tier A–C requests pass through;
+    a Tier D/E request returns `allowed`, the admitted `scenario_ids`, `reasons`, the forecast and `evidence_path`/`identity`
+    that later planning verifies (`plan_trials`)."""
+    return await blocking(lambda: _frontier_preflight(p))
 
 
 @swesim_activity
@@ -707,8 +738,11 @@ async def plan_trials_activity(p: dict) -> dict:
 
 @swesim_activity
 async def prepare_trial_plan_activity(p: dict) -> dict:
+    """The immutable trial plan for one scenario of a RunTasksWorkflow. A cached plan is returned only under the same admission
+    check a fresh plan needs (a plan page is never a way around the frontier gate)."""
     path = batching.plan_path(WS, p["workflow_id"], p["scenario_id"])
     if path.exists():
+        await blocking(lambda: _frontier_admission(p))
         return batching.write_plan(path, [])
     return await blocking(lambda: batching.trial_plan(WS, path, plan_trials(p)["trials"]))
 
@@ -1067,6 +1101,7 @@ ALL = [probe_models_activity, discover_activity, mine_activity, judge_activity, 
        await_trial_activity, cancel_trial_activity, cleanup_trial_activity, score_activity, export_activity, spend_check_activity, record_cost_activity,
        prepare_trial_plan_activity, prepare_candidate_plan_activity, read_plan_page_activity, checkpoint_workflow_activity]
 ALL.append(difficulty_label_activity)
+ALL.append(frontier_gate_activity)
 
 if __name__ == "__main__":
     raise SystemExit(main())
