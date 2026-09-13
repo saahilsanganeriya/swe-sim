@@ -2,7 +2,7 @@
 # Create the swesim GCE VM and bootstrap it (laptop side). Re-runnable: an existing instance is reused.
 #
 # Inputs (never printed, never evaluated as shell):
-#   SWESIM_ENV_FILE  dotenv file, default ~/Documents/.env. Read with a line parser (env_get) for GCP_PROJECT and
+#   SWESIM_ENV_FILE  dotenv file, default ./.env. Read with a line parser (env_get) for GCP_PROJECT and
 #                    GCP_ZONE when they are not already in the environment. The laptop file itself is NOT shipped:
 #                    render_worker_env writes a mode-0600 temp file holding only the worker's keys
 #                    (ANTHROPIC_API_KEY, OPENAI_API_KEY, SWESIM_WORKER_SECRET, SWESIM_STAKEHOLDER_URL, read-only GH_TOKEN)
@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-ENV_FILE=${SWESIM_ENV_FILE:-$HOME/Documents/.env}
+ENV_FILE=${SWESIM_ENV_FILE:-.env}
 MODAL_TOML=${MODAL_TOML:-$HOME/.modal.toml}
 VM_NAME=${VM_NAME:-swesim-worker}
 MACHINE_TYPE=${MACHINE_TYPE:-e2-standard-4}

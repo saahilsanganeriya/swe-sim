@@ -4,19 +4,22 @@
 locals {
   common_env = { for k, v in merge(
     {
-      SWESIM_WORKSPACE       = "/workspace"
-      SWESIM_REGISTRY        = "/workspace/registry.json"
-      SWESIM_BUCKET          = var.bucket
-      SWESIM_TRIAL_LAUNCHER  = "cloudrun"
-      SWESIM_ORIGIN          = "cloudrun"
-      SWESIM_GCP_PROJECT     = var.project
-      SWESIM_GCP_REGION      = var.region
-      SWESIM_EVALUATORS      = join(",", var.evaluators)
-      SWESIM_STAKEHOLDER_URL = var.stakeholder_url
-      SWESIM_CONSOLE_URL     = var.console_url
-      SWESIM_IAP_AUDIENCE    = var.iap_audience
-      TEMPORAL_ADDRESS       = var.temporal_address
-      TEMPORAL_NAMESPACE     = var.temporal_namespace
+      SWESIM_WORKSPACE              = "/workspace"
+      SWESIM_REGISTRY               = "/workspace/registry.json"
+      SWESIM_BUCKET                 = var.bucket
+      SWESIM_TRIAL_LAUNCHER         = "cloudrun"
+      SWESIM_ORIGIN                 = "cloudrun"
+      SWESIM_GCP_PROJECT            = var.project
+      SWESIM_GCP_REGION             = var.region
+      SWESIM_WORKER_IMAGE           = var.image
+      SWESIM_WORKER_SERVICE_ACCOUNT = var.worker_service_account
+      SWESIM_SQL_CONNECTION_NAME    = var.sql_connection_name
+      SWESIM_EVALUATORS             = join(",", var.evaluators)
+      SWESIM_STAKEHOLDER_URL        = var.stakeholder_url
+      SWESIM_CONSOLE_URL            = var.console_url
+      SWESIM_IAP_AUDIENCE           = var.iap_audience
+      TEMPORAL_ADDRESS              = var.temporal_address
+      TEMPORAL_NAMESPACE            = var.temporal_namespace
     },
     var.image_digest != "" ? { SWESIM_WORKER_IMAGE_DIGEST = var.image_digest } : {},
     var.spend_cap_usd != null ? { SWESIM_SPEND_CAP_USD = tostring(var.spend_cap_usd) } : {},
@@ -92,6 +95,66 @@ resource "google_cloud_run_v2_worker_pool" "pool" {
       name = "cloudsql"
       cloud_sql_instance {
         instances = [var.sql_connection_name]
+      }
+    }
+  }
+}
+
+# Operator maintenance uses the same image and mounted record as the workers. The default migrates the index;
+# `gcloud run jobs execute ... --args=rebuild,--origin=vm-systemd` imports the mirrored legacy record afterwards.
+resource "google_cloud_run_v2_job" "index_maintenance" {
+  project             = var.project
+  location            = var.region
+  name                = "swesim-index-maintenance"
+  deletion_protection = false
+  template {
+    task_count  = 1
+    parallelism = 1
+    template {
+      service_account = var.worker_service_account
+      max_retries     = 0
+      timeout         = "3600s"
+      containers {
+        image   = var.image
+        command = ["python", "-m", "swesim.index.cli"]
+        args    = ["migrate"]
+        resources { limits = { cpu = "1", memory = "2Gi" } }
+        dynamic "env" {
+          for_each = local.common_env
+          content {
+            name  = env.key
+            value = env.value
+          }
+        }
+        env {
+          name = "SWESIM_DATABASE_URL"
+          value_source {
+            secret_key_ref {
+              secret  = var.secret_ids["SWESIM_DATABASE_URL"]
+              version = "latest"
+            }
+          }
+        }
+        volume_mounts {
+          name       = "workspace"
+          mount_path = "/workspace"
+        }
+        volume_mounts {
+          name       = "cloudsql"
+          mount_path = "/cloudsql"
+        }
+      }
+      volumes {
+        name = "workspace"
+        gcs {
+          bucket        = var.bucket
+          read_only     = false
+          mount_options = local.gcs_mount_options
+        }
+      }
+      volumes {
+        name = "cloudsql"
+        cloud_sql_instance { instances = [var.sql_connection_name] }
       }
     }
   }

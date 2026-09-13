@@ -11,7 +11,7 @@ app = modal.App("swesim-stakeholder")
 volume = modal.Volume.from_name("swesim-stakeholder-state", create_if_missing=True)
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("fastapi[standard]", "pydantic>=2.7", "anthropic>=0.40", "openai>=1.50", "python-dotenv>=1.0")
+    .pip_install("fastapi[standard]", "pydantic>=2.7", "anthropic>=0.40", "openai>=1.50", "python-dotenv>=1.0", "python-ulid==4.0.1")
     .env({"SWESIM_SESSION_STORE": "/state/sessions"})
     .add_local_python_source("swesim")
 )

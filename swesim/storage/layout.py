@@ -33,11 +33,13 @@ TRIAL_FILES: frozenset[str] = frozenset(TrialFile.__args__)
 CANDIDATE_STAGES: frozenset[str] = frozenset(CandidateStage.__args__)
 JOB_KINDS: frozenset[str] = frozenset(JobKind.__args__)
 CONDITIONS: tuple[str, ...] = Condition.__args__
-EVIDENCE_KINDS: tuple[str, ...] = ("cloudrun", "cloud", "sweep", "console", "audit", "model-probe")
+EVIDENCE_KINDS: tuple[str, ...] = ("cloudrun", "cloud", "sweep", "console", "audit")  # directories; the model probe is one file
 
 TRIAL_ID_RE = re.compile(r"^[0-9a-f]{24}$")
 # One path segment: no separators, no `.`/`..`, the characters the pipeline uses for keys, instance ids and evidence kinds.
 SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Temporal workflow ids (`create:<sid>@v2`, `run:<...>`, trial ids) as one path segment: `:` and `@` allowed, no separators.
+WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$")
 _CANDIDATE_SUFFIX: dict[str, str] = {"mined": ".jsonl", "judged": ".judged.jsonl", "probed": ".judged.probed.jsonl",
                                      "probe_summary": ".judged.probed.summary.json", "rejects": ".rejects.json", "status": ".status"}
 
@@ -142,6 +144,10 @@ class Layout(Strict):
     def evidence_dir(self, kind: str) -> Path:
         return self.root / "evidence" / _segment(kind, "evidence kind")
 
+    def model_probe_path(self) -> Path:
+        """The resolved model roles (`probe_models_activity`): one file, `root/evidence/model-probe.json`."""
+        return self.root / "evidence" / "model-probe.json"
+
     def calibration_path(self, judge_model: str, day: date) -> Path:
         if not isinstance(day, date):
             raise LayoutError(f"invalid calibration day: {day!r}")
@@ -151,6 +157,16 @@ class Layout(Strict):
         if kind not in JOB_KINDS:
             raise LayoutError(f"invalid job kind: {kind!r}")
         return self.root / "jobs" / kind
+
+    # ------------------------------------------------------------------ costs outside a trial (swesim/costs.py)
+    def costs_dir(self) -> Path:
+        return self.root / "costs"
+
+    def workflow_costs_path(self, workflow_id: str) -> Path:
+        """Cost records of a workflow that has no trial (judge, drafter, audit...): `root/costs/<workflow_id>.json`."""
+        if not isinstance(workflow_id, str) or not WORKFLOW_ID_RE.fullmatch(workflow_id) or workflow_id in (".", ".."):
+            raise LayoutError(f"invalid workflow id: {workflow_id!r}")
+        return self.costs_dir() / f"{workflow_id}.json"
 
     def registry_path(self) -> Path:
         """The record's registry; `Settings.registry_path` may point elsewhere on a laptop."""

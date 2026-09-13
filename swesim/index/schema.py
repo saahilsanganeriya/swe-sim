@@ -81,8 +81,12 @@ def column_type(name: str, base) -> sa.types.TypeEngine:
     raise TypeError(f"no column type for {name!r}: {base!r}")
 
 
+MAX_IDENTIFIER = 63  # PostgreSQL truncates longer names silently; SQLAlchemy refuses them at DDL time
+
+
 def table_from_model(name: str, model: type[BaseModel], pk: tuple[str, ...], metadata: sa.MetaData, *,
-                     indexes: tuple[tuple[str, ...], ...] = ()) -> sa.Table:
+                     indexes: dict[str, tuple[str, ...]] | None = None) -> sa.Table:
+    """`indexes` maps an explicit index name (kept under 63 characters) to its columns."""
     # Column order: primary key, then the entity's own fields, then the remaining provenance columns.
     entity = [f for f in model.model_fields if f not in PROVENANCE_COLUMNS and f not in pk]
     provenance = [f for f in PROVENANCE_COLUMNS if f not in pk]
@@ -94,8 +98,10 @@ def table_from_model(name: str, model: type[BaseModel], pk: tuple[str, ...], met
             raise TypeError(f"primary key column {name}.{field} must not be optional")
         columns.append(sa.Column(field, column_type(field, base), primary_key=is_pk, nullable=nullable and not is_pk))
     table = sa.Table(name, metadata, *columns)
-    for cols in indexes:
-        sa.Index(f"ix_{name}_{'_'.join(cols)}", *[table.c[c] for c in cols])
+    for index_name, cols in (indexes or {}).items():
+        if len(index_name) > MAX_IDENTIFIER:
+            raise ValueError(f"index name {index_name!r} exceeds {MAX_IDENTIFIER} characters")
+        sa.Index(index_name, *[table.c[c] for c in cols])
     return table
 
 
@@ -111,16 +117,18 @@ PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "exchanges": ("trial_id", "seq"), "scores": ("scenario_id", "spec_hash", "condition", "brief_profile", "model", "run_config_hash"),
     "workflows": ("workflow_id", "run_id"), "costs": ("cost_id",), "operator_actions": ("action_id",), "index_rebuilds": ("rebuild_id",),
 }
-INDEXES: dict[str, tuple[tuple[str, ...], ...]] = {
-    "scenarios": (("validation_status",), ("source",)),
-    "candidates": (("source_key",), ("stage", "status"), ("scenario_id",)),
-    "trials": (("scenario_id",), ("model",), ("status",), ("started_at",), ("spec_hash", "condition", "brief_profile", "model", "run_config_hash")),
-    "exchanges": (),
-    "scores": (("scenario_id",),),
-    "workflows": (("type", "status"), ("started_at",), ("parent_workflow_id",)),
-    "costs": (("trial_id",), ("workflow_id",), ("provider", "model"), ("at",)),
-    "operator_actions": (("at",),),
-    "index_rebuilds": (("started_at",),),
+INDEXES: dict[str, dict[str, tuple[str, ...]]] = {
+    "scenarios": {"ix_scenarios_validation_status": ("validation_status",), "ix_scenarios_source": ("source",)},
+    "candidates": {"ix_candidates_source_key": ("source_key",), "ix_candidates_stage_status": ("stage", "status"), "ix_candidates_scenario_id": ("scenario_id",)},
+    "trials": {"ix_trials_scenario_id": ("scenario_id",), "ix_trials_model": ("model",), "ix_trials_status": ("status",), "ix_trials_started_at": ("started_at",),
+               # the score group key (interfaces §2 `scores` pk minus scenario_id): what the leaderboard and score pages join on
+               "ix_trials_lineage": ("spec_hash", "condition", "brief_profile", "model", "run_config_hash")},
+    "exchanges": {},
+    "scores": {"ix_scores_scenario_id": ("scenario_id",)},
+    "workflows": {"ix_workflows_type_status": ("type", "status"), "ix_workflows_started_at": ("started_at",), "ix_workflows_parent_workflow_id": ("parent_workflow_id",)},
+    "costs": {"ix_costs_trial_id": ("trial_id",), "ix_costs_workflow_id": ("workflow_id",), "ix_costs_provider_model": ("provider", "model"), "ix_costs_at": ("at",)},
+    "operator_actions": {"ix_operator_actions_at": ("at",)},
+    "index_rebuilds": {"ix_index_rebuilds_started_at": ("started_at",)},
 }
 
 TABLES: dict[str, sa.Table] = {

@@ -37,11 +37,13 @@ def test_forbidden_terms_come_from_hidden_tests_minus_what_the_reporter_said(tmp
     (tmp_path / "assets").mkdir(); (tmp_path / "assets" / "test.patch").write_text(HIDDEN_TEST_PATCH)
     terms = forbidden_terms(spec, tmp_path)
     assert terms == sorted(set(terms))                                                   # deterministic, unique
-    for t in ("Continuous", "_setup", "bool_series", "test_bool_series_maps_to_interval", "pkg", "scales", "out", "must", "never", "raised", "here"):
-        assert t in terms, t                                                            # in the hidden test, unknown to the reporter
+    for t in ("Continuous", "_setup", "bool_series", "test_bool_series_maps_to_interval", "pkg", "scales", "out"):
+        assert t in terms, t                                                            # code identifiers of the hidden test, unknown to the reporter
+    for t in ("must", "never", "raised", "here", "ValueError"):
+        assert t not in terms, t                                                        # comment words and Python builtins are reporter speech (A-P1-2 follow-up)
     for t in FIXED_FORBIDDEN: assert t in terms, t
-    assert "ValueError" in terms and "Raise" not in terms                                # in the test; requirements / facts never exempt a term (A-P1-2)
-    assert "IntervalProperty" in terms                                                  # named in a visible fact, not by the reporter
+    assert "Raise" not in terms
+    assert "IntervalProperty" in terms                                                  # named in a visible fact, not by the reporter: requirements / facts never exempt a term (A-P1-2)
     assert "Continuous" in terms                                                        # author-only facts do not count as visible
     for t in ("import", "from", "def", "diff", "git", "index", "mode", "dev", "null", "file"): assert t not in terms, t   # keywords and patch framing
     assert all(t.casefold() not in {"raise", "breaks"} for t in terms)
@@ -101,6 +103,8 @@ def scene(tmp_path, monkeypatch):
         (tdir / "instruction.natural.md").write_text(f"INSTRUCTION {cond} natural")   # compile-time per-profile render
         if cond == "interactive": (tdir / "agent_config.yaml").write_bytes(scaffold.read_bytes())  # compile-time scaffold copy
     calls = {"post": [], "get": [], "run": []}
+    # This fixture supplies placeholder compiled files. The real compiler/manifest boundary is covered below and in test_compile.
+    monkeypatch.setattr(run, "verify_compiled_artifacts", lambda task, record, condition: None)
     H = "a" * 64
     state = {"transcript_hash": H, "frozen": True, "report": {"transcript_hash": H, "patch_sha256": "p"}, "exception": None, "trajectory": None}
 
@@ -134,6 +138,15 @@ def scene(tmp_path, monkeypatch):
     return ws, spec, calls, state
 
 
+def test_run_rejects_unbound_compile_before_creating_a_session(scene, monkeypatch):
+    from swesim.stages.compile import verify_compiled_artifacts
+    monkeypatch.setattr(run, "verify_compiled_artifacts", verify_compiled_artifacts)
+    ws, spec, calls, _ = scene
+    with pytest.raises(ValueError, match="recompile"):
+        run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 0, URL, "secret")
+    assert calls == {"post": [], "get": [], "run": []}
+
+
 def test_run_trial_interactive_end_to_end(scene):
     ws, spec, calls, state = scene
     rc = RunConfig(condition="interactive", model="openai/gpt-5.5")
@@ -151,7 +164,7 @@ def test_run_trial_interactive_end_to_end(scene):
     assert body["spec_hash"] == spec.spec_hash and body["run_config_hash"] == effective.run_config_hash and body["image"] == "ubuntu:24.04"
     assert body["visible_view"]["facts"][0]["id"] == "f01" and body["stakeholder_config"]["patience_profile"]["start"] == 6
     ft = body["visible_view"]["forbidden_terms"]                                        # deny-list of tokens from the hidden test
-    assert {"Continuous", "IntervalProperty", "_setup", "_setup(", "assert", "pytest", "tests/", "test_", "ValueError"} <= set(ft) and "breaks" not in ft
+    assert {"Continuous", "IntervalProperty", "_setup", "_setup(", "assert", "pytest", "tests/", "test_"} <= set(ft) and "breaks" not in ft and "ValueError" not in ft
     assert HIDDEN_TEST_PATCH.splitlines()[-1].strip("+ ") not in json.dumps(body)        # tokens, never test content
     assert calls["post"][1][0] == URL + "/freeze" and calls["post"][1][2] == {"Authorization": "Bearer t1.tok"}
     assert calls["get"] == [(URL + f"/transcript/{tid}", {"X-Worker-Secret": "secret"})]

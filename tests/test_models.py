@@ -1,6 +1,19 @@
-import json, pytest
+import pytest
 from pydantic import ValidationError
 from swesim.models import (ScenarioSpec, RunConfig, canonical_hash, trial_id, minimal_spec_dict)
+
+
+@pytest.mark.parametrize("withheld", ["Title\nKeep existing behavior.\nA new requirement.", "Title"])
+def test_withheld_cannot_add_or_silently_remove_requirements(withheld):
+    d = minimal_spec_dict()
+    d["briefs"][0]["text"] = "Title\nKeep existing behavior.\nThe diagnostic is SECRET_ERROR."
+    d["briefs"].append({"profile": "withheld", "provenance": "withheld", "text": withheld})
+    d["ledger"].append({"id": "withheld-001", "text": "The diagnostic is SECRET_ERROR.", "kind": "reproduction",
+                        "provenance": "original-issue", "source_excerpt": "The diagnostic is SECRET_ERROR.",
+                        "source_url": "https://example.com/issue", "discovery": "on-request", "tests": []})
+    d["operations"] = [{"type": "withholding", "target": "withheld-001", "rationale": "Remove the diagnostic."}]
+    with pytest.raises(ValueError, match="reconstruct"):
+        ScenarioSpec.model_validate(d)
 
 def test_roundtrip_hash():
     spec = ScenarioSpec.model_validate(minimal_spec_dict())

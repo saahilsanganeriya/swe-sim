@@ -4,7 +4,7 @@ import hashlib, json, re
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator, computed_field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 
@@ -153,6 +153,10 @@ class ScenarioSpec(Strict):
                 if fact.source_excerpt.casefold() in withheld.text.casefold(): raise ValueError('removed excerpt still visible')
             # Keep the literal title, a conservative check; human approval assesses symptom/goal fidelity.
             if natural.text.splitlines()[0].strip() not in withheld.text: raise ValueError('withheld brief must retain title')
+            from swesim.stages.draft_spec import reconstruct_withheld
+            excerpts = [next(f.source_excerpt for f in self.ledger if f.id == op.target) for op in ops]
+            if reconstruct_withheld(natural.text, excerpts) != withheld.text:
+                raise ValueError('recorded removals do not reconstruct the withheld brief')
         elif any(o.type==OperationType.WITHHOLDING for o in self.operations): raise ValueError('missing withheld profile')
         if not self.contract.fail_to_pass: raise ValueError("fail_to_pass empty")
         f2p, p2p = self.contract.fail_to_pass, self.contract.pass_to_pass

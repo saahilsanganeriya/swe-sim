@@ -73,13 +73,18 @@ def _scenario_rows(paths: RecordPaths, registry: dict[str, dict]) -> tuple[list[
     return rows, unaudited
 
 
-def _model_row() -> dict:
-    return {"trials": 0, "trial_ids": [], "unknown_version_trials": [], "asked_trials": 0,
+def _row_key(model: str, version: str | None) -> str:
+    return f"{model} @ {version or 'unknown'}"
+
+
+def _model_row(model: str, version: str | None) -> dict:
+    return {"model": model, "stakeholder_version": version, "trials": 0, "trial_ids": [], "unknown_version_trials": [], "asked_trials": 0,
             "asked_before_implementing": {"true": 0, "false": 0, "unknown": 0, "rate": None},
             "questions": 0, "useful_questions": 0, "unlabelled_questions": 0, "useful_question_rate": None, "questions_per_trial": None,
             "questions_before_implementation": 0, "questions_after_implementation": 0,
             "confirmations": 0, "replies": 0, "targeted": 0, "not_targeted": 0, "targeted_unknown": 0, "volunteered_replies": 0,
             "test_or_identifier_disclosed": 0, "behaviour_level_false": 0, "behaviour_level_unknown": 0, "undeclared_replies": 0,
+            "ungrounded_replies": 0,
             "regenerated_replies": 0, "redacted_replies": 0, "patience_spent": 0, "patience_refusals": 0,
             "integrity_signals": 0, "flagged_trials": []}
 
@@ -132,22 +137,25 @@ def build_report(layout, registry_path: Path | None = None, *, llm_usage: dict |
             counts["unregistered_scenario"] += 1
             excluded.append({**base, "reason": "scenario not in the registry"})
             continue
+        reasons = []
         if reg.get("spec_hash") != a.spec_hash:
             counts["archived_spec"] += 1
-            excluded.append({**base, "reason": f"archived spec (registry has version {reg.get('version')}, spec {str(reg.get('spec_hash'))[:8]})"})
-            continue
+            reasons.append(f"archived spec (registry has version {reg.get('version')}, spec {str(reg.get('spec_hash'))[:8]})")
         if a.legacy:
             counts["legacy"] += 1
-            excluded.append({**base, "reason": "legacy stakeholder v1"})
+            reasons.append("legacy stakeholder v1")
+        if reasons:
+            excluded.append({**base, "reason": "; ".join(reasons)})
             continue
         counts["included"] += 1
-        m = models.setdefault(model, _model_row())
+        key = _row_key(model, a.stakeholder_version)      # stakeholder versions never pool (models.py: v3 = v2 prompt on Opus 5)
+        m = models.setdefault(key, _model_row(model, a.stakeholder_version))
         s = per_scenario.setdefault(sid, {"trials": 0, "models": {}, "questions": 0, "replies": 0, "volunteered_replies": 0,
                                           "test_or_identifier_disclosed": 0, "asked_trials": 0})
         m["trials"] += 1
         m["trial_ids"].append(a.trial_id)
         s["trials"] += 1
-        s["models"][model] = s["models"].get(model, 0) + 1
+        s["models"][key] = s["models"].get(key, 0) + 1
         if a.stakeholder_version is None:
             counts["unknown_version"] += 1
             m["unknown_version_trials"].append(a.trial_id)
@@ -193,6 +201,8 @@ def build_report(layout, registry_path: Path | None = None, *, llm_usage: dict |
                 m["behaviour_level_unknown"] += 1
             if r.undeclared:
                 m["undeclared_replies"] += 1
+            if r.ungrounded:
+                m["ungrounded_replies"] += 1
             if ev.get("regenerated"):
                 m["regenerated_replies"] += 1
             if ev.get("redacted_terms"):
@@ -200,13 +210,15 @@ def build_report(layout, registry_path: Path | None = None, *, llm_usage: dict |
             kinds = []
             if r.test_or_identifier_disclosed:
                 kinds.append("test_or_identifier_disclosed")
+            if r.ungrounded:
+                kinds.append("ungrounded_requirement")
             if r.volunteered:
                 kinds.append("volunteered")
             if r.behaviour_level is False:
                 kinds.append("not_behaviour_level")
             if kinds:
                 violations.append({**base, "seq": r.seq, "exchange": ev.get("exchange"), "kinds": kinds, "hits": r.hits,
-                                   "volunteered": r.volunteered, "reason": r.reason})
+                                   "ungrounded": r.ungrounded, "volunteered": r.volunteered, "reason": r.reason})
         if a.patience:
             m["patience_spent"] += a.patience.spent
             m["patience_refusals"] += a.patience.refusals
@@ -257,20 +269,21 @@ def render_markdown(report: dict) -> str:
             f"interaction), {c['included']} interactive trials pooled below; excluded: {c['legacy']} legacy (stakeholder v1), "
             f"{c['archived_spec']} on an archived spec, {c['unregistered_scenario']} on unregistered scenarios; {c['unknown_version']} pooled "
             f"trials have an undeterminable stakeholder version (no exchange).", "",
-            "| model | trials | asked | asked before implementing (true/false/unknown) | rate | questions | useful | useful rate | "
-            "confirmations | replies | targeted / not / unknown | volunteered | test or identifier disclosed | not behaviour-level | "
-            "undeclared facts | regenerated | redacted | patience spent | integrity signals |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
-    for model, m in report["models"].items():
+            "| model | stakeholder | trials | asked | asked before implementing (true/false/unknown) | rate | questions | useful | useful rate | "
+            "confirmations | replies | targeted / not / unknown | volunteered | test or identifier disclosed | ungrounded requirement | "
+            "not behaviour-level | undeclared facts | regenerated | redacted | patience spent | integrity signals |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for m in report["models"].values():
         abi = m["asked_before_implementing"]
-        out.append(f"| {model} | {m['trials']} | {m['asked_trials']} | {abi['true']}/{abi['false']}/{abi['unknown']} | {_pct(abi['rate'])} | "
+        out.append(f"| {m['model']} | {m['stakeholder_version'] or 'unknown'} | {m['trials']} | {m['asked_trials']} | "
+                   f"{abi['true']}/{abi['false']}/{abi['unknown']} | {_pct(abi['rate'])} | "
                    f"{m['questions']} | {m['useful_questions']} | {_pct(m['useful_question_rate'])} | {m['confirmations']} | {m['replies']} | "
                    f"{m['targeted']} / {m['not_targeted']} / {m['targeted_unknown']} | {m['volunteered_replies']} | {m['test_or_identifier_disclosed']} | "
-                   f"{m['behaviour_level_false']} | {m['undeclared_replies']} | {m['regenerated_replies']} | {m['redacted_replies']} | "
+                   f"{m['ungrounded_replies']} | {m['behaviour_level_false']} | {m['undeclared_replies']} | {m['regenerated_replies']} | {m['redacted_replies']} | "
                    f"{m['patience_spent']} | {m['integrity_signals']} |")
-    for model, m in report["models"].items():
+    for key, m in report["models"].items():
         if m["flagged_trials"]:
-            out += ["", f"Integrity signals under {model}:"]
+            out += ["", f"Integrity signals under {key}:"]
             out += [f"- `{f['trial_id']}` ({f['scenario_id']}): {', '.join(f['signals'])}; dropped paths {f['dropped_paths']}" for f in m["flagged_trials"]]
     out += ["", "## Per scenario (pooled interactive trials)", "", "| scenario | trials | models | asked | questions | replies | volunteered | test or identifier disclosed |",
             "|---|---|---|---|---|---|---|---|"]
@@ -282,7 +295,7 @@ def render_markdown(report: dict) -> str:
         out.append("None.")
     for v in report["disclosure_violations"]:
         out.append(f"- `{v['trial_id']}` seq {v['seq']} ({v['exchange']}, {v['model']}, {v['scenario_id']}): {', '.join(v['kinds'])}; "
-                   f"terms {v['hits']}; volunteered {v['volunteered']}. {v['reason']}")
+                   f"terms {v['hits']}; ungrounded {v['ungrounded']}; volunteered {v['volunteered']}. {v['reason']}")
     out += ["", "## Excluded trials", ""]
     if not report["excluded"]:
         out.append("None.")

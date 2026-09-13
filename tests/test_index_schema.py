@@ -47,6 +47,21 @@ def test_every_row_model_has_a_table_with_the_same_columns_and_nullability():
         assert tuple(c.name for c in table.primary_key.columns) == EXPECTED_PK[name], name
 
 
+def test_every_identifier_fits_postgres(tmp_path: Path):
+    """PostgreSQL identifiers are at most 63 characters; SQLite does not care, so the limit is asserted here and the
+    Postgres DDL is rendered once to prove every index and constraint name survives."""
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateIndex, CreateTable
+
+    for table in S.metadata.sorted_tables:
+        names = [table.name, *(c.name for c in table.columns), *(i.name for i in table.indexes), *(k.name for k in table.constraints if k.name)]
+        assert all(len(n) <= S.MAX_IDENTIFIER for n in names), (table.name, [n for n in names if len(n) > S.MAX_IDENTIFIER])
+        str(CreateTable(table).compile(dialect=postgresql.dialect()))
+        for index in table.indexes:
+            str(CreateIndex(index).compile(dialect=postgresql.dialect()))
+    assert {i.name for i in S.trials.indexes} >= {"ix_trials_lineage", "ix_trials_scenario_id", "ix_trials_status"}
+
+
 def test_column_types_follow_the_data_model_bar():
     for name, table in S.TABLES.items():
         model = S.ROW_MODELS[name]

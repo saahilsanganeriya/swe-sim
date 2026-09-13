@@ -41,7 +41,10 @@ def test_report_pools_only_current_v2_interactive_trials_and_lists_the_rest(tmp_
     assert {e["trial_id"]: e["reason"] for e in rep["excluded"]} == {ids["c"]: "legacy stakeholder v1",
                                                                      ids["d"]: rep["excluded"][[e["trial_id"] for e in rep["excluded"]].index(ids["d"])]["reason"]}
     assert "archived spec" in next(e["reason"] for e in rep["excluded"] if e["trial_id"] == ids["d"])
-    sonnet, haiku = rep["models"][SONNET], rep["models"][HAIKU]
+    # rows never pool stakeholder versions: Sonnet's trials ran under v2, the quiet Haiku trial has no exchange to tell from
+    assert set(rep["models"]) == {f"{SONNET} @ v2", f"{HAIKU} @ unknown"}
+    sonnet, haiku = rep["models"][f"{SONNET} @ v2"], rep["models"][f"{HAIKU} @ unknown"]
+    assert (sonnet["model"], sonnet["stakeholder_version"], haiku["stakeholder_version"]) == (SONNET, "v2", None)
     assert sonnet["trials"] == 2 and sonnet["asked_trials"] == 2 and sonnet["asked_before_implementing"] == {"true": 1, "false": 1, "unknown": 0, "rate": 0.5}
     assert sonnet["questions"] == 2 and sonnet["useful_questions"] == 2 and sonnet["useful_question_rate"] == 1.0 and sonnet["questions_per_trial"] == 1.0
     assert sonnet["questions_before_implementation"] == 1 and sonnet["questions_after_implementation"] == 1
@@ -50,12 +53,13 @@ def test_report_pools_only_current_v2_interactive_trials_and_lists_the_rest(tmp_
     assert haiku["trials"] == 1 and haiku["asked_trials"] == 0 and haiku["asked_before_implementing"] == {"true": 0, "false": 1, "unknown": 0, "rate": 0.0}
     assert haiku["questions"] == 0 and haiku["useful_question_rate"] is None and haiku["unknown_version_trials"] == [ids["b"]]
     v = rep["disclosure_violations"]
-    assert [(x["trial_id"], x["seq"], x["kinds"], x["hits"]) for x in v] == [(ids["a"], 2, ["test_or_identifier_disclosed"], ["test_raises_value_error"])]
+    assert [(x["trial_id"], x["seq"], x["kinds"]) for x in v] == [(ids["a"], 2, ["test_or_identifier_disclosed"])]
+    assert "test_raises_value_error" in v[0]["hits"] and "ValueError" not in v[0]["hits"]
     s = rep["scenarios"][0]
     assert s["scenario_id"] == spec.id and s["current"] is True and s["coherent"] is True and s["fair_tests"] is False and s["leaderboard_eligible"] is False
     assert s["unfair_tests"] == ["t1"] and rep["unaudited_scenarios"] == []
     ps = rep["per_scenario"][spec.id]
-    assert ps["trials"] == 3 and ps["models"] == {SONNET: 2, HAIKU: 1} and ps["questions"] == 2 and ps["replies"] == 4
+    assert ps["trials"] == 3 and ps["models"] == {f"{SONNET} @ v2": 2, f"{HAIKU} @ unknown": 1} and ps["questions"] == 2 and ps["replies"] == 4
     assert rep["llm_usage"]["calls"] == 1 + 3  # scenario + trials a, d, f (b has no exchanges, c is legacy, e is not interactive)
 
 

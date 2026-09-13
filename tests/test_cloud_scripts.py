@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -196,3 +197,74 @@ def test_main_writes_the_json_file(tmp_path: Path, capsys):
     doc = json.loads(out.read_text())
     assert doc["project"] == "p" and doc["github_repository"] == "acme/swesim" and doc["temporal_namespace"] == "n"
     assert "wrote" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("state,expected", [("module.run[0].pool\n", False), ("module.storage.bucket\n", True)])
+def test_bootstrap_never_disables_existing_workloads(tmp_path: Path, state: str, expected: bool):
+    """Exercise the actual bootstrap recipe with fake cloud tools and no live resources."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name, body in {
+        "gcloud": "exit 0",
+        "terraform": 'if [ "$1" = "state" ]; then printf "%s" "$TEST_STATE"; else exit 1; fi',
+    }.items():
+        path = fake / name
+        path.write_text("#!/bin/bash\n" + body + "\n")
+        path.chmod(0o755)
+    override = tmp_path / "override.mk"
+    calls = tmp_path / "calls"
+    override.write_text("require-project tf-init tfvars push-secrets seed-registry pin-image migrate verify-cloud:\n\t@true\n"
+                        "apply:\n\t@printf '%s\\n' '$(TF_ARGS)' >> $(CALLS)\n")
+    root = SCRIPTS.parents[1]
+    env = {**os.environ, "TEST_STATE": state}
+    result = subprocess.run(["make", "--no-print-directory", "-f", str(root / "Makefile"), "-f", str(override),
+                             "cloud-bootstrap", "PROJECT=test", f"PATH={fake}:/usr/bin:/bin", "TF=terraform",
+                             f"CALLS={calls}", f"MAKE=make --no-print-directory -f {root / 'Makefile'} -f {override}"],
+                            cwd=root, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("deploy_workloads=false" in calls.read_text()) is expected
+
+
+@pytest.mark.parametrize("build_body", ["exit 7", "printf 'not-a-pinned-image\\n'"])
+def test_ci_build_failure_never_publishes_a_deploy_digest(tmp_path: Path, build_body: str):
+    import yaml
+
+    workflow = yaml.safe_load((SCRIPTS.parents[1] / ".github/workflows/deploy.yml").read_text())
+    job = workflow["jobs"]["deploy"]
+    assert job["defaults"]["run"]["shell"] == "bash"
+    step = next(s for s in job["steps"] if s.get("id") == "build")
+    body = step["run"].replace("${{ steps.sha.outputs.sha }}", "a" * 40)
+    scripts = tmp_path / "scripts/cloud"
+    scripts.mkdir(parents=True)
+    (scripts / "build.sh").write_text("#!/bin/bash\n" + build_body + "\n")
+    output, summary = tmp_path / "output", tmp_path / "summary"
+    env = {**os.environ, "GCP_PROJECT": "test", "GCP_REGION": "region", "GITHUB_OUTPUT": str(output),
+           "GITHUB_STEP_SUMMARY": str(summary)}
+    result = subprocess.run(["bash", "-eo", "pipefail", "-c", body], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert not output.exists(), "no digest output may reach Terraform after a build failure"
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_local_deploy_checks_open_workflows_before_build(tmp_path: Path, override: bool):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name, body in {"gcloud": "exit 0", "uv": "printf 'TrialWorkflow\\t1\\n'"}.items():
+        tool = fake / name
+        tool.write_text("#!/bin/bash\n" + body + "\n")
+        tool.chmod(0o755)
+    calls = tmp_path / "calls"
+    overrides = tmp_path / "override.mk"
+    overrides.write_text("require-project apply migrate verify-cloud:\n\t@true\n"
+                         "pin-image:\n\t@printf 'build\\n' >> $(CALLS)\n")
+    root = SCRIPTS.parents[1]
+    result = subprocess.run(["make", "--no-print-directory", "-f", str(root / "Makefile"), "-f", str(overrides),
+                             "deploy", "PROJECT=test", "UV=uv", f"PATH={fake}:/usr/bin:/bin", f"CALLS={calls}",
+                             f"EVIDENCE_DIR={tmp_path / 'evidence'}", f"OVERRIDE_OPEN_EXECUTIONS={int(override)}",
+                             f"MAKE=make --no-print-directory -f {root / 'Makefile'} -f {overrides}"],
+                            cwd=root, capture_output=True, text=True)
+    assert (result.returncode == 0) is override, result.stdout + result.stderr
+    assert calls.exists() is override
+    evidence = next((tmp_path / "evidence").glob("open-types-*.txt")).read_text()
+    assert "TrialWorkflow\t1" in evidence
+    assert ("Explicit operator override" in evidence) is override

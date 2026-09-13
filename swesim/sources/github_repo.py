@@ -228,15 +228,18 @@ def _verifier_python() -> str:
 
 
 SWESIM_PYTHON = "/usr/local/bin/swesim-python"
+GRADING_USER = "tester"  # the identity compiled tasks grade under (compile._grader_config test_user); the probe measures as the same user
 
 
 def verifier_setup(python_version: str) -> str:
     """Dockerfile lines that give the probe's verifier image the same pinned controller interpreter as compiled tasks: the
     grader/probe controller runs under it (SWE-bench testbed interpreters can predate `from __future__ import annotations`);
-    only the test subprocess uses the task's own interpreter from the runner command."""
+    only the test subprocess uses the task's own interpreter from the runner command, and it runs as the grading user
+    (`GRADING_USER`, created here exactly as the compiled verifier image creates it)."""
     return ("USER root\n"
             "ENV DEBIAN_FRONTEND=noninteractive\n"
             "RUN apt-get update && apt-get install -y --no-install-recommends curl git ca-certificates && rm -rf /var/lib/apt/lists/*\n"
+            f"RUN if id {GRADING_USER} >/dev/null 2>&1; then echo '{GRADING_USER} user pre-exists in base image; rejected for this pilot' >&2; exit 1; fi && useradd -m {GRADING_USER}\n"
             "RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && uv --version\n"
             "ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python\n"
             f"RUN uv python install {python_version} && ln -s \"$(uv python find {python_version})\" {SWESIM_PYTHON} && {SWESIM_PYTHON} -I -c 'import sys; print(sys.version)'\n")
@@ -252,19 +255,25 @@ def runner_prefix(interpreter: str) -> str:
 # Stages: base (pristine), test (test_patch applied, whole test files), gold (oracle applied, whole files); then the CONTRACT
 # ids (fail/error->passed and passed->passed, in collected definition order) are re-run exactly as the grader will run them:
 # oracle reverted -> test_exact, oracle re-applied -> gold_exact. A contract test whose status differs between the whole-file
-# run and the exact-id run is order-dependent and is dropped from the contract.
+# run and the exact-id run is order-dependent and is dropped from the contract. The tests run as `test_user` (the grading
+# identity; the tree is chowned to it after every patch application, as grade() does) and the output records the `binding`
+# of the inputs it measured, so a job dir can only be reused for the row it was built for (B-P2-1).
 PROBE_SCRIPT = '''import sys,json,subprocess,shlex
 from pathlib import Path
 sys.path.insert(0,'/tests')
-from grader import GradeConfig,_run_tests
+from grader import GradeConfig,_run_tests,_chown_tree
 probe=json.loads(Path('/tests/probe_config.json').read_text())
-repo=probe.get('repo_dir','/app'); prefix=probe.get('prefix'); max_chars=int(probe.get('max_command_chars',120000))
-def cfg_for(command): return GradeConfig(Path('/tmp/a'),Path(repo),Path('/tmp/w'),{},[],[],{'kind':'pytest-ra','command':command},None,Path('/logs/verifier'),test_timeout_sec=int(probe.get('test_timeout_sec',300)))
+repo=probe.get('repo_dir','/app'); prefix=probe.get('prefix'); max_chars=int(probe.get('max_command_chars',120000)); user=probe.get('test_user')
+def cfg_for(command): return GradeConfig(Path('/tmp/a'),Path(repo),Path('/tmp/w'),{},[],[],{'kind':'pytest-ra','command':command},user,Path('/logs/verifier'),test_timeout_sec=int(probe.get('test_timeout_sec',300)))
 def run(command,expected=None):
     st,rc,out,error=_run_tests(cfg_for(command),Path(repo),expected)
     return {'statuses':st,'exit_code':rc,'error':error,'tail':out[-2000:]}
-def git_apply(patch,*flags): subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','apply',*flags,patch],cwd=repo,check=True)
-results={'base':run(probe['command'])}
+def own():
+    if user: _chown_tree(repo,user)
+def git_apply(patch,*flags):
+    subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-c','safe.directory=*','apply',*flags,patch],cwd=repo,check=True); own()
+own()
+results={'binding':probe.get('binding'),'test_user':user,'base':run(probe['command'])}
 git_apply('/tests/test.patch')
 results['test']=run(probe['command'])
 git_apply('/tests/oracle.diff')
@@ -353,7 +362,17 @@ def _probe_record(row: dict, data: dict, *, kind: str, digest: str | None, repo_
     (`test_exact`, `gold_exact`: exactly the contract ids in collected definition order, the grader's own command shape) are
     present, every contract test whose status differs between the whole-file run and the exact-id run in either stage is
     dropped as `order_dependent` (test pollution the grader would see and the whole-file run hides). Without exact stages
-    (older job dirs, argv budget) the whole-file contract stands and `probe.runner.exact` says why — approval can see it."""
+    (older job dirs, argv budget) the whole-file contract stands and `probe.runner.exact` says why — approval can see it.
+
+    Bound evidence (B-P2-1): the payload must record the `binding` of the base_commit/test_patch it measured and it must
+    equal the row's, and the tests must have run as `GRADING_USER`; otherwise the evidence is stale, foreign or measured
+    under a different identity and is rejected rather than relabelled with the row's hash."""
+    binding = probe_binding(row)
+    if data.get("binding") != binding:
+        raise ValueError("probe evidence is not bound to this row's base_commit/test_patch (recorded binding %s); keep evidence and re-probe"
+                         % ("missing" if not data.get("binding") else str(data["binding"])[:16]))
+    if data.get("test_user") != GRADING_USER:
+        raise ValueError(f"probe tests ran as {data.get('test_user') or 'root'!r}, not the grading identity {GRADING_USER!r}; keep evidence and re-probe")
     before, after = data["test"]["statuses"], data["gold"]["statuses"]
     if data["test"].get("error") or data["gold"].get("error") or not after or set(before) != set(after):
         raise ValueError("unreliable base/gold probe; keep evidence and reject")
@@ -378,8 +397,8 @@ def _probe_record(row: dict, data: dict, *, kind: str, digest: str | None, repo_
         statuses["test_exact"], statuses["gold_exact"] = data["test_exact"]["statuses"], data["gold_exact"]["statuses"]
     stages = [s for s in ("base", "test", "test_exact", "gold", "gold_exact") if s in data]
     probe = {"kind": kind, "image": row.get("image"), "image_digest": digest, "repo_dir": repo_dir, "test_python": interpreter, "test_files": files,
-             "command": command, "probe_dir": job_dir, "job_dir": job_dir, "stages": stages, "probed_at": probed_at,
-             "binding": probe_binding(row), "statuses": statuses, "dropped": dropped, "order": order,
+             "command": command, "probe_dir": job_dir, "job_dir": job_dir, "stages": stages, "probed_at": probed_at, "test_user": data["test_user"],
+             "binding": binding, "statuses": statuses, "dropped": dropped, "order": order,
              "runner": {"order": "definition", "prefix": runner_prefix(interpreter), "exact_command": data.get("exact_command"), "exact": exact_note},
              "errors": {stage: data[stage].get("error") for stage in stages},  # base collect errors are expected; kept for audit
              "counts": {"fail_to_pass": len(measured["fail_to_pass"]), "pass_to_pass": len(measured["pass_to_pass"]),
@@ -398,7 +417,8 @@ def reconstruct_probe(row: dict) -> dict | None:
     test_python / dockerfile) from the job directory still on disk, without another Modal run. Never for a row that already
     carries a bound `probe` block: if that binding did not match, the row changed since the measurement and re-binding the
     old job dir would launder a stale measurement — such rows must be probed again. None when the evidence is missing or
-    unreliable."""
+    unreliable, and None when the job's probe.json records no binding, a different binding, or a run as another user than
+    `GRADING_USER` (B-P2-1: unverifiable legacy evidence is never reused)."""
     if (row.get("probe") or {}).get("binding"):
         return None
     job_dir = row.get("probe_dir")
@@ -436,6 +456,8 @@ def probe_tests(row: dict, ws) -> dict:
     resolve_docker_hub_digest, verifier_src = _compile_imports()
     kind, repo_dir, interpreter, files = _probe_defaults(row)
     name = row["instance_id"].lower().replace("__", "--")
+    binding = probe_binding(row)
+    job_name = f"{name}--{binding[:16]}"  # a job dir names what it measured: a changed base_commit/test_patch never reuses an old one
     root = ws.root / "probes" / name
     env = root / "environment"
     tests = root / "tests"
@@ -464,14 +486,15 @@ def probe_tests(row: dict, ws) -> dict:
         raise ValueError("no python test files in test_patch to probe")
     command = runner_prefix(interpreter) + " ".join(shlex.quote(p) for p in files)
     atomic_json(tests / "probe_config.json", {"command": command, "prefix": runner_prefix(interpreter), "max_command_chars": MAX_COMMAND_CHARS,
-                                              "repo_dir": repo_dir, "test_timeout_sec": PROBE_TIMEOUT_SEC, "kind": kind})
+                                              "repo_dir": repo_dir, "test_timeout_sec": PROBE_TIMEOUT_SEC, "kind": kind,
+                                              "binding": binding, "test_user": GRADING_USER})
     # The probe controller (grader import, patch application, status collection) runs under the pinned verifier interpreter,
     # exactly like test.sh runs grader.py for compiled tasks; the test subprocess itself uses `command`'s task interpreter.
     (tests / "test.sh").write_text("#!/bin/bash\nset -euo pipefail\n" + SWESIM_PYTHON + " -I /tests/probe.py\n")
     (tests / "probe.py").write_text(PROBE_SCRIPT)
     (root / "instruction.md").write_text("Environment authoring probe; no solver work.")
     (root / "task.toml").write_text(PROBE_TASK_TOML)
-    td = harbor_cli.run_task(root, "nop", ws.jobs_dir / "probe", name, timeout_sec=9000)
+    td = harbor_cli.run_task(root, "nop", ws.jobs_dir / "probe", job_name, timeout_sec=9000)
     data = json.loads((td / "verifier" / "probe.json").read_text())
     res = _probe_record(row, data, kind=kind, digest=digest, repo_dir=repo_dir, interpreter=interpreter, files=files, command=command,
                         job_dir=str(td), probed_at=datetime.now(timezone.utc).isoformat())

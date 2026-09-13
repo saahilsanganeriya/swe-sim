@@ -229,6 +229,8 @@ def _probe_row():
 
 
 def _setup_probe(monkeypatch, tmp_path, probe_json):
+    """Fake Harbor: the probe.json the verifier would write. Unless the fixture says otherwise, the evidence is bound to the
+    row the probe task was built for and ran as the grading user, exactly as PROBE_SCRIPT records from probe_config.json."""
     from swesim import harbor_cli
     vsrc = tmp_path / "verifier"; vsrc.mkdir(exist_ok=True)
     for n in ("grader.py", "policy.py", "parsers.py", "run_pytest.py"): (vsrc / n).write_text(f"# {n}\n")
@@ -237,8 +239,10 @@ def _setup_probe(monkeypatch, tmp_path, probe_json):
 
     def fake_run_task(task_dir, agent, jobs_dir, job_name, **kw):
         seen.update(task_dir=task_dir, agent=agent, jobs_dir=jobs_dir, job_name=job_name, kw=kw)
+        cfg = json.loads((Path(task_dir) / "tests" / "probe_config.json").read_text())
+        data = {k: v for k, v in {"binding": cfg["binding"], "test_user": cfg["test_user"], **probe_json}.items() if v is not None}   # None = absent
         td = jobs_dir / job_name / "trial-1"; (td / "verifier").mkdir(parents=True)
-        (td / "verifier" / "probe.json").write_text(json.dumps(probe_json)); (td / "result.json").write_text("{}")
+        (td / "verifier" / "probe.json").write_text(json.dumps(data)); (td / "result.json").write_text("{}")
         return td
     monkeypatch.setattr(harbor_cli, "run_task", fake_run_task)
     return seen
@@ -257,7 +261,9 @@ def test_probe_tests_builds_probe_task_and_derives_f2p_p2p(monkeypatch, tmp_path
     assert out["test_python"] == "/usr/local/bin/python" and out["dockerfile"].startswith("FROM python@sha256:") and row["dockerfile"] == out["dockerfile"]
     assert "git checkout " + "b" * 40 in out["dockerfile"] and "pip install -e ." in out["dockerfile"] and "https://github.com/o/r" in out["dockerfile"]
     root = ws.root / "probes" / "o--r-42"
-    assert seen["task_dir"] == root and seen["agent"] == "nop" and seen["jobs_dir"] == ws.jobs_dir / "probe" and seen["job_name"] == "o--r-42"
+    binding = gr.probe_binding(row)
+    assert seen["task_dir"] == root and seen["agent"] == "nop" and seen["jobs_dir"] == ws.jobs_dir / "probe"
+    assert seen["job_name"] == "o--r-42--" + binding[:16]                              # B-P2-1: a job dir is named for what it measured
     assert (root / "environment" / "Dockerfile").read_text() == out["dockerfile"] and (root / "tests" / "Dockerfile").read_text().endswith("COPY . /tests/\n")
     assert "/usr/local/bin/swesim-python" in (root / "tests" / "Dockerfile").read_text() and (root / "tests" / "test.sh").read_text().endswith("/usr/local/bin/swesim-python -I /tests/probe.py\n")
     assert {p.name for p in (root / "tests").glob("*.py")} >= {"grader.py", "policy.py", "parsers.py", "run_pytest.py", "probe.py"}
@@ -267,7 +273,40 @@ def test_probe_tests_builds_probe_task_and_derives_f2p_p2p(monkeypatch, tmp_path
     assert cfg["repo_dir"] == "/app" and cfg["kind"] == "dockerfile" and out["probe"]["kind"] == "dockerfile" and out["dropped"] == {"network_or_env": [], "gold_regressions": [], "other": [], "order_dependent": []}
     toml = (root / "task.toml").read_text()
     assert 'environment_mode="separate"' in toml and 'network_mode="no-network"' in toml and (root / "instruction.md").exists()
-    assert out["probe_dir"] == str(seen["jobs_dir"] / "o--r-42" / "trial-1")
+    assert out["probe_dir"] == str(seen["jobs_dir"] / ("o--r-42--" + binding[:16]) / "trial-1")
+    # B-P2-1: the binding travels with the evidence and the probe runs under the grading identity
+    assert cfg["binding"] == binding and cfg["test_user"] == gr.GRADING_USER == "tester" and out["probe"]["test_user"] == "tester"
+    tests_df = (root / "tests" / "Dockerfile").read_text()
+    assert "useradd -m tester" in tests_df and tests_df.index("useradd -m tester") < tests_df.index("COPY . /tests/")
+    probe_py = (root / "tests" / "probe.py").read_text()
+    assert "'binding':probe.get('binding')" in probe_py and "user=probe.get('test_user')" in probe_py and "_chown_tree(repo,user)" in probe_py
+    assert "safe.directory=*" in probe_py and "'test_user':user" in probe_py
+
+
+def test_probe_reuse_requires_the_recorded_binding_to_match(monkeypatch, tmp_path):
+    """B-P2-1: a job dir that exists is reconciled, never relaunched, so its evidence must say what it measured. A probe.json
+    whose recorded binding differs from the row (or that carries none) is rejected; the row's own hash is never stamped on it."""
+    from swesim.paths import Workspace
+    ok = {"statuses": {"t::a": "passed", "t::b": "failed"}, "exit_code": 1, "error": None, "tail": ""}
+    gold = {"statuses": {"t::a": "passed", "t::b": "passed"}, "exit_code": 0, "error": None, "tail": ""}
+    row = _probe_row()
+    _setup_probe(monkeypatch, tmp_path, {"base": ok, "test": ok, "gold": gold, "binding": "0" * 64, "test_user": "tester"})
+    with pytest.raises(ValueError, match="binding"):
+        gr.probe_tests(dict(row), Workspace(tmp_path / "ws1"))
+    _setup_probe(monkeypatch, tmp_path, {"base": ok, "test": ok, "gold": gold, "binding": None})                        # unbound evidence
+    with pytest.raises(ValueError, match="binding"):
+        gr.probe_tests(dict(row), Workspace(tmp_path / "ws2"))
+    _setup_probe(monkeypatch, tmp_path, {"base": ok, "test": ok, "gold": gold, "test_user": None})                      # ran as root: not the grading identity
+    with pytest.raises(ValueError, match="tester"):
+        gr.probe_tests(dict(row), Workspace(tmp_path / "ws3"))
+    _setup_probe(monkeypatch, tmp_path, {"base": ok, "test": ok, "gold": gold, "binding": gr.probe_binding(row), "test_user": "tester"})
+    out = gr.probe_tests(dict(row), Workspace(tmp_path / "ws4"))
+    assert out["probe"]["binding"] == gr.probe_binding(row) and out["fail_to_pass"] == ["t::b"]
+    # a changed hidden test patch is a different job name, so an old job dir under the old name is never picked up
+    changed = {**row, "test_patch": "TP2"}
+    seen = _setup_probe(monkeypatch, tmp_path, {"base": ok, "test": ok, "gold": gold, "binding": gr.probe_binding(changed), "test_user": "tester"})
+    gr.probe_tests(dict(changed), Workspace(tmp_path / "ws5"))
+    assert seen["job_name"] == "o--r-42--" + gr.probe_binding(changed)[:16] != "o--r-42--" + gr.probe_binding(row)[:16]
 
 
 def test_probe_tests_rejects_unreliable_or_uncovered_probes(monkeypatch, tmp_path):
@@ -337,7 +376,8 @@ def test_probe_tests_measures_swebench_image_rows_offline(monkeypatch, tmp_path)
     assert gr.SWEBENCH_PYTHON not in (root / "environment" / "Dockerfile").read_text() and "uv python install" not in (root / "environment" / "Dockerfile").read_text()
     probe_py = (root / "tests" / "probe.py").read_text()
     assert "probe.get('repo_dir'" in probe_py and "cwd=repo" in probe_py and "'/app'" not in probe_py.replace("probe.get('repo_dir','/app')", "")
-    assert seen["agent"] == "nop" and seen["job_name"] == "pydata--xarray-5362" and out["probe"]["probe_dir"] == str(seen["jobs_dir"] / "pydata--xarray-5362" / "trial-1")
+    job = "pydata--xarray-5362--" + gr.probe_binding(row)[:16]
+    assert seen["agent"] == "nop" and seen["job_name"] == job and out["probe"]["probe_dir"] == str(seen["jobs_dir"] / job / "trial-1")
     assert out["probe"]["job_dir"] == out["probe"]["probe_dir"] and out["probe"]["stages"] == ["base", "test", "gold"]
     assert out["probe"]["binding"] == gr.probe_binding(row) and out["probe"]["probed_at"].endswith("+00:00")            # bound to base_commit + test_patch
     assert gr.probe_binding({**row, "test_patch": row["test_patch"] + "\n"}) != out["probe"]["binding"]
@@ -380,7 +420,7 @@ def test_probe_is_grading_faithful_exact_ids_in_definition_order(monkeypatch, tm
             "exact_command": "CMD", "test_exact": {"statuses": exact_test, "exit_code": 1, "error": None, "tail": ""},
             "gold": {"statuses": full_gold, "exit_code": 0, "error": None, "tail": ""},
             "gold_exact": {"statuses": {**full_gold, order[3]: "failed"}, "exit_code": 1, "error": None, "tail": ""}}
-    seen = _setup_probe(monkeypatch, tmp_path, data)
+    _setup_probe(monkeypatch, tmp_path, data)
     row = {**_swebench_probe_row(), "test_patch": "diff --git a/sklearn/utils/tests/test_pprint.py b/sklearn/utils/tests/test_pprint.py\n--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n x\n+def test_changed_only(): pass\n",
            "fail_to_pass": [order[1], order[2]], "pass_to_pass": [order[0], order[3]]}
     out = gr.probe_tests(row, Workspace(tmp_path / "ws"))
@@ -437,20 +477,27 @@ def test_classify_probe_buckets():
     assert gr.probe_kind({"image": "x:latest"}) == "image" and gr.probe_kind({"install_command": "pip install -e ."}) == "dockerfile"
 
 
-def _old_style_repo_row(tmp_path):
-    """A repo-URL row as mine_github_repo wrote it before `probe` existed: measured lists, probe_dir, test_python, dockerfile."""
+def _old_style_repo_row(tmp_path, binding: str | None = "row", test_user: str | None = "tester"):
+    """A repo-URL row as mine_github_repo wrote it before `probe` existed: measured lists, probe_dir, test_python, dockerfile.
+    `binding="row"` records the row's own binding in the job's probe.json (the shape PROBE_SCRIPT writes); None leaves the
+    evidence unbound, as jobs from before B-P2-1 are."""
     job = tmp_path / "jobs" / "probe" / "py-pdf--pypdf-3826" / "trial-1"
     (job / "verifier").mkdir(parents=True, exist_ok=True)
-    f = "tests/test_writer.py::"
-    (job / "verifier" / "probe.json").write_text(json.dumps({
-        "base": {"statuses": {}, "exit_code": 4, "error": "no tests", "tail": ""},
-        "test": {"statuses": {f + "test_new_a": "failed", f + "test_new_b": "error", f + "test_old": "passed", f + "test_socket": "failed"}, "exit_code": 1, "error": None, "tail": ""},
-        "gold": {"statuses": {f + "test_new_a": "passed", f + "test_new_b": "passed", f + "test_old": "passed", f + "test_socket": "failed"}, "exit_code": 1, "error": None, "tail": ""}}))
     tp = "diff --git a/tests/test_writer.py b/tests/test_writer.py\n--- a/tests/test_writer.py\n+++ b/tests/test_writer.py\n@@ -1 +1,3 @@\n x\n+def test_new_a(): pass\n+def test_new_b(): pass\n"
-    return {"source": "github-repo", "instance_id": "py-pdf__pypdf-3826", "repo": "py-pdf/pypdf", "base_commit": "c" * 40, "repo_dir": "/app", "image": None,
-            "test_patch": tp, "patch": "OP", "test_files": ["tests/test_writer.py"], "install_command": "pip install -e '.[full]'",
-            "fail_to_pass": [f + "test_new_a", f + "test_new_b"], "pass_to_pass": [f + "test_old"], "probe_dir": str(job), "test_python": "/usr/local/bin/python",
-            "dockerfile": "FROM python@sha256:abc\n", "judge": {"keep": True, "gaps": []}}
+    f = "tests/test_writer.py::"
+    row = {"source": "github-repo", "instance_id": "py-pdf__pypdf-3826", "repo": "py-pdf/pypdf", "base_commit": "c" * 40, "repo_dir": "/app", "image": None,
+           "test_patch": tp, "patch": "OP", "test_files": ["tests/test_writer.py"], "install_command": "pip install -e '.[full]'",
+           "fail_to_pass": [f + "test_new_a", f + "test_new_b"], "pass_to_pass": [f + "test_old"], "probe_dir": str(job), "test_python": "/usr/local/bin/python",
+           "dockerfile": "FROM python@sha256:abc\n", "judge": {"keep": True, "gaps": []}}
+    data = {"base": {"statuses": {}, "exit_code": 4, "error": "no tests", "tail": ""},
+            "test": {"statuses": {f + "test_new_a": "failed", f + "test_new_b": "error", f + "test_old": "passed", f + "test_socket": "failed"}, "exit_code": 1, "error": None, "tail": ""},
+            "gold": {"statuses": {f + "test_new_a": "passed", f + "test_new_b": "passed", f + "test_old": "passed", f + "test_socket": "failed"}, "exit_code": 1, "error": None, "tail": ""}}
+    if binding is not None:
+        data["binding"] = gr.probe_binding(row) if binding == "row" else binding
+    if test_user is not None:
+        data["test_user"] = test_user
+    (job / "verifier" / "probe.json").write_text(json.dumps(data))
+    return row
 
 
 def test_reconstruct_probe_from_job_dir_and_probe_candidates_reuses_measurements(monkeypatch, tmp_path):
@@ -458,6 +505,10 @@ def test_reconstruct_probe_from_job_dir_and_probe_candidates_reuses_measurements
     from swesim.stages.mine import probe_candidates
     row = _old_style_repo_row(tmp_path)
     f = "tests/test_writer.py::"
+    # B-P2-1: evidence without a recorded binding, with a foreign one, or measured as root is unverifiable and never reused
+    assert gr.reconstruct_probe(_old_style_repo_row(tmp_path / "unbound", binding=None)) is None
+    assert gr.reconstruct_probe(_old_style_repo_row(tmp_path / "foreign", binding="0" * 64)) is None
+    assert gr.reconstruct_probe(_old_style_repo_row(tmp_path / "root", test_user=None)) is None
     rec = gr.reconstruct_probe(row)
     assert rec["fail_to_pass"] == [f + "test_new_a", f + "test_new_b"] and rec["pass_to_pass"] == [f + "test_old"]
     assert rec["dropped"] == {"network_or_env": [f + "test_socket"], "gold_regressions": [], "other": [], "order_dependent": []} and rec["probe"]["reconstructed"] is True
@@ -495,6 +546,26 @@ def test_reconstruct_probe_from_job_dir_and_probe_candidates_reuses_measurements
     assert json.loads(out.with_suffix(".summary.json").read_text()) == {"rows": 4, "probed": 0, "already-probed": 1, "reconstructed-whole-file-only": 1, "reproducible": 1, "build-budget-exhausted": 2}
 
 
+@pytest.mark.parametrize("test_user", [None, "root"])
+def test_probe_candidates_never_reuses_matching_bindings_measured_as_root(monkeypatch, tmp_path, test_user):
+    from swesim.paths import Workspace
+    from swesim.stages.mine import probe_candidates
+    row = {**_swebench_probe_row(), "judge": {"keep": True}}
+    row["probe"] = {"binding": gr.probe_binding(row), "test_user": test_user, "statuses": {"test": {"t": "failed"}}, "runner": {"exact": "exact"}}
+    judged = tmp_path / "judged.jsonl"; judged.write_text(json.dumps(row) + "\n")
+    calls = []
+
+    def fake_probe(candidate, ws):
+        calls.append(candidate["instance_id"])
+        return {"fail_to_pass": ["t"], "pass_to_pass": [], "test_python": gr.SWEBENCH_PYTHON, "probe_dir": "/job/trial",
+                "dockerfile": None, "probe": {**candidate["probe"], "test_user": "tester"}}
+
+    monkeypatch.setattr(gr, "probe_tests", fake_probe)
+    result = probe_candidates(Workspace(tmp_path / "ws"), judged, max_builds=1)
+    assert calls == [row["instance_id"]]
+    assert json.loads(result.read_text())["probe"]["test_user"] == "tester"
+
+
 def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_rows(monkeypatch, tmp_path):
     from swesim.paths import Workspace
     from swesim.stages.mine import probe_candidates
@@ -509,7 +580,7 @@ def test_probe_candidates_replaces_swebench_lists_and_rejects_unreproducible_row
 
     def fake_probe(row, ws):
         probed.append(row["instance_id"])
-        bound = {"kind": "image", "statuses": {"test": {"x": "failed"}, "gold": {"x": "passed"}}, "binding": gr.probe_binding(row), "runner": {"exact": "exact"}}
+        bound = {"kind": "image", "test_user": "tester", "statuses": {"test": {"x": "failed"}, "gold": {"x": "passed"}}, "binding": gr.probe_binding(row), "runner": {"exact": "exact"}}
         if row["instance_id"] == "pydata__xarray-2":
             return {"fail_to_pass": [], "pass_to_pass": [f + "test_old"], "dropped": {"network_or_env": [f + "test_new"], "gold_regressions": [], "other": [], "order_dependent": []}, "statuses": {},
                     "dockerfile": "FROM x", "probe_dir": "/j/2", "test_python": gr.SWEBENCH_PYTHON, "probe": {**bound, "probe_dir": "/j/2"}}

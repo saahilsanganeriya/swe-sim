@@ -20,17 +20,18 @@ export PATH := $(HOME)/google-cloud-sdk/bin:$(HOME)/.local/bin:$(PATH)
 # Terraform (the google provider and the GCS backend) authenticates with Application Default Credentials. On a machine
 # without them (no `gcloud auth application-default login` yet) fall back to the active gcloud account's short-lived
 # access token, which the provider and backend accept through GOOGLE_OAUTH_ACCESS_TOKEN. Only for cloud goals.
+# ($(shell ...) does not inherit the exported PATH on GNU make 3.81, macOS's default, hence the explicit PATH= prefix.)
 ifneq ($(filter-out check fmt-check,$(MAKECMDGOALS)),)
-ADC_OK := $(shell gcloud auth application-default print-access-token >/dev/null 2>&1 && echo 1)
+ADC_OK := $(shell PATH="$(PATH)" gcloud auth application-default print-access-token >/dev/null 2>&1 && echo 1)
 ifeq ($(ADC_OK),)
-GCLOUD_TOKEN := $(shell gcloud auth print-access-token 2>/dev/null)
+GCLOUD_TOKEN := $(shell PATH="$(PATH)" gcloud auth print-access-token 2>/dev/null)
 ifneq ($(GCLOUD_TOKEN),)
 export GOOGLE_OAUTH_ACCESS_TOKEN ?= $(GCLOUD_TOKEN)
 endif
 endif
 endif
 
-PROJECT ?= $(shell gcloud config get project 2>/dev/null)
+PROJECT ?= $(shell PATH="$(PATH)" gcloud config get project 2>/dev/null)
 REGION ?= us-central1
 SHA ?= HEAD
 SWESIM_ENV_FILE ?= ./.env
@@ -38,6 +39,7 @@ EXTRA_ENV_FILES ?=
 MODAL_TOML ?= $(HOME)/.modal.toml
 EVIDENCE_DIR ?= workspace/evidence/cloud
 TF_ARGS ?=
+OVERRIDE_OPEN_EXECUTIONS ?= 0
 export SWESIM_ENV_FILE
 
 UV := uv run --frozen
@@ -47,7 +49,7 @@ STATE_BUCKET := $(PROJECT)-swesim-tfstate
 ENV_FILE_FLAGS := --env-file $(SWESIM_ENV_FILE) $(foreach f,$(EXTRA_ENV_FILES),--env-file $(f))
 
 .PHONY: check fmt-check require-project tf-init tfvars plan apply outputs push-secrets seed-registry build pin-image \
-        deploy verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
+        deploy open-executions verify-cloud migrate pull gh-variables import-bucket cloud-bootstrap cloud-destroy
 
 check:
 	uv sync --extra dev --frozen
@@ -67,7 +69,7 @@ tf-init: require-project
 
 # Non-secret Terraform inputs from the env file + gcloud account + git remote; a copy goes next to the state so the
 # GitHub deploy workflow applies with the same values.
-tfvars: require-project
+tfvars: tf-init
 	$(UV) python scripts/cloud/tfvars_from_env.py $(ENV_FILE_FLAGS) --project $(PROJECT) --region $(REGION) --out $(TFVARS)
 	gcloud storage cp $(TFVARS) gs://$(STATE_BUCKET)/env.auto.tfvars.json --quiet
 
@@ -103,19 +105,30 @@ pin-image: require-project
 	printf '{"image": "%s"}\n' "$$digest" > infra/image.auto.tfvars.json; \
 	echo "pinned $$digest"
 
-deploy: require-project pin-image
+open-executions:
+	mkdir -p $(EVIDENCE_DIR)
+	@report=$(EVIDENCE_DIR)/open-types-$$(date -u +%Y%m%dT%H%M%SZ).txt; \
+	$(UV) swesim workflows open-types > "$$report"; \
+	if [ -s "$$report" ]; then \
+	  cat "$$report"; \
+	  if [ "$(OVERRIDE_OPEN_EXECUTIONS)" = 1 ]; then \
+	    printf '# Explicit operator override: OVERRIDE_OPEN_EXECUTIONS=1\n' >> "$$report"; \
+	  else echo "open workflows exist; deployment stopped before build" >&2; exit 1; fi; \
+	else printf '# No open workflows\n' >> "$$report"; fi
+
+deploy: require-project
+	$(MAKE) open-executions
+	$(MAKE) pin-image
 	$(MAKE) apply
+	$(MAKE) migrate
 	$(MAKE) verify-cloud
 
 verify-cloud:
 	EVIDENCE_DIR=$(EVIDENCE_DIR) bash scripts/cloud/verify_cloud.sh
 
-# The index lives behind the Cloud SQL connection: from a laptop this needs SWESIM_DATABASE_URL through a Cloud SQL
-# Auth Proxy; otherwise run `swesim index migrate` from a Cloud Run Job. Never fatal for the bootstrap.
+# Run migrations where the Cloud SQL socket exists. A failed migration stops deployment.
 migrate:
-	if $(UV) swesim index --help >/dev/null 2>&1; then \
-	  $(UV) swesim index migrate || echo "notice: 'swesim index migrate' failed here; run it where Cloud SQL is reachable (see infra/README.md)"; \
-	else echo "notice: 'swesim index' is not available in this checkout; migrate skipped"; fi
+	gcloud run jobs execute "$$($(TF) output -raw index_maintenance_job)" --project $(PROJECT) --region $(REGION) --wait
 
 pull:
 	bash scripts/cloud/pull.sh
@@ -132,7 +145,10 @@ import-bucket: require-project
 	$(TF) import -input=false module.storage.google_storage_bucket.workspace $(PROJECT)/swesim-$(PROJECT)-workspace
 
 cloud-bootstrap: require-project tf-init tfvars
-	$(MAKE) apply TF_ARGS="-var deploy_workloads=false"
+	state=$$($(TF) state list); \
+	if printf '%s\n' "$$state" | grep -q '^module\.run\['; then \
+	  echo "workloads already exist; preserving them during bootstrap"; \
+	else $(MAKE) apply TF_ARGS="-var deploy_workloads=false"; fi
 	$(MAKE) push-secrets
 	$(MAKE) seed-registry
 	$(MAKE) pin-image

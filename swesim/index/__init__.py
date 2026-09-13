@@ -8,9 +8,11 @@ report computations both readers share (`reports.py`), the Temporal activities t
 (`activities.py`) and the operator CLI (`cli.py`).
 
 `get_reader(settings)` is the console's entry point: `IndexStore` when the index is enabled, else `FileIndexReader`.
+`ensure_migrated(settings)` is the worker's: bring the schema to head at start-up (False when the index is disabled).
 """
 from __future__ import annotations
 
 from swesim.index.reads import IndexReader, get_reader
+from swesim.index.store import ensure_migrated
 
-__all__ = ["IndexReader", "get_reader"]
+__all__ = ["IndexReader", "ensure_migrated", "get_reader"]

@@ -3,20 +3,23 @@
 Contract
 - Built from a SQLAlchemy URL (`postgresql+psycopg://...` in production; `sqlite://` in unit tests). `pool_pre_ping`
   is on; the URL is never logged or repr'd.
-- `migrate()` runs the Alembic revisions under `swesim/index/migrations` to head inside one transaction.
+- `migrate()` runs the Alembic revisions under `swesim/index/migrations` to head inside one transaction;
+  `ensure_migrated(settings)` is the worker's start-up entry point (False when disabled; otherwise migrate under
+  the schema advisory lock, idempotent, one log line with the head revision).
 - Every write is an upsert keyed by the table's primary key (`INSERT ... ON CONFLICT DO UPDATE` on Postgres and
   SQLite): running it twice leaves one row; `updated_at` bumps, `created_at` keeps the first value.
 - `advisory_lock(key)` is `pg_advisory_xact_lock(hashtext(key))` held for a transaction on Postgres and a
   process-local lock on SQLite. It replaces `registry.json.lock`, which GCS FUSE cannot honour across instances.
 - `rebuild_from_layout()` projects every file into rows first (reads outside the transaction), then truncates the
-  file-backed tables (scenarios, candidates, trials, exchanges, scores, trial costs) and inserts the projection in
-  one transaction, so readers never see a half-built index. Tables fed by activities and the console (workflows,
-  operator_actions, costs without a trial id, index_rebuilds) are kept. The returned `IndexRebuildRow` carries the
-  row counts after the rebuild, the per-table diff against before, and every skipped id with its reason.
+  file-backed tables (scenarios, candidates, trials, exchanges, scores, costs) and inserts the projection in one
+  transaction, so readers never see a half-built index. Tables the files cannot rebuild (workflows: Temporal state;
+  operator_actions: the console's audit; index_rebuilds) are kept. The returned `IndexRebuildRow` carries the row
+  counts after the rebuild, the per-table diff against before, and every skipped id with its reason.
 - Reads return the row models; invalid input (unknown table, unknown order_by/where column) raises `ValueError`.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import warnings
 from collections.abc import Iterable, Iterator
@@ -40,8 +43,9 @@ from swesim.index import schema as S
 from swesim.settings import Settings, get_settings
 from swesim.storage.layout import Layout
 
+log = logging.getLogger(__name__)
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
-REBUILT_TABLES: tuple[str, ...] = ("exchanges", "scores", "trials", "candidates", "scenarios")  # delete order (children first)
+REBUILT_TABLES: tuple[str, ...] = ("exchanges", "costs", "scores", "trials", "candidates", "scenarios")  # delete order (children first)
 BATCH = 500
 RANGES: dict[str, tuple[str, str]] = {"started_from": ("started_at", ">="), "started_to": ("started_at", "<="),
                                       "judged_from": ("judged_at", ">="), "judged_to": ("judged_at", "<="),
@@ -94,6 +98,34 @@ def jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
+
+
+MIGRATION_LOCK_KEY = "swesim.index.schema"
+
+
+def current_revision(engine: sa.Engine) -> str | None:
+    """The Alembic revision the database is at; None before the first migration."""
+    if "alembic_version" not in sa.inspect(engine).get_table_names():
+        return None
+    with engine.connect() as conn:
+        return conn.execute(sa.text("select version_num from alembic_version")).scalar_one_or_none()
+
+
+def ensure_migrated(settings: Settings | None = None) -> bool:
+    """Bring the index schema to head at process start (the control worker calls this; Cloud SQL has no laptop path).
+    False when the index is disabled. Otherwise runs `migrate()` under the schema advisory lock so concurrent workers
+    take turns and the second finds nothing to do; logs one line with the dialect and head revision, never the URL."""
+    s = settings or get_settings()
+    store = IndexStore.from_settings(s)
+    if store is None:
+        log.info("index: disabled (SWESIM_DATABASE_URL not set); schema not checked")
+        return False
+    with store.advisory_lock(MIGRATION_LOCK_KEY):
+        before = current_revision(store.engine)
+        store.migrate()
+        after = current_revision(store.engine)
+    log.info("index: schema at %s on %s%s", after, store.engine.dialect.name, "" if before == after else f" (migrated from {before or 'empty'})")
+    return True
 
 
 class IndexStore:
@@ -232,6 +264,10 @@ class IndexStore:
         trial_rows: list[M.TrialRow] = []
         exchange_rows: list[M.ExchangeRow] = []
         cost_rows: list[M.CostRow] = []
+        try:
+            cost_rows.extend(P.project_workflow_costs(layout, origin=origin, now=started))
+        except ValueError as e:
+            skipped["costs"] = [{"id": str(layout.costs_dir()), "reason": str(e)[:300]}]
         for tid in P.trial_ids(layout):
             try:
                 t, ex, cs = P.project_trial(layout, tid, origin=origin, now=started)
@@ -245,7 +281,6 @@ class IndexStore:
             before = self._counts(conn)
             for name in REBUILT_TABLES:
                 conn.execute(sa.delete(S.TABLES[name]))
-            conn.execute(sa.delete(S.costs).where(S.costs.c.trial_id.is_not(None)))
             self._upsert(S.scenarios, scenario_rows, conn)
             self._upsert(S.candidates, candidate_rows, conn)
             self._upsert(S.trials, trial_rows, conn)

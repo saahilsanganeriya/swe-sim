@@ -80,7 +80,8 @@ make cloud-bootstrap PROJECT=<id> REGION=us-central1 SWESIM_ENV_FILE=<path> [EXT
 ```
 
 `cloud-bootstrap` is idempotent and runs, in order: `scripts/cloud/bootstrap.sh` (enable APIs, create the state bucket,
-`terraform init`), `make tfvars`, `terraform apply -var deploy_workloads=false` (everything but the workloads),
+`terraform init`), `make tfvars`, `terraform apply -var deploy_workloads=false` on a stack without workloads (an existing
+`module.run` is preserved),
 `make push-secrets` (values streamed to Secret Manager on stdin; prints `NAME: updated|unchanged`), `make seed-registry`
 (the tracked `registry.json` into an empty bucket, never overwriting), `make pin-image` (`scripts/cloud/build.sh`:
 Cloud Build of `git archive HEAD`, reused when that sha already has an image, digest written to the git-ignored
@@ -102,6 +103,11 @@ Every apply is expected to be clean on re-run (`No changes.`); the second apply 
 `terraform-apply-2.txt` under the evidence directory.
 
 ### The GitHub path (`.github/workflows/deploy.yml`)
+
+The CI deployer applies changes inside `module.run` only. A plan that changes IAM, SQL, bucket settings, logging or
+other infrastructure is rejected before apply; an authenticated project operator applies those changes with `make apply`.
+The deploy checks out and tests the requested commit, requires a pinned build digest, and uses the same Temporal
+connection for its open-execution check and final verification. A missing open-execution command stops deployment.
 
 `workflow_dispatch` (inputs `sha`, `override_open_executions`) or a `v*` tag: authenticates with WIF as
 `swesim-deployer`, fetches `env.auto.tfvars.json` from the state bucket, runs the open-executions check

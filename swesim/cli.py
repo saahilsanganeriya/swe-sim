@@ -22,10 +22,14 @@ from swesim.paths import Workspace
 
 app = typer.Typer(no_args_is_help=True, help=__doc__)
 
-WS = Workspace(os.environ.get("SWESIM_WORKSPACE", "workspace"))
+from swesim.roles import ROLE_CHAINS
+from swesim.settings import get_settings
 
-JUDGE_MODEL_DEFAULT = "openai/gpt-5.5"
-DRAFT_MODEL_DEFAULT = "anthropic/claude-sonnet-5"
+_SETTINGS = get_settings()
+WS = Workspace(_SETTINGS.workspace, _SETTINGS.registry_path)
+
+JUDGE_MODEL_DEFAULT = ROLE_CHAINS["judge_model"][0]
+DRAFT_MODEL_DEFAULT = ROLE_CHAINS["draft_model"][0]
 SOLVER_MODEL_DEFAULT = "anthropic/claude-haiku-4-5-20251001"
 
 
@@ -151,10 +155,12 @@ def judge_calibrate(
     n: int = typer.Option(150),
     model: str = typer.Option(JUDGE_MODEL_DEFAULT),
     seed: int = typer.Option(0),
+    workers: int = typer.Option(4),
 ) -> None:
-    """Agreement of the judge with the human SWE-bench Verified labels (>= 2 threshold) on a random sample."""
+    """Agreement of the judge with the human SWE-bench Verified labels (positive = verified_rubric_score >= 2) on a random
+    sample; writes per-instance predictions under the record's calibration/ prefix and prints the summary."""
     from swesim.sources import swebench_annotated as sb
-    from swesim.stages.judge import calibrate
+    from swesim.stages.judge import run_calibration
 
     rows_by_id = {}
     for r in sb._load_dataset():
@@ -166,8 +172,9 @@ def judge_calibrate(
             "annotation": {},
             "thread": {},
         }
-    result = calibrate(Path("data/annotations/ensembled_annotations_public.csv"), rows_by_id, model, n, seed)
-    typer.echo(json.dumps({k: v for k, v in result.items() if k != "per_instance"}, indent=1))
+    path = run_calibration(WS.layout, Path("data/annotations/ensembled_annotations_public.csv"), rows_by_id, model, n, seed, workers=workers)
+    result = json.loads(path.read_text())
+    typer.echo(json.dumps({"path": str(path), **{k: v for k, v in result.items() if k not in ("per_instance", "errors")}}, indent=1))
 
 
 @app.command(hidden=True)
@@ -449,14 +456,17 @@ def create(source: list[str] = typer.Option(..., "--source", help="repeatable: a
     typer.echo(asyncio.run(start_create(params)))
 
 @app.command("run-tasks")
-def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenario ids"), models: str = typer.Option(SOLVER_MODEL_DEFAULT),
-              conditions: str = typer.Option("full,hidden,interactive"), k: int = typer.Option(3), purpose: str = typer.Option("comparison"),
+def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenario ids"), models: str | None = typer.Option(None, help="Comma-separated model ids; defaults to the screen model for screening, otherwise Haiku 4.5."),
+              conditions: str = typer.Option("full,hidden,interactive"), k: int = typer.Option(3), purpose: str = typer.Option("comparison", help="calibration | comparison | demonstration | screen"),
               brief_profile: str = typer.Option("withheld"), stakeholder_model: str = typer.Option("", help="resolved stakeholder id (workspace/evidence/model-probe.json)"),
-              attempt_offset: int = typer.Option(0), max_parallel_trials: int = typer.Option(1, help="1 on a laptop; raise on the VM"),
+              attempt_offset: int = typer.Option(0), max_parallel_trials: int = typer.Option(1, help="Maximum concurrent trial Jobs for this workflow"),
               stakeholder_url: str = typer.Option("", envvar="SWESIM_STAKEHOLDER_URL")) -> None:
     """Run selected task ids on selected models: one RunTasksWorkflow, TrialWorkflow children with REJECT_DUPLICATE ids."""
     import asyncio
     from swesim.workflows.client import start_run
+    if purpose not in ("calibration", "comparison", "demonstration", "screen"):
+        raise typer.BadParameter("purpose must be calibration, comparison, demonstration or screen")
+    models = models or (ROLE_CHAINS["screen_model"][0] if purpose == "screen" else SOLVER_MODEL_DEFAULT)
     params = {"scenario_ids": scenario_ids.split(","), "models": models.split(","), "conditions": conditions.split(","), "k": k, "purpose": purpose,
               "brief_profile": brief_profile, "attempt_offset": attempt_offset, "max_parallel_trials": max_parallel_trials, "stakeholder_url": _stakeholder_url(stakeholder_url)}
     if stakeholder_model:
@@ -465,6 +475,19 @@ def run_tasks(scenario_ids: str = typer.Option(..., help="comma-separated scenar
 
 workflows_app = typer.Typer(help="Inspect and steer Temporal workflows.")
 app.add_typer(workflows_app, name="workflows")
+from swesim.index.cli import index_app  # noqa: E402  (mounted after the root app exists)
+app.add_typer(index_app, name="index")
+from swesim.audit.cli import app as audit_app  # noqa: E402
+app.add_typer(audit_app, name="audit")
+
+
+@workflows_app.command("open-types")
+def workflows_open_types() -> None:
+    """List open execution counts by workflow type; no output means none are open."""
+    import asyncio
+    from swesim.workflows.client import open_types
+    for row in asyncio.run(open_types()):
+        typer.echo(f"{row['type']}\t{row['open_count']}")
 
 @workflows_app.command("list")
 def workflows_list(kind: str = typer.Argument("all", help="create | candidate | run | pipeline | matrix | trial | all"), limit: int = typer.Option(50)) -> None:

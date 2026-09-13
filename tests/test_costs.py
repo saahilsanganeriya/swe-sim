@@ -156,6 +156,20 @@ def test_record_cost_without_a_trial_needs_a_workflow_and_writes_under_costs(tmp
     assert costs.read_costs(ws.root / "costs" / "absent.json") == []
 
 
+def test_record_cost_with_the_storage_layout_writes_the_trial_costs_file(tmp_path):
+    from swesim.storage.layout import Layout
+
+    layout = Layout(root=tmp_path / "ws")
+    tid = "c" * 24
+    rec = costs.record_cost(layout, tid, None, "solver", "openai/gpt-5-mini", costs.Usage(input_tokens=1_000_000, output_tokens=0))
+    assert costs.read_costs(layout.trial_file(tid, "costs.json")) == [rec]
+    ws = Workspace(tmp_path / "ws2")                                                       # the adapter delegates to its Layout
+    rec2 = costs.record_cost(ws, tid, None, "solver", "openai/gpt-5-mini", costs.Usage(input_tokens=1_000_000, output_tokens=0))
+    assert costs.read_costs(ws.layout.trial_file(tid, "costs.json")) == [rec2]
+    with pytest.raises(ValueError):
+        costs.record_cost(layout, "not-a-trial-id", None, "solver", "openai/gpt-5-mini", costs.Usage())   # LayoutError is a ValueError
+
+
 def test_record_cost_accepts_a_layout_exposing_trial_dir(tmp_path):
     class Layout:                                             # the storage stream's Layout: trial_dir(trial_id)
         root = tmp_path

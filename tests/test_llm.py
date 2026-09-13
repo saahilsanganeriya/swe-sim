@@ -168,6 +168,23 @@ def test_chat_json_with_usage_tolerates_a_response_without_usage(monkeypatch):
     assert res.data == {"ok": True} and (res.usage.input_tokens, res.usage.output_tokens, res.usage.calls) == (0, 0, 1) and res.usage.cached_tokens is None
 
 
+def test_chat_json_leaves_the_calls_usage_for_the_thread_to_take_once(monkeypatch):
+    import threading
+    calls = []
+    r = _Resp([_Block("text", '{"ok": 1}')])
+    r.usage = types.SimpleNamespace(input_tokens=5, output_tokens=1, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+    _fake_anthropic(monkeypatch, [r], calls)
+    llm.take_last_usage()                                                                     # clear what an earlier call on this thread left
+    assert llm.take_last_usage() is None
+    assert llm.chat_json("anthropic/claude-sonnet-5", "sys", [{"role": "user", "content": "q"}], "{}") == {"ok": 1}
+    seen_elsewhere = []
+    t = threading.Thread(target=lambda: seen_elsewhere.append(llm.take_last_usage()))
+    t.start(); t.join()
+    assert seen_elsewhere == [None]                                                           # per thread: another thread sees nothing
+    u = llm.take_last_usage()
+    assert (u.input_tokens, u.output_tokens, u.calls) == (5, 1, 1) and llm.take_last_usage() is None   # taken once
+
+
 def test_unknown_provider_is_rejected_before_any_network(monkeypatch):
     with pytest.raises(llm.LLMError):
         llm.chat_json("mistral/x", "sys", [{"role": "user", "content": "q"}], "{}")

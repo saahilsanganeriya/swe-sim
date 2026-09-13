@@ -191,7 +191,7 @@ class CostRow(Provenance):
     input_tokens: int
     output_tokens: int
     cached_tokens: int | None
-    usd: Decimal
+    usd: Decimal | None  # None = the price is unknown (price_source says why); never zero for "could not tell"
     price_source: str
     at: AwareDatetime
 

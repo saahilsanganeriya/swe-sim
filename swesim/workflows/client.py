@@ -15,7 +15,8 @@ from temporalio.common import WorkflowIDReusePolicy
 
 from swesim.settings import MissingSecret, Settings, get_settings, secret
 from swesim.workflows import queues
-from swesim.workflows.workflows import CandidateWorkflow, CreateTasksWorkflow, PipelineWorkflow, RunMatrixWorkflow, RunTasksWorkflow
+from swesim.workflows.workflows import (CandidateWorkflow, CreateTasksWorkflow, PipelineWorkflow, RunMatrixWorkflow, RunTasksWorkflow,
+                                        params_summary)
 
 TASK_QUEUE = queues.AUTHORING  # operator workflows start here; children are started here too
 TYPES = {"create": "CreateTasksWorkflow", "candidate": "CandidateWorkflow", "run": "RunTasksWorkflow",
@@ -52,15 +53,7 @@ async def connect(environ: Mapping[str, str] | None = None) -> Client:
     return await Client.connect(**connect_kwargs(environ))
 
 
-def _summary(params: dict) -> dict:
-    """Small, secret-free memo shown by `list_runs` (ids, model ids, counts only)."""
-    out: dict = {}
-    if "sources" in params:
-        out["sources"] = [s.get("repo") or f"{s.get('kind', 'swebench-annotated')}:{s.get('pool', 'A')}" for s in params.get("sources", [])]
-    for k in ("scenario_ids", "models", "conditions", "k", "judge_model", "draft_model", "stakeholder_model", "approval_mode", "purpose", "source", "repo"):
-        if params.get(k) not in (None, "", []):
-            out[k] = params[k]
-    return out
+_summary = params_summary  # the memo shown by `list_runs` is the same summary the index rows carry
 
 
 async def _start(workflow_run, params: dict, prefix: str) -> str:
@@ -129,6 +122,15 @@ async def cancel(workflow_id: str) -> None:
     fresh launch, never a relaunch of the cancelled one."""
     c = await connect()
     await c.get_workflow_handle(workflow_id).cancel()
+
+
+async def open_types() -> list[dict]:
+    """Open executions per workflow type, `[{"type", "open_count"}]` sorted by type: the deploy path refuses to roll worker
+    pools while a type whose code changed has open executions and the change is not behind `workflow.patched`."""
+    c = await connect(); counts: dict[str, int] = {}
+    async for wf in c.list_workflows("ExecutionStatus = 'Running'"):
+        counts[wf.workflow_type] = counts.get(wf.workflow_type, 0) + 1
+    return [{"type": t, "open_count": n} for t, n in sorted(counts.items())]
 
 
 async def list_runs(kind: str = "all", limit: int = 50) -> list[dict]:

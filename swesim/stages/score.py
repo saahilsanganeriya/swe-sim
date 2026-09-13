@@ -5,6 +5,13 @@ under ``run_config``; sibling files fill gaps), groups attempts by ``condition|b
 -- ``run_config_hash`` already binds the actual model, purpose and build, so calibration and comparison
 runs can never share a group -- and writes ``workspace/scenarios/<id>/scores.json``.
 
+Scaffold identity (B-P2-5): the hash used for grouping is the *effective* one. A record whose ``run_config``
+predates ``RunConfig.agent_config`` but whose ``report.agent_config_sha256`` proves the trial ran with the
+interactive scaffold is regrouped under the hash its run config would carry today (``effective_run_config_hash``),
+so legacy scaffold trials pool with new scaffold trials and never with default-agent trials. Trial ids and the
+recorded ``run_config_hash`` are never rewritten; each group lists ``regrouped_trials`` and
+``recorded_run_config_hashes`` so the split is auditable.
+
 Denominators (integrator ruling 2026-09-12): outcomes 1-4 are agent-attributable trial results and all
 count in n for pass@k / pass^k; only 1 (valid-correct) counts as a success, 2-4 (valid-incorrect,
 agent-invalid-submission, agent-runtime-failure) count as failures. Infrastructure outcomes 5-7 are excluded
@@ -25,12 +32,14 @@ OUTCOME_NAMES = {1: "valid-correct", 2: "valid-incorrect", 3: "agent-invalid-sub
 VALID = {1, 2, 3, 4}  # agent-attributable results: in the pass@k denominator; only 1 is a success
 AGENT_FAILURE = {3, 4}  # subset of VALID, reported separately as n_agent_failures
 INFRA = {5, 6, 7}  # excluded from n; counted in outcomes / n_infra_failures
-PURPOSES = ("calibration", "comparison", "demonstration")
+PURPOSES = ("calibration", "comparison", "demonstration", "screen")
 # Files that make a record-less trial directory an "unresolved attempt" instead of nothing at all.
 UNRESOLVED_FILES = ("status.json", "runner-error.json", "request.json", "launch.json")
 UNKNOWN_GROUP = "unknown-config"
 # RunConfig fields a record may carry flat (TrialRecord dataclass) or nested under ``run_config``.
 _LINEAGE_FIELDS = ("model", "purpose", "brief_profile", "compiled_hash")
+# Scaffold identity as run.scaffold_identity records it in RunConfig.agent_config: prefix + sha256(agent_config.yaml)[:16].
+SCAFFOLD_PREFIX = "mini-swe-agent.interactive:"
 
 
 def _check_counts(n: int, c: int, k: int) -> None:
@@ -118,6 +127,7 @@ def normalize_record(rec: dict, trial_dir: Path | None = None) -> dict:
         out["label"] = _read_json(trial_dir / "label.json")
     else:
         out.setdefault("label", None)
+    out["scaffold"] = scaffold_identity(out)
     return out
 
 
@@ -126,6 +136,36 @@ def _run_config_hash_of(rc: dict) -> str | None:
         from swesim.models import RunConfig
         return RunConfig.model_validate(rc).run_config_hash
     return None
+
+
+def _report_scaffold(rec: dict) -> str:
+    """Scaffold identity derived from ``report.agent_config_sha256`` (the digest the run stage has always written for
+    interactive scaffold trials); empty when the report records none."""
+    sha = (rec.get("report") or {}).get("agent_config_sha256")
+    return SCAFFOLD_PREFIX + sha[:16] if isinstance(sha, str) and sha else ""
+
+
+def scaffold_identity(rec: dict) -> str:
+    """The agent scaffold a trial actually ran with: ``run_config.agent_config`` when the run recorded it, else the identity
+    derived from the report digest. Empty string = the agent's packaged defaults (no scaffold)."""
+    rc = rec.get("run_config") or {}
+    if isinstance(rc, dict) and rc.get("agent_config"):
+        return str(rc["agent_config"])
+    return _report_scaffold(rec)
+
+
+def effective_run_config_hash(rec: dict) -> tuple[str | None, bool]:
+    """``(hash to group by, regrouped)``. The recorded ``run_config_hash`` stands unless the run config lacks
+    ``agent_config`` while the report proves a scaffold: then the hash is recomputed with the derived identity, which is
+    exactly the hash a current run with that scaffold carries. A record without a usable run config keeps its recorded
+    hash (nothing to derive from)."""
+    rc = rec.get("run_config") or {}
+    ident = scaffold_identity(rec)
+    if isinstance(rc, dict) and rc and not rc.get("agent_config") and ident:
+        derived = _run_config_hash_of({**rc, "agent_config": ident})
+        if derived:
+            return derived, derived != rec.get("run_config_hash")
+    return rec.get("run_config_hash"), False
 
 
 def _task_metadata(trial_dir: Path) -> dict:
@@ -254,7 +294,9 @@ def load_trial_records(ws: Workspace, scenario_id: str | None = None, include_un
 
 
 def group_key(rec: dict) -> str:
-    return f"{rec['condition']}|{rec.get('brief_profile') or 'natural'}|{rec['run_config_hash']}"
+    """``condition|brief_profile|<effective run_config_hash>`` (see ``effective_run_config_hash``)."""
+    ehash, _ = effective_run_config_hash(rec)
+    return f"{rec['condition']}|{rec.get('brief_profile') or 'natural'}|{ehash if ehash else rec['run_config_hash']}"
 
 
 def _single(values: set, what: str, key: str):
@@ -318,13 +360,20 @@ def summarize(records: list[dict], k: int) -> dict:
             by_status[str(r.get("status") or "unknown")] = by_status.get(str(r.get("status") or "unknown"), 0) + 1
         if key == UNKNOWN_GROUP:
             condition = profile = rch = None
-            model = purpose = None  # attempts with no recoverable run config: nothing to bind them to
+            model = purpose = scaffold = None  # attempts with no recoverable run config: nothing to bind them to
+            regrouped: list = []
         else:
             condition, profile, rch = key.split("|", 2)
             model = _single({r.get("model") for r in recs + unres} - {None, ""}, "models", key)
             purpose = _single({r.get("purpose") for r in recs + unres} - {None, ""}, "purposes", key)
+            # The key already binds the effective scaffold; the report digests must agree with it (a run_config claiming one
+            # scaffold while the report proves another is a lineage bug, never pooled).
+            scaffold = _single({scaffold_identity(r) for r in recs} | {s for r in recs if (s := _report_scaffold(r))}, "scaffolds", key) or None
+            regrouped = [r.get("trial_id") for r in recs if effective_run_config_hash(r)[1]]
         out[key] = {
             "condition": condition, "brief_profile": profile, "run_config_hash": rch, "model": model, "purpose": purpose,
+            "scaffold": scaffold, "regrouped_trials": regrouped,
+            "recorded_run_config_hashes": sorted({r.get("run_config_hash") for r in recs if r.get("run_config_hash")}),
             "requested_k": k, "configured_k": _single(cfg_k, "configured k values", key),
             "estimator": "without-replacement",
             "n": n, "n_valid": n, "n_total": len(recs),

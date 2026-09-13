@@ -31,7 +31,10 @@ def withheld_reconstruction_failures(spec: ScenarioSpec) -> list[str]:
     facts = {f.id: f for f in spec.ledger}
     targets = [o.target for o in spec.operations if o.type == OperationType.WITHHOLDING]
     excerpts = [facts[t].source_excerpt for t in targets if t in facts and facts[t].source_excerpt]
-    expected = reconstruct_withheld(natural.text, excerpts)
+    try:
+        expected = reconstruct_withheld(natural.text, excerpts)
+    except ValueError as exc:
+        return [str(exc)]
     if expected != withheld.text:
         return [f"withheld brief is not the natural issue minus exactly the recorded excerpts ({len(excerpts)} recorded removal(s); "
                 f"reconstruction has {len(expected)} chars, the brief {len(withheld.text)})"]

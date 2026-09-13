@@ -14,7 +14,7 @@
 # Usage: bash scripts/snapshot_example.sh <scenario_id> <trial_id> [<trial_id>...]
 # Env:   SWESIM_WORKSPACE    workspace root (default: workspace)
 #        SWESIM_EXAMPLES_DIR destination root (default: examples); the only way to write a second copy
-#        SWESIM_ENV_FILE     ignored env file whose credential values are redacted if seen (default: ~/Documents/.env)
+#        SWESIM_ENV_FILE     ignored env file whose credential values are redacted if seen (default: ./.env)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [ "$#" -lt 2 ]; then
@@ -152,7 +152,7 @@ for tid in tids:
 
 # Known credential values: never printed, replaced wherever they appear.
 secrets = set()
-env_file = os.environ.get('SWESIM_ENV_FILE', str(Path.home() / 'Documents' / '.env'))
+env_file = os.environ.get('SWESIM_ENV_FILE', '.env')
 if Path(env_file).is_file():
     for key, value in dotenv_values(env_file).items():
         if value and len(value) >= 8 and any(x in key.upper() for x in ('KEY', 'TOKEN', 'SECRET', 'PASSWORD')):

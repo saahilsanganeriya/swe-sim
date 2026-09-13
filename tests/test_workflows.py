@@ -11,6 +11,7 @@ import asyncio
 import configparser
 import contextlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -263,12 +264,114 @@ def test_trial_workflow_launch_failure_is_swallowed_and_await_decides(monkeypatc
         async def act(name, p, minutes=10, **kw):
             calls.append((name, kw.get("retry")))
             if name == "launch_trial_activity": raise RuntimeError("launch requires reconciliation")
+            if name == "cleanup_trial_activity": return {"trial_id": p["trial_id"], "cleaned": True}
             return {"trial_id": p["trial_id"], "status": "launch-failed"}
         monkeypatch.setattr(W, "act", act)
         w = W.TrialWorkflow(); r = await w.run({"trial_id": "t1"})
-        assert calls == [("launch_trial_activity", W.retries.ONCE), ("await_trial_activity", W.retries.READ)] and r["status"] == "launch-failed"
+        main = [c for c in calls if c[0] in ("launch_trial_activity", "await_trial_activity")]
+        assert main == [("launch_trial_activity", W.retries.ONCE), ("await_trial_activity", W.retries.READ)] and r["status"] == "launch-failed"
+        # bookkeeping after the terminal status: cost, index, cleanup (hooks use the HOOK class so a missing activity fails fast)
+        tail = [c for c in calls if c[0] in ("record_cost_activity", "index_trial_activity", "cleanup_trial_activity")]
+        assert tail == [("record_cost_activity", W.retries.HOOK), ("index_trial_activity", W.retries.HOOK), ("cleanup_trial_activity", W.retries.HOOK)]
+        assert r["bookkeeping"]["cleanup"] == {"trial_id": "t1", "cleaned": True} and r["bookkeeping"]["indexed"] is True
         prog = w.progress()
         assert prog["stage"] == "done" and prog["trial_id"] == "t1" and prog["status"] == "launch-failed" and prog["launch"]["launched"] is False
+    asyncio.run(scenario())
+
+
+def _activity_error(cause):
+    from temporalio.exceptions import ActivityError
+    return ActivityError("activity failed", scheduled_event_id=1, started_event_id=2, identity="w", activity_type="x", activity_id="1", retry_state=None)
+
+
+def test_bookkeeping_hooks_never_fail_the_workflow_and_record_indexed_false(monkeypatch):
+    """A CONTROL activity the worker does not have (the owning stream is not merged) or that times out is recorded, not raised."""
+    from temporalio.exceptions import ApplicationError, TimeoutError as TTimeoutError, TimeoutType
+    async def scenario():
+        async def act(name, p, minutes=10, **kw):
+            if name == "index_trial_activity":
+                e = _activity_error(None); e.__cause__ = ApplicationError("Activity function index_trial_activity ... is not registered on this worker", type="NotFoundError"); raise e
+            if name == "record_cost_activity":
+                e = _activity_error(None); e.__cause__ = TTimeoutError("schedule to close", type=TimeoutType.SCHEDULE_TO_CLOSE, last_heartbeat_details=[]); raise e
+            if name == "cleanup_trial_activity": raise RuntimeError("no trials worker")
+            if name == "launch_trial_activity": return {"trial_id": p["trial_id"], "launched": True}
+            return {"trial_id": p["trial_id"], "status": "completed", "reward": {"reward": 1.0, "success": 1}}
+        monkeypatch.setattr(W, "act", act)
+        w = W.TrialWorkflow(); r = await w.run({"trial_id": "t1", "model": "m"})
+        assert r["status"] == "completed"                                                           # the trial's outcome is untouched
+        b = r["bookkeeping"]
+        assert b["indexed"] is False and b["index"]["indexed"] is False and "not registered" in b["index"]["reason"]
+        assert b["cost"]["indexed"] is False and "TimeoutError" in b["cost"]["reason"]
+        assert b["cleanup"]["cleaned"] is False and "no trials worker" in b["cleanup"]["reason"]
+        assert w.progress()["indexed"] is False and w.progress()["status"] == "completed"
+        # the hook helper itself: a successful hook passes the activity's dict through
+        async def ok(name, p, minutes=10, **kw): return {"indexed": True, "rows": 1}
+        monkeypatch.setattr(W, "act", ok)
+        assert await W.hook("index_score_activity", {"scenario_id": "s"}) == {"indexed": True, "rows": 1}
+        assert (await W.index_workflow("running", {}))["indexed"] is False                           # no workflow identity as a plain coroutine
+    asyncio.run(scenario())
+
+
+def test_run_tasks_stops_planning_when_the_spend_cap_is_exceeded(monkeypatch):
+    async def scenario():
+        calls = []; state = {"exceeded": False}
+        async def act(name, p, minutes=10, **kw):
+            calls.append(name)
+            if name == "spend_check_activity":
+                state["exceeded"] = state["exceeded"] or len([c for c in calls if c == "plan_trials_activity"]) >= 1
+                return {"spend_usd": 1600.0 if state["exceeded"] else 10.0, "cap_usd": p.get("cap_usd") or 1500.0, "exceeded": state["exceeded"]}
+            if name == "plan_trials_activity":
+                return {"scenario_id": p["scenario_id"], "trials": [{"trial_id": p["scenario_id"] + "-t0", "model": "m", "condition": "hidden", "attempt_index": 0}]}
+            return {}
+        async def child(fn, arg, **kw): return {"trial_id": arg["trial_id"], "status": "completed"}
+        monkeypatch.setattr(W, "act", act); monkeypatch.setattr(W.workflow, "execute_child_workflow", child)
+        # the scenarios are planned one after another: the first is planned, the check before the second sees the cap exceeded
+        w = W.RunTasksWorkflow()
+        real_gather = asyncio.gather
+        async def serial(*coros):
+            out = []
+            for c in coros: out.append(await c)
+            return out
+        monkeypatch.setattr(W.asyncio, "gather", serial)
+        try:
+            r = await w.run({"scenario_ids": ["s1", "s2", "s3"], "models": ["m"], "conditions": ["hidden"], "k": 1, "stakeholder_url": "https://s", "spend_cap_usd": 1500})
+        finally:
+            monkeypatch.setattr(W.asyncio, "gather", real_gather)
+        assert r["stopped_reason"] == "spend-cap" and r["spend"]["exceeded"] is True and r["spend"]["cap_usd"] == 1500.0
+        assert r["scenarios"]["s1"]["status"] == "complete" and r["scenarios"]["s2"] == {"status": "skipped", "reason": "spend-cap", "trials": []} and r["scenarios"]["s3"]["status"] == "skipped"
+        assert calls.count("plan_trials_activity") == 1 and r["status"] == "complete-with-failures"
+        assert w.progress()["stopped_reason"] == "spend-cap" and w.progress()["scenarios"]["s2"]["status"] == "skipped"
+        # once exceeded, later checks are not even asked (the run has stopped planning)
+        assert calls.count("spend_check_activity") == 3   # at start, before s1, before s2 (exceeded); s3 short-circuits
+    asyncio.run(scenario())
+
+
+def test_candidate_hooks_carry_source_key_and_scenario_and_tolerate_failure(monkeypatch):
+    from types import SimpleNamespace
+    async def scenario():
+        monkeypatch.setattr(W.workflow, "info", lambda: SimpleNamespace(parent=None, workflow_id="create:a--1", run_id="r1", workflow_type="CandidateWorkflow"))
+        hooks = []
+        async def act(name, p, minutes=10, **kw):
+            if name.startswith("index_"):
+                hooks.append((name, p))
+                if name == "index_scenario_activity": raise RuntimeError("index down")
+                return {"indexed": True}
+            if name == "judge_one_activity": return {"judged_path": "j", "instance_id": p["instance_id"], "scenario_id": "a--1", "keep": True, "reasons": []}
+            if name == "probe_candidate_activity": return {"judged_path": "j", "fail_to_pass": ["t"], "pass_to_pass": [], "reproducible": True}
+            if name == "draft_activity": return {"scenario_id": "a--1", "draft_path": "d"}
+            if name == "auto_approve_activity": return {"approved": False, "spec_hash": "h", "reasons": ["judge did not accept"]}
+            return dict(BIG)
+        monkeypatch.setattr(W, "act", act)
+        w = W.CandidateWorkflow()
+        r = await w.run({"instance_id": "a__1", "candidates_path": "/c/x.jsonl", "source_key": "github-repo:x/a", "judge_model": "j", "draft_model": "d"})
+        assert r["status"] == "rejected"                                                                     # the outcome ignores the failing scenario hook
+        cand = [p for n, p in hooks if n == "index_candidate_activity"]
+        assert cand and all(p == {"source_key": "github-repo:x/a", "candidates_path": "/c/x.jsonl", "instance_id": "a__1"} for p in cand)
+        scen = [p for n, p in hooks if n == "index_scenario_activity"]
+        assert scen and all(p == {"scenario_id": "a--1", "version": 1} for p in scen)
+        wf = [p for n, p in hooks if n == "index_workflow_activity"]
+        assert [p["status"] for p in wf] == ["running", "completed"] and wf[-1]["workflow_id"] == "create:a--1" and wf[-1]["params_summary"]["instance_id"] == "a__1"
+        assert w.progress()["indexed"] is False                                                             # the failed scenario hook is visible
     asyncio.run(scenario())
 
 
@@ -305,8 +408,25 @@ def trial_request(ws, spec, model="anthropic/claude-haiku-4-5-20251001", conditi
 
 # ---------------------------------------------------------------- launch once through the activities module (the launcher protocol itself: tests/test_launchers.py)
 
+class _Records(logging.Handler):
+    def __init__(self): super().__init__(level=logging.INFO); self.messages: list[str] = []
+    def emit(self, record): self.messages.append(record.getMessage())
+
+
 def test_activities_launch_once_uses_the_configured_launcher_and_stamps(ws, systemd):
     spec = frozen_scenario(ws); p = trial_request(ws, spec)
+    records = _Records(); A.log.addHandler(records); A.log.setLevel(logging.INFO)
+    try:
+        launched = asyncio.run(A.launch_trial_activity({**p}))
+        assert launched["launched"] is True
+        assert any(f"decision=launch trial={p['trial_id']}" in m and "launcher=systemd" in m for m in records.messages)   # the Cloud Logging metric's literals
+        records.messages.clear()
+        assert asyncio.run(A.launch_trial_activity({**p}))["decision"] == "reconcile"
+        assert any(f"decision=reconcile trial={p['trial_id']}" in m for m in records.messages)
+    finally:
+        A.log.removeHandler(records)
+    # the plain function path (no activity wrapper) behaves the same and writes launch.json once
+    import shutil; shutil.rmtree(ws.root / "trials"); systemd.units.clear(); systemd.calls.clear()
     first = A.launch_once(p)
     assert first["decision"] == "launch" and first["launched"] is True and first["launcher"] == "systemd" and first["unit"] == "swesim-trial-" + p["trial_id"]
     assert first["worker_image_digest"] == A.SETTINGS.worker_image_digest and first["origin"] == A.SETTINGS.origin
@@ -458,6 +578,83 @@ def test_cancel_and_cleanup_activities_follow_the_evidence(ws, systemd):
     assert done["cleaned"] is True and done["launcher"] == "systemd" and done["origin"] == A.SETTINGS.origin
 
 
+def test_spend_check_sums_cost_files_and_compares_with_the_cap(ws, monkeypatch):
+    from decimal import Decimal
+    trials = ws.root / "trials"
+    atomic_json(trials / ("a" * 24) / "costs.json", [{"role": "solver", "usd": 1.25}, {"role": "stakeholder", "usd": 0.25}])
+    atomic_json(trials / ("b" * 24) / "costs.json", [{"role": "solver", "usd": None, "price_source": "unknown"}])
+    (trials / ("c" * 24)).mkdir(); (trials / ("c" * 24) / "costs.json").write_text("{not json")
+    r = asyncio.run(A.spend_check_activity({}))
+    assert r["spend_usd"] == 1.5 and r["records"] == 3 and r["unpriced_records"] == 1 and r["source"] == "files"
+    assert r["cap_usd"] is None and r["exceeded"] is False                                           # no cap configured: never exceeded
+    assert asyncio.run(A.spend_check_activity({"cap_usd": 1.0})) | {} == {**r, "cap_usd": 1.0, "exceeded": True} | {}
+    monkeypatch.setattr(A, "SETTINGS", A.SETTINGS.model_copy(update={"spend_cap_usd": Decimal("2")}))
+    assert asyncio.run(A.spend_check_activity({}))["exceeded"] is False and asyncio.run(A.spend_check_activity({"cap_usd": 1.4}))["exceeded"] is True
+
+
+def test_record_cost_activity_is_idempotent_and_reports_missing_pieces(ws, monkeypatch):
+    import swesim
+    from types import SimpleNamespace
+    spec = frozen_scenario(ws); p = trial_request(ws, spec); tid = p["trial_id"]; d = ws.root / "trials" / tid
+    monkeypatch.setitem(sys.modules, "swesim.costs", None)                                   # a worker without the models stream's module
+    monkeypatch.setattr(swesim, "costs", None, raising=False)
+    r = asyncio.run(A.record_cost_activity({"trial_id": tid}))
+    assert r["recorded"] is False and "swesim.costs" in r["reason"]
+    written = []
+    def record_cost(layout, trial_id_, workflow_id, role, model_id, usage):
+        rec = {"role": role, "model": model_id, "usd": 0.42, "price_source": "table", "input_tokens": usage["input"], "output_tokens": usage["output"]}
+        path = layout.trial_dir(trial_id_) / "costs.json"; rows = json.loads(path.read_text()) if path.exists() else []; rows.append(rec); atomic_json(path, rows)
+        written.append((trial_id_, workflow_id, role, model_id)); return SimpleNamespace(usd=0.42, price_source="table")
+    fake_costs = fake_module("swesim.costs", solver_usage_from_trajectory=lambda traj: {"input": traj["in"], "output": traj["out"]}, record_cost=record_cost)
+    monkeypatch.setitem(sys.modules, "swesim.costs", fake_costs)
+    monkeypatch.setattr(swesim, "costs", fake_costs, raising=False)
+    assert asyncio.run(A.record_cost_activity({"trial_id": tid}))["reason"] == "no record.json"
+    atomic_json(d / "record.json", {"trial_id": tid, "status": "completed", "model": p["model"], "reward": {"reward": 1.0, "success": 1}})
+    assert asyncio.run(A.record_cost_activity({"trial_id": tid}))["reason"] == "no trajectory or agent result to read usage from"
+    atomic_json(d / "trajectory.json", {"in": 1000, "out": 50})
+    r = asyncio.run(A.record_cost_activity({"trial_id": tid, "workflow_id": tid}))
+    assert r["recorded"] is True and r["usd"] == 0.42 and r["model"] == p["model"] and written == [(tid, tid, "solver", p["model"])]
+    again = asyncio.run(A.record_cost_activity({"trial_id": tid}))
+    assert again["recorded"] is False and again["reason"] == "solver cost already recorded" and len(written) == 1
+    assert json.loads((d / "costs.json").read_text())[0]["input_tokens"] == 1000
+
+
+def test_record_cost_activity_with_the_real_costs_module_reads_harbor_agent_result(ws):
+    """The models stream's swesim.costs: usage from the Harbor trial dir the record names, a CostRecord row in trials/<tid>/costs.json."""
+    import swesim.costs as costs
+    spec = frozen_scenario(ws); p = trial_request(ws, spec, model="anthropic/claude-haiku-4-5-20251001"); tid = p["trial_id"]; d = ws.root / "trials" / tid
+    harbor = ws.root / "jobs" / "runs" / tid / "trial-1"; harbor.mkdir(parents=True)
+    (harbor / "result.json").write_text(json.dumps({"agent_result": {"n_input_tokens": 12000, "n_output_tokens": 800, "n_cache_tokens": 2000, "cost_usd": 0.05}}))
+    atomic_json(d / "record.json", {"trial_id": tid, "status": "completed", "model": p["model"], "trial_dir": str(harbor), "reward": {"reward": 1.0, "success": 1}})
+    r = asyncio.run(A.record_cost_activity({"trial_id": tid, "workflow_id": tid}))
+    assert r["recorded"] is True and r["model"] == p["model"] and r["records"] == 1
+    rows = costs.read_costs(d / "costs.json")
+    assert len(rows) == 1 and rows[0].role == "solver" and rows[0].trial_id == tid and rows[0].workflow_id == tid
+    assert rows[0].input_tokens == 12000 and rows[0].output_tokens == 800 and rows[0].cached_tokens == 2000 and rows[0].provider == "anthropic"
+    assert (rows[0].usd is None) == (r["usd"] is None) and r["price_source"] == rows[0].price_source
+    assert asyncio.run(A.record_cost_activity({"trial_id": tid}))["reason"] == "solver cost already recorded"
+    spend = asyncio.run(A.spend_check_activity({"cap_usd": 1000}))
+    assert spend["records"] == 1 and spend["exceeded"] is False and spend["unpriced_records"] == (1 if rows[0].usd is None else 0)
+
+
+def test_judge_one_records_a_judge_cost_row_when_the_judge_reports_usage(ws, monkeypatch):
+    """C2 (models stream): one `judge` cost row per judged candidate through swesim.costs; a ledger problem never fails the judge."""
+    import swesim.costs as costs
+    def judge_candidate(row, model_id):
+        return {"gaps": [], "verified_rubric_score": 2, "keep": True, "model_id": model_id, "usage": {"input_tokens": 5000, "output_tokens": 300, "calls": 1}}
+    monkeypatch.setitem(sys.modules, "swesim.stages.judge", fake_module("swesim.stages.judge", judge_candidate=judge_candidate))
+    cand = ws.candidates_dir / "github-repo--x__y.jsonl"; cand.parent.mkdir(parents=True)
+    cand.write_text(json.dumps({"instance_id": "a__1", "repo": "x/y"}) + "\n" + json.dumps({"instance_id": "b__2", "repo": "x/y"}) + "\n")
+    j = asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "a__1", "judge_model": OPUS}))
+    assert j["keep"] is True and j["cost"]["recorded"] is True and j["cost"]["workflow_id"] == "direct"   # no Temporal activity context here
+    rows = costs.read_costs(ws.root / "costs" / "direct.json")
+    assert len(rows) == 1 and rows[0].role == "judge" and rows[0].model.endswith("claude-opus-5") and rows[0].input_tokens == 5000 and rows[0].trial_id is None
+    again = asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "a__1", "judge_model": OPUS}))
+    assert again["cost"] is None and len(costs.read_costs(ws.root / "costs" / "direct.json")) == 1                          # retained row: no second charge
+    bad = asyncio.run(A.judge_one_activity({"candidates_path": str(cand), "instance_id": "b__2", "judge_model": "not-a-model-id"}))
+    assert bad["keep"] is True and bad["cost"]["recorded"] is False and "ModelIdError" in bad["cost"]["reason"]              # judged; the ledger problem is reported
+
+
 def test_register_activity_result_is_json_serializable(ws, monkeypatch):
     # Fix round 1, Important 5.
     spec = frozen_scenario(ws)
@@ -549,47 +746,53 @@ GPT, OPUS, SONNET, HAIKU = "openai/gpt-5.5", "anthropic/claude-opus-5", "anthrop
 SOL = "openai/gpt-5.6-sol"  # second link of every pipeline-role chain in swesim.roles.ROLE_CHAINS
 
 
-def _chat_failing(unavailable):
-    def chat_json(model_id, system, messages, schema_hint, temperature=0.0, max_tokens=4000):
-        if model_id in unavailable: raise RuntimeError(f"401 unauthorized for {model_id} with key fake-openai-key-value-1234")
-        return {"ok": True}
-    return chat_json
+def _probe_failing(unavailable):
+    """A stand-in for roles.probe_id: reachable unless the id is in `unavailable`; the error text carries a fake key, as a provider's would."""
+    from swesim.roles import ProbeResult
+    def probe_id(model_id, **kw):
+        if model_id in unavailable:
+            return ProbeResult(id=model_id, provider=model_id.partition("/")[0], reachable=False, latency_ms=12, error_class="AuthenticationError",
+                               error=f"401 unauthorized for {model_id} with key fake-openai-key-value-1234", served_provider=None, at="2026-09-13T08:00:00+00:00", usage=None)
+        return ProbeResult(id=model_id, provider=model_id.partition("/")[0], reachable=True, latency_ms=12, error_class=None, error=None,
+                           served_provider=None, at="2026-09-13T08:00:00+00:00", usage=None)
+    return probe_id
 
 
-def test_probe_chains_are_the_three_pipeline_roles_of_role_chains():
+def test_probe_chains_are_role_chains():
     from swesim.roles import ROLE_CHAINS
-    assert set(A.FALLBACK_CHAINS) == {"judge_model", "draft_model", "stakeholder_model"}          # audit/screen models are not probed here
-    assert all(A.FALLBACK_CHAINS[r] == ROLE_CHAINS[r] for r in A.FALLBACK_CHAINS)
+    assert A.FALLBACK_CHAINS is ROLE_CHAINS and {"judge_model", "draft_model", "stakeholder_model", "audit_model", "screen_model"} <= set(ROLE_CHAINS)
 
 
 def test_probe_chains_gpt_unavailable_judge_becomes_opus_draft_stays_sonnet(ws, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key-value-1234")
-    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({GPT}))
+    monkeypatch.setattr("swesim.roles.probe_id", _probe_failing({GPT}))
     r = A.probe_models({"judge_model": GPT, "draft_model": SONNET, "models": [GPT, HAIKU]})
-    assert r["resolved"] == {"judge_model": OPUS, "draft_model": SONNET, "stakeholder_model": OPUS}
+    three = lambda d: {k: d[k] for k in ("judge_model", "draft_model", "stakeholder_model")}
+    assert three(r["resolved"]) == {"judge_model": OPUS, "draft_model": SONNET, "stakeholder_model": OPUS}
     assert r["substitutions"] == {"judge_model": OPUS}
-    assert r["configured"] == {"judge_model": GPT, "draft_model": SONNET, "stakeholder_model": OPUS}   # stakeholder default is the chain head
-    assert r["models"][GPT]["ok"] is False and r["models"][OPUS]["ok"] is True and r["models"][SONNET]["ok"] is True
+    assert three(r["configured"]) == {"judge_model": GPT, "draft_model": SONNET, "stakeholder_model": OPUS}   # stakeholder default is the chain head
+    assert r["resolved"]["screen_model"] == A.FALLBACK_CHAINS["screen_model"][0] and r["resolved"]["audit_model"] == OPUS   # every role in the chains
+    assert r["models"][GPT]["ok"] is False and r["models"][OPUS]["ok"] is True and r["models"][SONNET]["ok"] is True and r["models"][OPUS]["latency_ms"] == 12
     assert r["needs_human"] == [f"solver model {GPT} unavailable; no silent substitution"] and r["solver_unavailable"] == [GPT]
     assert any("judge_model" in n and "fell back to " + OPUS in n for n in r["notes"])
     err = r["models"][GPT]["error"]
-    assert "fake-openai-key-value-1234" not in err and "[redacted:OPENAI_API_KEY]" in err   # provider error text is redacted
+    assert "fake-openai-key-value-1234" not in err and "[redacted:OPENAI_API_KEY]" in err and err.startswith("AuthenticationError")   # redacted
     saved = json.loads((ws.root / "evidence" / "model-probe.json").read_text())
     assert saved["resolved"] == r["resolved"] and saved["chains"] == A.FALLBACK_CHAINS and saved["notes"] == r["notes"]
 
 
 def test_probe_chains_never_resolve_judge_and_draft_to_the_same_model(ws, monkeypatch):
-    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing(set()))
+    monkeypatch.setattr("swesim.roles.probe_id", _probe_failing(set()))
     r = A.probe_models({"judge_model": SONNET, "draft_model": SONNET, "models": [HAIKU]})
     assert r["resolved"]["judge_model"] == SONNET and r["resolved"]["draft_model"] == SOL and r["resolved"]["stakeholder_model"] == OPUS
     assert r["resolved"]["judge_model"] != r["resolved"]["draft_model"]
     assert any("advanced the draft chain to " + SOL in n for n in r["notes"]) and r["needs_human"] == [] and r["solver_unavailable"] == []
     # draft chain exhausted: the judge chain advances instead (configured both to sonnet; gpt-5.6-sol unavailable)
-    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({SOL}))
+    monkeypatch.setattr("swesim.roles.probe_id", _probe_failing({SOL}))
     r2 = A.probe_models({"judge_model": SONNET, "draft_model": SONNET, "models": [HAIKU]})
     assert r2["resolved"]["draft_model"] == SONNET and r2["resolved"]["judge_model"] == OPUS and any("advanced the judge chain to " + OPUS in n for n in r2["notes"])
     # nothing distinct left: recorded for a human, never silently equal-and-proceed
-    monkeypatch.setattr("swesim.llm.chat_json", _chat_failing({SOL, OPUS, GPT}))
+    monkeypatch.setattr("swesim.roles.probe_id", _probe_failing({SOL, OPUS, GPT}))
     r3 = A.probe_models({"judge_model": SONNET, "draft_model": SONNET, "models": [HAIKU]})
     assert any("no distinct model is available" in n for n in r3["needs_human"])
 
@@ -744,30 +947,42 @@ def test_worker_registers_all_workflows_and_partitions_activities_by_queue(monke
     from temporalio import activity
     from swesim.settings import Settings
     from swesim.workflows import worker as WK
-    names = {WK.activity_name(a) for a in A.ALL}
+    own = {WK.activity_name(a) for a in A.ALL}
     assert {"mine_activity", "judge_activity", "draft_activity", "auto_approve_activity", "verify_approval_activity", "compile_activity", "validate_activity",
             "register_activity", "plan_trials_activity", "launch_trial_activity", "await_trial_activity", "score_activity", "export_activity", "probe_models_activity",
-            "list_candidates_activity", "judge_one_activity", "probe_candidate_activity", "precheck_draft_activity", "human_approve_activity"} <= names
+            "list_candidates_activity", "judge_one_activity", "probe_candidate_activity", "precheck_draft_activity", "human_approve_activity"} <= own
     assert set(WK.WORKFLOWS) == {W.TrialWorkflow, W.RunMatrixWorkflow, W.PipelineWorkflow, W.CandidateWorkflow, W.CreateTasksWorkflow, W.RunTasksWorkflow}
     assert A.LAUNCH_SLOTS._value == 1                        # one launch at a time per worker
-    # activities are partitioned by queue: the union is everything registered, the parts are disjoint
+    # everything registered (own + whichever optional stream modules import) is partitioned by queue: union == registered, parts disjoint
+    registered = {WK.activity_name(a) for a in WK.registered_activities()}
+    assert own <= registered and {WK.activity_name(a) for a in WK.optional_activities()} == registered - own
     parts = {q: {WK.activity_name(a) for a in WK.activities_for_queue(q)} for q in QUEUES}
-    assert set().union(*parts.values()) == names and sum(len(v) for v in parts.values()) == len(names)
+    assert set().union(*parts.values()) == registered and sum(len(v) for v in parts.values()) == len(registered)
     assert {"launch_trial_activity", "await_trial_activity"} <= parts[Q.TRIALS] and {"compile_activity", "probe_candidate_activity"} <= parts[Q.BUILD]
-    assert "judge_one_activity" in parts[Q.AUTHORING] and parts[Q.CONTROL] <= {"record_cost_activity", "spend_check_activity"}
-    # optional streams' modules register when importable and are skipped when not
+    assert "judge_one_activity" in parts[Q.AUTHORING] and {"record_cost_activity", "spend_check_activity"} <= parts[Q.CONTROL]
+    assert (registered - own) <= parts[Q.CONTROL]            # the optional streams' activities are all control-queue bookkeeping
+    # an optional module registers when importable and is skipped when not (independent of which ones main has today)
     @activity.defn(name="index_trial_activity")
     async def fake_index(p): return {}
-    monkeypatch.setitem(sys.modules, "swesim.index.activities", fake_module("swesim.index.activities", ALL=[fake_index]))
-    assert "index_trial_activity" in {WK.activity_name(a) for a in WK.activities_for_queue(Q.CONTROL)}
-    monkeypatch.delitem(sys.modules, "swesim.index.activities")
-    assert "index_trial_activity" not in {WK.activity_name(a) for a in WK.registered_activities()}
+    monkeypatch.setitem(sys.modules, "swesim.optional_fake.activities", fake_module("swesim.optional_fake.activities", ALL=[fake_index]))
+    assert [WK.activity_name(a) for a in WK.optional_activities(("swesim.optional_fake.activities", "swesim.not_merged_yet.activities"))] == ["index_trial_activity"]
+    assert WK.optional_activities(()) == []
     # concurrency: the per-queue default unless the pool overrides it; the startup line carries queues and digest, no secret
     s = Settings.from_env({"SWESIM_TASK_QUEUE": "swesim-build,swesim-control", "SWESIM_WORKER_IMAGE_DIGEST": "sha256:abc", "TEMPORAL_API_KEY": "tmprl_x",
                            "SWESIM_ENV_FILE": "/nonexistent/.env"})
     assert WK.concurrency(s, Q.BUILD) == 8 and WK.concurrency(s.model_copy(update={"max_concurrent_activities": 3}), Q.BUILD) == 3
     line = WK.startup_line(s)
     assert "queues=swesim-build,swesim-control" in line and "worker_image_digest=sha256:abc" in line and "tmprl_x" not in line
+    # the control pool migrates the index at startup when it is enabled; other pools and a disabled index skip; a missing entry point is reported
+    calls = []
+    fake_index = fake_module("swesim.index", ensure_migrated=lambda settings: calls.append(settings.temporal_namespace))
+    monkeypatch.setitem(sys.modules, "swesim.index", fake_index)
+    with_db = s.model_copy(update={"database_url": __import__("pydantic").SecretStr("postgresql+psycopg://u:pw@/db")})
+    assert WK.migrate_index_if_enabled(s) == {"migrated": False, "reason": "index disabled"} and calls == []
+    assert WK.migrate_index_if_enabled(with_db.model_copy(update={"task_queues": ("swesim-build",)})) == {"migrated": False, "reason": "not the control pool"}
+    assert WK.migrate_index_if_enabled(with_db) == {"migrated": True} and calls == ["default"]
+    monkeypatch.setitem(sys.modules, "swesim.index", fake_module("swesim.index"))
+    assert WK.migrate_index_if_enabled(with_db)["migrated"] is False and "ensure_migrated" in WK.migrate_index_if_enabled(with_db)["reason"]
 
 
 def test_client_ids_and_signal_payload(monkeypatch):
@@ -843,7 +1058,7 @@ def test_console_create_form_rebuild_checkbox_maps_to_the_param(monkeypatch):
     calls = []
     async def start_create(wf_params): calls.append(wf_params); return "create-fake"
     monkeypatch.setattr(console, "client_fn", lambda name: start_create if name == "start_create" else None)
-    monkeypatch.setattr(console, "stakeholder_url", lambda: "https://s")
+    monkeypatch.setattr(console, "stakeholder_url", lambda settings=None: "https://s")
     out = asyncio.run(console.start_create(params))
     assert out["workflow_ids"] == ["create-fake"] and calls[-1]["rebuild"] is True and calls[-1]["sources"][0]["kind"] == "swebench-annotated"
     asyncio.run(console.start_create(plain))
@@ -876,6 +1091,18 @@ def test_client_list_runs_filters_by_type_and_summarizes(monkeypatch):
     allruns = asyncio.run(C.list_runs("all", 5))
     assert [r["type"] for r in allruns] == ["CreateTasksWorkflow", "RunTasksWorkflow"] and " OR " in fc.queries[-1][0]
     with pytest.raises(ValueError): asyncio.run(C.list_runs("bogus"))
+    # open executions per type (the deploy path's open-executions check)
+    class OpenClient:
+        def __init__(s): s.queries = []
+        async def list_workflows(s, query, limit=None):
+            s.queries.append(query)
+            for wid, wtype in (("t1", "TrialWorkflow"), ("t2", "TrialWorkflow"), ("run-1", "RunTasksWorkflow")):
+                yield Exec(wid, wtype, WorkflowExecutionStatus.RUNNING, {})
+    oc = OpenClient()
+    async def connect_open(): return oc
+    monkeypatch.setattr(C, "connect", connect_open)
+    assert asyncio.run(C.open_types()) == [{"type": "RunTasksWorkflow", "open_count": 1}, {"type": "TrialWorkflow", "open_count": 2}]
+    assert oc.queries == ["ExecutionStatus = 'Running'"]
 
 
 # ---------------------------------------------------------------- task-creation activities
@@ -1016,6 +1243,8 @@ def _create_fakes(conc, judge_calls, validate_invalid=("a--5",), judge_error=("a
     async def probe(p): return {"resolved": {"judge_model": p.get("judge_model"), "draft_model": p.get("draft_model"), "stakeholder_model": "openai/gpt-5.5"}, "substitutions": {}, "needs_human": []}
     @activity.defn(name="mine_activity")
     async def mine(p): return {"candidates_path": f"/c/{p.get('repo') or p.get('pool')}.jsonl"}
+    @activity.defn(name="discover_activity")
+    async def discover(p): return {"candidates_path": f"/c/{p['repo']}.jsonl"}
     @activity.defn(name="list_candidates_activity")
     async def listc(p): return {"candidates": [{"instance_id": i, "scenario_id": sid(i)} for i in lists[p["candidates_path"]]]}
     @activity.defn(name="judge_one_activity")
@@ -1043,7 +1272,7 @@ def _create_fakes(conc, judge_calls, validate_invalid=("a--5",), judge_error=("a
     async def validate(p): return {"status": "invalid" if p["scenario_id"] in validate_invalid else "valid", "failures": ["oracle earned 0"]}
     @activity.defn(name="register_activity")
     async def register(p): return {"registry_entry": {}}
-    return [probe, mine, listc, judge, probe_c, draft, approve, precheck, human, verify, compile_, validate, register]
+    return [probe, mine, discover, listc, judge, probe_c, draft, approve, precheck, human, verify, compile_, validate, register]
 
 
 def test_env_create_tasks_fanout_bound_duplicates_failing_sibling_and_progress():
@@ -1341,7 +1570,12 @@ def test_env_run_tasks_two_scenarios_bounded_and_progress():
             prog = await h.query(W.RunTasksWorkflow.progress)
             assert prog["stage"] == "complete" and set(prog["trials"]) == {"s1-t0", "s1-t1", "s2-t0", "s2-t1"}
             assert prog["trials"]["s1-t0"] == {"scenario_id": "s1", "model": "m", "condition": "hidden", "attempt_index": 0, "status": "completed"}
-            assert prog["scenarios"] == {"s1": {"status": "complete", "trials": 2}, "s2": {"status": "complete", "trials": 2}, "bad": {"status": "error", "error": prog["scenarios"]["bad"]["error"], "trials": 0}}
+            # index_score_activity is not registered on these workers (the storage stream's module): recorded as indexed False, never a failure
+            assert prog["scenarios"] == {"s1": {"status": "complete", "trials": 2, "indexed": False}, "s2": {"status": "complete", "trials": 2, "indexed": False},
+                                         "bad": {"status": "error", "error": prog["scenarios"]["bad"]["error"], "trials": 0}}
+            assert prog["spend"]["indexed"] is False and "not registered" in prog["spend"]["reason"] and prog["stopped_reason"] is None
+            done = await env.client.get_workflow_handle("s1-t0").query(W.TrialWorkflow.progress)
+            assert done["status"] == "completed" and done["indexed"] is False
             # running the same selection again cannot relaunch: every trial id is already used
             r2 = await env.client.execute_workflow(W.RunTasksWorkflow.run, {**params, "scenario_ids": ["s1"]}, id="run-test-2", task_queue=Q.AUTHORING)
             assert [t["status"] for t in r2["scenarios"]["s1"]["trials"]] == ["duplicate-rejected", "duplicate-rejected"] and r2["status"] == "complete"

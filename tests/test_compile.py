@@ -11,7 +11,7 @@ from swesim.stages import compile as comp
 VERIFIER_FILES = ("grader.py", "policy.py", "parsers.py", "run_pytest.py")
 SHIM_FILES = ("ask-user", "confirm-behavior", "request-review")
 GRADE_CONFIG_FIELDS = {"artifacts_dir", "pristine_dir", "work_dir", "expected_tests", "groups", "protected", "runner",
-                       "test_user", "verifier_out", "test_timeout_sec", "target_dir", "contract_patch"}
+                       "test_user", "verifier_out", "test_timeout_sec", "target_dir", "contract_patch", "base_manifest"}
 URL = "https://x.modal.run"
 
 
@@ -193,10 +193,58 @@ def test_compile_json_and_compiled_hash(tmp_path, neighbours):
     bumped = RunConfig.model_validate({"condition": "full", "agent_version": "2.4.7"})
     v = json.loads(comp.compile_scenario(ws, spec, bumped, URL, resolve_digest=False).compile_json.read_text())
     assert v["compiled_hash"] != a["compiled_hash"]  # a different pre-baked agent is a different environment
-    assert comp.compiled_hash(spec, None, "2.4.6") == a["compiled_hash"] and comp.compiled_hash(spec, None, "2.4.7") == v["compiled_hash"]
+    assert comp.compiled_hash(spec, None, "2.4.6", compile_config=a["compile_config"], rendered_manifest=a["rendered_manifest"]) == a["compiled_hash"]
     (neighbours[0] / "grader.py").write_text("# changed\n")
     c = json.loads(comp.compile_scenario(ws, spec, rc, URL, resolve_digest=False).compile_json.read_text())
     assert c["compiled_hash"] != a["compiled_hash"]
+
+
+def test_compiled_hash_binds_render_configuration_and_constants(tmp_path, monkeypatch):
+    ws, spec = _materialize(tmp_path, minimal_spec_dict())
+    rc = RunConfig.default("interactive")
+
+    def build(config=rc, url=URL):
+        result = comp.compile_scenario(ws, spec, config, url, resolve_digest=False)
+        return json.loads(result.compile_json.read_text())["compiled_hash"]
+
+    original = build()
+    assert build(url=URL + "/other-endpoint") != original
+    assert build(config=rc.model_copy(update={"solver_timeout_sec": rc.solver_timeout_sec + 60})) != original
+    assert build(config=rc.model_copy(update={"stakeholder": rc.stakeholder.model_copy(update={"temperature": 0.5})})) != original
+    monkeypatch.setattr(comp, "COLLECT_TIMEOUT_SEC", comp.COLLECT_TIMEOUT_SEC + 1)
+    assert build() != original
+
+
+@pytest.mark.parametrize("change", ["modify", "delete", "add", "chmod", "symlink", "metadata"])
+def test_compiled_manifest_rejects_changed_tree(tmp_path, change):
+    ws, spec = _materialize(tmp_path, minimal_spec_dict())
+    result = comp.compile_scenario(ws, spec, RunConfig.default("interactive"), URL, resolve_digest=False)
+    record = json.loads(result.compile_json.read_text())
+    task = result.task_dirs["interactive"]
+    comp.verify_compiled_artifacts(task, record, "interactive")
+    target = task / "instruction.md"
+    if change == "modify": target.write_text("changed brief")
+    elif change == "delete": target.unlink()
+    elif change == "add": (task / "environment" / "extra.py").write_text("pass")
+    elif change == "chmod": target.chmod(0o755)
+    elif change == "symlink":
+        target.unlink(); target.symlink_to(task / "instruction.natural.md")
+    else:
+        path = task / "task.toml"
+        path.write_text(path.read_text().replace(record["compiled_hash"], "0" * 64))
+    with pytest.raises(ValueError, match="compiled"):
+        comp.verify_compiled_artifacts(task, record, "interactive")
+
+
+def test_compiled_manifest_requires_bound_record(tmp_path):
+    ws, spec = _materialize(tmp_path, minimal_spec_dict())
+    result = comp.compile_scenario(ws, spec, RunConfig.default("full"), URL, resolve_digest=False)
+    record = json.loads(result.compile_json.read_text())
+    with pytest.raises(ValueError, match="recompile"):
+        comp.verify_compiled_artifacts(result.task_dirs["full"], {"compiled_hash": record["compiled_hash"]}, "full")
+    record["compile_config"]["stakeholder_url"] = "https://changed.example"
+    with pytest.raises(ValueError, match="compiled"):
+        comp.verify_compiled_artifacts(result.task_dirs["full"], record, "full")
 
 
 def test_session_token_only_reaches_interactive(tmp_path):
@@ -269,6 +317,10 @@ def test_rejects_bad_inputs(tmp_path):
         comp.compile_scenario(ws, spec, RunConfig.default("full"), "http://x.modal.run", resolve_digest=False)
     with pytest.raises(ValueError, match="provider"):
         comp.compile_scenario(ws, spec, RunConfig.model_validate({"condition": "full", "model": "mystery/model-1"}), URL, resolve_digest=False)
+    # C4: OpenRouter solvers compile; the allowlist carries the OpenRouter API host from the shared provider table
+    res = comp.compile_scenario(ws, spec, RunConfig.model_validate({"condition": "full", "model": "openrouter/deepseek/deepseek-chat-v3-0324"}), URL, resolve_digest=False)
+    assert tomllib.loads((res.task_dirs["full"] / "task.toml").read_text())["agent"]["allowed_hosts"] == ["openrouter.ai", "x.modal.run"]
+    assert comp.MODEL_HOSTS == {"anthropic": ["api.anthropic.com"], "openai": ["api.openai.com"], "openrouter": ["openrouter.ai"]}
     d = minimal_spec_dict(); d["controls"]["tamper"].append({"name": "keyerror", "asset": "tamper.diff", "rationale": "dup", "cls": "benign-edit"})
     ws2, spec2 = _materialize(tmp_path / "b", d)
     with pytest.raises(ValueError, match="control name"):
@@ -311,10 +363,12 @@ def test_collector_is_stdlib_only_and_never_runs_git():
 
 def test_collector_archives_tree_and_writes_receipt(tmp_path):
     c = _collector(); repo = _tree(tmp_path / "app"); out = tmp_path / "collect"
-    receipt = c.collect(repo, out, stakeholder_url="", token="", kill=lambda: None)
+    manifest = tmp_path / "base-manifest.txt"; manifest.write_text("pristine image file hashes\n")
+    receipt = c.collect(repo, out, stakeholder_url="", token="", kill=lambda: None, base_manifest=manifest)
     assert set(receipt) >= set(c.RECEIPT_KEYS)
     assert receipt["status"] == "ok" and receipt["rc"] == 0 and receipt["user"] == "root" and receipt["freeze_status"] == "n/a" and receipt["transcript_hash"] is None
     assert receipt["bytes"] == 30 and receipt["sha256"] == hashlib.sha256((out / "app.tar").read_bytes()).hexdigest()
+    assert receipt["base_manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
     assert json.loads((out / "collect.status").read_text()) == receipt
     with tarfile.open(out / "app.tar") as t:
         names = {m.name: m for m in t.getmembers()}
@@ -403,12 +457,29 @@ def test_collector_main_reads_cleared_env(tmp_path, monkeypatch):
     c = _collector(); repo = _tree(tmp_path / "app"); out = tmp_path / "collect"
     monkeypatch.setattr(c, "OUT", out)
     monkeypatch.setattr(c, "kill_agent_processes", lambda: None)
+    manifest = tmp_path / "base-manifest.txt"; manifest.write_text("pristine image file hashes\n")
+    monkeypatch.setattr(c, "BASE_MANIFEST", manifest)
     monkeypatch.setenv("SWESIM_REPO_DIR", str(repo)); monkeypatch.setenv("SWESIM_STAKEHOLDER_URL", ""); monkeypatch.setenv("SWESIM_SESSION_TOKEN", "")
     c.main()
     assert json.loads((out / "collect.status").read_text())["status"] == "ok"
     monkeypatch.delenv("SWESIM_REPO_DIR")
     c.main()  # missing env is a collection failure, not a crash without a receipt
     assert json.loads((out / "collect.status").read_text())["status"] == "collection-failure"
+
+
+def test_collector_missing_base_manifest_fails_and_still_freezes(tmp_path, monkeypatch):
+    c = _collector(); repo = _tree(tmp_path / "app"); out = tmp_path / "collect"
+    calls = []
+
+    def freeze(*args):
+        calls.append(args)
+        return "ok", "f" * 64, {}
+
+    monkeypatch.setattr(c, "freeze", freeze)
+    receipt = c.collect(repo, out, "https://s.modal.run", "tok", kill=lambda: None, base_manifest=tmp_path / "missing")
+    assert receipt["status"] == "collection-failure" and receipt["rc"] == 1
+    assert receipt["base_manifest_sha256"] is None and "base manifest" in receipt["error"]
+    assert calls and receipt["freeze_status"] == "ok"
 
 
 # ---- llm client helpers (offline) --------------------------------------------------------------
