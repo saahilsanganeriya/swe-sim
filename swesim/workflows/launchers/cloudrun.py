@@ -138,7 +138,9 @@ class CloudRunLauncher:
         solver_timeout = int((request.get("run_config") or {}).get("solver_timeout_sec") or DEFAULT_SOLVER_TIMEOUT_SEC)
         labels = {LABEL_TRIAL: label_value(trial_id), LABEL_SCENARIO: label_value(request.get("scenario_id")), LABEL_RUN: label_value(request.get("run_workflow_id"))}
         mounts = [run_v2.VolumeMount(name=WORKSPACE_VOLUME, mount_path=WORKSPACE_MOUNT)]
-        volumes = [run_v2.Volume(name=WORKSPACE_VOLUME, gcs=run_v2.GCSVolumeSource(bucket=self.settings.bucket, read_only=False))]
+        volumes = [run_v2.Volume(name=WORKSPACE_VOLUME, gcs=run_v2.GCSVolumeSource(
+            bucket=self.settings.bucket, read_only=False,
+            mount_options=["uid=1000", "gid=1000", "file-mode=0660", "dir-mode=0770"]))]
         if self.sql_connection_name:
             mounts.append(run_v2.VolumeMount(name=CLOUDSQL_VOLUME, mount_path=CLOUDSQL_MOUNT))
             volumes.append(run_v2.Volume(name=CLOUDSQL_VOLUME, cloud_sql_instance=run_v2.CloudSqlInstance(instances=[self.sql_connection_name])))

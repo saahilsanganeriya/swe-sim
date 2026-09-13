@@ -134,6 +134,7 @@ def test_start_creates_the_job_spec_the_brief_fixes_and_runs_it_once(cloud):
     assert "fake-anthropic-value-123456" not in spec_text and "fake-worker-secret-xyz" not in spec_text   # secret values never enter the spec
     volumes = {v.name: v for v in task.volumes}; mounts = {m.name: m.mount_path for m in container.volume_mounts}
     assert volumes["swesim-workspace"].gcs.bucket == "swesim-proj-workspace" and volumes["swesim-workspace"].gcs.read_only is False
+    assert set(volumes["swesim-workspace"].gcs.mount_options) == {"uid=1000", "gid=1000", "file-mode=0660", "dir-mode=0770"}
     assert list(volumes["cloudsql"].cloud_sql_instance.instances) == ["proj:us-central1:swesim"]
     assert mounts == {"swesim-workspace": "/workspace", "cloudsql": "/cloudsql"}
     launch = json.loads((layout.trial_dir(p["trial_id"]) / "launch.json").read_text())
