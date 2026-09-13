@@ -23,7 +23,8 @@ def connect_kwargs(env: dict | None = None) -> dict:
     e = os.environ if env is None else env
     kw: dict = {"target_host": e.get("TEMPORAL_ADDRESS", "localhost:7233"), "namespace": e.get("TEMPORAL_NAMESPACE", "default")}
     if e.get("TEMPORAL_API_KEY"):
-        kw["api_key"] = e["TEMPORAL_API_KEY"]; kw["tls"] = True
+        # Temporal Cloud regional endpoints route by this header; measured 2026-09-13: without it the same key is "Request unauthorized".
+        kw["api_key"] = e["TEMPORAL_API_KEY"]; kw["tls"] = True; kw["rpc_metadata"] = {"temporal-namespace": kw["namespace"]}
     elif e.get("TEMPORAL_TLS_CERT") and e.get("TEMPORAL_TLS_KEY"):
         from temporalio.service import TLSConfig
         kw["tls"] = TLSConfig(client_cert=Path(e["TEMPORAL_TLS_CERT"]).read_bytes(), client_private_key=Path(e["TEMPORAL_TLS_KEY"]).read_bytes())

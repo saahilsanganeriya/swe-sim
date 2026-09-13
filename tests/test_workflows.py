@@ -1538,7 +1538,8 @@ def test_connect_kwargs_local_api_key_and_mtls(tmp_path):
     from swesim.workflows import client as C
     assert C.connect_kwargs({}) == {"target_host": "localhost:7233", "namespace": "default"}
     kw = C.connect_kwargs({"TEMPORAL_ADDRESS": "us-central1.gcp.api.temporal.io:7233", "TEMPORAL_NAMESPACE": "swesim.abcde", "TEMPORAL_API_KEY": "tmprl_secret"})
-    assert kw == {"target_host": "us-central1.gcp.api.temporal.io:7233", "namespace": "swesim.abcde", "api_key": "tmprl_secret", "tls": True}
+    assert kw == {"target_host": "us-central1.gcp.api.temporal.io:7233", "namespace": "swesim.abcde", "api_key": "tmprl_secret", "tls": True,
+                  "rpc_metadata": {"temporal-namespace": "swesim.abcde"}}   # the routing header Temporal Cloud requires with API keys
     line = C.describe_connection({"TEMPORAL_ADDRESS": "x:7233", "TEMPORAL_NAMESPACE": "n", "TEMPORAL_API_KEY": "tmprl_secret"})
     assert line == "temporal=x:7233 namespace=n auth=api-key" and "tmprl_secret" not in line
     cert = tmp_path / "c.pem"; key = tmp_path / "k.pem"; cert.write_bytes(b"CERT"); key.write_bytes(b"KEY")
