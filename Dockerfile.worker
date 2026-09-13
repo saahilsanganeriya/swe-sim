@@ -14,12 +14,24 @@ ENV UV_COMPILE_BYTECODE=1 \
     PATH="/app/.venv/bin:$PATH"
 
 # git: swesim/stages/draft_spec.py checks oracle patches with `git apply --check`. ca-certificates: TLS to providers,
-# Temporal Cloud and Modal.
+# Temporal Cloud and Modal. curl: fetches the pinned GitHub CLI release below.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 1000 --user-group --shell /usr/sbin/nologin swesim \
  && mkdir -p /app && chown swesim:swesim /app
+
+# gh: swesim/sources/threads.py discovers repository candidates with `gh api` (GH_TOKEN arrives from Secret Manager).
+# Pinned release, checksum verified against GitHub's published checksums file (measured 2026-09-13: the first hosted
+# discovery failed with FileNotFoundError: 'gh' because the image lacked it).
+ARG GH_VERSION=2.100.0
+RUN cd /tmp \
+ && curl -fsSL -o gh.tgz "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+ && curl -fsSL -o gh_checksums.txt "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_checksums.txt" \
+ && grep " gh_${GH_VERSION}_linux_amd64.tar.gz$" gh_checksums.txt | sed -E 's/ +gh_.*/  gh.tgz/' | sha256sum -c - \
+ && tar -xzf gh.tgz --strip-components=2 -C /usr/local/bin "gh_${GH_VERSION}_linux_amd64/bin/gh" \
+ && rm -f gh.tgz gh_checksums.txt \
+ && gh --version
 
 WORKDIR /app
 COPY --chown=swesim:swesim pyproject.toml uv.lock README.md ./
