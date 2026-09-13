@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from swesim.sources import github_repo as gr
 from swesim.sources import swebench_annotated as sb
 from swesim.sources import threads
 
@@ -17,7 +18,10 @@ P2P = "xarray/tests/test_weighted.py::test_weighted_sum"
 ISSUE = ("Weighted mean silently ignores missing dims\n"
          "Calling ds.weighted(w).mean('z') with a dim 'z' that does not exist returns a result.\n"
          "Traceback shows no error at all.\n"
-         "Expected: raise ValueError.")
+         "Expected: raise ValueError.\n"
+         "I am using xarray 0.18 on Linux.\n"
+         "A small reproducer is attached below.")
+WITHHOLD_PROMPT_MARK = "Select spans of this issue to withhold"
 
 
 # ---------------------------------------------------------------- pool A / pure helpers
@@ -314,21 +318,281 @@ def test_judge_candidate_adds_code_owned_fields(monkeypatch):
     from swesim.stages import judge
     seen = {}
 
+    base = {"derivable_from_repo": False, "consequential": True, "category": "behavior"}
+    cand_text = judge.issue_contract_delta(_row())[0]["text"]          # "tests assert the literal 'dimension '": the one code-extracted gap of the fixture
+
     def fake_chat(model_id, system, messages, schema, **kw):
         seen.update(model=model_id, system=system, user=json.loads(messages[0]["content"]))
-        return {"gaps": [{"id": "g1", "text": "tests expect ValueError", "source": "test-exception", "derivable_from_repo": False, "consequential": True, "resolved_by": "thread", "category": "behavior"}],
+        return {"gaps": [{"id": "g1", "text": cand_text, "source": "test-literal", "resolved_by": "thread",
+                          "resolution_excerpt": "raise a ValueError when the dim is missing", **base},
+                         {"id": "g2", "text": "message names the dim", "source": "proposed", "evidence": "match=\"dimension 'z' not found\"", "question": "message?",
+                          "resolved_by": "tests", "resolution_excerpt": "", **base},
+                         {"id": "g3", "text": "invented", "source": "proposed", "evidence": "raise TypeError('nope')", "resolved_by": "tests", **base},   # not verbatim: dropped
+                         {"id": "g4", "text": "dup", "source": "proposed", "evidence": "match=\"dimension  'z' not found\"", "question": "message?", "resolved_by": "tests", **base}],  # same evidence + question: dropped
                 "verified_rubric_score": "2", "complexity": 2, "test_behavioralness": 4, "self_contained": True, "alternatives_accepted": False, "rationale": "ok"}
     monkeypatch.setattr(judge, "chat_json", fake_chat)
-    row = {"instance_id": "pydata__xarray-5362", "problem_statement": ISSUE, "test_patch": "+    with pytest.raises(ValueError):\n", "patch": "", "thread": {}}
+    row = _row(annotation={**_row()["annotation"], "underspecified_notes": "ANNOTATOR SECRET NOTE"})
     out = judge.judge_candidate(row, "openai/gpt-5.5")
     assert out["keep"] is True and out["structural_tests"] is True and out["verified_rubric_score"] == 2
-    assert out["prompt_version"] == judge.JUDGE_PROMPT_VERSION and out["model_id"] == "openai/gpt-5.5"
+    assert out["prompt_version"] == judge.JUDGE_PROMPT_VERSION == "judge-v3" and out["model_id"] == "openai/gpt-5.5"
     assert out["candidate_gaps"] == judge.issue_contract_delta(row) and seen["user"]["candidate_gaps"] == out["candidate_gaps"]
-    assert "CANDIDATE GAPS" in seen["system"]
+    assert [g["id"] for g in out["gaps"]] == ["g1", "g2"] and out["gaps_proposed"] == 1 and out["gaps_dropped"] == 2 and out["gaps_extracted"] == len(out["candidate_gaps"])
+    assert out["gaps"][0]["resolved_by"] == "thread" and out["gaps"][1]["resolved_by"] == "tests" and out["gaps"][1]["evidence_grounded"] is True
+    assert "CANDIDATE GAPS" in seen["system"] and "PROPOSE" in seen["system"]
+    # calibration independence: the judge never sees the annotators' notes
+    assert "annotation" not in seen["user"]["candidate"] and "ANNOTATOR SECRET NOTE" not in json.dumps(seen["user"])
     with pytest.raises(ValueError, match="incomplete source evidence"):
         judge.judge_candidate({**row, "thread": {"fetch_errors": [{"issue": 3}]}}, "openai/gpt-5.5")
-    with pytest.raises(ValueError, match="context budget"):
-        judge.judge_candidate({**row, "patch": "x" * 130000}, "openai/gpt-5.5")
+    # an oversized patch is trimmed to fit instead of aborting; the payload records the cut
+    out = judge.judge_candidate({**row, "patch": "x" * 130000}, "openai/gpt-5.5")
+    assert out["payload_trimmed"] == {"patch": 30000} and out["payload_chars"] <= judge.CONTEXT_BUDGET_CHARS
+    assert seen["user"]["candidate"]["patch"].startswith("x" * 30000) and "characters trimmed" in seen["user"]["candidate"]["patch"]
+    # only when the essentials themselves do not fit does the judge still refuse
+    with pytest.raises(ValueError, match="context budget even after trimming"):
+        judge.judge_candidate({**row, "fail_to_pass": [f"tests/test_big.py::test_case_{i:05d}" for i in range(6000)]}, "openai/gpt-5.5")
+
+
+def test_llm_view_trims_the_largest_field_first_to_fit_the_budget():
+    from swesim.stages import judge
+    row = _row(patch="p" * 130000, thread={**_thread("pydata/xarray", 5362), "pr_comments": [_c("u", "c" * 20, "2021-05-01T00:00:00Z")] * 300})
+    view = judge.llm_view(row, budget=120000)
+    assert view["trimmed"] == {"patch": 30000} and len(json.dumps(view)) <= 120000                     # only the culprit is cut
+    assert view["problem_statement"] == ISSUE and view["fail_to_pass"] == [F2P] and view["test_patch"] == row["test_patch"]
+    assert len(view["thread"]["pr_comments"]) == 300 and "pr_comments_total" not in view["thread"]
+    view = judge.llm_view(row, budget=60000)                                    # tighter: patch to 30k, then the thread (now the largest) to 20 comments, then it fits
+    assert view["trimmed"] == {"patch": 30000, "thread": 20} and len(json.dumps(view)) <= 60000
+    assert view["thread"]["pr_comments_total"] == 300 and len(view["thread"]["pr_comments"]) == 20
+    view = judge.llm_view(row, budget=30000)                                    # below the first notch: the patch takes its second notch
+    assert view["trimmed"]["patch"] == 8000 and len(json.dumps(view)) <= 30000
+    assert judge.llm_view(row, budget=60000, extra_chars=0)["fail_to_pass"] == [F2P]                    # F2P ids are never trimmed
+    assert "trimmed" not in judge.llm_view(_row(), budget=120000)                                        # nothing to do when it fits
+    assert judge.llm_view(_row()) == judge.llm_view(_row(), budget=None)
+    with pytest.raises(ValueError, match="even after trimming"):
+        judge.llm_view(_row(fail_to_pass=[f"tests/test_big.py::test_case_{i:05d}" for i in range(6000)]), budget=120000)
+    small = judge.llm_view(_row(problem_statement="s" * 50000, hints_text="h" * 50000), budget=40000)
+    assert small["trimmed"] == {"problem_statement": 20000, "hints_text": 20000} or small["trimmed"]["problem_statement"] in (20000, 6000)
+    assert small["problem_statement"].startswith("s" * 6000) and len(json.dumps(small)) <= 40000
+
+
+def test_calibrate_records_per_row_errors_and_excludes_them_from_denominators(monkeypatch):
+    from swesim.stages import judge
+    pool = sb.pool_a(CSV)[:3]
+    others = [i for i in sb.annotation_rows(CSV) if float(sb.annotation_rows(CSV)[i]["underspecified"]) < 2][:3]
+    ids = pool + others
+    rows = {i: {"instance_id": i} for i in ids}
+
+    def flaky(row, model_id):
+        if row["instance_id"] == pool[0]:
+            raise ValueError("candidate exceeds authoring context budget even after trimming")
+        if row["instance_id"] == others[0]:
+            raise RuntimeError("provider timeout")
+        return {"verified_rubric_score": 3 if row["instance_id"] in pool else 0}
+    monkeypatch.setattr(judge, "judge_candidate", flaky)
+    out = judge.calibrate(Path(CSV), rows, "fake/model", n=6)
+    assert out["n_requested"] == 6 and out["n_judged"] == 4 and out["n_errored"] == 2 and out["n"] == 4
+    assert {e["instance_id"] for e in out["errors"]} == {pool[0], others[0]} and all("ValueError" in e["error"] or "RuntimeError" in e["error"] for e in out["errors"])
+    assert out["confusion"] == {"tp": 2, "fp": 0, "tn": 2, "fn": 0} and out["agreement"] == 1.0 and len(out["per_instance"]) == 4
+    assert {p["instance_id"] for p in out["per_instance"]}.isdisjoint({e["instance_id"] for e in out["errors"]})
+
+
+def test_ground_gaps_requires_verbatim_evidence_and_grounded_resolutions():
+    from swesim.stages.judge import accept, ground_gaps
+    row = _row()
+    base = {"derivable_from_repo": False, "consequential": True, "category": "behavior"}
+    from swesim.stages.judge import issue_contract_delta
+    assert [c["text"] for c in issue_contract_delta(row)] == ["tests assert the literal 'dimension '"]   # the issue already names ValueError
+    gaps = [
+        {"id": "g1", "source": "test-exception", "text": "tests assert the literal 'dimension '", "resolved_by": "thread", "resolution_excerpt": "raise a ValueError when the dim is missing", **base},
+        {"id": "g2", "source": "proposed", "text": "message names the dim", "evidence": "match=\"dimension 'z' not found\"", "resolved_by": "tests", "resolution_excerpt": "", **base},
+        {"id": "g3", "source": "proposed", "text": "invented", "evidence": "raise TypeError('nope')", "resolved_by": "tests", **base},                 # not in tests/patch: dropped
+        {"id": "g4", "source": "proposed", "text": "dup", "evidence": "match=\"dimension  'z' not found\"", "resolved_by": "tests", **base},            # same evidence after _norm: dropped
+        {"id": "g5", "source": "proposed", "text": "short", "evidence": "x\n", "resolved_by": "tests", **base},                                          # below the 12-char floor: dropped
+        {"id": "g6", "source": "proposed", "text": "claims thread", "evidence": "with pytest.raises(ValueError, match=\"dimension 'z' not found\"):",
+         "resolved_by": "thread", "resolution_excerpt": "the maintainer agreed to raise", **base},                                                    # thread claim not in thread -> tests
+        {"id": "g7", "source": "test-literal", "text": "literal", "resolved_by": "tests", **base},                              # extracted-looking label, text matches no candidate gap: a proposal without evidence -> dropped
+        {"id": "g8", "source": "diff-branch", "text": "invented source", "resolved_by": "none", **base},                                              # non-extracted source, no evidence: dropped
+        "garbage",
+    ]
+    kept, stats = ground_gaps(gaps, row)
+    assert [g["id"] for g in kept] == ["g1", "g2", "g6"]
+    assert stats == {"gaps_proposed": 2, "gaps_dropped": 6, "resolution_downgraded": 1}
+    by = {g["id"]: g for g in kept}
+    assert by["g1"]["resolved_by"] == "thread" and by["g2"]["resolved_by"] == "tests" and by["g6"]["resolved_by"] == "tests"
+    assert by["g1"]["source"] == "test-literal" and by["g6"]["source"] == "proposed" and by["g2"]["evidence_grounded"] is True and by["g1"]["evidence_grounded"] is False   # source is code-owned
+    assert by["g2"]["evidence_in_tests"] is True and by["g6"]["evidence_in_tests"] is True
+    assert accept({"self_contained": True, "gaps": [by["g2"]]}) and accept({"self_contained": True, "gaps": [by["g1"]]})
+    assert not accept({"self_contained": True, "gaps": [{**by["g2"], "resolved_by": "none"}]}) and not accept({"self_contained": False, "gaps": [by["g2"]]})
+    assert ground_gaps([], row) == ([], {"gaps_proposed": 0, "gaps_dropped": 0, "resolution_downgraded": 0})
+
+
+def test_ground_gaps_closes_the_label_smuggle_and_boilerplate_evidence_holes():
+    """Reviewer probes on d5ad128: an invented gap labelled with an extracted source, `diff --git a/` as evidence, and patch-only
+    evidence all passed both auto gates. None may."""
+    from swesim.stages.draft_spec import tests_resolved_facts
+    from swesim.stages.judge import accept, evidence_ok, ground_gaps
+    row = _row(patch="diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n@@ -1 +1,3 @@\n x\n"
+                     "+    if dim not in self.obj.dims:\n+        raise ValueError(f\"dimension {dim!r} not found in weights\")\n")
+    base = {"derivable_from_repo": False, "consequential": True, "category": "behavior"}
+    smuggled = {"id": "s1", "source": "test-exception", "text": "tests require a retry loop", "resolved_by": "thread", "resolution_excerpt": "Please raise a ValueError", **base}
+    boiler = {"id": "s2", "source": "proposed", "text": "invented decision", "evidence": "diff --git a/", "resolved_by": "tests", **base}
+    header = {"id": "s3", "source": "proposed", "text": "invented decision", "evidence": "+++ b/xarray/core/weighted.py", "resolved_by": "tests", **base}
+    keywords = {"id": "s4", "source": "proposed", "text": "invented decision", "evidence": "if not in", "resolved_by": "tests", **base}
+    patch_only = {"id": "s5", "source": "proposed", "text": "the fix rejects unknown dims", "evidence": "if dim not in self.obj.dims:", "question": "which dims?", "resolved_by": "tests", **base}
+    kept, stats = ground_gaps([smuggled, boiler, header, keywords, patch_only], row)
+    assert [g["id"] for g in kept] == ["s5"] and stats["gaps_dropped"] == 4
+    assert kept[0]["evidence_grounded"] is True and kept[0]["evidence_in_tests"] is False and kept[0]["resolved_by"] == "none"   # patch-only evidence cannot be tests-resolved
+    assert not accept({"self_contained": True, "gaps": kept})
+    assert tests_resolved_facts(row, {"gaps": [{**patch_only, "resolved_by": "tests"}]}) == []                                     # and synthesizes no on-request fact
+    assert not evidence_ok("diff --git a/") and not evidence_ok("assert not in") and not evidence_ok("valueerror") and evidence_ok("raise valueerror(msg) here")
+    # two distinct decisions pinned by the same test line both survive (dedupe is on evidence + question)
+    ev = "match=\"dimension 'z' not found\""
+    two = [{"id": "d1", "source": "proposed", "text": "message names the dim", "evidence": ev, "question": "what message?", "resolved_by": "tests", **base},
+           {"id": "d2", "source": "proposed", "text": "message quotes the dim name", "evidence": ev, "question": "is the dim name quoted?", "resolved_by": "tests", **base},
+           {"id": "d3", "source": "proposed", "text": "dup of d1", "evidence": ev, "question": "what message?", "resolved_by": "tests", **base}]
+    kept, stats = ground_gaps(two, _row())
+    assert [g["id"] for g in kept] == ["d1", "d2"] and stats["gaps_dropped"] == 1
+
+
+def test_tests_for_excerpt_and_synthesized_authored_facts():
+    from swesim.stages.draft_spec import tests_for_excerpt, tests_resolved_facts
+    row = _row()
+    f2p = [F2P, "xarray/tests/test_weighted.py::test_new", "xarray/tests/test_other.py::test_x"]
+    assert tests_for_excerpt(row["test_patch"], "match=\"dimension 'z' not found\"", f2p) == [F2P]                       # enclosing test function
+    assert tests_for_excerpt(row["test_patch"], "def test_new(): pass", f2p) == ["xarray/tests/test_weighted.py::test_new"]
+    assert tests_for_excerpt(row["test_patch"], "not in the test patch at all", f2p) == []                            # no all-F2P fallback any more
+    assert tests_for_excerpt(row["test_patch"], "", f2p) == []
+    # the hunk trailer names the existing test an edit lands in; a hunk without a test trailer is module level and links nothing
+    edited = ("diff --git a/xarray/tests/test_weighted.py b/xarray/tests/test_weighted.py\n--- a/xarray/tests/test_weighted.py\n+++ b/xarray/tests/test_weighted.py\n"
+              "@@ -1,2 +1,3 @@\n import pytest\n+import numpy as np\n"
+              "@@ -5,2 +5,3 @@ def test_new():\n     first = 1\n+    assert first == 1\n"
+              "@@ -40,3 +41,5 @@ def test_weighted_operations_nonexistent_dim(a):\n     w = weights()\n+    with pytest.raises(ValueError, match=\"dimension 'z' not found\"):\n+        ds.weighted(w).mean('z')\n"
+              "@@ -80,2 +83,3 @@ class TestOther:\n     pass\n+    helper_line = 2\n")
+    assert tests_for_excerpt(edited, "match=\"dimension 'z' not found\"", f2p) == [F2P]                                # not test_new, the previous block
+    assert tests_for_excerpt(edited, "assert first == 1", f2p) == ["xarray/tests/test_weighted.py::test_new"]
+    assert tests_for_excerpt(edited, "helper_line = 2", f2p) == []                                                    # a class trailer is not a test function
+    assert tests_for_excerpt(edited, "import numpy as np", f2p) == []                                                 # module-level hunk
+    facts = tests_resolved_facts(row, _judged())
+    assert len(facts) == 1 and facts[0]["id"] == "tests-001" and facts[0]["provenance"] == "authored" and facts[0]["discovery"] == "on-request"
+    assert facts[0]["source_excerpt"] == "match=\"dimension 'z' not found\"" and facts[0]["source_url"] == "https://github.com/pydata/xarray/pull/5362"
+    assert facts[0]["tests"] == [F2P] and facts[0]["kind"] == "behavior" and "g2" in facts[0]["authored_rationale"] and "What should the message say?" in facts[0]["authored_rationale"]
+    assert facts[0]["text"] == "Expected error: dimension not found"                                                  # judge prose within the fact_text bounds
+    j = _judged(); j["gaps"][1]["text"] = "The kubernetes scheduler must reject the dimension"                          # foreign content words: falls back to the question, then the excerpt
+    assert tests_resolved_facts(row, j)[0]["text"] == "What should the message say?" or tests_resolved_facts(row, j)[0]["text"] == j["gaps"][1]["evidence"]
+    j = _judged(); j["gaps"][1]["text"] = "x" * 500; j["gaps"][1]["question"] = "y" * 500
+    assert tests_resolved_facts(row, j)[0]["text"] == j["gaps"][1]["evidence"]
+    j = _judged(); j["gaps"][1]["evidence"] = "raise TypeError('nope')"                                             # evidence re-checked by code: fabricated -> no fact
+    assert tests_resolved_facts(row, j) == []
+    j = _judged(); j["gaps"][1]["derivable_from_repo"] = True
+    assert tests_resolved_facts(row, j) == []
+    j = _judged(); j["gaps"][1]["evidence"] = "def test_new(): pass"                                                # in a test function -> linked to it, not to every F2P test
+    assert tests_resolved_facts(row, j) == [] if F2P.startswith("xarray/tests/test_weighted.py::test_new") else tests_resolved_facts(_row(fail_to_pass=f2p), j)[0]["tests"] == ["xarray/tests/test_weighted.py::test_new"]
+    assert tests_resolved_facts(_row(thread={}), _judged())[0]["source_url"] == "https://github.com/pydata/xarray/pull/5362"   # PR url fallback from the instance id
+
+
+def test_authored_facts_must_ground_in_tests_or_patch():
+    from swesim.stages.draft_spec import ledger_violations
+    assert ledger_violations(_draft_llm(), _row()) == []                                                            # f04 quotes the test patch
+    d = _draft_llm(); d["ledger"][3]["source_excerpt"] = "Reviewer tone is terse and precise"                          # not in tests/patch
+    assert any("f04" in v and "merged tests/patch" in v for v in ledger_violations(d, _row()))
+    d = _draft_llm(); d["ledger"][3]["source_excerpt"] = None
+    assert any("f04" in v and "too short" in v for v in ledger_violations(d, _row()))
+    d = _draft_llm(); d["ledger"][3]["source_url"] = "https://github.com/other/repo/pull/1"
+    assert any("f04" in v and "source_url" in v for v in ledger_violations(d, _row()))
+    d = _draft_llm(); d["ledger"].append({**d["ledger"][3], "id": "tests-001"})
+    assert any("tests-001" in v and "reserved" in v for v in ledger_violations(d, _row()))
+    d = _draft_llm(); d["ledger"][0]["discovery"] = d["ledger"][3]["discovery"] = "repo-derivable"                     # no model fact links a F2P test any more ...
+    assert any("on-request" in v for v in ledger_violations(d, _row()))
+    assert not any("on-request" in v for v in ledger_violations(d, _row(), [{"discovery": "on-request", "tests": [F2P]}]))   # ... but a synthesized one does
+
+
+# ---------------------------------------------------------------- urgent drafter fixes: diff-body corpus, on-request facts carry tests, auto-link fallback
+
+SPHINX_TEST_PATCH = ("diff --git a/tests/test_ext_autodoc.py b/tests/test_ext_autodoc.py\nindex 1111111..2222222 100644\n--- a/tests/test_ext_autodoc.py\n+++ b/tests/test_ext_autodoc.py\n"
+                     "@@ -10,3 +10,6 @@ def test_other():\n     pass\n+def test_table_rows(app):\n+    content = app.render()\n+    rows = content.splitlines()\n"
+                     "+    assert len(content.splitlines()) == 11\n+    assert len(rows) == 11\n-    assert old_value == 7\n\\ No newline at end of file\n")
+
+
+def test_diff_body_text_strips_markers_and_headers():
+    from swesim.stages.judge import diff_body_lines, diff_body_text
+    body = diff_body_text(SPHINX_TEST_PATCH)
+    assert body == ("    pass\ndef test_table_rows(app):\n    content = app.render()\n    rows = content.splitlines()\n"
+                    "    assert len(content.splitlines()) == 11\n    assert len(rows) == 11")
+    assert "diff --git" not in body and "index " not in body and "+++" not in body and "@@" not in body and "No newline" not in body and "old_value" not in body
+    assert "    assert old_value == 7" in diff_body_lines(SPHINX_TEST_PATCH, include_removed=True)
+    assert diff_body_text("plain text, not a diff\nsecond line") == "plain text, not a diff\nsecond line"
+
+
+def test_grounding_excerpt_may_span_adjacent_added_lines():
+    """sphinx-doc__sphinx-9467: `assert len(content.splitlines()) == 11 assert len(rows) == 11` sits on two adjacent `+` lines."""
+    from swesim.stages.draft_spec import ledger_violations
+    from swesim.stages.judge import ground_gaps
+    f2p = ["tests/test_ext_autodoc.py::test_table_rows"]
+    row = _row(repo="sphinx-doc/sphinx", test_patch=SPHINX_TEST_PATCH, fail_to_pass=f2p, thread=_thread("sphinx-doc/sphinx", 9467))
+    excerpt = "assert len(content.splitlines()) == 11 assert len(rows) == 11"
+    d = _draft_llm(repo="sphinx-doc/sphinx", pr=9467)
+    d["ledger"] = [{"id": "f01", "text": "The rendered table has eleven rows", "kind": "behavior", "provenance": "authored", "source_excerpt": excerpt,
+                    "source_url": "https://github.com/sphinx-doc/sphinx/pull/9467", "authored_rationale": "only the tests pin the count", "discovery": "on-request", "tests": f2p}]
+    assert ledger_violations(d, row) == []
+    d["ledger"][0]["source_excerpt"] = "assert len(rows) == 11 assert old_value == 7"     # removed (`-`) lines are not evidence of the merged state
+    assert any("f01" in v and "verbatim" in v for v in ledger_violations(d, row))
+    gap = {"id": "g9", "source": "proposed", "text": "row count", "evidence": excerpt, "question": "how many rows?", "derivable_from_repo": False, "consequential": True,
+           "resolved_by": "tests", "category": "behavior"}
+    kept, stats = ground_gaps([gap], row)
+    assert kept and kept[0]["evidence_grounded"] is True and kept[0]["resolved_by"] == "tests" and stats["gaps_dropped"] == 0
+
+
+MPL_TEST_PATCH = ("diff --git a/lib/matplotlib/tests/test_figure.py b/lib/matplotlib/tests/test_figure.py\n--- a/lib/matplotlib/tests/test_figure.py\n+++ b/lib/matplotlib/tests/test_figure.py\n"
+                  "@@ -1 +1,9 @@\n x\n+def test_subplot_mosaic_width_ratios():\n+    fig = plt.figure()\n+    fig.subplot_mosaic([[\"A\", [[\"B\"], [\"C\"]]]], width_ratios=[2, 1])\n"
+                  "+    assert fig.axes\n+def test_subplot_mosaic_height_ratios_nested():\n+    fig = plt.figure()\n+    fig.subplot_mosaic([[\"A\"], [[[\"B\", \"C\"]]]], height_ratios=[1, 3])\n"
+                  "+def test_unrelated_colorbar_label():\n+    assert plt.colorbar().ax.get_ylabel() == \"\"\n")
+MPL_F2P = ["lib/matplotlib/tests/test_figure.py::test_subplot_mosaic_width_ratios", "lib/matplotlib/tests/test_figure.py::test_subplot_mosaic_height_ratios_nested[a]",
+           "lib/matplotlib/tests/test_figure.py::test_unrelated_colorbar_label"]
+
+
+def test_auto_link_tests_by_shared_content_words():
+    from swesim.stages.draft_spec import auto_link_tests, content_words
+    assert content_words("Nested subplot_mosaic layouts must apply width_ratios while nothing is None") == {"nested", "subplot", "mosaic", "layouts", "apply", "width", "ratios", "nothing"}
+    assert auto_link_tests("Nested subplot_mosaic layouts must apply width_ratios to every level", MPL_TEST_PATCH, MPL_F2P) == sorted([MPL_F2P[0], MPL_F2P[1]])   # mosaic+subplot shared with both; width+ratios with the first
+    assert auto_link_tests("Only the height_ratios of nested mosaics matter here", MPL_TEST_PATCH, MPL_F2P) == [MPL_F2P[1]]
+    assert auto_link_tests("The maintainer prefers a friendly wording", MPL_TEST_PATCH, MPL_F2P) == []                  # no shared content words
+    assert auto_link_tests("figure figure figure", MPL_TEST_PATCH, MPL_F2P) == []                                    # one distinct shared word is not enough
+    assert auto_link_tests("", MPL_TEST_PATCH, MPL_F2P) == [] and auto_link_tests("assert while return", MPL_TEST_PATCH, MPL_F2P) == []   # keywords never count
+
+
+def test_on_request_facts_must_carry_f2p_tests_named_in_the_violation():
+    from swesim.stages.draft_spec import ledger_violations
+    d = _draft_llm(); d["ledger"][0]["tests"] = []
+    bad = ledger_violations(d, _row())
+    assert any(v.startswith("f01:") and "on-request" in v and F2P in v for v in bad)
+    d["ledger"][0]["tests"] = [P2P]                                                       # a PASS_TO_PASS link does not satisfy the rule
+    assert any(v.startswith("f01:") for v in ledger_violations(d, _row()))
+    # withheld facts are on-request without tests by design: exempt via require_f2p_link=False
+    w = {"id": "withheld-001", "text": "t", "kind": "context", "provenance": "original-issue", "source_excerpt": "Traceback shows no error at all.",
+         "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": []}
+    assert ledger_violations({"ledger": [w]}, _row(), corpus_by_fact={"withheld-001": w["source_excerpt"]}, allow_reserved=True, require_f2p_link=False) == []
+
+
+def test_draft_lists_f2p_ids_and_auto_links_on_request_facts_before_failing(monkeypatch, tmp_path):
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    d = _draft_llm(); d["ledger"][0].update(tests=[], text="Raise ValueError with the dimension not found message")   # shares valueerror/dimension/found with the test body
+    calls = _patch_llm(monkeypatch, d, _withhold_llm())
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert next(f for f in spec.ledger if f.id == "f01").tests == [F2P]
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert meta["auto_linked"] == ["f01"]
+    draft_calls = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
+    assert len(draft_calls) == 2                                                                        # correction round happened before the fallback
+    assert draft_calls[0]["messages"][0]["content"].startswith("FAIL_TO_PASS ids") and F2P in draft_calls[0]["messages"][0]["content"].splitlines()[0]
+    correction = draft_calls[1]["messages"][-1]["content"]
+    assert "Correct these violations" in correction and "f01:" in correction and F2P in correction
+    # no shared content words: the fallback cannot link, so the draft fails as before
+    d = _draft_llm(); d["ledger"][0].update(tests=[], text="The maintainer prefers a friendly wording")
+    _patch_llm(monkeypatch, d, _withhold_llm())
+    with pytest.raises(ValueError, match="grounding validation after two attempts.*f01: every on-request fact must carry"):
+        draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s2")
+    assert not (tmp_path / "s2" / "scenario.draft.json").exists()
 
 
 def test_calibrate_reports_agreement_at_threshold(monkeypatch):
@@ -342,43 +606,225 @@ def test_calibrate_reports_agreement_at_threshold(monkeypatch):
     assert out["n"] == 6 and out["confusion"] == {"tp": 3, "fp": 1, "tn": 2, "fn": 0}
     assert out["agreement"] == pytest.approx(5 / 6) and out["precision"] == pytest.approx(0.75) and out["recall"] == 1.0
     assert out["prompt_version"] == judge.JUDGE_PROMPT_VERSION and len(out["per_instance"]) == 6 and out["model_id"] == "fake/model"
+    assert out["n_requested"] == out["n_judged"] == 6 and out["n_errored"] == 0 and out["errors"] == []
 
 
 # ---------------------------------------------------------------- draft_spec
 
 def test_withheld_brief_has_no_excerpts(monkeypatch):
     from swesim.stages import draft_spec
-    issue = 'Import fails\nTraceback: ERROR42\nrun_import("bad.csv")'
+    issue = 'Import fails\nThe importer stops on the first row.\nTraceback: ERROR42 raised in importer\nrun_import("bad.csv") crashes at once\nWe expected the whole file to load.'
     monkeypatch.setattr(draft_spec, 'chat_json', lambda *a, **k: {'withheld_brief': 'Import fails',
-        'removed': [{'category': 'error_message', 'excerpt': 'ERROR42', 'kind': 'reproduction', 'discovery': 'on-request'},
-                    {'category': 'reproduction', 'excerpt': 'run_import("bad.csv")', 'kind': 'reproduction', 'discovery': 'on-request'}]})
+        'removed': [{'category': 'error_message', 'excerpt': 'ERROR42 raised in importer', 'kind': 'reproduction', 'discovery': 'on-request'},
+                    {'category': 'reproduction', 'excerpt': 'run_import("bad.csv") crashes at once', 'kind': 'reproduction', 'discovery': 'on-request'}]})
     result = draft_spec.withhold(issue, 'fake/model')
     assert all(x['excerpt'] not in result['withheld_brief'] for x in result['removed'])
+    assert result['withheld_brief'] == 'Import fails\nThe importer stops on the first row.\nWe expected the whole file to load.'
 
 
 def test_withhold_retries_once_with_violations_then_fails(monkeypatch):
+    """A selected span that does not match the issue verbatim gets one correction round, then ValueError."""
     from swesim.stages import draft_spec
-    issue = 'Import fails\nTraceback: ERROR42'
+    issue = 'Import fails\nThe importer stops on the first row.\nTraceback: ERROR42 raised in importer'
     attempts = []
 
-    def leaky(model_id, system, messages, schema, **kw):
+    def not_verbatim(model_id, system, messages, schema, **kw):
         attempts.append(messages)
-        return {'withheld_brief': 'Import fails ERROR42', 'removed': [{'category': 'error_message', 'excerpt': 'ERROR42', 'kind': 'reproduction', 'discovery': 'on-request'}]}
-    monkeypatch.setattr(draft_spec, 'chat_json', leaky)
-    with pytest.raises(ValueError, match="withholding failed"):
+        return {'removed': [{'category': 'error_message', 'excerpt': 'Traceback: ERROR99 raised in importer', 'kind': 'reproduction', 'discovery': 'on-request'}]}
+    monkeypatch.setattr(draft_spec, 'chat_json', not_verbatim)
+    with pytest.raises(ValueError, match="withholding failed.*not a verbatim span"):
         draft_spec.withhold(issue, 'fake/model')
-    assert len(attempts) == 2 and "Correct these violations" in attempts[1][-1]["content"] and "ERROR42" in attempts[1][-1]["content"]
+    assert len(attempts) == 2 and "Correct these violations" in attempts[1][-1]["content"] and "ERROR99" in attempts[1][-1]["content"]
+
+
+WITHHOLD_ISSUE = ("Importer crashes on empty header\n"
+                  "Running run_import(\"bad.csv\") stops at row 1. The importer must stay compatible with v1 files.\n"
+                  "Traceback: ERROR42 raised in parse_header\n"
+                  "> quoted from the mailing list: the expected result is an empty table\n"
+                  "Expected: an empty table and no error.\n"
+                  "Seen on version 2.3.1 with Python 3.12.")
+CODE_ISSUE = ("Parser drops the last row\n"
+              "When the file has no trailing newline the final row disappears. I expected all rows to be kept, e.g. three rows in the sample below.\n"
+              "\n"
+              "```python\n"
+              "from importer import run_import\n"
+              "\n"
+              "rows = run_import(\"bad.csv\")\n"
+              "    # indented comment\n"
+              "```\n"
+              "\n"
+              "Traceback (most recent call last):\n"
+              "  File \"importer.py\", line 12, in run_import\n"
+              "    raise ParseError(\"row 3 truncated\")\n"
+              "ParseError: row 3 truncated\n"
+              "\n"
+              "Seen with importer 2.3.1 on Python 3.12.\n")
+
+
+def _select(*items):
+    """Model selections without fact_text: the ledger text then defaults to the removed span itself."""
+    return {"removed": [{"category": c, "excerpt": e, "kind": "context", "discovery": "on-request"} for c, e in items]}
+
+
+def test_withhold_brief_is_computed_not_trusted(monkeypatch):
+    """The model's own brief is ignored: it cannot add a requirement or silently delete an unlisted sentence."""
+    from swesim.stages import draft_spec
+    hostile = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
+    hostile["withheld_brief"] = ("Importer crashes on empty header\nThe importer must break v1 files.\n"
+                                 "Running run_import(\"bad.csv\") stops at row 1.")      # adds a contradictory requirement, drops the compatibility and expectation sentences
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: hostile)
+    res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert res["withheld_brief"] == WITHHOLD_ISSUE.replace("Traceback: ERROR42 raised in parse_header\n", "")   # byte-exact: the line and its newline
+    assert "break v1" not in res["withheld_brief"] and "ERROR42" not in res["withheld_brief"]
+    assert [r["excerpt"] for r in res["removed"]] == ["Traceback: ERROR42 raised in parse_header"] and res["removed"][0]["fact_text"] == res["removed"][0]["excerpt"]
+    assert res["removed"][0]["selected"] == "Traceback: ERROR42 raised in parse_header" and res["stats"]["sentences_total"] == 7
+
+
+def test_withhold_extends_to_sentence_boundaries_and_reconstructs(monkeypatch):
+    from swesim.stages import draft_spec
+    sel = _select(("expected_output", "empty table and no error"), ("version", "version 2.3.1 with Python"), ("reproduction", "stops at row 1"))
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: sel)
+    res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert [r["excerpt"] for r in res["removed"]] == ["Expected: an empty table and no error.", "Seen on version 2.3.1 with Python 3.12.",
+                                                       "Running run_import(\"bad.csv\") stops at row 1."]
+    assert all(WITHHOLD_ISSUE[r["start"]:r["end"]] == r["excerpt"] for r in res["removed"])
+    ranges = sorted(res["deleted"] + res["kept"])
+    assert "".join(WITHHOLD_ISSUE[a:b] for a, b in ranges) == WITHHOLD_ISSUE                       # kept pieces + deleted ranges partition the natural issue
+    assert all(any(a <= o["start"] and o["end"] <= b for a, b in res["deleted"]) for r in res["removed"] for o in r["occurrences"])
+    assert res["withheld_brief"] == "".join(WITHHOLD_ISSUE[a:b] for a, b in res["kept"])          # the brief IS the kept text, byte for byte
+    assert res["withheld_brief"] == (WITHHOLD_ISSUE.replace("Running run_import(\"bad.csv\") stops at row 1. ", "")   # first sentence: splice, one space left
+                                     .replace("Expected: an empty table and no error.\n", "")                          # whole line with its newline
+                                     .replace("\nSeen on version 2.3.1 with Python 3.12.", ""))                        # last line: takes the newline before it
+    assert res["stats"] == {"sentences_total": 7, "sentences_removed": 3, "fraction_removed": 0.429, "duplicate_selections": 0, "prompt_version": "withhold-v2"}
+
+
+def test_withhold_preserves_code_blocks_tracebacks_and_paragraphs(monkeypatch):
+    from swesim.stages import draft_spec
+    sel = _select(("expected_output", "I expected all rows to be kept"), ("version", "importer 2.3.1 on Python 3.12"))
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: sel)
+    res = draft_spec.withhold(CODE_ISSUE, "fake/model")
+    expected = CODE_ISSUE.replace(" I expected all rows to be kept, e.g. three rows in the sample below.", "").replace("Seen with importer 2.3.1 on Python 3.12.\n", "")
+    assert res["withheld_brief"] == expected
+    assert "```python\nfrom importer import run_import\n\nrows = run_import(\"bad.csv\")\n    # indented comment\n```\n" in res["withheld_brief"]   # fence, blank line, indentation intact
+    assert "Traceback (most recent call last):\n  File \"importer.py\", line 12, in run_import\n    raise ParseError(\"row 3 truncated\")\nParseError: row 3 truncated\n" in res["withheld_brief"]
+    assert "disappears.\n\n```python" in res["withheld_brief"]                                     # paragraph break kept, no trailing space after the splice
+    assert res["removed"][0]["excerpt"] == "I expected all rows to be kept, e.g. three rows in the sample below."   # "e.g." does not end a sentence
+    # a deleted line between two blank lines takes one blank line with it, so paragraphs keep a single separator
+    issue = "T\nFirst paragraph here.\n\nMiddle paragraph to remove.\n\nLast paragraph here.\n"
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("reproduction", "Middle paragraph to remove")))
+    assert draft_spec.withhold(issue, "fake/model")["withheld_brief"] == "T\nFirst paragraph here.\n\nLast paragraph here.\n"
+    # mid-line splices: middle sentence leaves one space; last sentence leaves no trailing space
+    issue = "T\nA sentence here. Another middle one. Final sentence here.\nOne more line to keep.\nAnd another kept line."
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("reproduction", "Another middle one")))
+    assert draft_spec.withhold(issue, "fake/model")["withheld_brief"] == "T\nA sentence here. Final sentence here.\nOne more line to keep.\nAnd another kept line."
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("reproduction", "Final sentence here")))
+    assert draft_spec.withhold(issue, "fake/model")["withheld_brief"] == "T\nA sentence here. Another middle one.\nOne more line to keep.\nAnd another kept line."
+    # deleting the last two lines of an issue without a trailing newline leaves none behind either
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("reproduction", "One more line to keep"), ("reproduction", "And another kept line")))
+    assert draft_spec.withhold(issue, "fake/model")["withheld_brief"] == "T\nA sentence here. Another middle one. Final sentence here."
+
+
+def test_withhold_selection_minimums_malformed_items_duplicates_and_fact_text(monkeypatch):
+    from swesim.stages import draft_spec
+    attempts = []
+
+    def fake(items):
+        def chat(model_id, system, messages, schema, **kw):
+            attempts.append(messages)
+            return {"removed": items}
+        return chat
+    # a one-word selection cannot delete sentences
+    monkeypatch.setattr(draft_spec, "chat_json", fake(_select(("reproduction", "the"))["removed"]))
+    with pytest.raises(ValueError, match="selected span too short"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    # malformed selections enter the correction round instead of raising TypeError/AttributeError
+    monkeypatch.setattr(draft_spec, "chat_json", fake(["just a string", {"category": "error_message", "excerpt": 42, "kind": "context", "discovery": "on-request"}, None]))
+    attempts.clear()
+    with pytest.raises(ValueError, match="withholding failed.*must be an object.*excerpt must be a string"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert len(attempts) == 2 and "Correct these violations" in attempts[1][-1]["content"]
+    # duplicate selections of the same span collapse into one fact
+    dup = _select(("error_message", "Traceback: ERROR42 raised in parse_header"), ("error_message", "ERROR42 raised in parse_header"))
+    monkeypatch.setattr(draft_spec, "chat_json", fake(dup["removed"]))
+    res = draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    assert len(res["removed"]) == 1 and res["stats"]["duplicate_selections"] == 1 and res["stats"]["sentences_removed"] == 1
+    # fact_text: bounded, and content words must come from the span or the issue
+    ok = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
+    ok["removed"][0]["fact_text"] = "Traceback with ERROR42 raised in parse_header when the importer crashes."   # every 5+ letter word occurs in the span or issue
+    monkeypatch.setattr(draft_spec, "chat_json", fake(ok["removed"]))
+    assert draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")["removed"][0]["fact_text"] == ok["removed"][0]["fact_text"]
+    foreign = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
+    foreign["removed"][0]["fact_text"] = "The kubernetes scheduler raises ERROR42"
+    monkeypatch.setattr(draft_spec, "chat_json", fake(foreign["removed"]))
+    with pytest.raises(ValueError, match="introduces words absent.*kubernetes"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    long = _select(("error_message", "Traceback: ERROR42 raised in parse_header"))
+    long["removed"][0]["fact_text"] = "ERROR42 " * 60
+    monkeypatch.setattr(draft_spec, "chat_json", fake(long["removed"]))
+    with pytest.raises(ValueError, match="longer than 400"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+
+
+def test_withheld_facts_pass_through_ledger_violations_with_their_span_as_corpus():
+    from swesim.stages.draft_spec import ledger_violations
+    fact = {"id": "withheld-001", "text": "Traceback shows no error at all.", "kind": "reproduction", "provenance": "original-issue",
+            "source_excerpt": "Traceback shows no error at all.", "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": []}
+    kw = {"corpus_by_fact": {"withheld-001": fact["source_excerpt"]}, "allow_reserved": True, "require_f2p_link": False}
+    assert ledger_violations({"ledger": [fact]}, _row(), **kw) == []
+    assert any("reserved" in v for v in ledger_violations({"ledger": [fact]}, _row(), corpus_by_fact=kw["corpus_by_fact"], require_f2p_link=False))
+    assert any("source_url" in v for v in ledger_violations({"ledger": [{**fact, "source_url": "https://github.com/other/repo/issues/1"}]}, _row(), **kw))
+    assert any("removed span" in v for v in ledger_violations({"ledger": [fact]}, _row(), corpus_by_fact={"withheld-001": "a different span entirely"}, allow_reserved=True, require_f2p_link=False))
+
+
+def test_withhold_caps_removed_fraction_and_protects_title(monkeypatch):
+    from swesim.stages import draft_spec
+    too_much = _select(("reproduction", "stops at row 1"), ("error_message", "Traceback: ERROR42 raised in parse_header"), ("expected_output", "an empty table and no error"),
+                       ("version", "with Python 3.12"), ("location", "quoted from the mailing list"))
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: too_much)
+    with pytest.raises(ValueError, match="removed 5 of 7 sentences; the cap is 60%"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("location", "crashes on empty header")))
+    with pytest.raises(ValueError, match="title line cannot be withheld"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: {"removed": []})
+    with pytest.raises(ValueError, match="no removed spans"):
+        draft_spec.withhold(WITHHOLD_ISSUE, "fake/model")
+
+
+def test_withhold_matches_after_normalization_and_removes_every_occurrence(monkeypatch):
+    from swesim.stages import draft_spec
+    issue = "Dup title\nThe error is  Boom.\nUnrelated line here.\n> the error is boom.\nAnother fine line."
+    monkeypatch.setattr(draft_spec, "chat_json", lambda *a, **k: _select(("error_message", "the ERROR is boom")))
+    res = draft_spec.withhold(issue, "fake/model")
+    assert res["withheld_brief"] == "Dup title\nUnrelated line here.\nAnother fine line."
+    assert len(res["removed"]) == 1 and len(res["removed"][0]["occurrences"]) == 2 and res["removed"][0]["excerpt"] == "The error is  Boom."
+    norm_text, idx = draft_spec._norm_map(issue)
+    assert norm_text == draft_spec._norm(issue) and len(idx) == len(norm_text)
+    norm_text, idx = draft_spec._norm_map(WITHHOLD_ISSUE)
+    assert norm_text == draft_spec._norm(WITHHOLD_ISSUE)
 
 
 def _row(**over):
     row = {"instance_id": "pydata__xarray-5362", "repo": "pydata/xarray", "base_commit": "a" * 40, "version": "0.18",
            "problem_statement": ISSUE, "hints_text": "", "fail_to_pass": [F2P], "pass_to_pass": [P2P],
            "patch": "diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n@@ -1 +1,2 @@\n x\n+y\n",
-           "test_patch": "diff --git a/xarray/tests/test_weighted.py b/xarray/tests/test_weighted.py\n--- a/xarray/tests/test_weighted.py\n+++ b/xarray/tests/test_weighted.py\n@@ -1 +1,2 @@\n x\n+def test_new(): pass\n",
+           "test_patch": ("diff --git a/xarray/tests/test_weighted.py b/xarray/tests/test_weighted.py\n--- a/xarray/tests/test_weighted.py\n+++ b/xarray/tests/test_weighted.py\n"
+                          "@@ -1 +1,5 @@\n x\n+def test_weighted_operations_nonexistent_dim(a):\n+    with pytest.raises(ValueError, match=\"dimension 'z' not found\"):\n"
+                          "+        ds.weighted(w).mean('z')\n+def test_new(): pass\n"),
            "image": sb.image_for("pydata__xarray-5362"), "repo_dir": "/testbed",
            "annotation": {"underspecified": "2.0", "underspecified_notes": "n", "false_negative": "0.0", "false_negative_notes": "", "difficulty": "15 min - 1 hour"},
-           "thread": _thread("pydata/xarray", 5362)}
-    row.update(over); return row
+           "thread": _thread("pydata/xarray", 5362), "probe": _probe_meta()}
+    row.update(over)
+    if "probe" not in over and isinstance(row.get("probe"), dict):
+        row["probe"]["binding"] = gr.probe_binding(row)   # the default probe is bound to whatever base_commit/test_patch the row ends up with
+    return row
+
+
+def _probe_meta():
+    """Offline probe metadata as `probe_candidates` attaches it: the measured contract, not SWE-bench's network-era lists."""
+    return {"kind": "image", "probe_dir": "/ws/jobs/probe/pydata--xarray-5362/trial-1", "image_digest": "sha256:" + "e" * 64, "repo_dir": "/testbed",
+            "statuses": {"base": {}, "test": {F2P: "failed", P2P: "passed"}, "gold": {F2P: "passed", P2P: "passed"}},
+            "dropped": {"network_or_env": [], "gold_regressions": []}, "counts": {"fail_to_pass": 1, "pass_to_pass": 1, "network_or_env": 0, "gold_regressions": 0}}
 
 
 def _thread(repo, pr):
@@ -393,7 +839,12 @@ def _thread(repo, pr):
 
 
 def _judged(**over):
-    j = {"gaps": [{"id": "g1", "text": "tests expect ValueError", "source": "test-exception", "derivable_from_repo": False, "consequential": True, "resolved_by": "thread", "category": "behavior"}],
+    j = {"gaps": [{"id": "g1", "text": "tests assert the literal 'dimension '", "source": "test-literal", "evidence": "pytest.raises(ValueError", "question": "Which exception?",
+                   "derivable_from_repo": False, "consequential": True, "resolved_by": "thread", "resolution_excerpt": "raise a ValueError when the dim is missing", "category": "behavior"},
+                  {"id": "g2", "text": "Expected error: dimension not found", "source": "proposed", "evidence": "match=\"dimension 'z' not found\"",
+                   "question": "What should the message say?", "derivable_from_repo": False, "consequential": True, "resolved_by": "tests",
+                   "resolution_excerpt": "match=\"dimension 'z' not found\"", "category": "behavior"}],
+         "gaps_proposed": 1, "gaps_extracted": 1, "gaps_dropped": 0, "resolution_downgraded": 0,
          "verified_rubric_score": 2, "complexity": 2, "test_behavioralness": 4, "self_contained": True, "alternatives_accepted": True, "keep": True, "structural_tests": False,
          "prompt_version": "judge-v2", "model_id": "fake/judge"}
     j.update(over); return j
@@ -409,8 +860,9 @@ def _draft_llm(alt=None, repo="pydata/xarray", pr=5362):
                         "source_url": url, "authored_rationale": None, "discovery": "author-only", "tests": []},
                        {"id": "f03", "text": "Reporter expects a ValueError", "kind": "behavior", "provenance": "original-issue", "source_excerpt": "Expected: raise ValueError.",
                         "source_url": f"https://github.com/{repo}/issues/5360", "authored_rationale": None, "discovery": "brief", "tests": []},
-                       {"id": "f04", "text": "Reviewer tone is terse", "kind": "context", "provenance": "authored", "source_excerpt": None, "source_url": None,
-                        "authored_rationale": "persona detail inferred from the thread", "discovery": "repo-derivable", "tests": []}],
+                       {"id": "f04", "text": "The tests pin the exact error message", "kind": "behavior", "provenance": "authored",
+                        "source_excerpt": "with pytest.raises(ValueError, match=\"dimension 'z' not found\"):", "source_url": url,   # authored = pinned only by the merged tests
+                        "authored_rationale": "only the merged tests state the message", "discovery": "on-request", "tests": [F2P]}],
             "operations": [{"type": "clarification", "target": "f01", "rationale": "issue never names the exception"}],
             "persona": {"summary": "xarray maintainer", "tone": "terse", "disclosure_style": "answers what is asked",
                         "derived_from_urls": [url], "role": "maintainer"},
@@ -426,7 +878,7 @@ def _withhold_llm():
     return {"withheld_brief": "Weighted mean silently ignores missing dims\nCalling a weighted reduction with a missing dim returns a result.",
             "removed": [{"category": "expected_output", "excerpt": "Expected: raise ValueError.", "kind": "behavior", "discovery": "on-request"},
                         {"category": "error_message", "excerpt": "Traceback shows no error at all.", "kind": "reproduction", "discovery": "on-request"},
-                        {"category": "location", "excerpt": "ds.weighted(w).mean('z')", "kind": "context", "discovery": "on-request"}]}
+                        {"category": "location", "excerpt": "Calling ds.weighted(w).mean('z') with a dim", "kind": "context", "discovery": "on-request"}]}
 
 
 def _patch_llm(monkeypatch, draft_out, withhold_out):
@@ -435,7 +887,7 @@ def _patch_llm(monkeypatch, draft_out, withhold_out):
 
     def fake_chat(model_id, system, messages, schema, **kw):
         calls.append({"model": model_id, "system": system, "messages": messages, "kw": kw})
-        return withhold_out if "Remove selected spans" in system else draft_out
+        return withhold_out if WITHHOLD_PROMPT_MARK in system else draft_out
     monkeypatch.setattr(draft_spec, "chat_json", fake_chat)
     monkeypatch.setattr(threads, "base_text", lambda repo, commit, path: "def test_weighted_sum():\n    assert True\n" if path.endswith(".py") and "tests" in path else None)
     return calls
@@ -471,7 +923,8 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     assert "{{" not in r.command and "}}" not in r.command and r.command.count("{") == 2  # {junit_path} + the literal brace in F2P
     assert r.single_command.endswith("{nodeid}") and r.test_files == ["xarray/tests/test_weighted.py"]
     assert spec.environment.test_command == r.command
-    assert spec.contract.test_assets == ["test.patch"] and spec.contract.protected_paths == ["xarray/tests/data/w.nc", "xarray/tests/test_weighted.py"]
+    assert spec.contract.test_assets == ["test.patch"] and spec.contract.protected_paths == ["xarray/tests/data/w.nc", "xarray/tests/test_weighted.py"]   # test files + a test-tree extra
+    assert not (set(spec.contract.protected_paths) & draft_spec.patch_paths(_row()["patch"]))                                   # never a gold-patched file
     # briefs / withholding provenance
     assert [b.profile for b in spec.briefs] == ["natural", "withheld"] and spec.briefs[0].text == ISSUE
     ops = [o for o in spec.operations if o.type == "withholding"]
@@ -479,6 +932,21 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     wf = {f.id: f for f in spec.ledger if f.id.startswith("withheld-")}
     assert all(f.provenance == "original-issue" and f.source_excerpt in ISSUE and f.source_url.endswith("/issues/5360") for f in wf.values())
     assert wf["withheld-001"].discovery == "on-request" and wf["withheld-003"].discovery == "repo-derivable"  # location category is repo-derivable
+    # the brief is computed by code: title plus every sentence not selected; operations carry the exact spans and offsets
+    assert spec.briefs[1].text == "Weighted mean silently ignores missing dims\nI am using xarray 0.18 on Linux.\nA small reproducer is attached below."
+    assert wf["withheld-003"].source_excerpt == "Calling ds.weighted(w).mean('z') with a dim 'z' that does not exist returns a result."  # selection extended to its sentence
+    assert wf["withheld-001"].text == wf["withheld-001"].source_excerpt   # no fact_text given: the ledger text is the span itself
+    for o, f in zip(ops, wf.values()):
+        start, end = ISSUE.index(f.source_excerpt), ISSUE.index(f.source_excerpt) + len(f.source_excerpt)
+        assert f"natural[{start}:{end}]" in o.rationale and repr(f.source_excerpt) in o.rationale
+    # code-synthesized fact for the judge gap that only the merged tests resolve: authored, on-request, linked to the test citing it
+    tf = next(f for f in spec.ledger if f.id == "tests-001")
+    assert tf.provenance == "authored" and tf.discovery == "on-request" and tf.tests == [F2P] and tf.source_url.endswith("/pull/5362")
+    assert tf.source_excerpt == "match=\"dimension 'z' not found\"" and "g2" in tf.authored_rationale and "resolved_by=tests" in tf.authored_rationale
+    assert [f.id for f in spec.ledger] == ["f01", "f02", "f03", "f04", "tests-001", "withheld-001", "withheld-002", "withheld-003"]
+    meta = json.loads((out_dir / "draft.meta.json").read_text())
+    assert meta["auto_linked"] == [] and [r["fact_id"] for r in meta["withholding"]["removed"]] == ["withheld-001", "withheld-002", "withheld-003"]
+    assert meta["withholding"]["stats"]["sentences_removed"] == 3 and meta["withholding"]["kept"]
     # the on-request fact linked to a FAIL_TO_PASS test survives for the approval gate
     assert any(f.discovery == "on-request" and F2P in f.tests for f in spec.ledger)
     assert [g.weight for g in spec.groups] == [1.0]
@@ -489,7 +957,8 @@ def test_draft_writes_valid_spec_assets_and_judge_json(monkeypatch, tmp_path):
     assert {"gaps", "verified_rubric_score", "keep"} <= set(j) and j["keep"] is True
     # LLM calls: one draft, one withhold, both with the requested model
     assert [c["model"] for c in calls] == ["fake/model", "fake/model"] and calls[0]["kw"].get("max_tokens") == 8000
-    assert json.loads(calls[0]["messages"][0]["content"])["candidate"]["instance_id"] == "pydata__xarray-5362"
+    first = calls[0]["messages"][0]["content"]
+    assert first.startswith("FAIL_TO_PASS ids") and json.loads(first.split("\n\n", 1)[1])["candidate"]["instance_id"] == "pydata__xarray-5362"
 
 
 def test_draft_structural_tests_require_alternative_correct(monkeypatch, tmp_path):
@@ -509,7 +978,7 @@ def test_draft_structural_tests_require_alternative_correct(monkeypatch, tmp_pat
 
 def test_draft_rejects_leaky_withholding_and_empty_controls(monkeypatch, tmp_path):
     from swesim.stages import draft_spec
-    leaky = _withhold_llm(); leaky["withheld_brief"] = ISSUE
+    leaky = _withhold_llm(); leaky["removed"][0]["excerpt"] = "Expected: raise TypeError."   # not a verbatim span of the issue
     _patch_llm(monkeypatch, _draft_llm(), leaky)
     with pytest.raises(ValueError, match="withholding failed"):
         draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s1")
@@ -561,7 +1030,79 @@ def test_llm_view_trims_pass_to_pass_but_spec_keeps_it(monkeypatch, tmp_path):
     p = draft_spec.draft(_row(pass_to_pass=p2p), _judged(), "fake/model", tmp_path / "s")
     spec = ScenarioSpec.model_validate_json(p.read_text())
     assert spec.contract.pass_to_pass == p2p and all(t in spec.contract.runner.command for t in p2p)
-    assert json.loads(calls[0]["messages"][0]["content"])["candidate"]["pass_to_pass_count"] == 300
+    assert json.loads(calls[0]["messages"][0]["content"].split("\n\n", 1)[1])["candidate"]["pass_to_pass_count"] == 300
+
+
+def test_protected_paths_are_code_owned_and_never_shield_gold_files(monkeypatch, tmp_path):
+    """pytest-dev--pytest-7283 / seaborn-3190: the model's protected_paths_extra named the source files the gold patch modifies,
+    so the oracle control was graded agent-invalid-submission. Only test-tree paths untouched by the gold patch may be added."""
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    d = _draft_llm(); d["protected_paths_extra"] = ["xarray/core/weighted.py", "docs/whats-new.rst", "xarray/tests/data/w.nc", "src/_pytest/unittest.py", "", None]
+    _patch_llm(monkeypatch, d, _withhold_llm())
+    p = draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert spec.contract.protected_paths == ["xarray/tests/data/w.nc", "xarray/tests/test_weighted.py"]
+    meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
+    assert [(x["path"], x["reason"]) for x in meta["protected_paths_dropped"]] == [
+        ("xarray/core/weighted.py", "touched by the gold patch"), ("docs/whats-new.rst", "not a test-tree path"),
+        ("src/_pytest/unittest.py", "not a test-tree path"), ("", "not a path"), (None, "not a path")]
+    assert draft_spec.patch_paths(_row()["patch"]) == {"xarray/core/weighted.py"}
+    assert draft_spec.patch_paths("diff --git a/old/name.py b/new/name.py\n--- a/old/name.py\n+++ b/new/name.py\n") == {"old/name.py", "new/name.py"}
+    # hard invariant: a hidden test file the gold patch also modifies is a drafter error, not a correction round
+    calls = _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    shared = "diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n@@ -1 +1,2 @@\n x\n+z\n"
+    with pytest.raises(ValueError, match="drafter error: protected_paths would shield.*xarray/core/weighted.py"):
+        draft_spec.draft(_row(test_patch=_row()["test_patch"] + shared), _judged(), "fake/model", tmp_path / "s2")
+    assert not (tmp_path / "s2" / "scenario.draft.json").exists()
+    assert len([c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]) == 1                       # one authoring call, no correction round
+    assert draft_spec.protected_paths_for(["tests/test_a.py"], ["tests/fixtures/a.json", "pkg/a.py"], {"pkg/a.py"}) == (["tests/fixtures/a.json", "tests/test_a.py"], [{"path": "pkg/a.py", "reason": "touched by the gold patch"}])
+    with pytest.raises(ValueError, match="drafter error"):
+        draft_spec.protected_paths_for(["src/_pytest/unittest.py"], [], {"src/_pytest/unittest.py"})
+
+
+def test_draft_requires_offline_probe_metadata(monkeypatch, tmp_path):
+    """SWE-bench's FAIL_TO_PASS/PASS_TO_PASS were produced with network access; drafting needs the offline-measured contract."""
+    from swesim.stages import draft_spec
+    calls = _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    with pytest.raises(ValueError, match="no offline probe metadata"):
+        draft_spec.draft(_row(probe=None), _judged(), "fake/model", tmp_path / "s1")
+    with pytest.raises(ValueError, match="no offline probe metadata"):
+        draft_spec.draft(_row(probe={"error": "unreliable base/gold probe"}), _judged(), "fake/model", tmp_path / "s2")   # a failed probe is not a measurement
+    stale = _row(); stale["probe"]["binding"] = "0" * 64                                                                  # measured a different base_commit/test_patch
+    with pytest.raises(ValueError, match="binding mismatch"):
+        draft_spec.draft(stale, _judged(), "fake/model", tmp_path / "s2b")
+    edited = _row(); edited["test_patch"] += "\n"                                                                          # row edited after the probe: the binding no longer matches
+    with pytest.raises(ValueError, match="binding mismatch"):
+        draft_spec.draft(edited, _judged(), "fake/model", tmp_path / "s2c")
+    assert calls == [] and not (tmp_path / "s1").exists()                                                                    # refused before any LLM call or file
+    # a repo-URL row probed by mine_github_repo carries the same metadata and is accepted without a second Modal run
+    repo_row = _row(source="github-repo", instance_id="py-pdf__pypdf-3826", repo="py-pdf/pypdf", image=None, repo_dir="/app", dockerfile="FROM python@sha256:abc\n",
+                    test_python="/usr/local/bin/python", thread={**_thread("py-pdf/pypdf", 3826), "gold_commit": None, "linked_issues": [], "issue_url": None},
+                    annotation={"underspecified": "", "underspecified_notes": "", "false_negative": "", "false_negative_notes": "", "difficulty": ""})
+    repo_row["probe"].update(kind="dockerfile", repo_dir="/app", job_dir="/ws/jobs/probe/py-pdf--pypdf-3826/trial-1", probed_at="2026-09-12T20:00:00+00:00")
+    assert repo_row["probe"]["binding"] == gr.probe_binding(repo_row)
+    _patch_llm(monkeypatch, _draft_llm(repo="py-pdf/pypdf", pr=3826), _withhold_llm())
+    assert draft_spec.draft(repo_row, _judged(), "fake/model", tmp_path / "s2d").exists()
+    _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    p = draft_spec.draft(_row(probe=None), _judged(), "fake/model", tmp_path / "s3", require_probe=False)
+    meta = json.loads((tmp_path / "s3" / "draft.meta.json").read_text())
+    assert p.exists() and meta["probe"] == {"unmeasured": True}
+    draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s4")
+    meta = json.loads((tmp_path / "s4" / "draft.meta.json").read_text())
+    assert meta["probe"]["kind"] == "image" and meta["probe"]["probe_dir"].endswith("trial-1") and meta["probe"]["counts"]["fail_to_pass"] == 1
+
+
+def test_draft_trims_an_oversized_candidate_for_the_model_but_grounds_against_the_full_row(monkeypatch, tmp_path):
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    calls = _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    big = _row(patch=_row()["patch"] + "\n" + "+# " + "x" * 130000 + "\n")            # oversized fix: trimmed in the prompt only
+    p = draft_spec.draft(big, _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert (tmp_path / "s" / "assets" / "oracle.diff").read_text() == big["patch"] and spec.assets["oracle.diff"].bytes == len(big["patch"].encode())
+    sent = json.loads(calls[0]["messages"][0]["content"].split("\n\n", 1)[1])["candidate"]
+    assert sent["trimmed"] == {"patch": 30000} and len(calls[0]["messages"][0]["content"]) <= draft_spec.CONTEXT_BUDGET_CHARS
 
 
 def test_draft_fails_without_a_source_url_for_withheld_facts(monkeypatch, tmp_path):
@@ -585,9 +1126,9 @@ def test_ledger_violations_ground_every_non_authored_fact():
     assert any("f02" in v for v in ledger_violations(d, _row()))
     d = _draft_llm(); d["ledger"][2]["source_excerpt"] = "Expected: raise KeyError."                    # not in the original issue
     assert any("f03" in v for v in ledger_violations(d, _row()))
-    d = _draft_llm(); d["ledger"][0]["discovery"] = "repo-derivable"                                    # nothing on-request links a F2P test any more
+    d = _draft_llm(); d["ledger"][0]["discovery"] = d["ledger"][3]["discovery"] = "repo-derivable"      # nothing on-request links a F2P test any more
     assert any("on-request" in v for v in ledger_violations(d, _row()))
-    d = _draft_llm(); d["ledger"].append({"id": "f05", "text": "n", "kind": "context", "provenance": "annotator-note", "source_excerpt": "The note says n", "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": []})
+    d = _draft_llm(); d["ledger"].append({"id": "f05", "text": "n", "kind": "context", "provenance": "annotator-note", "source_excerpt": "The note says n", "source_url": "https://github.com/pydata/xarray/issues/5360", "discovery": "on-request", "tests": [F2P]})
     assert ledger_violations(d, _row(annotation={**_row()["annotation"], "underspecified_notes": "The note says n"})) == []  # annotator notes are a valid corpus
     assert any("f05" in v for v in ledger_violations(d, _row()))                                        # blank annotation notes cannot ground a fact
     # hints_text counts as issue-thread text (SWE-bench issue comments)
@@ -627,7 +1168,7 @@ def test_draft_rejects_ungrounded_facts_after_one_correction_round(monkeypatch, 
     calls = _patch_llm(monkeypatch, d, _withhold_llm())
     with pytest.raises(ValueError, match="grounding validation after two attempts.*f01"):
         draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "s")
-    draft_calls = [c for c in calls if "Remove selected spans" not in c["system"]]
+    draft_calls = [c for c in calls if WITHHOLD_PROMPT_MARK not in c["system"]]
     assert len(draft_calls) == 2 and "Correct these violations" in draft_calls[1]["messages"][-1]["content"] and "f01" in draft_calls[1]["messages"][-1]["content"]
     assert not (tmp_path / "s" / "scenario.draft.json").exists()
 
@@ -657,6 +1198,9 @@ def test_accept_requires_explicit_non_derivable_gap():
     assert not accept({"gaps": [{**gap, "derivable_from_repo": None}], "self_contained": True})
     assert accept({"gaps": [{**gap, "derivable_from_repo": False}], "self_contained": True})
     assert not accept({"gaps": [{**gap, "derivable_from_repo": False}], "self_contained": "yes"})
+    assert accept({"gaps": [{**gap, "derivable_from_repo": False, "resolved_by": "tests"}], "self_contained": True})      # pinned only by the merged tests
+    assert not accept({"gaps": [{**gap, "derivable_from_repo": False, "resolved_by": "none"}], "self_contained": True})
+    assert not accept({"gaps": [{**gap, "derivable_from_repo": False, "resolved_by": "patch"}], "self_contained": True})  # old enum value never accepts
 
 
 def test_eligibility_excludes_network_test_repos():
