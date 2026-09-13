@@ -27,7 +27,10 @@ QUEUE_OF: dict[str, str] = {
     # control: workflow-side bookkeeping (index writes, cost accounting, audits)
     "index_scenario_activity": CONTROL, "index_candidate_activity": CONTROL, "index_trial_activity": CONTROL,
     "index_score_activity": CONTROL, "index_workflow_activity": CONTROL, "index_rebuild_activity": CONTROL,
+    "index_discovery_activity": CONTROL,
     "record_cost_activity": CONTROL, "spend_check_activity": CONTROL,
+    "prepare_trial_plan_activity": CONTROL, "prepare_candidate_plan_activity": CONTROL,
+    "read_plan_page_activity": CONTROL, "checkpoint_workflow_activity": CONTROL,
     "audit_transcript_activity": CONTROL, "audit_scenario_activity": CONTROL,
 }
 

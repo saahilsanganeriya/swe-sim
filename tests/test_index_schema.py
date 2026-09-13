@@ -1,6 +1,6 @@
 """Index data model (interfaces §2): one Pydantic row model per table, one SQLAlchemy table per model, agreeing field
-for field; money is Decimal / numeric(12,6), rates numeric(8,6), times tz-aware timestamptz; Alembic revision
-0001_index_v1 creates exactly the metadata and is idempotent."""
+for field; money is Decimal / numeric(12,6), rates numeric(8,6), times tz-aware timestamptz; Alembic upgrades
+create exactly the metadata and preserve existing rows."""
 from __future__ import annotations
 
 import types
@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 from alembic.autogenerate import compare_metadata
+from alembic import command
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from pydantic import ValidationError
@@ -25,6 +26,7 @@ EXPECTED_PK = {
     "scenarios": ("scenario_id", "version"), "candidates": ("instance_id", "source_key"), "trials": ("trial_id",),
     "exchanges": ("trial_id", "seq"), "scores": ("scenario_id", "spec_hash", "condition", "brief_profile", "model", "run_config_hash"),
     "workflows": ("workflow_id", "run_id"), "costs": ("cost_id",), "operator_actions": ("action_id",), "index_rebuilds": ("rebuild_id",),
+    "discoveries": ("source_key", "discovery_id"),
 }
 NOW = datetime(2026, 9, 13, 8, 0, tzinfo=UTC)
 
@@ -133,8 +135,21 @@ def test_migration_creates_the_metadata_exactly_and_is_idempotent(tmp_path: Path
     insp = sa.inspect(store.engine)
     assert set(S.TABLES) <= set(insp.get_table_names()) and "alembic_version" in insp.get_table_names()
     with store.engine.connect() as conn:
-        assert conn.execute(sa.text("select version_num from alembic_version")).scalar_one() == "0001_index_v1"
+        assert conn.execute(sa.text("select version_num from alembic_version")).scalar_one() == "0002_discoveries"
         diff = compare_metadata(MigrationContext.configure(conn), S.metadata)
     assert diff == [], diff
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == ["0001_index_v1"]
+    assert script.get_heads() == ["0002_discoveries"]
+
+
+def test_discovery_migration_preserves_existing_v1_rows(tmp_path: Path):
+    store = IndexStore(f"sqlite:///{tmp_path / 'old-index.db'}")
+    config = alembic_config()
+    with store.engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0001_index_v1")
+    row = _trial()
+    store.upsert_trial(row)
+    store.migrate()
+    assert store.trial(row.trial_id).scenario_id == row.scenario_id
+    assert store.table("discoveries", M.TableFilter()).total == 0
