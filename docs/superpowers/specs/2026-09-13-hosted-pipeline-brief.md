@@ -51,6 +51,9 @@ artifacts on disk or on the VM; nothing is asserted without a path.
 | Pipeline LLMs (judge, stakeholder, drafter) | **Very well-aligned frontier models only**: judge and stakeholder on `claude-opus-5` or `gpt-5.6-sol` (the user said "GPT 5.6 Soul"; `gpt-5.6-sol` is the id that exists — confirm the variant with the user; `luna`/`terra` also exist). |
 | Evaluated agents | **Older-generation and newer-generation DeepSeek and GLM first**, then other cheap open and small closed models; **frontier (GPT-6 Astra, Fable 5.1, Opus 5, gpt-5.5) only after the path is tested.** |
 | Tasks | Must be **hard enough**: difficulty is measured, not asserted (§5). |
+| Runtime (confirmed ~07:50 UTC) | **Cloud Run**, not GKE. The user first asked about the ECS equivalent, then leaned GKE, then confirmed Cloud Run for tonight; the launcher contract and queue split are runtime-neutral so GKE remains a later Terraform module. |
+| "GPT 5.6 Soul" | Mapped to `gpt-5.6-sol` (the id that exists; `luna` and `terra` also exist). Opus 5 is primary for judge and stakeholder, `gpt-5.6-sol` the fallback, unless the user swaps them. |
+| Console scope (added ~08:10 UTC) | **The website is the way we interact with the pipeline.** It must show the entire database and every artifact in the bucket, and the complete history of everything that ever happened: every workflow, every trial including failed, unresolved and launch-failed ones, every candidate and gate reject, every scenario version. See §2.5. |
 
 ## 2. Target architecture on GCP
 
@@ -139,19 +142,46 @@ recorded in `docs/ops.md` with the command.
   on the bucket, `cloudsql.client`, and `run.developer` scoped to creating/deleting trial Jobs.
 - Never in images, manifests, Temporal payloads, logs, or the console. The laptop-copied `/etc/swesim/env` path is retired.
 
-### 2.5 Console
-- Same FastAPI app as a Cloud Run **service** behind an external HTTPS load balancer (serverless NEG) with a
-  Google-managed certificate on `swesim.<ip>.nip.io` (or the user's domain) and **IAP enabled** with an allowlist of Google
-  accounts; ingress restricted to the load balancer.
-- The evaluator gate reads the IAP identity header (`X-Goog-Authenticated-User-Email`, verified through the IAP JWT)
-  and an `EVALUATORS` allowlist; `?evaluator=1` is removed.
-- Reads: Postgres for lists, funnels, score tables and trends; the bucket for artifacts (transcripts, patches, exports).
-  Writes (create/run/approve): through the Temporal client with the same confirmation + Origin checks as today.
-- Live views: creation funnel (mined → judged → probed → drafted → approved → compiled → validated → registered, with
-  gate-reject reasons), trials by state and queue, spend by provider/model/run, per-model accuracy tables by condition ×
-  brief profile (pass@k, pass^k, n; null when n is insufficient), trend charts (pass rate by model and condition as
-  scenarios accrue; asked vs did not ask; questions and confirmations per trial; cost per solved task), episode pages.
-  Charts follow the dataviz skill (one hue per model family, sequential for magnitudes, legend + table view, no dual axes).
+### 2.5 Console: the operator surface for the whole record
+
+The website is how the pipeline is operated and how its history is read. Nothing an operator needs should require
+`gcloud`, `kubectl`, Temporal's UI or the CLI. Concretely:
+
+- **Deployment:** the same FastAPI app as a Cloud Run **service** behind an external HTTPS load balancer (serverless NEG)
+  with a Google-managed certificate on `swesim.<ip>.nip.io` (or the user's domain) and **IAP enabled** with an allowlist
+  of Google accounts; ingress restricted to the load balancer. The evaluator gate reads the IAP identity header
+  (`X-Goog-Authenticated-User-Email`, verified through the IAP JWT) against an `EVALUATORS` allowlist; `?evaluator=1` is
+  removed. Evaluator-only data (author-only facts, hidden test assets, oracle, redacted sentences, tool audit, judge and
+  draft metadata) renders only for evaluator identities; the public timeline never carries `redacted_terms` or
+  `withheld_sentences` (Codex B-P2-6).
+- **Data sources:** Postgres for every list, filter, funnel, score table and trend; the bucket for artifacts. A page never
+  globs the bucket to list things; it reads the index and links to the artifact.
+- **History, complete:** a Workflows page listing every workflow ever started (create, run, candidate, trial children)
+  with type, status including failed/cancelled/terminated with the failure message, params summary, start/close times,
+  cost, and a link to the Temporal Cloud UI; a Trials page listing every trial record and every planned-but-unresolved or
+  launch-failed attempt, filterable by scenario, version, model, condition, brief profile, status, outcome, origin
+  (vm-systemd / cloudrun), date; a Candidates page with the creation funnel (mined → judged → probed → drafted → approved →
+  compiled → validated → registered) and every reject with its gate and reason; a Scenarios page with every version and
+  its archive, the control table, the difficulty label and the build hashes.
+- **Database browser:** every table in §2.3 is browsable with filters, sorting, paging and CSV export; the schema page
+  shows the index rebuild time and the last rebuild's diff against the files.
+- **Artifact browser:** a tree over the bucket (scenarios, tasks, trials, exports, evidence, candidates, archive) with
+  file sizes, sha256 where the manifest has one, text preview for JSON/diff/log/toml files and download; evaluator-only
+  paths are gated; the per-trial task copy (session token) is never listed.
+- **Actions, all from the UI:** create tasks (sources, band, models, approval mode, rebuild), run tasks (scenario
+  selection with difficulty/tier filters, models, conditions, k, purpose, cap), approve/reject held drafts, cancel
+  workflows, retry a failed candidate, label episodes (simulator validity), trigger an index rebuild; every action needs a
+  confirmation step and a scheme+host+port Origin check (Codex B-P2-7), and is written to an `operator_actions` audit
+  table with the IAP identity.
+- **Live views:** trials by state and queue, worker pool health, spend by provider/model/run (live ledger), the creation
+  funnel as it moves, episode pages with the agent/stakeholder conversation streaming as it happens.
+- **Measurement views:** per-model accuracy tables by condition × brief profile (pass@k, pass^k, n; null when n is
+  insufficient), trend charts (pass rate by model and condition as scenarios accrue; asked vs did not ask; questions and
+  confirmations per trial; cost per solved task; difficulty distribution), model tier and difficulty labels everywhere a
+  model or scenario is named. Charts follow the dataviz skill (one hue per model family, sequential for magnitudes, legend
+  + table view, no dual axes).
+- **Quality bar:** consistent layout, keyboard-navigable tables, dark and light, no page over ~1 s on the index, every
+  number linked to the artifact it came from.
 
 ### 2.6 Build and deploy
 - `Dockerfile.worker` (python 3.12, `uv sync --frozen`, Harbor + Modal clients, `swesim` installed). Cloud Build
@@ -172,6 +202,49 @@ recorded in `docs/ops.md` with the command.
   disable --now swesim-worker`) and the VM is documented as the fallback path in `docs/ops.md`. The Temporal dev server on
   the VM is not migrated (Temporal Cloud is a fresh namespace; workflow history restarts).
 - Modal stays for sandboxes and the stakeholder service.
+
+### 2.8 Temporal design: what exists and what the goal must change
+
+Measured against `swesim/workflows/*.py` at `15bf683`:
+
+**Already proper.** Two operator workflows (`CreateTasksWorkflow`, `RunTasksWorkflow`) fan out to one child per unit of
+work (`CandidateWorkflow` per candidate with id `create:<sid>[@v<n>]`, `TrialWorkflow` per trial with id = trial id) under
+explicit id-reuse policies; per-candidate activities (`judge_one`, `probe_candidate`, `draft`, `precheck_draft`,
+`auto_approve`/`human_approve`, `verify_approval`, `compile`, `validate`, `register`, `scenario_version`, `archive`) and
+per-trial activities (`plan_trials`, `launch_trial`, `await_trial`, `score`, `export`); every blocking stage runs in a thread
+with heartbeats; `await_trial` is a heartbeating read-only poll with `maximum_attempts=3`; stage outputs are idempotent
+(existing output is retained, write-then-rename); payloads carry paths and ids, not bodies; `launch.json` before the
+launch call makes a lost acknowledgement reconcilable.
+
+**Not yet proper — required in the goal:**
+1. **One task queue** (`swesim`) carries LLM calls, Modal builds, launches and bookkeeping. Split into
+   `swesim-authoring`, `swesim-build`, `swesim-trials`, `swesim-control` (§2.1); each `execute_activity` names its queue;
+   one worker pool per queue with its own concurrency.
+2. **Retry classification.** `act()` uses `maximum_attempts=1` for everything. Temporal's rule: retry network errors,
+   timeouts, rate limits and transient unavailability; never retry invalid input or business rejections. Activities must
+   raise `ApplicationError(non_retryable=True)` for gate rejections, schema failures and "candidate not kept", and let
+   transient provider/Modal/GitHub errors retry with backoff (3–5 attempts, initial 10 s, max 2 min). Launch stays at one
+   attempt (the launcher is idempotent by design, but a retry must go through `decide_launch`, never a blind relaunch).
+3. **Coarse activities.** `mine_activity` for a GitHub repository does discovery *and* up to three Modal probe builds in
+   one activity; split into `discover_activity` (GitHub only) and per-candidate `probe_candidate_activity` (already
+   exists). `validate_activity` runs all seven control Harbor runs in one activity (10–25 min); split into one activity per
+   control (`validate_control_activity`) plus an `evaluate_controls_activity`, so a single infrastructure failure retries one
+   control, and the console can show per-control progress. The legacy whole-file `judge_activity` is used only by the
+   legacy `PipelineWorkflow`; mark it legacy or delete it.
+4. **Versioning discipline.** No `workflow.patched(...)` anywhere; workflow code changed while workflows could be running
+   (rebuild mode, band parameter). Every change to a workflow's command sequence ships behind `workflow.patched("<id>")`
+   until no pre-change executions remain; worker deploys check `temporal workflow list` for open executions of changed
+   types first; the deploy step records the check in `docs/ops.md`.
+5. **Search attributes.** Register `swesim_scenario_id`, `swesim_model`, `swesim_condition`, `swesim_status`,
+   `swesim_version`, `swesim_purpose` (keyword) on the namespace and set them on every workflow start and on status changes
+   (`upsert_search_attributes`), so the console and the Temporal UI can filter without reading files.
+6. **Continue-as-new.** `CreateTasksWorkflow` over 109 + repository candidates and `RunTasksWorkflow` over hundreds of trials
+   must continue-as-new every N children (N = 100) carrying the remaining plan, so histories stay far below the event
+   limit.
+7. **Cancellation.** Activities that run threads (`blocking()`) heartbeat but do not observe cancellation; add
+   `activity.is_cancelled()` checks between stages and let the launcher cancel a Job on workflow cancellation.
+8. **Payload hygiene.** `visible_view` and forbidden terms are sent to the stakeholder over HTTP, not through Temporal;
+   keep it that way; assert every activity input/output is under 256 KB in tests.
 
 ## 3. Models
 
@@ -283,6 +356,31 @@ Per-trial cost is estimated from measured token usage of the first trials per mo
   plus a reading pass (LLM-assisted, Opus 5, evaluator-only) that flags replies naming a test, a verification step, an
   identifier outside the brief, or a code-path choice; counts by model in the report.
 
+## 7.1 Independent review (Codex, 2026-09-13 07:00 UTC, snapshot at a76654a) — dispositions
+
+Reports: `/private/tmp/swesim-independent-review/part-a.md`, `part-b.md` (copy both into `docs/reviews/2026-09-13-codex/`
+in the repository, unchanged). Dispositions below are binding for the goal.
+
+| Finding | Disposition | When |
+|---|---|---|
+| A-P1-1 in-process falsification (pytest runs as `tester` with the submitted roots loaded; the parent trusts its outputs) | Acknowledged residual, already documented in `docs/grading.md` and CLAUDE.md; add the explicit statement Codex asks for and the list of what the consistency checks do and do not authenticate. No code change tonight. | docs, before sweep |
+| A-P1-2 demoted fact still disclosed through requirement text; deny-list exempts identifiers present in requirements; sanitizer skips `repo-derivable`/`volunteered-at-review` | **Fix before the sweep:** run `unsafe_fact_text` on every stakeholder-visible discovery and on every requirement text; a requirement whose fact was demoted is rewritten from the thread or dropped with the scenario failing the gate; forbidden terms are computed from the hidden assets minus the *natural issue* only (not minus requirements). Tests for each. | code, before sweep |
+| A-P1-3 `tier` and `patience_remaining` returned to the agent | **Ruling:** remaining patience is the availability signal the design intends and stays public; `tier` is removed from public responses; docs updated to say exactly that. | code, before sweep |
+| A-P1-4 reporter stance partly prompt-enforced; `confirm` accepts any text incl. code | **Mitigate:** `confirm-behavior` rejects inputs that look like code (fenced blocks, `def `/`class `/`import `, braces-heavy lines, diff headers) with a 422 and a hint; the filter also rejects replies that name any identifier from the hidden assets regardless of the request's option letters; docs qualify the remaining guarantees as prompt rules with the audit as the evidence. | code + docs, before sweep |
+| B-P1-1 planned vs executed trial identity | Fixed (`ec16791`), confirmed by Codex's late check. | done |
+| B-P1-2 a repeated selected phrase removes several sentences but records one; requirements with `fact_id=None` are ungrounded | **Fix before the sweep:** every expanded occurrence becomes its own ledger removal (or the selection is rejected when it matches more than one sentence and the model did not select each); `_integrity` verifies that the kept text equals the natural text minus exactly the recorded excerpts; every requirement must carry a grounded `fact_id` or a verbatim thread excerpt. | code, before sweep |
+| B-P2-1 probe reuse binding attaches to old cached executions; probe runs as root while grading runs as `tester` | **Fix before creation:** Harbor probe job names include the probe binding hash; reuse only when the job's recorded binding equals the current one; probe runs under the grading identity. | code, before sweep |
+| B-P2-2 fallback plausible-wrong control can invert inside a docstring and keep gold behaviour | Fix the lexical mask (carry open-string state across hunks) and require the fallback control to differ from gold in executable AST; reject `unfetched:` for fallback controls; append-only control notes. | code, during the night |
+| B-P2-3 `compiled_hash` omits compiler constants and render inputs (stakeholder URL, hosts, timeouts, review config) | Include a canonical dump of the compile configuration and a manifest of rendered files in the hash; run verifies the manifest before use. | code, during the night |
+| B-P2-4 base manifests written but never compared | Verifier compares the agent image's base manifest to its own at collection and fails closed on mismatch; a test covers it. | code, during the night |
+| B-P2-5 legacy scaffold and non-scaffold trials pool | Score grouping derives the scaffold identity from `report.agent_config_sha256` when `run_config.agent_config` is absent; legacy trials regroup; docs updated. | code, before sweep |
+| B-P2-6 console evaluator gate leaks `redacted_terms`/`withheld_sentences`; raw judge/draft metadata served | Fixed as part of §2.5 (IAP identity gate, strip list extended, gated file routes). | code, before console cutover |
+| B-P2-7 create/run without confirmation; Origin check hostname-only | Fixed as part of §2.5 (confirmation step, scheme+host+port, audit table). | code, before console cutover |
+| B-P2-8 calibration metric definition and missing per-instance predictions | Save `per_instance` predictions with the calibration; define the positive as `verified_rubric_score >= 2` in the docs; recompute with the new judge. | code + docs, during the night |
+| B-P2-9 stale README numbers; laptop-off evidence lacks a session log; nine non-interactive exports training-eligible | README numbers regenerated from the index at the end; laptop-off labelled operator-reported unless the VM auth log is captured; training-eligible statement corrected. | docs |
+| B-P3-1 README offline command includes the integration test | Fix the command. | docs |
+| A-P3-1 diagnostic rerun budget and forged-output prose | Document the separate diagnostic budget; qualify the example. | docs |
+
 ## 8. Work breakdown (streams, interfaces, order)
 
 Streams run in parallel worktrees on `fable`; the integrator merges. Order within the night:
@@ -296,14 +394,18 @@ Streams run in parallel worktrees on `fable`; the integrator merges. Order withi
    records; unit tests with a fake API; the worker-pool restart proof after 2. ~2 h.
 4. **storage+index** — FUSE mount config, Postgres schema + `swesim index` (rebuild, upsert activities), advisory lock
    for the registry, VM import script `scripts/cloud/import_vm.sh`. ~2 h.
-5. **console** — IAP identity gate, Postgres-backed lists and score tables, funnel, spend, trend charts, model tier
-   labels, difficulty labels. ~2 h, after 4's schema is frozen (schema first, data later).
-6. **models** — OpenRouter provider in the solver path and probe; judge/stakeholder switch to Opus 5 with fallbacks;
+5. **console** — everything in §2.5: IAP identity gate, history pages (workflows incl. failed, trials incl. unresolved,
+   candidates funnel, scenario versions), database browser with CSV export, artifact browser over the bucket with gating,
+   all actions with confirmation + audit, live views, measurement views. ~3 h, after 4's schema is frozen (schema first,
+   data later).
+6. **review-fixes** — the before-sweep rows of §7.1 (A-P1-2, A-P1-3, A-P1-4, B-P1-2, B-P2-1, B-P2-5) with tests. ~2 h. Independent of 1–5; starts immediately.
+7. **temporal-design** — §2.8 items 1–8 (queues, retry classification, split mine/validate, `patched`, search attributes, continue-as-new, cancellation, payload tests). ~2 h. Overlaps with 3.
+8. **models** — OpenRouter provider in the solver path and probe; judge/stakeholder switch to Opus 5 with fallbacks;
    judge recalibration; per-trial cost capture. ~1.5 h. Independent of 1–5; can start immediately.
-7. **smoke on the new stack** — `CreateTasksWorkflow` on one swebench id and `RunTasksWorkflow` on one scenario
+9. **smoke on the new stack** — `CreateTasksWorkflow` on one swebench id and `RunTasksWorkflow` on one scenario
    completing end to end; IAP login works; index rows appear. Gate for the sweep.
-8. **sweep** — creation, screen, Tier A–C matrix, trend check, gated frontier; disclosure audit; integrity report.
-9. **review+docs** — Part A review; README/architecture/ops/grading/hosting spec; `scripts/verify_cloud.sh`; evidence.
+10. **sweep** — creation, screen, Tier A–C matrix, trend check, gated frontier; disclosure audit; integrity report.
+11. **review+docs** — Part A review; README/architecture/ops/grading/hosting spec; `scripts/verify_cloud.sh`; evidence.
 
 Fallback if 1–3 slip past ~04:00 PDT: keep the VM path for the sweep (documented as such), finish the stack, and cut
 over the console only. The goal says infra first, so the sweep does not start on the VM unless the user changes the
@@ -351,3 +453,25 @@ priority.
 | GitHub API rate limit during discovery of ten repos | Sequential discovery per repo with the mine activity's existing pagination bound; spread over the authoring queue. |
 | Cost overrun | Spend ledger per run; `SWESIM_SPEND_CAP_USD`; frontier tiers gated. |
 | Presentation at 16:00 PDT the same day | Everything reported is measured; the fallback path (VM) stays documented and runnable. |
+
+## 12. Goal command (verbatim)
+
+The `/goal` text the user runs; it points here and this brief is binding where they differ.
+
+```
+Ship swesim as a hosted production pipeline on GCP (Cloud Run, Temporal Cloud) and run the tiered multi-model sweep on it, by 2026-09-13 08:00 PDT. The brief docs/superpowers/specs/2026-09-13-hosted-pipeline-brief.md is binding on every detail; where this text and the brief differ, the brief wins. Infra first; the sweep runs only on the new stack; the website is the way the pipeline is operated.
+
+Infrastructure (brief 2.1-2.7, Terraform in infra/, second apply clean): Temporal Cloud for every client and worker; one worker image built by Cloud Build, digest pinned in Terraform and recorded in every activity result and trial record; four Cloud Run worker pools, one per task queue; one Cloud Run Job per trial named by trial id (SWESIM_TRIAL_LAUNCHER=cloudrun), deleted after its record is written, launch-once proven by a worker-pool restart during a running trial with saved evidence; workspace on a versioned GCS bucket mounted everywhere, the VM record imported and labelled; Cloud SQL Postgres index written by the workflows and rebuildable from the files; secrets only from Secret Manager; the console as a Cloud Run service behind an HTTPS load balancer with IAP, evaluator gate bound to the IAP identity; one CreateTasksWorkflow and one RunTasksWorkflow completing end to end on the new stack before any sweep; the VM worker then stopped and documented as fallback.
+
+Temporal design (brief 2.8, all eight items): per-queue activity routing; retry classification (transient retries with backoff, gate rejections non-retryable, no blind relaunch); mine split into discover plus per-candidate probe, validate split per control; workflow.patched with an open-executions check before every deploy; search attributes; continue-as-new every 100 children; cancellation observed; payload sizes asserted.
+
+Independent review (brief 7.1): Codex reports in docs/reviews/2026-09-13-codex/ unchanged; the before-sweep rows fixed with tests (A-P1-2, A-P1-3, A-P1-4, B-P1-2, B-P2-1, B-P2-5, B-P2-6, B-P2-7); the rest done or documented as the table says.
+
+Models (brief 3): judge and stakeholder anthropic/claude-opus-5 with openai/gpt-5.6-sol fallback, drafter anthropic/claude-sonnet-5; judge calibration re-run with per-instance predictions saved; OpenRouter in the solver path with a smoke trial before any open-model run; per-trial cost captured.
+
+Sweep (brief 4-6, Temporal only): swebench:A plus the ten repositories in the bugfix band and a feature-band pass; seven-control validation and the difficulty screen on every valid scenario; Tier A-C matrix on the six matrix models, remaining Tier A-C on a 10-scenario subset; Tier D and E (claude-sonnet-5, gpt-5.6-sol; gpt-6-astra, claude-fable-5-1, claude-opus-5, gpt-5.5) only when the brief 3.2 gate holds, k=1 first; spend tracked per run and capped by SWESIM_SPEND_CAP_USD at about $1,500.
+
+Console (brief 2.5, all of it): complete history of every workflow, trial (including failed, unresolved, launch-failed), candidate, gate reject and scenario version; database browser with CSV export; artifact browser over the bucket with evaluator gating; every operator action from the UI with confirmation, Origin check and audit; live views; accuracy tables with null on insufficient n; trend charts; difficulty and tier labels.
+
+Done also requires: scripts/verify_cloud.sh passing (Temporal Cloud auth mode, IAP redirect, bucket vs registry, Postgres vs files, one Job and one execution per trial, image digest consistency); scripts/verify.sh 10 on a bucket mirror; offline suite green; README, architecture, ops, grading and the hosting spec describing measured hosted behaviour with dates, ids and evidence paths; disclosure audit and integrity-signal report per model; every commit pushed to origin main; no fabricated numbers, hand-edited artifacts or credentials; anything only a human can do written to docs/ops.md with the exact step while all other work continues.
+```
