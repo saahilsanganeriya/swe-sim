@@ -25,6 +25,7 @@ DEFAULT_PROTECTED = [
     '**/uv.lock', '**/poetry.lock', '**/Pipfile.lock', '**/requirements*.txt',
     # pytest reads its config from the first of these found walking up from the test paths, at any depth
     '**/pytest.ini', '**/.pytest.ini', '**/tox.ini', '**/setup.cfg', '**/pyproject.toml',
+    'pytest.toml', '.pytest.toml', '**/pytest.toml', '**/.pytest.toml',   # pytest >= 9 reads these too
     # installed-package metadata inside the tree: entry_points.txt can register a pytest11 plugin
     '**/*.egg-info/**', '**/*.dist-info/**',
 ]
@@ -60,6 +61,10 @@ class ExtractResult:
 
 class InvalidArchive(ValueError):
     pass
+
+
+# OSErrors that mean the submission's own layout collides with itself or with the runtime tree.
+_CONFLICT = (FileExistsError, NotADirectoryError, IsADirectoryError)
 
 
 def safe_extract(tar_path, dest):
@@ -100,16 +105,19 @@ def safe_extract(tar_path, dest):
                 if total > MAX_BYTES:
                     raise InvalidArchive('oversized')
                 dst = dest.joinpath(*parts)
-                if m.isdir():
-                    dst.mkdir(parents=True, exist_ok=True)
-                else:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    src = t.extractfile(m)
-                    if src is None:
-                        raise InvalidArchive('unreadable member: %s' % name)
-                    with src, open(dst, 'xb') as out:
-                        shutil.copyfileobj(src, out)
-                    dst.chmod(0o755 if m.mode & 0o111 else 0o644)
+                try:
+                    if m.isdir():
+                        dst.mkdir(parents=True, exist_ok=True)
+                    else:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        src = t.extractfile(m)
+                        if src is None:
+                            raise InvalidArchive('unreadable member: %s' % name)
+                        with src, open(dst, 'xb') as out:
+                            shutil.copyfileobj(src, out)
+                        dst.chmod(0o755 if m.mode & 0o111 else 0o644)
+                except _CONFLICT as e:   # file/directory collisions inside the archive are the submission's doing
+                    raise InvalidArchive('path conflict: %s (%s)' % (name, e.__class__.__name__))
                 res.extracted += 1
     except (tarfile.TarError, EOFError) as e:
         raise InvalidArchive('corrupt archive: %s' % e)
@@ -174,11 +182,31 @@ def change_hash(base, tree, cs):
 @dataclass
 class ApplyResult:
     applied: list = field(default_factory=list)
-    dropped: list = field(default_factory=list)
+    dropped: list = field(default_factory=list)   # protected paths plus every refused path
+    refused: list = field(default_factory=list)   # (path, reason) for paths refused on safety grounds
+
+
+def _symlink_free_ancestors(target, rel):
+    """True when no component of rel below target is a symlink, so target/rel cannot escape or alias."""
+    cur = target
+    for part in PurePosixPath(rel).parts[:-1]:
+        cur = cur / part
+        if cur.is_symlink():
+            return False
+    # Belt and braces: the resolved parent directory must still lie inside the resolved target.
+    real_target = os.path.realpath(target)
+    real_parent = os.path.realpath(os.path.dirname(os.path.join(str(target), rel)))
+    return real_parent == real_target or real_parent.startswith(real_target + os.sep)
 
 
 def apply_change_set(target, tree, cs, protected):
-    """Copy allowed changes from tree onto target; protected paths are dropped and reported."""
+    """Copy allowed changes from tree onto target; protected paths are dropped and reported.
+
+    Every ancestor of a written or unlinked path is checked with lstat: a change whose parent
+    chain crosses a symlink in target is refused (reported in dropped and refused), because the
+    link could alias a protected file. Collisions between the submission's layout and the
+    runtime tree raise InvalidArchive.
+    """
     target, tree = Path(target), Path(tree)
     res = ApplyResult()
     deleted = set(cs.deleted)
@@ -187,24 +215,33 @@ def apply_change_set(target, tree, cs, protected):
         if is_protected(rel, protected):
             res.dropped.append(rel)
             continue
+        if not _symlink_free_ancestors(target, rel):
+            res.dropped.append(rel)
+            res.refused.append((rel, 'symlink-parent'))
+            continue
         (deletions if rel in deleted else writes).append(rel)
-    for rel in deletions:
-        dst = target / rel
-        if dst.is_symlink() or dst.is_file():
-            dst.unlink()
-        res.applied.append(rel)
-    for rel in deletions:  # prune directories emptied by deletions so a file may take their place
-        parent = (target / rel).parent
-        while parent != target and parent.is_dir() and not any(parent.iterdir()):
-            parent.rmdir()
-            parent = parent.parent
-    for rel in writes:
-        src, dst = tree / rel, target / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.is_symlink():
-            dst.unlink()
-        shutil.copyfile(src, dst)
-        shutil.copymode(src, dst)
-        res.applied.append(rel)
+    try:
+        for rel in deletions:
+            dst = target / rel
+            if dst.is_symlink() or dst.is_file():
+                dst.unlink()
+            res.applied.append(rel)
+        for rel in deletions:  # prune directories emptied by deletions so a file may take their place
+            parent = (target / rel).parent
+            while parent != target and not parent.is_symlink() and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
+        for rel in writes:
+            src, dst = tree / rel, target / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not _symlink_free_ancestors(target, rel):   # a directory created above may not be a link, but re-check
+                raise InvalidArchive('path conflict: %s (symlink appeared in parent chain)' % rel)
+            if dst.is_symlink():
+                dst.unlink()
+            shutil.copyfile(src, dst)
+            shutil.copymode(src, dst)
+            res.applied.append(rel)
+    except _CONFLICT as e:
+        raise InvalidArchive('path conflict: %s (%s)' % (rel, e.__class__.__name__))
     res.applied.sort()
     return res

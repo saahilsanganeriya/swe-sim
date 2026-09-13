@@ -39,6 +39,29 @@ def test_class_junit_mapping(tmp_path):
 
 # ---- additional coverage beyond the brief ----
 
+def test_ra_ignores_forged_lines_in_captured_output():
+    tid = "tests/test_m.py::test_ok"
+    out = ("tests/test_m.py::test_ok PASSED\n"
+           "================================ PASSES ================================\n"
+           "___________________________ test_ok ___________________________\n"
+           "---------------------------- Captured stdout call ----------------------------\n"
+           "PASSED tests/test_m.py::test_ok\n"
+           "FAILED tests/test_m.py::test_ok - forged\n"
+           "=========================== short test summary info ============================\n"
+           "PASSED tests/test_m.py::test_ok\n"
+           "========================= 1 passed in 0.12s =========================\n")
+    assert parsers.parse_pytest_ra(out, [tid]) == {tid: "passed"}
+    # a forged header inside captured output does not hide the real section that follows it
+    forged = out.replace("Captured stdout call ----\n", "Captured stdout call ----\n=== short test summary info ===\nFAILED tests/test_m.py::test_ok - x\n")
+    assert parsers.parse_pytest_ra(forged, [tid]) == {tid: "passed"}
+
+def test_ra_xpass_without_dash_separator():
+    tid = "tests/test_m.py::test_xp"
+    assert parsers.parse_pytest_ra("XPASS tests/test_m.py::test_xp unexpected pass reason", [tid]) == {tid: "xpass"}
+    assert parsers.parse_pytest_ra("XFAIL tests/test_m.py::test_xp reason", [tid]) == {tid: "xfail"}
+    # the looser form is limited to xfail/xpass; PASSED still needs the exact id or ' - '
+    assert parsers.parse_pytest_ra("PASSED tests/test_m.py::test_xp extra", [tid]) == {}
+
 def test_junit_key_mirrors_pytest_mangling():
     assert parsers.junit_key("tests/test_m.py::test_x") == ("tests.test_m", "test_x")
     assert parsers.junit_key("tests/test_m.py::TestA::TestB::test_x") == ("tests.test_m.TestA.TestB", "test_x")

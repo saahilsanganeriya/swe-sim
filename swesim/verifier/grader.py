@@ -138,11 +138,24 @@ def _config_problem(cfg):
         w = g.get('weight')
         if isinstance(w, bool) or not isinstance(w, (int, float)) or not (0 < w <= 1):
             return 'group %r weight out of range' % g.get('id')
+    if not cfg.expected_tests:
+        return 'expected_tests is empty: nothing to grade'
+    if not cfg.groups:
+        return 'groups is empty: no requirement groups to credit'
     if not cfg.pristine_dir.is_dir():
         return 'pristine_dir missing: %s' % cfg.pristine_dir
     if cfg.target_dir is not None and cfg.target_dir.resolve() == cfg.pristine_dir.resolve():
         return 'target_dir must differ from pristine_dir (the base stays untouched)'
     return None
+
+
+def _unquote_git_path(raw):
+    """Undo git's C-style path quoting ("a/caf\\303\\251.py"); plain paths are returned unchanged."""
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        import codecs
+        return codecs.escape_decode(raw[1:-1].encode('utf-8'))[0].decode('utf-8', 'replace')
+    return raw.split('\t')[0].strip()
 
 
 def _patch_paths(patch):
@@ -155,11 +168,16 @@ def _patch_paths(patch):
         return []
     out = set()
     for line in text.splitlines():
-        for prefix in ('--- a/', '+++ b/', 'rename from ', 'rename to ', 'copy from ', 'copy to '):
-            if line.startswith(prefix):
-                p = line[len(prefix):].split('\t')[0].strip()
-                if p and p != '/dev/null':
-                    out.add(p)
+        for marker in ('--- ', '+++ ', 'rename from ', 'rename to ', 'copy from ', 'copy to '):
+            if not line.startswith(marker):
+                continue
+            p = _unquote_git_path(line[len(marker):])
+            if marker in ('--- ', '+++ '):
+                if p == '/dev/null' or '/' not in p:
+                    continue
+                p = p.split('/', 1)[1]   # git apply -p1 strips the a/ or b/ component
+            if p:
+                out.add(p)
     return sorted(out)
 
 
@@ -174,11 +192,20 @@ def _apply_contract_patch(patch, target):
     git = '/usr/bin/git' if os.path.exists('/usr/bin/git') else shutil.which('git')
     if not git:
         return False, 'git not found'
-    proc = subprocess.run([git, '-c', 'core.hooksPath=/dev/null', 'apply', '--whitespace=nowarn', str(patch)],
+    # safe.directory=*: an in-place /testbed may be owned by a different uid than the grader
+    proc = subprocess.run([git, '-c', 'core.hooksPath=/dev/null', '-c', 'safe.directory=*', 'apply', '--whitespace=nowarn', str(patch)],
                           cwd=str(target), capture_output=True, text=True, errors='replace')
     if proc.returncode:
         return False, (proc.stderr or proc.stdout)[-2000:]
     return True, ''
+
+
+def _current_user():
+    try:
+        import pwd
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (ImportError, KeyError):
+        return str(os.geteuid())
 
 
 def _chown_tree(path, user):
@@ -326,7 +353,12 @@ def _write_submission_diff(cfg, target, applied_paths, report):
             continue
         diff = difflib.unified_diff(old, new, fromfile='a/' + rel if a.is_file() else '/dev/null',
                                     tofile='b/' + rel if b.is_file() else '/dev/null')
-        lines.extend(ln if ln.endswith('\n') else ln + '\n' for ln in diff)
+        for ln in diff:
+            if ln.endswith('\n'):
+                lines.append(ln)
+            else:   # only a file's last line lacks a newline; mark it the way diff(1) does
+                lines.append(ln + '\n')
+                lines.append('\\ No newline at end of file\n')
     _atomic_write(cfg.verifier_out / 'submission.diff', ''.join(lines))
 
 
@@ -389,13 +421,17 @@ def grade(cfg):
         target, in_place = cfg.work_dir / 'repo', False
     report['target_mode'] = 'in-place' if in_place else 'copy'
     protected = list(cfg.protected) + policy.DEFAULT_PROTECTED + _patch_paths(cfg.contract_patch)
+    # InvalidArchive is the submission's doing (3); any other OSError here (ENOSPC, EACCES) is ours (7).
     try:
         if tree.exists():
             shutil.rmtree(tree)
         ext = policy.safe_extract(tar, tree)
-    except (policy.InvalidArchive, OSError) as e:
+    except policy.InvalidArchive as e:
         report['invalid_tree'] = '%s: %s' % (type(e).__name__, e)
         return finish('agent-invalid-submission')
+    except OSError as e:
+        report['error'] = 'extracting submission: %s' % e
+        return finish('evaluator-failure')
     if not in_place:
         try:
             if target.exists():
@@ -408,15 +444,21 @@ def grade(cfg):
         cs = policy.change_set(cfg.pristine_dir, tree)
         report['submission_sha256'] = policy.change_hash(cfg.pristine_dir, tree, cs)
         applied = policy.apply_change_set(target, tree, cs, protected)
-    except (policy.InvalidArchive, OSError, ValueError) as e:
+    except policy.InvalidArchive as e:
         report['invalid_tree'] = '%s: %s' % (type(e).__name__, e)
         return finish('agent-invalid-submission')
+    except (OSError, ValueError) as e:
+        report['error'] = 'applying submission: %s' % e
+        return finish('evaluator-failure')
     report['rejected_members'] = [list(x) for x in ext.rejected]
     report['dropped_paths'] = applied.dropped
+    report['refused_paths'] = [list(x) for x in applied.refused]
     report['applied_paths'] = applied.applied
     report['change_counts'] = {'added': len(cs.added), 'modified': len(cs.modified), 'deleted': len(cs.deleted)}
+    refused = {p for p, _ in applied.refused}
     report['integrity_signals'] += [{'kind': 'rejected-archive-member', 'path': n, 'reason': r} for n, r in ext.rejected]
-    report['integrity_signals'] += [{'kind': 'protected-path-edit', 'path': x} for x in applied.dropped]
+    report['integrity_signals'] += [{'kind': 'symlink-traversal', 'path': p, 'reason': r} for p, r in applied.refused]
+    report['integrity_signals'] += [{'kind': 'protected-path-edit', 'path': x} for x in applied.dropped if x not in refused]
     kept = set(applied.applied)
     applied_cs = policy.ChangeSet(added=[p for p in cs.added if p in kept], modified=[p for p in cs.modified if p in kept],
                                   deleted=[p for p in cs.deleted if p in kept])
@@ -447,6 +489,9 @@ def grade(cfg):
     mapping = cfg.runner.get('nodeid_map') or {}
     actual = {t: mapping.get(t, t) for t in cfg.expected_tests}
     report['runner_command'] = cfg.runner['command']
+    report['tests_ran_as'] = cfg.test_user or _current_user()
+    if not cfg.test_user:   # tests share the grader's identity; validation must see this
+        report['integrity_signals'].append({'kind': 'tests-ran-as-grader', 'user': report['tests_ran_as']})
     statuses, rc, out, error = _run_tests(cfg, target, list(actual.values()))
     report.update(runner_exit_code=rc, runner_tail=out[-4000:], runner_error=error)
     _atomic_write(cfg.verifier_out / 'runner_stdout.txt', out[-STDOUT_KEEP:])

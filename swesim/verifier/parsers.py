@@ -15,6 +15,7 @@ class EvidenceError(ValueError):
 _STATES = {'PASSED': 'passed', 'FAILED': 'failed', 'ERROR': 'error', 'XFAIL': 'xfail', 'XPASS': 'xpass'}
 _RA_LINE = re.compile(r'^(PASSED|FAILED|ERROR|XFAIL|XPASS) (.+)$')
 _SUMMARY_LINE = re.compile(r'^=+ .* in [0-9.]+')
+_SUMMARY_HEADER = re.compile(r'^=* ?short test summary info ?=*$')
 _COUNT = re.compile(r'(\d+) (passed|failed|skipped|errors?|xfailed|xpassed)\b')
 
 
@@ -61,17 +62,32 @@ def parse_junit(xml_path, expected=None):
     return out
 
 
+def summary_section(stdout):
+    """Lines after the last 'short test summary info' header; the whole output when there is none.
+
+    Captured output of passing tests (the -rA PASSES section) and of failures is printed before
+    that header, so agent-controlled text cannot collide with the real summary lines.
+    """
+    lines = stdout.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if _SUMMARY_HEADER.match(lines[i].strip()):
+            return lines[i + 1:]
+    return lines
+
+
 def parse_pytest_ra(stdout, expected=None):
     """Statuses from -rA short-summary lines. Whole nodeids are matched, so parameter ids may contain spaces."""
     out = {}
     nodeids = sorted(expected, key=len, reverse=True) if expected is not None else None
-    for raw in stdout.splitlines():
+    for raw in summary_section(stdout):
         m = _RA_LINE.match(raw.strip())
         if not m:
             continue
         state, tail = m.groups()
         if nodeids is not None:
-            matches = [n for n in nodeids if tail == n or tail.startswith(n + ' - ')]
+            # xfail/xpass lines from older pytest carry the reason after a bare space
+            loose = state in ('XFAIL', 'XPASS')
+            matches = [n for n in nodeids if tail == n or tail.startswith(n + ' - ') or (loose and tail.startswith(n + ' '))]
             if not matches:
                 continue
             nodeid = matches[0]

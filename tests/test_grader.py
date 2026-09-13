@@ -127,10 +127,82 @@ def test_symlink_member_is_rejected_and_signaled_but_source_still_graded(tmp_pat
         ti = tarfile.TarInfo("./pkg/secret"); ti.type = tarfile.SYMTYPE; ti.linkname = "/tests/test.patch"; t.addfile(ti)
     (a / "collect.status").write_text(json.dumps({"status": "ok", "rc": 0, "sha256": grader.sha256_file(tar), "user": "root"}))
     res = grader.grade(_cfg(tmp_path, p, a))
-    assert res.reward["outcome_code"] == 1 and res.reward["integrity_signal_count"] == 1
+    assert res.reward["outcome_code"] == 1 and res.reward["integrity_signal_count"] == 2
     assert res.report["rejected_members"] == [["./pkg/secret", "non-regular"]]
-    assert res.report["integrity_signals"] == [{"kind": "rejected-archive-member", "path": "./pkg/secret", "reason": "non-regular"}]
+    assert [s["kind"] for s in res.report["integrity_signals"]] == ["rejected-archive-member", "tests-ran-as-grader"]
+    assert res.report["integrity_signals"][0] == {"kind": "rejected-archive-member", "path": "./pkg/secret", "reason": "non-regular"}
     assert not (tmp_path / "work" / "repo" / "pkg" / "secret").exists()
+
+def test_tests_ran_as_is_recorded_and_signaled_without_test_user(tmp_path):
+    import pwd
+    p = _pristine(tmp_path); res = grader.grade(_cfg(tmp_path, p, _artifacts(tmp_path, _fixed_tree(tmp_path, p))))
+    me = pwd.getpwuid(os.geteuid()).pw_name
+    assert res.report["tests_ran_as"] == me and {"kind": "tests-ran-as-grader", "user": me} in res.report["integrity_signals"]
+    assert res.reward["integrity_signal_count"] == 1
+
+def test_symlinked_parent_in_base_cannot_reach_protected_file(tmp_path):
+    p = _pristine(tmp_path)
+    (p / "docs").mkdir(); os.symlink("../tests", p / "docs" / "link")          # base ships docs/link -> ../tests
+    tree = _fixed_tree(tmp_path, p)                                            # copytree follows the link: docs/link is a real dir
+    assert not (tree / "docs" / "link").is_symlink()
+    (tree / "docs" / "link" / "test_mod.py").write_text("def test_new(): pass\ndef test_old(): pass\n")
+    res = grader.grade(_cfg(tmp_path, p, _artifacts(tmp_path, tree)))
+    target = tmp_path / "work" / "repo"
+    assert (target / "docs" / "link").is_symlink() and (target / "tests" / "test_mod.py").read_text() == (p / "tests" / "test_mod.py").read_text()
+    assert res.report["dropped_paths"] == ["docs/link/test_mod.py"]
+    assert {"kind": "symlink-traversal", "path": "docs/link/test_mod.py", "reason": "symlink-parent"} in res.report["integrity_signals"]
+    assert res.reward["outcome_code"] == 1 and res.reward["success"] == 1   # the real source fix still grades
+
+def test_forged_summary_line_in_captured_stdout_does_not_break_evidence(tmp_path):
+    p = _pristine(tmp_path); tree = _fixed_tree(tmp_path, p)
+    (tree / "pkg" / "mod.py").write_text("def f(x):\n    print('PASSED tests/test_mod.py::test_old')\n    print('FAILED tests/test_mod.py::test_new - x')\n    return x * 2\n")
+    res = grader.grade(_cfg(tmp_path, p, _artifacts(tmp_path, tree)))
+    assert res.reward["outcome_code"] == 1 and res.report["runner_error"] is None
+
+def test_disk_level_oserror_during_apply_is_evaluator_failure(tmp_path, monkeypatch):
+    p = _pristine(tmp_path); cfg = _cfg(tmp_path, p, _artifacts(tmp_path, _fixed_tree(tmp_path, p)))
+    from swesim.verifier import policy
+    def boom(*a, **k): raise OSError(28, "No space left on device")
+    monkeypatch.setattr(policy, "apply_change_set", boom)
+    res = grader.grade(cfg)
+    assert res.reward["outcome_code"] == 7 and "No space left" in res.report["error"]
+    monkeypatch.setattr(policy, "apply_change_set", lambda *a, **k: (_ for _ in ()).throw(policy.InvalidArchive("conflict")))
+    assert grader.grade(cfg).reward["outcome_code"] == 3
+
+def test_empty_contract_or_groups_is_evaluator_failure(tmp_path):
+    p = _pristine(tmp_path); a = _artifacts(tmp_path, _fixed_tree(tmp_path, p))
+    cfg = _cfg(tmp_path, p, a); cfg.expected_tests = {}; cfg.groups = []
+    assert grader.grade(cfg).reward["outcome_code"] == 7
+    cfg = _cfg(tmp_path, p, a); cfg.groups = []
+    assert grader.grade(cfg).reward["outcome_code"] == 7
+
+def test_braces_in_nodeids_survive_command_substitution(tmp_path):
+    p = tmp_path / "pristine"; (p / "pkg").mkdir(parents=True); (p / "tests").mkdir()
+    (p / "pkg" / "__init__.py").write_text(""); (p / "pkg" / "mod.py").write_text("def f(x):\n    return x\n")
+    (p / "tests" / "test_mod.py").write_text("import pytest\nfrom pkg.mod import f\n@pytest.mark.parametrize('v', ['{a}'])\ndef test_p(v):\n    assert f(2) == 4\ndef test_old():\n    assert f(0) == 0\n")
+    tree = tmp_path / "tree"; shutil.copytree(p, tree); (tree / "pkg" / "mod.py").write_text("def f(x):\n    return x * 2\n")
+    cfg = _cfg(tmp_path, p, _artifacts(tmp_path, tree))
+    cfg.expected_tests = {"tests/test_mod.py::test_p[{a}]": "f2p", "tests/test_mod.py::test_old": "p2p"}
+    cfg.groups = [{"id": "g01", "weight": 1.0, "tests": ["tests/test_mod.py::test_p[{a}]"]}]
+    assert grader.grade(cfg).reward["outcome_code"] == 1
+    # force the single_command path: the full run collects one id while two are expected
+    cfg.runner["command"] = cfg.runner["command"].replace(" tests", " tests/test_mod.py::test_old")
+    res = grader.grade(cfg)
+    assert res.reward["outcome_code"] == 4 and res.report["reruns"][0]["statuses"] == {"tests/test_mod.py::test_p[{a}]": "passed"}
+
+def test_patch_paths_handles_git_quoted_names(tmp_path):
+    patch = tmp_path / "t.patch"
+    patch.write_text('diff --git "a/tests/da ta.txt" "b/tests/da ta.txt"\n--- "a/tests/da ta.txt"\n+++ "b/tests/da ta.txt"\n@@ -1 +1 @@\n-x\n+y\n'
+                     'diff --git a/tests/plain.py b/tests/plain.py\n--- a/tests/plain.py\t2020\n+++ b/tests/plain.py\n'
+                     '--- /dev/null\n+++ "b/tests/caf\\303\\251.py"\nrename from old/name.py\nrename to new/name.py\n')
+    assert grader._patch_paths(patch) == ["new/name.py", "old/name.py", "tests/café.py", "tests/da ta.txt", "tests/plain.py"]
+
+def test_submission_diff_marks_missing_trailing_newline(tmp_path):
+    p = _pristine(tmp_path); tree = tmp_path / "tree"; shutil.copytree(p, tree)
+    (tree / "pkg" / "mod.py").write_text("def f(x):\n    return x * 2")   # no trailing newline
+    grader.grade(_cfg(tmp_path, p, _artifacts(tmp_path, tree)))
+    diff = (tmp_path / "verifier_out" / "submission.diff").read_text()
+    assert "+    return x * 2\n\\ No newline at end of file\n" in diff and diff.count("\\ No newline") == 1
 
 def test_corrupt_archive_is_agent_invalid_submission(tmp_path):
     p = _pristine(tmp_path); a = tmp_path / "artifacts"; a.mkdir()
@@ -255,7 +327,7 @@ def test_freeze_failure_is_signaled_without_changing_outcome(tmp_path):
     (a / "collect.status").write_text(json.dumps(receipt))
     res = grader.grade(_cfg(tmp_path, p, a))
     assert res.reward["outcome_code"] == 1 and res.report["transcript_hash"] is None
-    assert {"kind": "freeze-failed"} in res.report["integrity_signals"] and res.reward["integrity_signal_count"] == 1
+    assert {"kind": "freeze-failed"} in res.report["integrity_signals"] and res.reward["integrity_signal_count"] == 2
 
 def test_submission_diff_and_hashes_recorded(tmp_path):
     p = _pristine(tmp_path); tree = _fixed_tree(tmp_path, p)

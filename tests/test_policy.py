@@ -52,6 +52,7 @@ def test_default_protected_covers_pytest_config_and_package_metadata():
     P = policy.DEFAULT_PROTECTED
     for path in ("conftest.py", "a/b/conftest.py", "sitecustomize.py", "pkg/usercustomize.py", "x.pth", "a/b.pth",
                  "pytest.ini", ".pytest.ini", "tests/pytest.ini", "sub/tox.ini", "sub/setup.cfg", "sub/pyproject.toml",
+                 "pytest.toml", ".pytest.toml", "tests/pytest.toml", "a/b/.pytest.toml",
                  ".github/workflows/ci.yml", ".gitattributes", ".gitignore", "uv.lock", "requirements-dev.txt",
                  "pkg.egg-info/entry_points.txt", "src/pkg.egg-info/SOURCES.txt", "Pkg.Egg-Info/PKG-INFO"):
         assert policy.is_protected(path, P), path
@@ -104,6 +105,50 @@ def test_apply_handles_directory_to_file_swap_and_protected_deletion(tmp_path):
     assert res.dropped == ["conftest.py"] and (target / "conftest.py").exists()
     assert (target / "pkg" / "util.py").read_text() == "flat\n" and not (target / "pkg" / "util").exists()
     assert res.applied == ["pkg/util.py", "pkg/util/__init__.py"]
+
+def test_apply_refuses_writes_through_symlinked_parent(tmp_path):
+    # base ships docs/link -> ../tests; the submission replaces the link with a real dir holding test_c.py
+    pristine = tmp_path / "p"; tree = tmp_path / "t"
+    (pristine / "tests").mkdir(parents=True); (pristine / "tests" / "test_c.py").write_text("def test_c(): assert True\n")
+    (pristine / "docs").mkdir(); os.symlink("../tests", pristine / "docs" / "link")
+    (tree / "tests").mkdir(parents=True); (tree / "tests" / "test_c.py").write_text("def test_c(): assert True\n")
+    (tree / "docs" / "link").mkdir(parents=True); (tree / "docs" / "link" / "test_c.py").write_text("def test_c(): pass\n")
+    cs = policy.change_set(pristine, tree)
+    assert cs.added == ["docs/link/test_c.py"] and cs.modified == [] and cs.deleted == []
+    target = tmp_path / "apply"; shutil.copytree(pristine, target, symlinks=True)
+    res = policy.apply_change_set(target, tree, cs, ["tests/**"])
+    assert (target / "tests" / "test_c.py").read_text() == "def test_c(): assert True\n"
+    assert res.applied == [] and res.dropped == ["docs/link/test_c.py"]
+    assert res.refused == [("docs/link/test_c.py", "symlink-parent")]
+    assert (target / "docs" / "link").is_symlink()
+
+def test_apply_refuses_deletions_through_symlinked_parent(tmp_path):
+    pristine = tmp_path / "p"; tree = tmp_path / "t"
+    (pristine / "tests").mkdir(parents=True); (pristine / "tests" / "test_c.py").write_text("c\n")
+    (pristine / "docs").mkdir(); (pristine / "docs" / "keep.txt").write_text("k\n")
+    (tree / "tests").mkdir(parents=True); (tree / "tests" / "test_c.py").write_text("c\n"); (tree / "docs").mkdir()
+    cs = policy.change_set(pristine, tree)
+    assert cs.deleted == ["docs/keep.txt"]
+    # the runtime tree differs from the base: docs became a symlink to tests, and a same-named file lives there
+    target = tmp_path / "apply"; (target / "tests").mkdir(parents=True)
+    (target / "tests" / "test_c.py").write_text("c\n"); (target / "tests" / "keep.txt").write_text("protected\n")
+    os.symlink("tests", target / "docs")
+    res = policy.apply_change_set(target, tree, cs, ["tests/**"])
+    assert res.applied == [] and res.dropped == ["docs/keep.txt"] and res.refused == [("docs/keep.txt", "symlink-parent")]
+    assert (target / "tests" / "keep.txt").read_text() == "protected\n"
+
+def test_path_conflicts_are_invalid_archive_not_oserror(tmp_path):
+    tar = _make_tar(tmp_path, [("a", "file", b"x"), ("a/b.py", "file", b"y")])
+    with pytest.raises(policy.InvalidArchive, match="conflict"):
+        policy.safe_extract(tar, tmp_path / "out")
+    pristine = tmp_path / "p"; tree = tmp_path / "t"
+    pristine.mkdir(); (pristine / "pkg").write_text("i am a file\n")
+    (tree / "pkg").mkdir(parents=True); (tree / "pkg" / "m.py").write_text("m\n"); (tree / "pkg2").write_text("i am a file\n")
+    cs = policy.change_set(pristine, tree)
+    target = tmp_path / "apply"; shutil.copytree(pristine, target)
+    (target / "pkg2").mkdir()   # runtime tree has a directory where the submission adds a file
+    with pytest.raises(policy.InvalidArchive, match="conflict"):
+        policy.apply_change_set(target, tree, cs, [])
 
 def test_change_set_uses_content_not_mtime(tmp_path):
     pristine = tmp_path / "p"; tree = tmp_path / "t"
