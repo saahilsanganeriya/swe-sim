@@ -21,6 +21,9 @@ SECONDARY_LIMIT_MIN_SLEEP = 60.0  # GitHub asks for at least a minute after a se
 _RATE_LIMIT = re.compile(r"rate limit|HTTP 429|abuse detection", re.I)
 _SECONDARY = re.compile(r"secondary|abuse detection", re.I)
 _LINK = re.compile(r"(?:[Ff]ix(?:es|ed)?|[Cc]los(?:es|ed)?|[Rr]esolves?)\s*:?\s*#(\d+)")
+# Weaker evidence, used only when no closing keyword and no timeline cross-reference names a real issue: a plain
+# `#N`, `GH-N` or full issue URL in the PR title/body. Recorded as link_kind="mention" so ranking can prefer stronger links.
+_MENTION = re.compile(r"(?:(?<![\w/])#|GH-|/issues/)(\d+)")
 
 
 def _rate_limit_wait(attempt: int, stderr: str = "") -> float:
@@ -116,11 +119,15 @@ def closing_text(pr: dict) -> str:
     return f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
 
 
+MAX_MENTIONS = 4  # bound on plain-mention issue lookups per PR (one API call each)
+
+
 def linked_targets(repo: str, pr: int, body: str) -> dict:
     """Classify the numbers a PR claims to close. Closing-keyword numbers are fetched and kept only when the payload is
     a real issue (no `pull_request`); PR-typed targets go to `prs`, unfetchable ones to `missing`. When no real issue
     is named, fall back to issues of this repo that cross-reference the PR in its timeline.
-    Returns {"issues": [n], "prs": [n], "missing": [n], "payloads": {n: issue_json}}."""
+    When the timeline names none either, plain mentions (`#N`, `GH-N`, issue URLs) are tried as the weakest tier.
+    Returns {"issues": [n], "prs": [n], "missing": [n], "payloads": {n: issue_json}, "link_kind": closing|timeline|mention|None}."""
     out = {"issues": [], "prs": [], "missing": [], "payloads": {}}
     for n in sorted({int(x) for x in _LINK.findall(body or "")}):
         try:
@@ -135,6 +142,7 @@ def linked_targets(repo: str, pr: int, body: str) -> dict:
         else:
             out["issues"].append(n)
             out["payloads"][n] = payload
+    out["link_kind"] = "closing" if out["issues"] else None
     if not out["issues"]:
         for event in pages(f"repos/{repo}/issues/{pr}/timeline", max_pages=3):
             issue = (event.get("source") or {}).get("issue") or {}
@@ -142,6 +150,25 @@ def linked_targets(repo: str, pr: int, body: str) -> dict:
                 if (issue.get("html_url") or "").startswith(f"https://github.com/{repo}/issues/") and int(issue["number"]) not in out["issues"]:
                     out["issues"].append(int(issue["number"]))
         out["issues"].sort()
+        if out["issues"]:
+            out["link_kind"] = "timeline"
+    if not out["issues"]:
+        mentioned = sorted({int(x) for x in _MENTION.findall(body or "")} - {pr} - set(out["prs"]) - set(out["missing"]))
+        for n in mentioned[:MAX_MENTIONS]:
+            try:
+                payload = _gh(f"repos/{repo}/issues/{n}")
+            except subprocess.CalledProcessError as e:
+                if "404" in (e.stderr or ""):
+                    out["missing"].append(n)
+                    continue
+                raise
+            if payload.get("pull_request"):
+                out["prs"].append(n)
+            else:
+                out["issues"].append(n)
+                out["payloads"][n] = payload
+        if out["issues"]:
+            out["link_kind"] = "mention"
     return out
 
 
