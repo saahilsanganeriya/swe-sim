@@ -341,8 +341,56 @@ def test_judge_candidate_adds_code_owned_fields(monkeypatch):
     assert "annotation" not in seen["user"]["candidate"] and "ANNOTATOR SECRET NOTE" not in json.dumps(seen["user"])
     with pytest.raises(ValueError, match="incomplete source evidence"):
         judge.judge_candidate({**row, "thread": {"fetch_errors": [{"issue": 3}]}}, "openai/gpt-5.5")
-    with pytest.raises(ValueError, match="context budget"):
-        judge.judge_candidate({**row, "patch": "x" * 130000}, "openai/gpt-5.5")
+    # an oversized patch is trimmed to fit instead of aborting; the payload records the cut
+    out = judge.judge_candidate({**row, "patch": "x" * 130000}, "openai/gpt-5.5")
+    assert out["payload_trimmed"] == {"patch": 30000} and out["payload_chars"] <= judge.CONTEXT_BUDGET_CHARS
+    assert seen["user"]["candidate"]["patch"].startswith("x" * 30000) and "characters trimmed" in seen["user"]["candidate"]["patch"]
+    # only when the essentials themselves do not fit does the judge still refuse
+    with pytest.raises(ValueError, match="context budget even after trimming"):
+        judge.judge_candidate({**row, "fail_to_pass": [f"tests/test_big.py::test_case_{i:05d}" for i in range(6000)]}, "openai/gpt-5.5")
+
+
+def test_llm_view_trims_the_largest_field_first_to_fit_the_budget():
+    from swesim.stages import judge
+    row = _row(patch="p" * 130000, thread={**_thread("pydata/xarray", 5362), "pr_comments": [_c("u", "c" * 20, "2021-05-01T00:00:00Z")] * 300})
+    view = judge.llm_view(row, budget=120000)
+    assert view["trimmed"] == {"patch": 30000} and len(json.dumps(view)) <= 120000                     # only the culprit is cut
+    assert view["problem_statement"] == ISSUE and view["fail_to_pass"] == [F2P] and view["test_patch"] == row["test_patch"]
+    assert len(view["thread"]["pr_comments"]) == 300 and "pr_comments_total" not in view["thread"]
+    view = judge.llm_view(row, budget=60000)                                    # tighter: patch to 30k, then the thread (now the largest) to 20 comments, then it fits
+    assert view["trimmed"] == {"patch": 30000, "thread": 20} and len(json.dumps(view)) <= 60000
+    assert view["thread"]["pr_comments_total"] == 300 and len(view["thread"]["pr_comments"]) == 20
+    view = judge.llm_view(row, budget=30000)                                    # below the first notch: the patch takes its second notch
+    assert view["trimmed"]["patch"] == 8000 and len(json.dumps(view)) <= 30000
+    assert judge.llm_view(row, budget=60000, extra_chars=0)["fail_to_pass"] == [F2P]                    # F2P ids are never trimmed
+    assert "trimmed" not in judge.llm_view(_row(), budget=120000)                                        # nothing to do when it fits
+    assert judge.llm_view(_row()) == judge.llm_view(_row(), budget=None)
+    with pytest.raises(ValueError, match="even after trimming"):
+        judge.llm_view(_row(fail_to_pass=[f"tests/test_big.py::test_case_{i:05d}" for i in range(6000)]), budget=120000)
+    small = judge.llm_view(_row(problem_statement="s" * 50000, hints_text="h" * 50000), budget=40000)
+    assert small["trimmed"] == {"problem_statement": 20000, "hints_text": 20000} or small["trimmed"]["problem_statement"] in (20000, 6000)
+    assert small["problem_statement"].startswith("s" * 6000) and len(json.dumps(small)) <= 40000
+
+
+def test_calibrate_records_per_row_errors_and_excludes_them_from_denominators(monkeypatch):
+    from swesim.stages import judge
+    pool = sb.pool_a(CSV)[:3]
+    others = [i for i in sb.annotation_rows(CSV) if float(sb.annotation_rows(CSV)[i]["underspecified"]) < 2][:3]
+    ids = pool + others
+    rows = {i: {"instance_id": i} for i in ids}
+
+    def flaky(row, model_id):
+        if row["instance_id"] == pool[0]:
+            raise ValueError("candidate exceeds authoring context budget even after trimming")
+        if row["instance_id"] == others[0]:
+            raise RuntimeError("provider timeout")
+        return {"verified_rubric_score": 3 if row["instance_id"] in pool else 0}
+    monkeypatch.setattr(judge, "judge_candidate", flaky)
+    out = judge.calibrate(Path(CSV), rows, "fake/model", n=6)
+    assert out["n_requested"] == 6 and out["n_judged"] == 4 and out["n_errored"] == 2 and out["n"] == 4
+    assert {e["instance_id"] for e in out["errors"]} == {pool[0], others[0]} and all("ValueError" in e["error"] or "RuntimeError" in e["error"] for e in out["errors"])
+    assert out["confusion"] == {"tp": 2, "fp": 0, "tn": 2, "fn": 0} and out["agreement"] == 1.0 and len(out["per_instance"]) == 4
+    assert {p["instance_id"] for p in out["per_instance"]}.isdisjoint({e["instance_id"] for e in out["errors"]})
 
 
 def test_ground_gaps_requires_verbatim_evidence_and_grounded_resolutions():
@@ -508,6 +556,7 @@ def test_calibrate_reports_agreement_at_threshold(monkeypatch):
     assert out["n"] == 6 and out["confusion"] == {"tp": 3, "fp": 1, "tn": 2, "fn": 0}
     assert out["agreement"] == pytest.approx(5 / 6) and out["precision"] == pytest.approx(0.75) and out["recall"] == 1.0
     assert out["prompt_version"] == judge.JUDGE_PROMPT_VERSION and len(out["per_instance"]) == 6 and out["model_id"] == "fake/model"
+    assert out["n_requested"] == out["n_judged"] == 6 and out["n_errored"] == 0 and out["errors"] == []
 
 
 # ---------------------------------------------------------------- draft_spec
@@ -921,6 +970,18 @@ def test_llm_view_trims_pass_to_pass_but_spec_keeps_it(monkeypatch, tmp_path):
     spec = ScenarioSpec.model_validate_json(p.read_text())
     assert spec.contract.pass_to_pass == p2p and all(t in spec.contract.runner.command for t in p2p)
     assert json.loads(calls[0]["messages"][0]["content"].split("\n\n", 1)[1])["candidate"]["pass_to_pass_count"] == 300
+
+
+def test_draft_trims_an_oversized_candidate_for_the_model_but_grounds_against_the_full_row(monkeypatch, tmp_path):
+    from swesim.models import ScenarioSpec
+    from swesim.stages import draft_spec
+    calls = _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    big = _row(patch=_row()["patch"] + "\n" + "+# " + "x" * 130000 + "\n")            # oversized fix: trimmed in the prompt only
+    p = draft_spec.draft(big, _judged(), "fake/model", tmp_path / "s")
+    spec = ScenarioSpec.model_validate_json(p.read_text())
+    assert (tmp_path / "s" / "assets" / "oracle.diff").read_text() == big["patch"] and spec.assets["oracle.diff"].bytes == len(big["patch"].encode())
+    sent = json.loads(calls[0]["messages"][0]["content"].split("\n\n", 1)[1])["candidate"]
+    assert sent["trimmed"] == {"patch": 30000} and len(calls[0]["messages"][0]["content"]) <= draft_spec.CONTEXT_BUDGET_CHARS
 
 
 def test_draft_fails_without_a_source_url_for_withheld_facts(monkeypatch, tmp_path):

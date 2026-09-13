@@ -54,13 +54,78 @@ def norm_text(text: str | None) -> str:
     return " ".join(_BLOCKQUOTE.sub("", text or "").split()).casefold()
 
 
-def llm_view(row: dict) -> dict:
-    """The candidate as shown to the judge/draft model: PASS_TO_PASS ids are regression bookkeeping, not evidence, so only a
-    count and a head sample are sent (some instances carry 2,000+ ids). The spec itself always keeps the full list."""
+# Trim ladders for fitting a candidate into the model context: each field is cut to the next limit only when the payload is
+# still over budget, largest current contributor first. FAIL_TO_PASS ids are never trimmed; the heads of the issue text and
+# test patch are the essentials, so exhausting every ladder means the candidate genuinely does not fit.
+TRIM_LADDER = {"problem_statement": [20000, 6000], "hints_text": [20000, 4000], "patch": [30000, 8000], "test_patch": [40000, 15000],
+               "pass_to_pass": [10, 0], "thread": [20, 5, 0]}
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n[... {len(text) - limit} characters trimmed for the model; the candidate row keeps the full text]"
+
+
+def _trim_thread(thread: dict, n: int) -> dict:
+    """Keep the first `n` comments of every comment list in the thread, recording the totals."""
+    t = dict(thread)
+    for k in ("pr_comments", "review_comments", "reviews"):
+        if isinstance(t.get(k), list) and len(t[k]) > n:
+            t[k + "_total"] = len(t[k])
+            t[k] = t[k][:n]
+    if isinstance(t.get("linked_issues"), list):
+        issues = []
+        for i in t["linked_issues"]:
+            i = dict(i)
+            if isinstance(i.get("comments"), list) and len(i["comments"]) > n:
+                i["comments_total"] = len(i["comments"])
+                i["comments"] = i["comments"][:n]
+            issues.append(i)
+        t["linked_issues"] = issues
+    return t
+
+
+def _apply_trim(view: dict, row: dict, field: str, limit: int) -> None:
+    if field == "pass_to_pass":
+        p2p = row.get("pass_to_pass") or []
+        view.update(pass_to_pass=p2p[:limit], pass_to_pass_count=len(p2p), pass_to_pass_truncated=True)
+    elif field == "thread":
+        view["thread"] = _trim_thread(row.get("thread") or {}, limit)
+    else:
+        view[field] = _truncate(row.get(field) or "", limit)
+
+
+def llm_view(row: dict, budget: int | None = None, extra_chars: int = 0) -> dict:
+    """The candidate as shown to the judge/draft model. PASS_TO_PASS ids are regression bookkeeping, not evidence, so only a
+    count and a head sample are sent (some instances carry 2,000+ ids). With `budget`, the JSON size of the view plus
+    `extra_chars` must fit: the largest trimmable field is cut one ladder notch at a time (`TRIM_LADDER`), the cuts are
+    recorded under `trimmed`, and ValueError is raised only when every ladder is exhausted and the essentials (issue text
+    head, FAIL_TO_PASS ids, test patch head) still do not fit. The spec itself always keeps the full row."""
+    view = dict(row)
     p2p = row.get("pass_to_pass") or []
-    if len(p2p) <= P2P_SAMPLE:
-        return row
-    return {**row, "pass_to_pass": p2p[:P2P_SAMPLE], "pass_to_pass_count": len(p2p), "pass_to_pass_truncated": True}
+    if len(p2p) > P2P_SAMPLE:
+        view.update(pass_to_pass=p2p[:P2P_SAMPLE], pass_to_pass_count=len(p2p), pass_to_pass_truncated=True)
+    if budget is None:
+        return view
+
+    def size() -> int:
+        return len(json.dumps(view, ensure_ascii=False)) + extra_chars
+
+    notch = {f: 0 for f in TRIM_LADDER}
+    trimmed: dict[str, int] = {}
+    while size() > budget:
+        options = [(len(json.dumps(view.get(f), ensure_ascii=False)), f) for f in TRIM_LADDER if notch[f] < len(TRIM_LADDER[f]) and view.get(f)]
+        if not options:
+            raise ValueError(f"candidate exceeds authoring context budget even after trimming ({size()} > {budget} chars; "
+                             "FAIL_TO_PASS ids, issue head and test patch head alone do not fit)")
+        _, field = max(options)
+        limit = TRIM_LADDER[field][notch[field]]
+        notch[field] += 1
+        _apply_trim(view, row, field, limit)
+        trimmed[field] = limit
+        view["trimmed"] = trimmed
+    return view
 
 
 def issue_contract_delta(row: dict) -> list[dict]:
@@ -183,12 +248,16 @@ def judge_candidate(row: dict, model_id: str) -> dict:
     if thread.get("fetch_errors"):
         raise ValueError("incomplete source evidence")
     candidate_gaps = issue_contract_delta(row)
-    view = {k: v for k, v in llm_view(row).items() if k != "annotation"}  # calibration independence: no annotator notes
+    gaps_json = json.dumps(candidate_gaps, ensure_ascii=False)
+    base = {k: v for k, v in row.items() if k != "annotation"}  # calibration independence: no annotator notes
+    view = llm_view(base, budget=CONTEXT_BUDGET_CHARS, extra_chars=len(gaps_json) + len('{"candidate": , "candidate_gaps": }'))
     payload = {"candidate": view, "candidate_gaps": candidate_gaps}
     user = json.dumps(payload, ensure_ascii=False)
     if len(user) > CONTEXT_BUDGET_CHARS:
         raise ValueError("candidate exceeds authoring context budget")
     out = chat_json(model_id, SYSTEM, [{"role": "user", "content": user}], SCHEMA)
+    out["payload_chars"] = len(user)
+    out["payload_trimmed"] = view.get("trimmed", {})
     gaps, stats = ground_gaps(out.get("gaps") if isinstance(out.get("gaps"), list) else [], row)
     out["gaps"] = gaps
     out.update(stats)
@@ -206,24 +275,34 @@ def judge_candidate(row: dict, model_id: str) -> dict:
 
 
 def calibrate(csv_path: Path, rows_by_id: dict[str, dict], model_id: str, n: int, seed: int = 0) -> dict:
-    """Agreement of the judge's verified_rubric_score with the human ensembled labels at the >=2 threshold."""
+    """Agreement of the judge's verified_rubric_score with the human ensembled labels at the >=2 threshold.
+
+    Resilient per row: a failure while preparing or judging one instance is recorded under `errors` and excluded from every
+    denominator instead of aborting the run. `n` is the number of judged rows; `n_requested` / `n_judged` / `n_errored` make
+    the coverage explicit."""
     with open(csv_path, newline="") as f:
         ann = {r["instance_id"]: r for r in csv.DictReader(f)}
     ids = [i for i in ann if i in rows_by_id]
     random.Random(seed).shuffle(ids)
     ids = ids[:n]
     tp = fp = tn = fn = 0
-    per = []
+    per, errors = [], []
     for iid in ids:
-        human = float(ann[iid]["underspecified"]) >= 2
-        judged = judge_candidate(rows_by_id[iid], model_id)
-        model = int(judged.get("verified_rubric_score", 0)) >= 2
-        per.append({"instance_id": iid, "human": float(ann[iid]["underspecified"]), "model": judged.get("verified_rubric_score")})
+        try:
+            human_score = float(ann[iid]["underspecified"])
+            judged = judge_candidate(rows_by_id[iid], model_id)
+            score = int(judged.get("verified_rubric_score", 0))
+        except Exception as e:  # noqa: BLE001 - one bad row must not lose the whole calibration
+            errors.append({"instance_id": iid, "error": f"{type(e).__name__}: {e}"})
+            continue
+        human, model = human_score >= 2, score >= 2
+        per.append({"instance_id": iid, "human": human_score, "model": score})
         tp += human and model
         fp += (not human) and model
         tn += (not human) and (not model)
         fn += human and (not model)
     total = max(1, tp + fp + tn + fn)
-    return {"n": len(ids), "agreement": (tp + tn) / total, "precision": tp / max(1, tp + fp), "recall": tp / max(1, tp + fn),
+    return {"n": len(per), "n_requested": len(ids), "n_judged": len(per), "n_errored": len(errors),
+            "agreement": (tp + tn) / total, "precision": tp / max(1, tp + fp), "recall": tp / max(1, tp + fn),
             "confusion": {"tp": tp, "fp": fp, "tn": tn, "fn": fn}, "model_id": model_id, "prompt_version": JUDGE_PROMPT_VERSION,
-            "per_instance": per}
+            "per_instance": per, "errors": errors}

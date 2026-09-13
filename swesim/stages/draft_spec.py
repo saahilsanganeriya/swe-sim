@@ -477,8 +477,10 @@ def _author(row: dict, judged: dict, model_id: str, extra_facts: list[dict] | No
     on-request facts without tests to the FAIL_TO_PASS tests sharing content words with them (`auto_link_tests`), then fail.
     Returns (draft dict, ids of auto-linked facts)."""
     f2p = list(row.get("fail_to_pass") or [])
-    user = ("FAIL_TO_PASS ids (every on-request fact must carry `tests` drawn from this list): " + json.dumps(f2p) + "\n\n"
-            + json.dumps({"candidate": llm_view(row), "judge": judged}, ensure_ascii=False))
+    prefix = "FAIL_TO_PASS ids (every on-request fact must carry `tests` drawn from this list): " + json.dumps(f2p) + "\n\n"
+    judged_json = json.dumps(judged, ensure_ascii=False)
+    view = llm_view(row, budget=CONTEXT_BUDGET_CHARS, extra_chars=len(prefix) + len(judged_json) + len('{"candidate": , "judge": }'))
+    user = prefix + json.dumps({"candidate": view, "judge": judged}, ensure_ascii=False)
     if len(user) > CONTEXT_BUDGET_CHARS:
         raise ValueError("candidate exceeds authoring context budget")
     messages = [{"role": "user", "content": user}]
