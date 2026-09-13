@@ -137,6 +137,17 @@ def _valid(out) -> bool:
     return isinstance(out, dict) and isinstance(out.get("reply"), str) and bool(out["reply"].strip())
 
 
+def _sum_usage(parts: list) -> dict | None:
+    """Sum of the `usage` dicts the model calls of one exchange returned; None unless every call reported one."""
+    if not parts or any(not isinstance(p, dict) for p in parts):
+        return None
+    from swesim.costs import Usage
+    total = Usage()
+    for p in parts:
+        total = total + Usage.model_validate(p)
+    return total.model_dump(mode="json")
+
+
 @dataclass
 class Reply:
     reply: str
@@ -149,6 +160,7 @@ class Reply:
     redaction_count: int = 0
     regenerated: bool = False
     withheld_sentences: list = field(default_factory=list)
+    usage: dict | None = None                               # costs.Usage as JSON, summed over the exchange's model calls; None when unknown
 
     def public(self) -> dict:
         """What the agent sees: the text and remaining availability. Fact annotations, the tool audit, redaction details
@@ -220,16 +232,19 @@ class Session:
         agent_options = option_markers(content)
         out = await asyncio.to_thread(llm, system_prompt(self.view, persona, patience, mode), messages, REPLY_SCHEMA)
         if not _valid(out): raise ValueError("empty stakeholder reply")
+        usages = [out.get("usage")]
         hits = self._hits(out["reply"], agent_options); regenerated = False
         if hits:
+            usages.append(None)  # a failed or malformed second response leaves its billed usage unknown
             try:                                                        # one stricter attempt; the first draft stays the fallback
                 again = await asyncio.to_thread(llm, system_prompt(self.view, persona, patience, mode, strict=True), messages, REPLY_SCHEMA)
+                if isinstance(again, dict): usages[-1] = again.get("usage")
                 if _valid(again): out, regenerated = again, True; hits = self._hits(out["reply"], agent_options)
             except Exception: pass
         withheld: list[str] = []
         if hits:
             text, withheld = redact(out["reply"], hits); out = {**out, "reply": text}
-        return out, hits, regenerated, withheld
+        return {**out, "usage": _sum_usage(usages)}, hits, regenerated, withheld
 
     # -- exchanges ------------------------------------------------------------------------------------------
     async def _exchange(self, rid: str, kind: str, content: str, cost: int, llm, fingerprint: str, sha=None, calls=None) -> Reply:
@@ -252,14 +267,14 @@ class Session:
                 ids: list[str] = []
                 for i in (raw_ids if isinstance(raw_ids, list) else []):
                     if isinstance(i, str) and i in allowed and i not in ids: ids.append(i)
-                reply = Reply(out["reply"], ids, self.remaining, tier, calls, sha, hits, len(withheld), regenerated, withheld)
+                reply = Reply(out["reply"], ids, self.remaining, tier, calls, sha, hits, len(withheld), regenerated, withheld, out.get("usage"))
             user_extra = {"reviewed_diff_sha256": sha} if kind == "review" else {}
             self._record("message", role="user", actor="coding-agent", content=content, request_id=rid, exchange=kind, **user_extra)
             self._record("message", role="assistant", actor="stakeholder", content=reply.reply, request_id=rid, exchange=kind,
                          disclosed_fact_ids=reply.disclosed_fact_ids, tier=reply.tier, patience_remaining=reply.patience_remaining,
                          tool_calls=calls, reviewed_diff_sha256=sha, delivery="generated",
                          redacted_terms=reply.redacted_terms, redaction_count=reply.redaction_count, regenerated=reply.regenerated,
-                         withheld_sentences=reply.withheld_sentences)
+                         withheld_sentences=reply.withheld_sentences, usage=reply.usage)
             self.cache[rid] = {"fingerprint": fingerprint, "reply": asdict(reply)}
             return reply
 

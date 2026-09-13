@@ -384,6 +384,46 @@ def test_confirm_rejects_code_looking_descriptions_without_spending():
     ok = asyncio.run(s.confirm("c2", prose[1], llm)); assert ok.reply == CLEAN and s.remaining == 2
 
 
+def test_usage_is_summed_over_the_exchange_and_stays_evaluator_only():
+    """C3: the service's call_llm returns `usage`; the session keeps the sum over regeneration attempts on the Reply and the
+    transcript event, never in the public shape."""
+    class UsageLLM(SeqLLM):
+        def __call__(self, system, messages, schema):
+            out = super().__call__(system, messages, schema)
+            return {**out, "usage": {"input_tokens": 100, "output_tokens": 20, "cached_tokens": None, "calls": 1, "reported_cost_usd": None,
+                                     "reported_cost_source": None, "agent_reported_cost_usd": None}}
+    s = Session("t1", VIEW_F, cfg(start=6, terse_below=0))
+    r = asyncio.run(s.ask("q1", "Anything else?", UsageLLM(LEAK, CLEAN)))          # leak -> regenerated: two calls billed
+    assert r.regenerated is True and r.usage["calls"] == 2 and r.usage["input_tokens"] == 200 and r.usage["output_tokens"] == 40
+    assert "usage" not in r.public()
+    ev = [e for e in s.events if e["kind"] == "message" and e["role"] == "assistant"][0]
+    assert ev["usage"] == r.usage
+    r2 = asyncio.run(s.ask("q2", "And?", UsageLLM(CLEAN))); assert r2.usage["calls"] == 1
+    r3 = asyncio.run(Session("t2", VIEW, cfg()).ask("q1", "x", FakeLLM()))          # a model adapter without usage: unknown, not zero
+    assert r3.usage is None and Reply(**asdict_roundtrip(r3)).usage is None
+
+
+def asdict_roundtrip(reply):
+    import dataclasses
+    return json.loads(json.dumps(dataclasses.asdict(reply)))
+
+
+@pytest.mark.parametrize("retry", [None, RuntimeError("provider unavailable")])
+def test_regeneration_without_usage_does_not_report_a_partial_total(retry):
+    calls = []
+
+    def llm(system, messages, schema):
+        calls.append(system)
+        if len(calls) == 1:
+            return {"reply": LEAK, "usage": {"input_tokens": 100, "output_tokens": 10, "calls": 1}}
+        if isinstance(retry, Exception):
+            raise retry
+        return retry
+
+    reply = asyncio.run(Session("t1", VIEW_F, cfg()).ask("q", "Anything else?", llm))
+    assert len(calls) == 2 and reply.usage is None
+
+
 def test_identifier_hits_do_not_depend_on_option_letters():
     """A-P1-4: naming a hidden-asset identifier is redacted whether or not the agent's request offered lettered options."""
     view = {**VIEW, "forbidden_terms": ["IntervalProperty", "ContinuousBase"]}

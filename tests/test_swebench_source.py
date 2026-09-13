@@ -1184,6 +1184,7 @@ def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
     meta = json.loads((tmp_path / "s" / "draft.meta.json").read_text())
     assert meta["controls"]["plausible_wrong"] == {"name": "keyerror", "label": "keyerror", "rationale": "wrong exception type", "method": "difflib", "verified": True}
     assert meta["controls_dropped"] == [] and meta["controls_fallback"] == {} and meta["oracle_apply"]["verified"] is True and meta["oracle_apply"]["base_files_fetched"] == ["xarray/core/weighted.py"]
+    assert any(a["control"] == "plausible_wrong" and a["phase"] == "correction" for a in meta["control_attempts"])
     # still corrupt after the correction round: plausible-wrong is replaced by a REAL incorrect change (an inverted comparison
     # in the gold's first code chunk), a corrupt alternative-correct is dropped
     gold_two = ("diff --git a/xarray/core/weighted.py b/xarray/core/weighted.py\n--- a/xarray/core/weighted.py\n+++ b/xarray/core/weighted.py\n"
@@ -1195,7 +1196,7 @@ def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
     meta = json.loads((tmp_path / "s2" / "draft.meta.json").read_text())
     assert spec.controls.plausible_wrong[0].name == "fallback-inverted-comparison" and spec.controls.alternative_correct == []
     assert meta["controls_fallback"] == {"plausible_wrong": "fallback-inverted-comparison"}
-    assert [(x["control"], x["method"]) for x in meta["controls_dropped"]] == [("plausible_wrong", "model-diff"), ("alternative_correct", "model-diff")]
+    assert [(x["control"], x["method"]) for x in meta["controls_dropped"]] == [("plausible_wrong", "model-diff"), ("alternative_correct", "model-diff")] * 2
     fallback_diff = (tmp_path / "s2" / "assets" / "plausible-wrong.diff").read_text()
     assert "+if dim != 'z':" in fallback_diff and "+    raise ValueError(dim)" in fallback_diff and draft_spec.verify_diff_applies(base, fallback_diff) == (True, "")
     # no comparison to invert: one added code line is dropped, the emptied hunk removed and the following hunk re-based
@@ -1213,12 +1214,9 @@ def test_control_patches_are_verified_at_draft_time(monkeypatch, tmp_path):
     # a fetch-bound (unfetched) file: the model control is dropped with the reason, never turned into a bogus new-file diff
     monkeypatch.setattr(draft_spec, "MAX_BASE_FILES", 0)
     outputs = iter([second, second]); calls.clear()
-    p = draft_spec.draft(_row(patch=gold_two), _judged(), "fake/model", tmp_path / "s5")
-    meta = json.loads((tmp_path / "s5" / "draft.meta.json").read_text())
-    assert meta["controls_dropped"][0]["control"] == "plausible_wrong" and "could not be fetched" in meta["controls_dropped"][0]["reason"]
-    assert meta["controls_fallback"] == {"plausible_wrong": "fallback-inverted-comparison"} and meta["oracle_apply"]["verified"] is None
-    assert meta["controls"]["plausible_wrong"]["verified"] is None                                   # honest: the fallback could not be checked either
-    assert "new file mode" not in (tmp_path / "s5" / "assets" / "plausible-wrong.diff").read_text()
+    with pytest.raises(ValueError, match="no usable plausible-wrong control"):
+        draft_spec.draft(_row(patch=gold_two), _judged(), "fake/model", tmp_path / "s5")
+    assert not (tmp_path / "s5" / "scenario.draft.json").exists()
     monkeypatch.setattr(draft_spec, "MAX_BASE_FILES", 8)
     # an oracle that does not apply to its base is a drafter error, not a correction
     outputs = iter([_draft_llm(), _draft_llm()])
@@ -1815,6 +1813,52 @@ def test_requirement_of_a_demoted_fact_is_rewritten_from_the_thread_or_dropped()
     log = []
     draft_spec.ledger_violations(d, row, demote_unsafe=True, filter_log=log)
     assert d["requirements"] == [] and ("r01", "dropped") in {(x.get("requirement_id"), x["action"]) for x in log if "requirement_id" in x}
+
+
+def test_draft_records_withholder_and_drafter_usage(monkeypatch, tmp_path):
+    """C3: every chat_json call's usage (llm.note_usage / take_last_usage) is summed per role, written to draft.meta.json and,
+    when the caller passes a layout and workflow id, recorded through costs.record_cost under costs/<workflow_id>.json."""
+    from swesim import costs, llm
+    from swesim.paths import Workspace
+    from swesim.stages import draft_spec
+    draft_out, withhold_out = _draft_llm(), _withhold_llm()
+
+    def fake_chat(model_id, system, messages, schema, **kw):
+        llm.note_usage(costs.Usage(input_tokens=100, output_tokens=10, calls=1))
+        return withhold_out if WITHHOLD_PROMPT_MARK in system else draft_out
+    monkeypatch.setattr(draft_spec, "chat_json", fake_chat)
+    monkeypatch.setattr(threads, "base_text", _fake_base_text)
+    ws = Workspace(tmp_path / "ws")
+    draft_spec.draft(_row(), _judged(), "anthropic/claude-sonnet-5", ws.scenario_dir("pydata--xarray-5362"), layout=ws.layout, workflow_id="wf-draft-1")
+    meta = json.loads((ws.scenario_dir("pydata--xarray-5362") / "draft.meta.json").read_text())
+    assert meta["usage"]["withholder"]["input_tokens"] == 100 and meta["usage"]["withholder"]["calls"] == 1
+    assert meta["usage"]["drafter"]["input_tokens"] == 100 and meta["usage"]["recorded"] is True and meta["usage"]["workflow_id"] == "wf-draft-1"
+    rows = costs.read_costs(ws.root / "costs" / "wf-draft-1.json")
+    assert sorted(r.role for r in rows) == ["drafter", "withholder"] and all(r.model == "anthropic/claude-sonnet-5" and r.trial_id is None and r.input_tokens == 100 for r in rows)
+    assert all(r.usd is not None for r in rows)                                                     # a priced model id
+    # a second draft of the same workflow is a no-op for the ledger (dedupe on tokens), and no layout means: written to meta only
+    draft_spec.draft(_row(), _judged(), "anthropic/claude-sonnet-5", ws.scenario_dir("pydata--xarray-5362"), layout=ws.layout, workflow_id="wf-draft-1")
+    assert len(costs.read_costs(ws.root / "costs" / "wf-draft-1.json")) == 2
+    draft_spec.draft(_row(), _judged(), "anthropic/claude-sonnet-5", tmp_path / "plain")
+    meta = json.loads((tmp_path / "plain" / "draft.meta.json").read_text())
+    assert meta["usage"]["recorded"] is False and meta["usage"]["drafter"]["output_tokens"] == 10
+    # a fake without usage (every other test here) leaves usage unknown, never zero
+    _patch_llm(monkeypatch, _draft_llm(), _withhold_llm())
+    draft_spec.draft(_row(), _judged(), "fake/model", tmp_path / "nousage", layout=ws.layout, workflow_id="wf-2")
+    meta = json.loads((tmp_path / "nousage" / "draft.meta.json").read_text())
+    assert meta["usage"] == {"withholder": None, "drafter": None, "recorded": False, "workflow_id": "wf-2"} and not (ws.root / "costs" / "wf-2.json").exists()
+    # two withholder calls (nudge) are summed
+    calls = {"n": 0}
+
+    def two_calls(model_id, system, messages, schema, **kw):
+        llm.note_usage(costs.Usage(input_tokens=7, output_tokens=3, calls=1))
+        if WITHHOLD_PROMPT_MARK in system:
+            calls["n"] += 1
+            return {"removed": []} if calls["n"] == 1 else _withhold_llm()
+        return draft_out
+    monkeypatch.setattr(draft_spec, "chat_json", two_calls)
+    res = draft_spec.withhold("Title\n```python\nx = 1\n```\n" + ISSUE, "fake/model")
+    assert res["usage"]["calls"] == 2 and res["usage"]["input_tokens"] == 14
 
 
 def test_draft_never_writes_an_ungrounded_or_unsafe_requirement(monkeypatch, tmp_path):

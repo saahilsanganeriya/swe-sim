@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import stat
+import tomllib
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -20,7 +21,8 @@ from urllib.parse import urlparse
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from swesim.models import Discovery, RunConfig, ScenarioSpec
-from swesim.paths import Workspace
+from swesim.paths import Workspace, atomic_json
+from swesim.roles import PROVIDERS
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 # Owned by the verifier and stakeholder streams; tests monkeypatch these to placeholder trees.
@@ -28,7 +30,8 @@ VERIFIER_SRC = Path(__file__).resolve().parent.parent / "verifier"
 SHIMS = Path(__file__).resolve().parent.parent / "stakeholder" / "shims"
 VERIFIER_FILES = ("grader.py", "policy.py", "parsers.py", "run_pytest.py")
 SHIM_FILES = ("ask-user", "confirm-behavior", "request-review")
-MODEL_HOSTS = {"anthropic": ["api.anthropic.com"], "openai": ["api.openai.com"]}
+# Provider API hosts the sandbox allowlist carries, from the one provider table (`swesim.roles.PROVIDERS`: anthropic, openai, openrouter).
+MODEL_HOSTS = {name: [p.host] for name, p in PROVIDERS.items()}
 AGENT_PYTHON = "3.12"  # Harbor's mini-swe-agent adapter pin (_MINI_SWE_AGENT_PYTHON_VERSION)
 CONDITIONS = ("full", "hidden", "interactive")
 VERIFIER_TIMEOUT_SEC = 1800.0
@@ -195,15 +198,67 @@ def _digest_tree(paths) -> dict[str, str]:
     return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(paths) if p.is_file()}
 
 
-def compiled_hash(spec: ScenarioSpec, image_digest: str | None, agent_version: str | None) -> str:
-    """Content hash of everything that shapes the graded environment: spec, base image, pre-baked agent toolchain,
-    templates, verifier, shims. Two task trees with the same hash build the same images."""
-    inputs = {"spec_hash": spec.spec_hash, "image_digest": image_digest,
+def _compiler_inputs(spec: ScenarioSpec, image_digest: str | None, agent_version: str | None) -> dict:
+    return {"spec_hash": spec.spec_hash, "image_digest": image_digest,
               "agent_version": agent_version, "agent_python": AGENT_PYTHON,
               "templates": _digest_tree(TEMPLATES.iterdir()),
               "verifier": _digest_tree(VERIFIER_SRC / f for f in VERIFIER_FILES),
               "shims": _digest_tree(SHIMS / f for f in SHIM_FILES)}
-    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def _canonical(data: dict) -> bytes:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _build_hash(inputs: dict, config: dict, manifest: dict) -> str:
+    return hashlib.sha256(_canonical({"compiler_inputs": inputs, "compile_config": config, "rendered_manifest": manifest})).hexdigest()
+
+
+def compiled_hash(spec: ScenarioSpec, image_digest: str | None, agent_version: str | None, *,
+                  compile_config: dict, rendered_manifest: dict) -> str:
+    """Bind compiler sources, canonical render configuration, and every rendered file's content and permissions."""
+    return _build_hash(_compiler_inputs(spec, image_digest, agent_version), compile_config, rendered_manifest)
+
+
+def rendered_manifest(task_dir: Path) -> dict:
+    """File digests and modes; normalize only the embedded build hash to avoid a self-reference."""
+    manifest = {}
+    for path in sorted(task_dir.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"compiled task contains a symlink: {path.relative_to(task_dir)}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(f"compiled task contains a non-file: {path.relative_to(task_dir)}")
+        rel = path.relative_to(task_dir).as_posix()
+        data = path.read_bytes()
+        if rel == "task.toml":
+            parsed = tomllib.loads(data.decode())
+            parsed["metadata"]["compiled_hash"] = ""
+            data = _canonical(parsed)
+        manifest[rel] = {"sha256": hashlib.sha256(data).hexdigest(), "mode": stat.S_IMODE(path.stat().st_mode)}
+    return manifest
+
+
+def verify_compiled_artifacts(task_dir: Path, record: dict, condition: str) -> None:
+    """Reject legacy, incomplete or changed compiled inputs before a trial or validation uses them."""
+    required = ("compiler_inputs", "compile_config", "rendered_manifest")
+    if any(not isinstance(record.get(key), dict) for key in required):
+        raise ValueError("compiled inputs lack a bound manifest; recompile and revalidate")
+    try:
+        expected = _build_hash(*(record[key] for key in required))
+        if record.get("compiled_hash") != expected or record.get("spec_hash") != record["compiler_inputs"].get("spec_hash"):
+            raise ValueError("compiled record hash mismatch; recompile and revalidate")
+        if condition not in record["rendered_manifest"] or not task_dir.is_dir() or task_dir.is_symlink():
+            raise ValueError("compiled condition is missing; recompile and revalidate")
+        actual = rendered_manifest(task_dir)
+        if actual != record["rendered_manifest"][condition]:
+            raise ValueError("compiled file manifest mismatch; recompile and revalidate")
+        metadata = tomllib.loads((task_dir / "task.toml").read_text())["metadata"]
+        if metadata.get("compiled_hash") != expected:
+            raise ValueError("compiled task metadata hash mismatch; recompile and revalidate")
+    except (OSError, KeyError, TypeError, UnicodeError) as exc:
+        raise ValueError("compiled inputs cannot be verified; recompile and revalidate") from exc
 
 
 def _collect_command(spec: ScenarioSpec, stakeholder_url: str) -> str:
@@ -242,7 +297,14 @@ def compile_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, s
     submodules = _submodules_record(spec, sdir)
     hosts = _hosts(run_config, stakeholder_url)
     natural, selected = _select_briefs(spec, run_config)
-    chash = compiled_hash(spec, digest, run_config.agent_version)
+    # Render with a fixed placeholder, hash the resulting tree, then fill only the self-referential metadata field.
+    chash = "0" * 64
+    compile_config = {"run_config": run_config.model_dump(mode="json"), "stakeholder_url": stakeholder_url,
+                      "agent_hosts": hosts, "brief_profile": selected.profile, "base_stage": base_stage,
+                      "grader_config": _grader_config(spec), "submodule_guard": SUBMODULE_GUARD,
+                      "verifier_timeout_sec": VERIFIER_TIMEOUT_SEC, "collect_timeout_sec": COLLECT_TIMEOUT_SEC,
+                      "artifacts_dir": ARTIFACTS_DIR, "trial_id": trial_id,
+                      "session_token_sha256": hashlib.sha256(session_token.encode()).hexdigest() if session_token else None}
     env = Environment(loader=FileSystemLoader(str(TEMPLATES)), keep_trailing_newline=True, trim_blocks=True, lstrip_blocks=True, undefined=StrictUndefined)
     repo_dir = spec.environment.repo_dir
     out: dict[str, Path] = {}
@@ -284,8 +346,15 @@ def compile_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, s
         shutil.copyfile(sdir / spec.assets[spec.controls.oracle].path, tdir / "solution" / "oracle.diff")
         for c in controls: shutil.copyfile(sdir / spec.assets[c.asset].path, tdir / "controls" / f"{c.name}.diff")
         out[condition] = tdir
+    manifest = {condition: rendered_manifest(task) for condition, task in out.items()}
+    inputs = _compiler_inputs(spec, digest, run_config.agent_version)
+    chash = _build_hash(inputs, compile_config, manifest)
+    for task in out.values():
+        path = task / "task.toml"
+        path.write_text(path.read_text().replace('compiled_hash = "' + "0" * 64 + '"', f'compiled_hash = "{chash}"', 1))
     cj = sdir / "compile.json"
-    cj.write_text(json.dumps({"compiled_hash": chash, "spec_hash": spec.spec_hash, "run_config_hash": run_config.run_config_hash,
+    atomic_json(cj, {"compiled_hash": chash, "spec_hash": spec.spec_hash, "run_config_hash": run_config.run_config_hash,
                               "image_digest": digest, "brief_profile": selected.profile, "agent_hosts": hosts, "submodules": submodules,
-                              "task_dirs": {k: str(v) for k, v in out.items()}}, indent=2))
+                              "compiler_inputs": inputs, "compile_config": compile_config, "rendered_manifest": manifest,
+                              "task_dirs": {k: str(v) for k, v in out.items()}})
     return CompileResult(out, digest, cj)

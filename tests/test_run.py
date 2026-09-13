@@ -103,6 +103,8 @@ def scene(tmp_path, monkeypatch):
         (tdir / "instruction.natural.md").write_text(f"INSTRUCTION {cond} natural")   # compile-time per-profile render
         if cond == "interactive": (tdir / "agent_config.yaml").write_bytes(scaffold.read_bytes())  # compile-time scaffold copy
     calls = {"post": [], "get": [], "run": []}
+    # This fixture supplies placeholder compiled files. The real compiler/manifest boundary is covered below and in test_compile.
+    monkeypatch.setattr(run, "verify_compiled_artifacts", lambda task, record, condition: None)
     H = "a" * 64
     state = {"transcript_hash": H, "frozen": True, "report": {"transcript_hash": H, "patch_sha256": "p"}, "exception": None, "trajectory": None}
 
@@ -134,6 +136,15 @@ def scene(tmp_path, monkeypatch):
     monkeypatch.setattr(harbor_cli, "run_task", fake_run)
     monkeypatch.setattr(run, "has_secret", lambda name, settings=None: True)   # every provider key present unless a test says otherwise
     return ws, spec, calls, state
+
+
+def test_run_rejects_unbound_compile_before_creating_a_session(scene, monkeypatch):
+    from swesim.stages.compile import verify_compiled_artifacts
+    monkeypatch.setattr(run, "verify_compiled_artifacts", verify_compiled_artifacts)
+    ws, spec, calls, _ = scene
+    with pytest.raises(ValueError, match="recompile"):
+        run_trial(ws, spec, RunConfig(condition="interactive", model="openai/gpt-5.5"), 0, URL, "secret")
+    assert calls == {"post": [], "get": [], "run": []}
 
 
 def test_run_trial_interactive_end_to_end(scene):

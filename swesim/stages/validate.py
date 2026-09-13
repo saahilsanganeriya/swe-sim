@@ -13,7 +13,7 @@ from pathlib import Path
 from swesim import harbor_cli
 from swesim.models import ControlPatch, RunConfig, ScenarioSpec
 from swesim.paths import Workspace
-from swesim.stages.compile import compile_scenario
+from swesim.stages.compile import compile_scenario, verify_compiled_artifacts
 
 PATCH_AGENT = "swesim.agents.patch_agent:PatchAgent"
 OUTCOME_NAMES = {1: "valid-correct", 2: "valid-incorrect", 3: "agent-invalid-submission", 4: "agent-runtime-failure",
@@ -135,7 +135,8 @@ def validate_scenario(ws: Workspace, spec: ScenarioSpec, run_config: RunConfig, 
     from swesim.agents.patch_agent import parse_probe_output  # harbor import kept off the module path
 
     sdir = ws.scenario_dir(spec.id); comp = compile_scenario(ws, spec, run_config, stakeholder_url)
-    task = comp.task_dirs["full"]; chash = json.loads(comp.compile_json.read_text())["compiled_hash"]
+    task = comp.task_dirs["full"]; compile_record = json.loads(comp.compile_json.read_text()); chash = compile_record["compiled_hash"]
+    verify_compiled_artifacts(task, compile_record, "full")
     jobs = ws.jobs_dir / "validate" / spec.id / chash[:16]
     results: dict[str, dict] = {}; trial_dirs: dict[str, str] = {}; failures: list[str] = []
     expected = {"nop": {"reward": 0}, "oracle": {"success": 1, "reward": 1}}

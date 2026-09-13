@@ -104,9 +104,10 @@ def write_trial(ws: Workspace, spec: ScenarioSpec, *, condition: str = "interact
                 purpose: str = "calibration", attempt: int = 0, outcome_code: int = 1, success: int = 1,
                 reward: float = 1.0, events: list[dict] | None = None, traj: bool = True, shape: str = "flat",
                 brief_profile: str = "withheld", label: dict | None = None, status: str = "completed",
-                harbor_exception: str | None = None, trajectory: dict | None = None) -> str:
+                harbor_exception: str | None = None, trajectory: dict | None = None, agent_config: str = "",
+                agent_config_sha256: str | None = None) -> str:
     rc = RunConfig(condition=condition, model=model, purpose=purpose, compiled_hash=COMPILED,
-                   brief_profile="natural" if condition == "full" else brief_profile)
+                   brief_profile="natural" if condition == "full" else brief_profile, agent_config=agent_config)
     tid = trial_id(spec.spec_hash, rc.condition, rc.run_config_hash, attempt)
     tdir = ws.root / "trials" / tid
     (tdir / "task").mkdir(parents=True)
@@ -129,7 +130,7 @@ def write_trial(ws: Workspace, spec: ScenarioSpec, *, condition: str = "interact
               "transcript_hash": "h" * 64 if interactive else None, "reviewed_diff_sha256": None,
               "integrity_signals": [], "dropped_paths": [], "reviewed_equals_submitted": None,
               "image_digest": IMAGE, "simulator_validity": "unadjudicated" if interactive else "n/a",
-              "harbor_exception": harbor_exception}
+              "harbor_exception": harbor_exception, "agent_config_sha256": agent_config_sha256}
     if interactive:
         report["transcript_binding_valid"] = True
     transcript = ({"trial_id": tid, "events": events, "patience_start": 6, "patience_end": 6 - asks - 2 * reviews,
@@ -286,6 +287,66 @@ def test_summarize_never_pools_purposes_or_configs():
     assert summarize([], k=3) == {}
 
 
+def test_summarize_never_pools_scaffold_and_default_agent_trials():
+    """B-P2-5: legacy records whose run_config predates `agent_config` still prove their scaffold through
+    report.agent_config_sha256; the group is derived from that, so one legacy and one scaffold trial are two groups."""
+    import hashlib
+    from swesim.stages.score import effective_run_config_hash, scaffold_identity
+    sha = hashlib.sha256(b"scaffold").hexdigest()
+    base_rc = RunConfig(condition="interactive", model=HAIKU, purpose="calibration", compiled_hash=COMPILED, brief_profile="withheld")
+    legacy = {"condition": "interactive", "brief_profile": "withheld", "run_config_hash": base_rc.run_config_hash, "model": HAIKU, "purpose": "calibration",
+              "run_config": base_rc.model_dump(mode="json"), "reward": {"success": 1, "reward": 1.0, "outcome_code": 1}, "transcript": {}, "report": {}}
+    plain = {**legacy, "trial_id": "a" * 24}
+    with_scaffold = {**legacy, "trial_id": "b" * 24, "report": {"agent_config_sha256": sha}}
+    assert scaffold_identity(plain) == "" and scaffold_identity(with_scaffold) == "mini-swe-agent.interactive:" + sha[:16]
+    derived = RunConfig.model_validate({**base_rc.model_dump(), "agent_config": "mini-swe-agent.interactive:" + sha[:16]}).run_config_hash
+    assert effective_run_config_hash(plain) == (base_rc.run_config_hash, False) and effective_run_config_hash(with_scaffold) == (derived, True)
+    out = summarize([plain, with_scaffold], k=1)
+    assert set(out) == {f"interactive|withheld|{base_rc.run_config_hash}", f"interactive|withheld|{derived}"}
+    g0, g1 = out[f"interactive|withheld|{base_rc.run_config_hash}"], out[f"interactive|withheld|{derived}"]
+    assert g0["trial_ids"] == ["a" * 24] and g0["scaffold"] is None and g0["regrouped_trials"] == [] and g0["n"] == 1
+    assert g1["trial_ids"] == ["b" * 24] and g1["scaffold"] == "mini-swe-agent.interactive:" + sha[:16] and g1["regrouped_trials"] == ["b" * 24]
+    assert g1["recorded_run_config_hashes"] == [base_rc.run_config_hash] and g1["run_config_hash"] == derived
+    # a new-style record that recorded the scaffold in run_config lands in the same group as the regrouped legacy one
+    new_rc = RunConfig.model_validate({**base_rc.model_dump(), "agent_config": "mini-swe-agent.interactive:" + sha[:16]})
+    new = {**legacy, "trial_id": "c" * 24, "run_config_hash": new_rc.run_config_hash, "run_config": new_rc.model_dump(mode="json"), "report": {"agent_config_sha256": sha}}
+    out = summarize([plain, with_scaffold, new], k=2)
+    g1 = out[f"interactive|withheld|{derived}"]
+    assert g1["trial_ids"] == ["b" * 24, "c" * 24] and g1["regrouped_trials"] == ["b" * 24] and g1["n"] == 2 and g1["pass_at_k"] == 1.0
+    assert sorted(g1["recorded_run_config_hashes"]) == sorted({base_rc.run_config_hash, new_rc.run_config_hash})
+    # two records whose run_config claims one scaffold while the reports prove different ones never pool
+    other = {**new, "trial_id": "d" * 24, "report": {"agent_config_sha256": hashlib.sha256(b"other").hexdigest()}}
+    with pytest.raises(ValueError, match="pool"):
+        summarize([new, other], k=1)
+    # a record without any run_config cannot be regrouped and keeps its recorded hash
+    bare = {**legacy, "trial_id": "e" * 24, "report": {"agent_config_sha256": sha}}
+    bare.pop("run_config")
+    assert effective_run_config_hash(bare) == (base_rc.run_config_hash, False)
+
+
+def test_legacy_scaffold_trials_regroup_on_disk(tmp_path):
+    """The seaborn scores.json case: attempts 20/21 without the scaffold and 50/51 with it shared a group of n=4."""
+    import hashlib
+    spec = make_spec()
+    ws = make_workspace(tmp_path, spec)
+    sha = hashlib.sha256(b"scaffold").hexdigest()
+    ident = "mini-swe-agent.interactive:" + sha[:16]
+    plain = write_trial(ws, spec, attempt=20)
+    plain2 = write_trial(ws, spec, attempt=21, shape="nested")
+    legacy = write_trial(ws, spec, attempt=50, agent_config_sha256=sha)
+    new = write_trial(ws, spec, attempt=60, agent_config=ident, agent_config_sha256=sha)
+    scores = json.loads(score_scenario(ws, spec.id, k=3).read_text())
+    base = RunConfig(condition="interactive", model=HAIKU, purpose="calibration", compiled_hash=COMPILED, brief_profile="withheld")
+    scaffold = RunConfig.model_validate({**base.model_dump(), "agent_config": ident})
+    assert set(scores) == {f"interactive|withheld|{base.run_config_hash}", f"interactive|withheld|{scaffold.run_config_hash}"}
+    g0, g1 = scores[f"interactive|withheld|{base.run_config_hash}"], scores[f"interactive|withheld|{scaffold.run_config_hash}"]
+    assert g0["trial_ids"] == [plain, plain2] and g0["n"] == 2 and g0["pass_at_k"] is None and g0["scaffold"] is None
+    assert g1["trial_ids"] == [legacy, new] and g1["n"] == 2 and g1["pass_at_k"] is None and g1["scaffold"] == ident and g1["regrouped_trials"] == [legacy]
+    recs = {r["trial_id"]: r for r in load_trial_records(ws, spec.id)}
+    assert recs[legacy]["run_config_hash"] == base.run_config_hash                      # immutable trial identity is never rewritten
+    assert recs[legacy]["scaffold"] == ident and recs[plain]["scaffold"] == "" and recs[new]["scaffold"] == ident
+
+
 # ---------------------------------------------------------------- record normalisation and scoring on disk
 
 def test_normalize_record_accepts_flat_and_nested_dumps(tmp_path):
@@ -300,7 +361,7 @@ def test_normalize_record_accepts_flat_and_nested_dumps(tmp_path):
         assert r["scenario_id"] == spec.id and r["run_config_hash"] == rc.run_config_hash and r["model"] == HAIKU
         assert r["purpose"] == "calibration" and r["brief_profile"] == "withheld" and r["spec_hash"] == spec.spec_hash
         assert r["compiled_hash"] == COMPILED and r["reward"]["outcome_code"] == 1 and r["status_file"]["status"] == "finished"
-    assert normalize_record({"trial_id": "x", "condition": "full"}) == {"trial_id": "x", "condition": "full", "label": None}
+    assert normalize_record({"trial_id": "x", "condition": "full"}) == {"trial_id": "x", "condition": "full", "label": None, "scaffold": ""}
     other = make_spec("other-scenario")
     (ws.scenario_dir(other.id)).mkdir(parents=True)
     write_trial(ws, other, attempt=0)

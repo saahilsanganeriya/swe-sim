@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 from swesim.stakeholder import service
 from swesim.stakeholder.session import REFUSAL
 
+REAL_CALL_LLM = service.call_llm   # captured before any fixture stubs it
+
 VIEW = {"brief": "b", "facts": [{"id": "f01", "text": "x", "discovery": "on-request", "kind": "interface"}], "requirements": [],
         "persona": {"summary": "m", "tone": "t", "disclosure_style": "d", "role": "maintainer"}, "checks": []}
 CFG = {"model_id": "openai/gpt-5.5", "prompt_version": "v1", "temperature": 0.0,
@@ -304,6 +306,25 @@ def test_confirm_endpoint_costs_review_cost_and_is_filtered(svc, monkeypatch):
     r2 = c.post("/confirm", headers=h, json={"request_id": "c5", "description": "Also the other case still works."}).json()
     assert r2["patience_remaining"] == 0 and "tier" not in r2
     assert c.post("/confirm", headers=h, json={"request_id": "c6", "description": "more"}).json()["reply"] == REFUSAL
+
+
+def test_call_llm_returns_usage_that_reaches_the_transcript_only(svc, monkeypatch):
+    """C3: call_llm uses chat_json_with_usage; the usage lands on the assistant transcript event (evaluator-only, for the
+    stakeholder cost row) and never in the public reply."""
+    from swesim import costs, llm
+    seen = {}
+
+    def fake_chat(model_id, system, messages, schema, temperature=None, max_tokens=4000, **kw):
+        seen["model"] = model_id
+        return llm.ChatResult({"reply": "Yes.", "disclosed_fact_ids": []}, costs.Usage(input_tokens=321, output_tokens=12, calls=1))
+    monkeypatch.setattr(service, "chat_json_with_usage", fake_chat)
+    monkeypatch.setattr(service, "call_llm", REAL_CALL_LLM)                          # the fixture stubbed it; use the real adapter over the fake client
+    c = TestClient(service.app); w = {"X-Worker-Secret": "s3"}
+    tok = c.post("/sessions", headers=w, json=body()).json()["token"]; h = {"Authorization": f"Bearer {tok}"}
+    a = c.post("/ask", headers=h, json={"request_id": "1", "question": "ok?"}).json()
+    assert a == {"reply": "Yes.", "patience_remaining": 1} and seen["model"] == "openai/gpt-5.5"
+    ev = [e for e in c.get("/transcript/t1", headers=w).json()["events"] if e["kind"] == "message" and e["role"] == "assistant"][0]
+    assert ev["usage"]["input_tokens"] == 321 and ev["usage"]["output_tokens"] == 12 and ev["usage"]["calls"] == 1
 
 
 def test_confirm_endpoint_rejects_code_with_422_and_a_hint(svc, monkeypatch):
