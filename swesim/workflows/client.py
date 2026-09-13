@@ -124,6 +124,15 @@ async def cancel(workflow_id: str) -> None:
     await c.get_workflow_handle(workflow_id).cancel()
 
 
+async def open_types() -> list[dict]:
+    """Open executions per workflow type, `[{"type", "open_count"}]` sorted by type: the deploy path refuses to roll worker
+    pools while a type whose code changed has open executions and the change is not behind `workflow.patched`."""
+    c = await connect(); counts: dict[str, int] = {}
+    async for wf in c.list_workflows("ExecutionStatus = 'Running'"):
+        counts[wf.workflow_type] = counts.get(wf.workflow_type, 0) + 1
+    return [{"type": t, "open_count": n} for t, n in sorted(counts.items())]
+
+
 async def list_runs(kind: str = "all", limit: int = 50) -> list[dict]:
     """Recent workflows of one kind (create | candidate | run | pipeline | matrix | trial | all) with a params summary."""
     if kind != "all" and kind not in TYPES:

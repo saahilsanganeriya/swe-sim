@@ -11,13 +11,15 @@ Contract
 - Concurrency per queue is `Settings.max_concurrent_activities` when set, else `queues.CONCURRENCY[queue]`.
 - Configuration comes from `Settings` only; the startup line names the connection mode, the queues, the launcher and
   the worker image digest, never a secret. A pool that polls `swesim-trials` builds its launcher at startup so a
-  misconfigured launcher (no image, no service account) fails the deploy instead of the first trial.
+  misconfigured launcher (no image, no service account) fails the deploy instead of the first trial. The pool that
+  polls `swesim-control` runs the index migration at startup when the index is enabled.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import contextlib
+import logging
 import sys
 from typing import Callable
 
@@ -83,14 +85,38 @@ def build_workers(client: Client, settings: Settings) -> list[Worker]:
                    max_concurrent_activities=concurrency(settings, q)) for q in settings.task_queues]
 
 
+def configure_logging() -> None:
+    """INFO to stdout once per process (Cloud Logging reads the pool's stdout); a process that configured logging keeps its handlers."""
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+
+def migrate_index_if_enabled(settings: Settings) -> dict:
+    """The control pool runs the index migration at startup (`swesim.index.ensure_migrated`), so nobody reaches Cloud SQL from a
+    laptop. Skipped when the index is disabled or this worker does not poll the control queue; reported when the storage stream's
+    entry point is not merged yet."""
+    if not settings.index_enabled:
+        return {"migrated": False, "reason": "index disabled"}
+    if queues.CONTROL not in settings.task_queues:
+        return {"migrated": False, "reason": "not the control pool"}
+    try:
+        from swesim.index import ensure_migrated
+    except ImportError:
+        return {"migrated": False, "reason": "swesim.index.ensure_migrated is not available on this worker"}
+    ensure_migrated(settings)
+    return {"migrated": True}
+
+
 async def run_workers(client: Client, settings: Settings, stop: asyncio.Event | None = None) -> None:
     """Run one worker per configured queue until `stop` is set (forever when None)."""
+    configure_logging()
     A.configure(settings)
     if queues.TRIALS in settings.task_queues:
         A.launcher()  # fail closed now, not at the first trial
     if settings.trial_launcher != "systemd" and settings.trial_launcher != "cloudrun":
         print(f"WARNING: trial launcher {settings.trial_launcher!r} is for local smoke only; NOT production", file=sys.stderr, flush=True)
-    print(startup_line(settings), flush=True)
+    migration = await asyncio.to_thread(migrate_index_if_enabled, settings)
+    print(f"{startup_line(settings)} index_migration={migration}", flush=True)
     async with contextlib.AsyncExitStack() as stack:
         for worker in build_workers(client, settings):
             await stack.enter_async_context(worker)
