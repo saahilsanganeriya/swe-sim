@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import contextlib
 import inspect
-import os
 import re
 import shlex
 import time
@@ -22,6 +21,7 @@ from pathlib import Path
 
 from swesim.dashboard.data import ID_RE, read_json
 from swesim.paths import Workspace, atomic_json
+from swesim.settings import Settings
 
 GITHUB_REPO_RE = re.compile(r"^(?:https://github\.com/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 MODEL_RE = re.compile(r"^[a-z0-9-]+/[A-Za-z0-9._:-]+$")
@@ -29,13 +29,24 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+$")
 WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")  # `@` for rebuilt candidates: create:<sid>@v<n>
 CONDITIONS = ("full", "hidden", "interactive")
-PURPOSES = ("calibration", "comparison", "demonstration")
+PURPOSES = ("calibration", "comparison", "demonstration", "screen")  # screen = the difficulty screen run (brief §5)
 PROFILES = ("withheld", "natural")
 # Form values are the CreateTasksWorkflow's modes; the legacy PipelineWorkflow spells "hold" as "signal".
 APPROVAL_MODES = (("auto", "Auto-approve with morning review (default)"), ("hold", "Hold each task for my approval"))
 LEGACY_APPROVAL = {"auto": "auto", "hold": "signal"}
-SOLVER_TIERS = ("anthropic/claude-haiku-4-5-20251001", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "openai/gpt-5.5")
-STAKEHOLDER_DEFAULT = "openai/gpt-5.5"
+SOLVER_TIERS = ("anthropic/claude-haiku-4-5-20251001", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "openai/gpt-5.5")  # legacy picker; the run page uses render.TIERS
+
+
+def _stakeholder_default() -> str:
+    """The frozen default of ``StakeholderConfig.model_id`` (interfaces §7: anthropic/claude-opus-5 once the integrator lands it)."""
+    try:
+        from swesim.models import StakeholderConfig
+        return str(StakeholderConfig().model_id)
+    except Exception:  # noqa: BLE001 - models.py is the integrator's; a construction error must not break the console
+        return "anthropic/claude-opus-5"
+
+
+STAKEHOLDER_DEFAULT = _stakeholder_default()
 MAX_PARALLEL = 8
 CREATION_TYPES = ("CreateTasksWorkflow", "CandidateWorkflow", "PipelineWorkflow", "create", "candidate", "pipeline")
 OPEN_STATUSES = ("running", "open", "unknown", "continued_as_new")
@@ -73,11 +84,9 @@ def defaults() -> dict:
             "since": "2026-06-01", "max_candidates": 3, "limit": 5, "max_parallel": 1, "k": 3}
 
 
-def stakeholder_url() -> str:
-    """Server-side only; loaded from SWESIM_ENV_FILE, never rendered or echoed."""
-    from dotenv import load_dotenv
-    load_dotenv(os.environ.get("SWESIM_ENV_FILE", str(Path.home() / "Documents" / ".env")), override=False)
-    return os.environ.get("SWESIM_STAKEHOLDER_URL", "")
+def stakeholder_url(settings: Settings) -> str:
+    """Server-side only (``Settings.stakeholder_url``); passed to the workflow, never rendered or echoed."""
+    return settings.stakeholder_url or ""
 
 
 def _lines(value) -> list[str]:
@@ -187,11 +196,13 @@ def valid_registered(registry_path: Path) -> list[dict]:
             for sid, e in sorted(reg.items()) if isinstance(e, dict) and e.get("validation_status") == "valid"]
 
 
-def validate_run(body: dict, registry_path: Path) -> tuple[dict, list[str]]:
+def validate_run(body: dict, valid_ids: set[str] | Path) -> tuple[dict, list[str]]:
+    """``valid_ids``: the registered valid scenario ids (from the reader); a registry path is accepted for the CLI fallback."""
     d = defaults()
     errors: list[str] = []
     body = body if isinstance(body, dict) else {}
-    valid_ids = {s["id"] for s in valid_registered(registry_path)}
+    if isinstance(valid_ids, Path):
+        valid_ids = {s["id"] for s in valid_registered(valid_ids)}
     scenario_ids = _lines(body.get("scenario_ids"))
     if not scenario_ids:
         errors.append("select at least one registered, valid scenario")
@@ -213,7 +224,7 @@ def validate_run(body: dict, registry_path: Path) -> tuple[dict, list[str]]:
             errors.append(f"unknown condition {c!r}")
     purpose = str(body.get("purpose") or "comparison")
     if purpose not in PURPOSES:
-        errors.append("purpose must be calibration, comparison or demonstration")
+        errors.append("purpose must be calibration, comparison, demonstration or screen")
     profile = str(body.get("brief_profile") or "withheld")
     if profile not in PROFILES:
         errors.append("brief profile must be withheld or natural")
@@ -276,10 +287,10 @@ def _ids(result) -> list[str]:
     return [str(x) for x in result] if isinstance(result, (list, tuple)) else [str(result)]
 
 
-async def start_create(params: dict) -> dict:
+async def start_create(params: dict, settings: Settings) -> dict:
     """Prefer CreateTasksWorkflow (one workflow for every source); fall back to one PipelineWorkflow per repository."""
     cli = cli_for_create(params)
-    url = stakeholder_url()
+    url = stakeholder_url(settings)
     fn = client_fn("start_create")
     try:
         if fn is not None:
@@ -322,11 +333,11 @@ def planner_workspace(root: Path | None):
         activities.WS = previous
 
 
-async def start_run(params: dict, root: Path | None = None) -> dict:
+async def start_run(params: dict, settings: Settings, root: Path | None = None) -> dict:
     """Prefer RunTasksWorkflow (one workflow, bounded parallelism); fall back to one serial RunMatrixWorkflow per scenario,
     planned by the worker's own ``plan_trials`` so trial ids and score groups agree with the CLI."""
     cli = cli_for_run(params)
-    url = stakeholder_url()
+    url = stakeholder_url(settings)
     fn = client_fn("start_run")
     try:
         if fn is not None:
@@ -366,9 +377,29 @@ def normalize_job(raw: dict) -> dict:
     summary = raw.get("summary")
     if isinstance(summary, dict):
         summary = ", ".join(f"{k}={','.join(map(str, v)) if isinstance(v, (list, tuple)) else v}" for k, v in summary.items())
-    return {"workflow_id": wid, "type": _job_type(wid, raw), "status": str(raw.get("status") or "unknown").lower(),
+    return {"workflow_id": wid, "run_id": raw.get("run_id"), "type": _job_type(wid, raw), "status": str(raw.get("status") or "unknown").lower(),
             "started_at": raw.get("started_at") or raw.get("start_time"), "closed_at": raw.get("close_time"),
-            "summary": summary or raw.get("stage") or "", "scenario_id": raw.get("scenario_id")}
+            "summary": summary or raw.get("stage") or "", "params_summary": raw.get("summary") if isinstance(raw.get("summary"), dict) else {},
+            "scenario_id": raw.get("scenario_id"), "failure": raw.get("failure")}
+
+
+def validate_retry(body: dict, candidate: dict | None) -> tuple[dict, list[str]]:
+    """Retry a failed/rejected candidate: a creation job over that candidate's source only (SWE-bench: the instance id;
+    GitHub: its repository with max 1 candidate and the same PR band). Discovery re-runs; nothing is hand-edited."""
+    errors: list[str] = []
+    if not candidate:
+        return {}, ["candidate not found in the index"]
+    if candidate.get("source") == "swebench-annotated":
+        params, errs = validate_create({"source": "swebench-annotated", "instance_ids": [candidate["instance_id"]], "limit": 1,
+                                        "approval_mode": (body or {}).get("approval_mode") or "auto"})
+    else:
+        repo = candidate.get("repo") or ""
+        params, errs = validate_create({"source": "github-repo", "repos": [repo], "max_candidates": 1, "pr_kind": candidate.get("pr_kind") or "bugfix",
+                                        "since": (body or {}).get("since") or defaults()["since"], "approval_mode": (body or {}).get("approval_mode") or "auto",
+                                        "rebuild": bool(candidate.get("scenario_id"))})
+    errors.extend(errs)
+    params["retry_of"] = {"instance_id": candidate["instance_id"], "source_key": candidate["source_key"]}
+    return params, errors
 
 
 async def list_jobs() -> list[dict]:
