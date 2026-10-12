@@ -37,6 +37,11 @@ the ignored env file and the environment) and lists `files_changed`; the replace
 `manifest.path_rewrites` lists how absolute host paths were rewritten: to `runs/<trial_id>` or `task__<condition>`
 when the target is in the package, to a repo-relative `workspace/...` path when it is not.
 
+The stakeholder host in `compile.json` and the three `task.toml` files is the placeholder
+`example--swesim-stakeholder-web.modal.run`, not the deployment that ran these trials. The manifest digests cover
+the files as tracked. The recorded `compiled_hash` was computed over the deployed host, so recompiling with your own
+stakeholder URL gives a different hash.
+
 ## The included example: `mwaskom--seaborn-3190` (version 2)
 
 SWE-bench annotated instance `mwaskom__seaborn-3190` (boolean data in a continuous color scale), rebuilt as version 2 on
@@ -92,7 +97,7 @@ Read, in this order, then recompute; nothing here needs a network.
    ```bash
    uv run --frozen python -c "
    import json
-   run = 'examples/mwaskom--seaborn-3190/runs/24ce7fb7bef1fa33f394493f'
+   run = 'examples/mwaskom--seaborn-3190/runs/c1846a15feb5afc61bfdc76e'
    rec = json.load(open(run + '/record.json')); rep = json.load(open(run + '/report.json'))
    cfg = json.load(open('examples/mwaskom--seaborn-3190/task__%s/tests/grader_config.json' % rec['condition']))
    observed = {t['id']: t['observed'] for t in rep['per_test']}
@@ -129,7 +134,7 @@ collector receipt beside the tree hash. The run stage then fetches the transcrip
 ```bash
 uv run --frozen python -c "
 import hashlib, json
-run = 'examples/mwaskom--seaborn-3190/runs/24ce7fb7bef1fa33f394493f'
+run = 'examples/mwaskom--seaborn-3190/runs/c1846a15feb5afc61bfdc76e'
 t = json.load(open(run + '/transcript.json')); r = json.load(open(run + '/report.json'))
 h = hashlib.sha256(json.dumps(t['events'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 print(t['frozen'], h == t['transcript_hash'] == r['receipt']['transcript_hash'], r['transcript_binding_valid'])"
