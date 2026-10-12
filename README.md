@@ -1,39 +1,50 @@
-# swesim
+# swe-sim
 
-swesim turns underspecified GitHub issues into interactive software-engineering tasks. A coding agent can ask a simulated stakeholder about missing requirements, implement a patch, and receive a grade from hidden tests in a separate offline container. Asking changes the information available to the agent; it does not change the reward contract.
+swe-sim turns underspecified GitHub issues into graded tasks for coding agents. The agent gets the issue as its
+reporter wrote it and a simulated stakeholder it may ask about what is missing. It submits a patch, and hidden tests
+in a separate offline container grade it. Each task runs in three conditions against one frozen reward contract, so
+you can measure what asking is worth. A task enters the pool only after a set of executed controls shows its grader
+cannot be fooled by a no-op, a wrong patch or a tampered test run.
 
-Task creation and graded trials run through Temporal. The hosted implementation uses **Temporal Cloud, four Cloud Run worker pools, one Cloud Run Job per trial, a versioned GCS record, a rebuildable Cloud SQL index, and an IAP-protected console**. Harbor 0.23.0 builds and runs the agent and verifier environments on Modal; the stakeholder also runs on Modal. A laptop is an operator client.
+The Python package and the CLI are both named `swesim`.
 
-## Start here
+## The idea
 
-A stranger needs: a billing-enabled GCP project, a Temporal Cloud namespace with an API key, Modal, Anthropic/OpenAI/OpenRouter and GitHub credentials, and `git`, `uv`, Terraform, `gcloud`, `gh` on the laptop. Follow [cloud setup](docs/setup.md) step by step (seven steps, each with its check), then [the runbook](docs/runbook.md) for operations. Configuration lives in a git-ignored `./.env` (or the file named by `SWESIM_ENV_FILE`) generated from `.env.example`, which explains every variable. Local Docker is not required.
+Many SWE-bench issues are underspecified: the information that settled them is in the discussion thread and the
+fix, not in the issue. swe-sim keeps the issue as the brief. It moves the missing information into a ledger of
+facts, each quoted from the thread or the fix, and gives the stakeholder those facts. The stakeholder speaks as the
+reporter. It describes the behaviour wanted and observed, and never the tests, the oracle or which of the agent's
+options to pick.
 
-```bash
-uv sync --extra dev --frozen
-uv run --frozen --offline python -m pytest -q tests --ignore=tests/integration
-uv run --frozen swesim --help
-```
+| Condition | What the agent sees |
+|---|---|
+| `full` | The natural brief plus every stakeholder-visible fact |
+| `hidden` | The selected brief only: the natural issue, or a withheld version with recorded spans removed |
+| `interactive` | The same brief as `hidden`, plus `ask-user` and `confirm-behavior` to reach the stakeholder |
 
-The first two lines are `make check`; the integration tests under `tests/integration` need credentials and are not part of the offline suite.
+All three conditions share one contract. The FAIL_TO_PASS tests are split into weighted requirement groups. The
+reward is partial credit over those groups, and any PASS_TO_PASS regression sets it to zero. `success` means the whole
+contract passed. Asking changes what the agent knows, never the tests or the weights.
 
-After the setup prerequisites:
+Grading happens in a separate offline container. A root-owned collector freezes the submitted tree and the
+stakeholder transcript. The verifier diffs the tree against the untouched base and drops edits to protected paths
+(contract tests, pytest configuration, conftest and startup hooks, package metadata). It then runs the hidden tests
+and requires the collected test ids, JUnit, the terminal summary and the exit status to agree. The full contract is
+in [docs/grading.md](docs/grading.md).
 
-```bash
-make cloud-bootstrap PROJECT=YOUR_PROJECT REGION=us-central1 SWESIM_ENV_FILE=./.env
-```
+A drafted task must pass nine code-owned approval gates: schema, asset hashes, judge acceptance, a load-bearing
+on-request fact, grounded requirements, withholding leaks, exact brief reconstruction, controls present, and fact
+scope. It then must pass executed controls before it can be registered:
 
-The console URL is the Terraform `console_url` output. Sign in with an IAP-allowed Google account. Browse **Scenarios**, **Trials**, **Workflows**, **Candidates**, **Database** and the artifact views. Mutations require confirmation; evaluator-only artifacts require a verified IAP identity on the evaluator list.
+| Control | Must show |
+|---|---|
+| No-op | Reward 0; the FAIL_TO_PASS tests fail on the base and the PASS_TO_PASS tests hold |
+| Oracle (the real fix) | Success 1 and reward 1 |
+| Plausible-wrong patch | Applies, fails correctness, stays under its declared reward ceiling |
+| Tamper (root `conftest.py`, `sitecustomize.py`, skip marker) | Applies and earns exactly 0 without an infrastructure failure |
+| Reachability probe | The gold commit and distinctive post-fix lines cannot be reached from the agent's environment |
 
-Workflow inspection is also available from the CLI:
-
-```bash
-uv run --frozen swesim workflows list all
-uv run --frozen swesim workflows progress WORKFLOW_ID
-```
-
-Replace uppercase placeholders. Task creation and graded runs start from the console's Create/Run pages or `swesim create` and `swesim run-tasks`; both go through Temporal. The stage commands are internal building blocks; their direct execution switch is for debugging one stage, not operating the pipeline.
-
-## How a task is created
+## How a task is made and run
 
 ```mermaid
 flowchart LR
@@ -47,45 +58,99 @@ flowchart LR
   H --> I["Grade, audit, score and export"]
 ```
 
-The natural issue remains the original text. Withholding removes selected spans and records each occurrence in a ledger. Every stakeholder requirement must be grounded in a visible fact or a verbatim human statement. Author-only facts stay outside the stakeholder view. The judge and drafter resolve to different model ids.
+Tasks come from two sources: the human-annotated SWE-bench Verified pool, and any GitHub repository URL, where
+discovery finds merged PRs with linked issues and filters them by diff size. Tasks are compiled to
+[Harbor](https://github.com/laude-institute/harbor) 0.23 task directories, and Harbor builds and runs both images on
+Modal. The agent is mini-swe-agent, running as an unprivileged user with a host allowlist; the verifier has no
+network. Temporal orchestrates creation and trials. The hosted deployment consists of four Cloud Run worker pools,
+one Cloud Run Job per trial, a versioned GCS bucket as the record, a Cloud SQL index and an IAP-protected console
+([docs/architecture.md](docs/architecture.md)).
 
-| Condition | Information available |
-|---|---|
-| Full | Natural brief plus stakeholder-visible facts |
-| Hidden | Selected natural or withheld brief |
-| Interactive | The same selected brief plus `ask-user` and `confirm-behavior` |
+## Run it locally
 
-Repository discovery has explicit `bugfix` and `feature` bands. Diff size is a candidate filter, not measured difficulty. Discovery rejection counts and subsequent candidate gate rejections have distinct labels in the console; historical discovery snapshots retain their provenance.
+You need Python 3.12 and [uv](https://docs.astral.sh/uv/). The offline suite needs no credentials, no Docker and no
+network after the first sync:
 
-Eight automatic approval gates cover schema, asset hashes, judge acceptance, an on-request fact linked to FAIL_TO_PASS, grounded requirements, withholding leaks, exact brief reconstruction, and controls. Validation then executes the no-op, oracle, plausible-wrong and tamper controls and checks gold reachability. Infrastructure failure does not count as a defeated attack.
+```bash
+uv sync --extra dev --frozen
+uv run --frozen --offline python -m pytest -q tests --ignore=tests/integration
+uv run --frozen swesim --help
+```
 
-## Hosted state — 2026-09-13
+`tests/test_compile.py::test_llm_helpers` expects `OPENAI_API_KEY` to be absent. If your shell exports it, run the
+suite under `env -u OPENAI_API_KEY`. The tests under `tests/integration` need live credentials.
 
-Console: <https://<console-host>> (native IAP; an unauthenticated request is redirected to Google sign-in, `workspace/evidence/cloud/iap-headers-20260913T202624Z.txt`). Region `us-central1`, Temporal Cloud namespace `swesim.abcde`; the GCP project id is in the header line of every `workspace/evidence/cloud/verify_cloud-*.txt`.
+You can inspect the tracked example offline as well. These commands check every file against the example's manifest
+and recompute one run's reward from the verifier's per-test observations
+([examples/README.md](examples/README.md#reproducing-the-grading-offline) walks through each file):
 
-| Fact | Value | Source |
-|---|---|---|
-| Deployed commit and image | `cf471f6` (`cf471f618aad66090225f78089b3e3da4e4c0f27`), image `worker@sha256:2c539bf4b58b3a7aa0fbc017dfbf08c6dbc40da1ebc5ab0c3143407d473fb79e`; Cloud Build `d8467c3e…` SUCCESS; Terraform 0 added / 6 changed / 0 destroyed; migration execution `swesim-index-maintenance-hmmls` completed, Alembic head `0005_funnel_versions`; `verify_cloud` `result: OK` at 20:26:24 UTC (API-key Temporal with pollers on all four queues, IAP 302, four pools and console Ready on the pinned image, 16 `swesim-trial-*` Jobs each with exactly one execution). The seventh verified deploy of the afternoon; the six before it, with digests, are in ops.md. | `workspace/evidence/cloud/deploy-cf471f6.log`, `verify_cloud-20260913T202624Z.txt`, [ops.md](docs/ops.md#hosted-runs-2026-09-13-afternoon) |
-| Hosted task creation | `pytest-dev--pytest-7283` (SWE-bench pool A) registered through seven executed controls by `create-b788cb22d7064a4d8bcbe63bb943c709` — the first hosted valid task. Repository creations have yielded no novel task yet: `encode/httpx` 0 PRs merged since 2026-06-01; `pydantic/pydantic` and `pytest-dev/pytest` 3 candidates each, all rejected (judge; not reproducible offline; alternative-correct control failed); a nine-repository sweep hit GitHub's secondary rate limit (six of nine errored; handling fixed and deployed in `cf471f6`). **The since-2023 both-band sweep is running** (10 repositories × bugfix/feature, one scan at a time; first creation `create-06b18aec377b4697986b09e6d8dcc84d`, log written 20:26 UTC). | `workspace/evidence/smoke/`, [ops.md](docs/ops.md#creation-workflows) |
-| Hosted graded trials | **29 trials, $3.01 in total** (`total_trials: 29`, `total_cost_usd: 3.0124`), all on `pytest-dev--pytest-7283`: the first, `50d797789546d178d8add487`, ran as one Cloud Run Job with one execution while a deploy rolled the trials pool (valid-incorrect, reward 0.0); a screen (`broken` for the screen model `openrouter/deepseek/deepseek-v3.2`); and a four-model × three-condition × k=2 comparison (24 trials). Per-cell numbers, the inverted full/hidden ordering it exposed and what the data does not show are in grading.md. | `workspace/evidence/sweep/pytest-7283-comparison-2026-09-13.json`, `workspace/evidence/cloudrun/executions-50d797789546d178d8add487.json`, [grading.md](docs/grading.md#first-hosted-results-2026-09-13) |
-| Preserved laptop/VM record | 50 trial records, 19 matching the three registered version-2 specs (`mwaskom--seaborn-3190`, `scikit-learn--scikit-learn-13584`, `py-pdf--pypdf-3826`), 13 correct / 6 incorrect; not a hosted comparison | [grading.md](docs/grading.md#preserved-inventory--2026-09-13) |
-| Model roles | Workflows started before the `400c288` roll (verified 19:12 UTC), including the one that registered pytest-7283: judge `openai/gpt-5.5`, drafter/stakeholder/audit `openai/gpt-5.6-sol` — fallbacks after the Anthropic workspace limit. After the roll, with key version 2 in Secret Manager, roles resolve to the configured heads (`anthropic/claude-opus-5` judge/stakeholder, `anthropic/claude-sonnet-5` drafter); the comparison run's stakeholder was Opus 5. Screen `openrouter/deepseek/deepseek-v3.2` throughout. Every record names the id that actually ran. | `workspace/evidence/model-probe-takeover.json`, [ops.md](docs/ops.md#model-role-fallbacks-in-force) |
+```bash
+uv run --frozen python -c "
+import hashlib, json, pathlib
+root = pathlib.Path('examples/mwaskom--seaborn-3190'); m = json.load(open(root / 'manifest.json'))
+bad = [p for p, h in m['files'].items() if hashlib.sha256((root / p).read_bytes()).hexdigest() != h]
+print('ok' if not bad else bad)"
+```
 
-Everything a finishing stream cut on 2026-09-13, plus what the afternoon runs added to that list, is in [ops.md](docs/ops.md#deferred-from-the-2026-09-13-finishing-run). See [grading](docs/grading.md) for the grading contract, the hosted results and the historical record with their limits.
+To create and run tasks yourself you need a Modal account, model-provider keys (Anthropic, OpenAI or OpenRouter, per
+the roles you configure), a GitHub token for mining and a Temporal namespace. Configuration lives in a git-ignored
+`.env` generated from [.env.example](.env.example), which explains every variable. The supported deployment is the
+hosted one: [docs/setup.md](docs/setup.md) goes from an empty GCP project to a running pipeline in seven checked
+steps, and [docs/runbook.md](docs/runbook.md) covers operations. `scripts/vm/` keeps an older single-VM backend with
+a local Temporal dev server.
 
-## Trust and measurement
+## Results
 
-The compiler hashes its render configuration and file manifest. Runs verify that manifest before use. The root collector records its base-manifest digest; the separate verifier requires the same base before grading. Reward is partial credit by fixed requirement groups, with any regression forcing zero; success means the full contract passed.
+Every number below comes from a file in this repository. The sample sizes are small, so treat them as measurements
+of the pipeline, not as claims about models.
 
-The stakeholder exposes reply text and remaining patience. Patience tier, fact labels, redactions and usage stay evaluator-only. Code filters cover hidden-test identifiers and recognized option markers; semantic reporter behavior remains partly prompt-enforced and is measured by the disclosure audit.
+**The tracked example passes its controls.** `examples/mwaskom--seaborn-3190/validation.json` records the controls
+that admitted SWE-bench instance `mwaskom__seaborn-3190`. The no-op scored reward 0 (FAIL_TO_PASS 0 of 1,
+PASS_TO_PASS 84 of 84). The oracle scored reward 1. The plausible-wrong patch scored 0. Each of the three tamper
+patches scored 0 with a `protected-path-edit` signal. The reachability probe found no gold-commit hits. The three
+tracked runs, two `interactive` and one `hidden`, each scored reward 1.0 with 85 of 85 tests passing
+(`runs/*/reward.json`). In one interactive run the agent asked one question, got a behaviour-level answer and had its
+fix confirmed. The hidden run passed too, so on this task the model did not need the stakeholder.
 
-Submitted code still executes inside pytest and can attempt coordinated report forgery. These checks are tested defenses, not a proof of complete isolation from in-process attacks. Interactive exports remain unadjudicated until reviewed. Historical non-interactive `training_eligible` flags are exporter metadata, not a substitute for task-sense review.
+**The first hosted task found a task-authoring defect.** On `pytest-dev--pytest-7283`, 29 hosted trials cost $3.01
+in total: four models, three conditions, k=2, plus a screen and a demonstration run. Two models solved every
+condition (7 of 7 and 6 of 6). For the other two, scores ran the wrong way: `full` < `hidden` < `interactive`
+(0/3, 3/5, 2/2 and 0/2, 1/2, 2/2). The cause was a stakeholder-visible fact that described behaviour only a
+PASS_TO_PASS test covered. Agents given every fact acted on it, and one regressed a passing test. The fix was a
+ninth approval gate, `fact-scope`, which rejects such a fact. The per-cell table, costs and caveats are in
+[docs/grading.md](docs/grading.md#first-hosted-results-2026-09-13).
+
+**The issue judge is weak on recall.** The judge decides which issues count as underspecified. Against the human
+labels on 145 annotated SWE-bench rows, `openai/gpt-5.5` scored agreement 0.655, precision 0.644 and recall 0.460, and
+`anthropic/claude-opus-5` scored 0.634, 0.604 and 0.460. Answering "not underspecified" every time would score
+82/145 = 0.566 on the same rows (from the confusion counts in
+[docs/grading.md](docs/grading.md#judge-calibration)). The judge misses more than half of the underspecified issues.
+
+**Earlier runs, kept separate.** `registry.json` lists three version-2 scenarios. Their 19 current-spec trials
+scored 6/6 on seaborn, 7/7 on scikit-learn and 0/6 on pypdf. The saved task-sense audit flags the pypdf hidden test
+as unfair: it calls a helper that only the oracle introduces. So that 0/6 shows a task defect, not difficulty
+([docs/grading.md](docs/grading.md#preserved-inventory--2026-09-13)).
+
+**Limits.** Submitted code runs inside pytest's process and can try to forge its reports. The four-way evidence
+check catches disagreement, but it does not prove isolation. The stakeholder's reporter stance is partly
+prompt-enforced and is measured by a disclosure audit. Interactive episodes stay unadjudicated until a person
+reviews them.
 
 ## Repository map
 
-- [Setup](docs/setup.md), [runbook](docs/runbook.md), [architecture](docs/architecture.md), [grading](docs/grading.md), [operations evidence](docs/ops.md).
-- `swesim/`: models, stages, sources, verifier, stakeholder, Temporal workflows, index and console.
+- `swesim/`: models, stages (mine, judge, draft, approve, compile, validate, run, score, export), sources,
+  verifier, stakeholder service, Temporal workflows, index and console.
+- `tests/`: the offline suite; `tests/integration/` needs credentials.
+- `examples/mwaskom--seaborn-3190/`: a sanitized, hash-listed snapshot of one validated task and three runs.
 - `infra/`, `Dockerfile.worker`, `cloudbuild.yaml`, `scripts/cloud/`: hosted infrastructure and deployment.
-- `workspace/`: ignored local mirror; the hosted bucket is the authoritative record.
-- `examples/mwaskom--seaborn-3190/`: historical sanitized example, with a manifest.
-- [Hosted design](docs/superpowers/specs/2026-09-13-gcp-hosting-design.md): implemented topology and acceptance status.
+- `docs/`: [architecture](docs/architecture.md), [grading](docs/grading.md), [setup](docs/setup.md),
+  [runbook](docs/runbook.md), [operations record](docs/ops.md); `docs/superpowers/` holds the design specs and
+  plans, and `docs/reviews/` holds adversarial reviews of the design.
+- `data/annotations/`: OpenAI's SWE-bench Verified annotations, which the SWE-bench source and the judge
+  calibration read, plus two pool subsets derived from them.
+
+## Licence
+
+MIT, © 2026 Saahil Sanganeriya; see [LICENSE](LICENSE). Third-party material keeps its own terms: OpenAI's
+annotation file in `data/annotations/` and Harbor's SWE-bench adapter template in
+`references/harbor-swebench-adapter-template/`.
